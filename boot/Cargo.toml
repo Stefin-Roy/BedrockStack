@@ -1,0 +1,10 @@
+[package]
+name = "boot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+uefi = { version = "0.37", features = ["alloc", "logger", "panic_handler"] }
+log = "0.4"
+common = { path = "../common" }
+

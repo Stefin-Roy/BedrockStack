@@ -1,0 +1,12 @@
+[build]
+# No default target — specified per-crate via --target
+
+[target.x86_64-unknown-none]
+# -no-pie / -static force a fixed-position ET_EXEC. The bootloader loads the
+# kernel at the ELF pheaders' physical addresses (0x400000) and jumps there
+# directly, so the binary must NOT be position-independent (ET_DYN).
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
+]
