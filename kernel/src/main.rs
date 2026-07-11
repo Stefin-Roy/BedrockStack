@@ -76,7 +76,6 @@ _start:
 
 const MAX_MEMORY_REGIONS: usize = 8;
 static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { core::mem::zeroed() };
-static mut DTB_MEMORY_COUNT: usize = 0;
 
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
@@ -130,13 +129,6 @@ struct FdtHeader {
     size_dt_struct: u32,
 }
 
-fn fdt_read_u32_base(base: *const u8, offset: u32) -> u32 {
-    unsafe {
-        let ptr = base.add(offset as usize) as *const u32;
-        u32::from_be(core::ptr::read_volatile(ptr))
-    }
-}
-
 fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
     if dtb.is_null() {
         return None;
@@ -174,24 +166,6 @@ fn fdt_str_eq(ptr: *const u8, expected: &[u8]) -> bool {
     }
 }
 
-fn fdt_next_prop(ptr: &mut *const u8) -> Option<(u32, u32)> {
-    let token = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
-    if token != FDT_PROP {
-        return None;
-    }
-    *ptr = unsafe { ptr.add(4) };
-    let len = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
-    *ptr = unsafe { ptr.add(4) };
-    let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
-    *ptr = unsafe { ptr.add(4) };
-    Some((len, nameoff))
-}
-
-fn fdt_skip_prop_value(ptr: &mut *const u8, len: u32) {
-    let padded = (len + 3) & !3;
-    *ptr = unsafe { ptr.add(padded as usize) };
-}
-
 /// Parse the DTB to populate memory regions and return a slice.
 ///
 /// Falls back to the hardcoded 256 MB QEMU virt layout on failure.
@@ -210,8 +184,7 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
     let struct_base = unsafe { dtb.add(hdr.off_dt_struct as usize) };
     let mut pos: *const u8 = struct_base;
 
-    // Skip past the root node's name.
-    let _token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+    // Skip past the root node's name (BEGIN_NODE token + name string).
     pos = unsafe { pos.add(4) };
     while unsafe { core::ptr::read_volatile(pos) } != 0 {
         pos = unsafe { pos.add(1) };
@@ -239,12 +212,8 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
             }
-            FDT_BEGIN_NODE => {
-                break;
-            }
-            FDT_END_NODE => {
-                break;
-            }
+            FDT_BEGIN_NODE => break,
+            FDT_END_NODE => break,
             FDT_END => break,
             _ => { pos = unsafe { pos.add(4) }; }
         }
@@ -311,7 +280,7 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
             FDT_PROP => {
                 let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
                 pos = unsafe { pos.add(4) };
-                let _nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let _ = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
                 pos = unsafe { pos.add(4) };
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
@@ -322,10 +291,7 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
     }
 
     if region_count > 0 {
-        unsafe {
-            DTB_MEMORY_COUNT = region_count;
-            &DTB_MEMORY_REGIONS[..region_count]
-        }
+        unsafe { &DTB_MEMORY_REGIONS[..region_count] }
     } else {
         riscv_fallback_memory()
     }
@@ -375,8 +341,7 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
     let struct_base = unsafe { dtb.add(hdr.off_dt_struct as usize) };
     let mut pos: *const u8 = struct_base;
 
-    // Skip root node name.
-    let _token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+    // Skip root node name (BEGIN_NODE token + name string).
     pos = unsafe { pos.add(4) };
     while unsafe { core::ptr::read_volatile(pos) } != 0 {
         pos = unsafe { pos.add(1) };
@@ -427,7 +392,7 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
             FDT_PROP => {
                 let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
                 pos = unsafe { pos.add(4) };
-                let _nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let _ = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
                 pos = unsafe { pos.add(4) };
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
