@@ -1,9 +1,6 @@
 use core::arch::asm;
 
-const SBI_SUCCESS: i64 = 0;
 pub const SBI_EXT_LEGACY: u64 = 0x10;
-const SBI_EXT_DBCN: u64 = 0x4442434E;
-const SBI_EXT_HSM: u64 = 0x48534D;
 const SBI_EXT_SRST: u64 = 0x53525354;
 
 const SBI_EXT_LEGACY_CONSOLE_PUTCHAR: u64 = 1;
@@ -16,12 +13,8 @@ const SBI_EXT_SEND_IPI: u64 = 0;
 
 const SRST_TYPE_SHUTDOWN: u64 = 0;
 const SRST_TYPE_COLD_REBOOT: u64 = 1;
-const SRST_TYPE_WARM_REBOOT: u64 = 2;
 const SRST_REASON_NONE: u64 = 0;
 const SRST_FUNCTION: u64 = 0;
-
-const DBCN_WRITE: u64 = 0;
-const DBCN_READ: u64 = 1;
 
 fn ecall(extension: u64, function: u64, arg0: u64, arg1: u64, arg2: u64) -> (i64, u64) {
     let error: i64;

@@ -82,7 +82,7 @@ static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { cor
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
-    use kernel::boot::{MemoryRegionKind, PixelFormat};
+    use kernel::boot::PixelFormat;
     SerialPort::init();
     SerialPort::puts("[kernel] riscv64 _start entered, hart_id=");
     SerialPort::put_u64(hart_id);
@@ -126,6 +126,7 @@ const FDT_END: u32 = 0x00000009;
 
 #[cfg(target_arch = "riscv64")]
 #[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
 struct FdtHeader {
     magic: u32,
     totalsize: u32,
@@ -265,12 +266,12 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
                 pos = unsafe { pos.add(4) };
                 let name_ptr = fdt_string(&hdr, dtb, nameoff);
                 let val_ptr = pos;
-                if fdt_str_eq(name_ptr, b"reg") && region_count < MAX_MEMORY_REGIONS {
-                    let mut offset = 0usize;
-                    while (offset as u32) < len {
-                        let addr = read_be_n(val_ptr.add(offset), addr_cells);
-                        offset += addr_cells as usize * 4;
-                        let size = read_be_n(val_ptr.add(offset), size_cells);
+                    if fdt_str_eq(name_ptr, b"reg") && region_count < MAX_MEMORY_REGIONS {
+                        let mut offset = 0usize;
+                        while (offset as u32) < len {
+                            let addr = read_be_n(unsafe { val_ptr.add(offset) }, addr_cells);
+                            offset += addr_cells as usize * 4;
+                            let size = read_be_n(unsafe { val_ptr.add(offset) }, size_cells);
                         offset += size_cells as usize * 4;
                         if size > 0 {
                             let kind = if addr == 0x80000000 && size <= 0x100000 {

@@ -325,17 +325,17 @@ impl AcpiSubsystem {
             handler.write_io_u8(0x64, 0xFE);
         }
 
-        // 3. RISC-V: try SBI SRST cold reboot.
+        // 3. RISC-V: try SBI SRST cold reboot (diverging).
         #[cfg(target_arch = "riscv64")]
         crate::arch::riscv64::sbi::cold_reboot();
 
         // 4. Last resort: halt forever.
-        log::error!("ACPI: reset failed — halting");
-        loop {
-            #[cfg(target_arch = "x86_64")]
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+        #[cfg(target_arch = "x86_64")]
+        {
+            log::error!("ACPI: reset failed — halting");
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
     }
 
@@ -387,17 +387,17 @@ impl AcpiSubsystem {
             handler.write_io_u16(pm1a_port, val);
         }
 
-        // RISC-V: try SBI SRST shutdown.
+        // RISC-V: try SBI SRST shutdown (diverging).
         #[cfg(target_arch = "riscv64")]
         crate::arch::riscv64::sbi::system_reset();
 
         // Last resort: halt forever.
-        log::error!("ACPI: shutdown failed — halting");
-        loop {
-            #[cfg(target_arch = "x86_64")]
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
-            #[cfg(target_arch = "riscv64")]
-            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+        #[cfg(target_arch = "x86_64")]
+        {
+            log::error!("ACPI: shutdown failed — halting");
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
     }
 

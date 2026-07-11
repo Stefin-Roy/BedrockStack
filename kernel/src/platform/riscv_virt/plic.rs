@@ -2,7 +2,6 @@ use core::ptr::{read_volatile, write_volatile};
 
 const PLIC_BASE: u64 = 0x0C000000;
 const PLIC_PRIORITY: u64 = 0x000000;
-const PLIC_PENDING: u64 = 0x001000;
 const PLIC_ENABLE: u64 = 0x002000;
 const PLIC_CONTEXT: u64 = 0x200000;
 
@@ -19,10 +18,6 @@ const NUM_SOURCES: usize = 127;
 
 fn priority_addr(irq: u32) -> *mut u32 {
     (PLIC_BASE + PLIC_PRIORITY + irq as u64 * PRIORITY_STRIDE) as *mut u32
-}
-
-fn pending_addr(word: usize) -> *mut u32 {
-    (PLIC_BASE + PLIC_PENDING + word as u64 * WORD_STRIDE) as *mut u32
 }
 
 fn enable_addr(context: usize, word: usize) -> *mut u32 {
