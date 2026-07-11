@@ -2,6 +2,7 @@
 #![no_main]
 
 use core::panic::PanicInfo;
+use kernel::arch::{Arch, CurrentArch};
 use kernel::boot::{FramebufferInfo, MemoryRegion};
 use kernel::drivers::serial::SerialPort;
 
@@ -10,6 +11,7 @@ use kernel::drivers::serial::SerialPort;
 /// # Safety
 /// Called from boot after exit_boot_services.
 #[no_mangle]
+#[cfg(target_arch = "x86_64")]
 pub extern "sysv64" fn _start(
     memory_map_ptr: *const MemoryRegion,
     memory_map_len: usize,
@@ -38,6 +40,16 @@ pub extern "sysv64" fn _start(
     kernel.run();
 }
 
+#[cfg(target_arch = "riscv64")]
+pub extern "C" fn _start(
+    memory_map_ptr: *const MemoryRegion,
+    memory_map_len: usize,
+    framebuffer_ptr: *const FramebufferInfo,
+    stack_guard: u64,
+) -> ! {
+    loop {}
+}
+
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     SerialPort::puts("\n*** KERNEL PANIC: ");
@@ -48,10 +60,10 @@ fn panic(info: &PanicInfo) -> ! {
         SerialPort::puts(" ");
     }
     use core::fmt::Write;
-    let _ = write!(SerialPort, "{}", info.message());
+    let _ = write!(SerialPort::new(), "{}", info.message());
     SerialPort::puts("\n");
     loop {
-        x86_64::instructions::interrupts::disable();
-        x86_64::instructions::hlt();
+        CurrentArch::disable_interrupts();
+        CurrentArch::halt();
     }
 }

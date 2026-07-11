@@ -1,6 +1,8 @@
 //! Minimal ELF64 parser for loading kernel binaries.
 //!
-//! Only handles ELF64 little-endian, executable, x86_64.
+//! Only handles ELF64 little-endian executables.  The expected `e_machine`
+//! value is set per target architecture so the bootloader validates that the
+//! kernel it loads matches the platform it runs on.
 //! Copies LOAD segments to their physical addresses after reserving that
 //! physical range from UEFI, so firmware/boot-services allocations can never
 //! sit under the kernel image and get clobbered by the copy.
@@ -87,7 +89,7 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
         return Err("Invalid ELF magic");
     }
 
-    // Validate ELF64 (class = 2), little-endian (data = 1), x86_64 (machine = 0x3E)
+    // Validate ELF64 (class = 2), little-endian (data = 1)
     if elf_data[4] != 2 {
         return Err("Not ELF64");
     }
@@ -108,9 +110,14 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
     if e_type != 2 {
         return Err("Not a non-PIE executable ELF (ET_EXEC required)");
     }
-    // EM_X86_64 = 0x3E
-    if e_machine != 0x3E {
-        return Err("Not x86_64");
+
+    // Validate the kernel's machine type matches the bootloader's target.
+    #[cfg(target_arch = "x86_64")]
+    const EXPECTED_MACHINE: u16 = 0x3E; // EM_X86_64
+    #[cfg(target_arch = "riscv64")]
+    const EXPECTED_MACHINE: u16 = 0xF3; // EM_RISCV
+    if e_machine != EXPECTED_MACHINE {
+        return Err("Architecture mismatch between bootloader and kernel");
     }
     // ELF64 program header is 56 bytes minimum
     if e_phentsize < 56 {

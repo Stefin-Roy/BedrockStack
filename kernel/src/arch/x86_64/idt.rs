@@ -3,6 +3,8 @@
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
+use crate::arch::{Arch, CurrentArch};
+use crate::arch::x86_64::apic;
 use crate::drivers::serial::SerialPort;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -33,10 +35,18 @@ pub fn init() {
                 .set_stack_index(crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
+        // Register APIC timer interrupt at vector 32.
+        idt[32].set_handler_fn(timer_handler);
+
         idt
     });
 
     idt.load();
+}
+
+/// Timer interrupt handler (vector 32).
+extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    apic::apic_eoi();
 }
 
 /// Print a short message then halt forever.
@@ -45,8 +55,8 @@ fn fault_halt(name: &str) -> ! {
     SerialPort::puts(name);
     SerialPort::puts("\n");
     loop {
-        x86_64::instructions::interrupts::disable();
-        x86_64::instructions::hlt();
+        CurrentArch::disable_interrupts();
+        CurrentArch::halt();
     }
 }
 

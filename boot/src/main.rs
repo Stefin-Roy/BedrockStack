@@ -14,7 +14,7 @@ use uefi::fs::FileSystem;
 mod allocator;
 mod elf;
 
-use common::serial::SerialPort;
+use common::serial::x86_64::SerialPort;
 use common::types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
 
 #[global_allocator]
@@ -110,8 +110,8 @@ fn main() -> Status {
     let stack_region_top = stack_base + stack_pages * PAGE_SIZE;
 
     // Stack grows downward. Align the top DOWN to 16 bytes, then subtract 8 to
-    // emulate the post-`call` stack state SysV64 expects at function entry
-    // (RSP % 16 == 8).
+    // emulate the post-`call` stack state the calling convention expects at
+    // function entry (RSP % 16 == 8 on x86_64 SysV; RISC-V uses a0-a7).
     let stack_top = (((stack_region_top) & !0xF) - 8) as *const u8;
 
     let _ = output.output_string(uefi::cstr16!("Exiting boot services..."));
@@ -128,13 +128,14 @@ fn main() -> Status {
         if desc.page_count == 0 {
             continue;
         }
-        // SAFETY/ROBUSTNESS: Only conventional memory BELOW 4 GiB is treated as
-        // usable RAM. OVMF/QEMU commonly report gigantic "conventional" regions in
-        // the high address space (e.g. 12 GiB @ 0xfd00000000) that are NOT backed
-        // by real RAM. Mapping or allocating from them makes the kernel fabricate
-        // page tables for nonexistent memory. Real RAM for this target lives below
-        // 4 GiB; legitimate >4 GiB RAM (real hardware) would need a proper
-        // above-4G memory map and is out of scope here.
+        // SAFETY/ROBUSTNESS: On x86_64 only conventional memory BELOW 4 GiB is
+        // treated as usable RAM. OVMF/QEMU commonly report gigantic "conventional"
+        // regions in the high address space (e.g. 12 GiB @ 0xfd00000000) that are
+        // NOT backed by real RAM. Mapping or allocating from them makes the kernel
+        // fabricate page tables for nonexistent memory. Real RAM for this target
+        // lives below 4 GiB; legitimate >4 GiB RAM (real hardware) would need a
+        // proper above-4G memory map and is out of scope here.
+        #[cfg(target_arch = "x86_64")]
         if desc.ty == MemoryType::CONVENTIONAL && desc.phys_start >= 0x1_0000_0000 {
             continue;
         }
@@ -232,7 +233,7 @@ fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
     fs.read(path).expect("Failed to read kernel file from disk")
 }
 
-/// Jump to kernel entry point with sysv64 calling convention.
+/// Jump to kernel entry point.
 ///
 /// # Safety
 /// - entry must be a valid kernel entry point
@@ -249,16 +250,38 @@ unsafe fn jump_to_kernel(
     fb_ptr: *const FramebufferInfo,
     stack_guard: u64,
 ) -> ! {
-    core::arch::asm!(
-        "mov rsp, r8",
-        "xor rbp, rbp",
-        "jmp r9",
-        in("r8") stack_top,
-        in("r9") entry,
-        in("rdi") regions_ptr,
-        in("rsi") regions_len,
-        in("rdx") fb_ptr,
-        in("rcx") stack_guard,
-        options(noreturn)
-    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        core::arch::asm!(
+            "mov rsp, r8",
+            "xor rbp, rbp",
+            "jmp r9",
+            in("r8") stack_top,
+            in("r9") entry,
+            in("rdi") regions_ptr,
+            in("rsi") regions_len,
+            in("rdx") fb_ptr,
+            in("rcx") stack_guard,
+            options(noreturn)
+        );
+    }
+
+    #[cfg(target_arch = "riscv64")]
+    {
+        core::arch::asm!(
+            "mv sp, {stack_top}",
+            "mv a0, {regions_ptr}",
+            "mv a1, {regions_len}",
+            "mv a2, {fb_ptr}",
+            "mv a3, {stack_guard}",
+            "jalr zero, {entry}, 0",
+            stack_top = in(reg) stack_top,
+            regions_ptr = in(reg) regions_ptr,
+            regions_len = in(reg) regions_len,
+            fb_ptr = in(reg) fb_ptr,
+            stack_guard = in(reg) stack_guard,
+            entry = in(reg) entry,
+            options(noreturn)
+        );
+    }
 }

@@ -1,8 +1,8 @@
 # BedrockOS - Invariants v0.1
 
-**Version**: 0.1.2
+**Version**: 0.2.0
 **Date**: 2026-07-11
-**Status**: Post-audit fix (huge-page paging, W^X, guard page, load-region reservation)
+**Status**: Added kernel heap allocator + APIC timer with PIT calibration
 
 ---
 
@@ -22,30 +22,46 @@ Properties of system state that must always hold.
 **ALLOC-03**: Reserved frames (from UEFI memory map) are marked allocated at initialization.
 - Location: `kernel/src/mm/phys_alloc.rs:52-64`
 
+**ALLOC-04**: The kernel heap is backed by physical frames from the bitmap allocator.
+- Location: `kernel/src/mm/heap.rs`
+- `heap::init()` allocates 64 initial pages (256 KB) via `BitmapAllocator::alloc()`.
+- When the heap runs out, `GlobalAlloc::alloc()` grows by allocating 16 more pages.
+
+**ALLOC-05**: The heap free list is singly-linked through free block headers.
+- Location: `kernel/src/mm/heap.rs`
+- Each free block starts with a `BlockHeader` containing `size` and `next` pointer.
+- Allocated blocks return a payload address immediately after the header.
+- Adjacent free blocks are coalesced during `push_free()`.
+
+**ALLOC-06**: The heap allocator is protected by `spin::Mutex` for interrupt safety.
+- Location: `kernel/src/mm/heap.rs`
+- The `#[global_allocator]` static wraps `Mutex<HeapInner>`.
+- Interrupt handlers calling `alloc`/`dealloc` will spin-wait if the main thread holds the lock.
+
 ### Page Table State
 
 **PAGING-01**: Paging uses a freshly built PML4 (not the firmware's tables),
 loaded via a single `Cr3::write`.
-- Location: `kernel/src/mm/virt_mem.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs`
 - Building our own table avoids UEFI huge-page mappings silently blocking our
   flags (e.g. framebuffer `NO_CACHE`).
 
 **PAGING-02**: Identity mapping covers all physical memory from 0 to
 max(4GB, framebuffer_end, allocator.managed_end()).
-- Location: `kernel/src/mm/virt_mem.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs`
 - Bulk RAM uses 2 MiB huge pages (fast, compact). The kernel image, the NULL
   page's 2 MiB chunk, and the guard page's chunk use 4 KiB pages.
 - Covers kernel code/data, framebuffer, all managed RAM (incl. the stack and
   hand-off buffers), and hardware-mapped regions within the range.
 
 **PAGING-03**: W^X — no page is both writable and executable.
-- Location: `kernel/src/mm/virt_mem.rs` (`leaf_flags_4k`)
+- Location: `kernel/src/arch/x86_64/paging.rs` (`leaf_flags_4k`)
 - `.text` = executable + read-only; `.rodata` = read-only + NX; everything else
   = writable + NX. Requires EFER.NXE and CR0.WP, both enabled in `setup`.
 
 **PAGING-04**: The NULL page (frame 0) and the stack guard page are unmapped, so
 null derefs and stack overflows fault instead of corrupting memory.
-- Location: `kernel/src/mm/virt_mem.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs`
 
 ### Module State
 
@@ -61,6 +77,33 @@ null derefs and stack overflows fault instead of corrupting memory.
 - Location: `kernel/src/display/framebuffer.rs`
 - `Framebuffer::new()` stores the pixel format from `FramebufferInfo`.
 - `draw_char()` writes pixel bytes in the correct order (BGR or RGB).
+
+### APIC / Timer State
+
+**APIC-01**: Local APIC is enabled before the timer is programmed.
+- Location: `kernel/src/arch/x86_64/apic.rs` (`init`)
+- Bit 11 of `IA32_APIC_BASE` MSR is set.
+- Spurious Interrupt Vector Register (offset `0xF0`) has bit 8 set.
+
+**APIC-02**: The APIC timer is calibrated via PIT channel 0 before starting.
+- Location: `kernel/src/arch/x86_64/apic.rs` (`calibrate_via_pit`)
+- PIT is programmed in one-shot mode with count 0xFFFF (~54.9 ms at 1.193182 MHz).
+- The APIC timer runs simultaneously with maximum initial count.
+- The elapsed APIC ticks during the PIT period are used to compute the count for
+  100 Hz (10 ms period).
+- Formula: `count = elapsed_ticks * 1193182 / 6553500`.
+
+**APIC-03**: The APIC timer interrupt is delivered at vector 32.
+- Location: `kernel/src/arch/x86_64/idt.rs`
+- LVT Timer register (offset `0x320`) is configured with periodic mode (bit 17)
+  and vector 32.
+- The timer handler writes the EOI register (offset `0xB0`) via `apic::apic_eoi()`.
+
+**APIC-04**: The APIC MMIO region is within the identity-mapped first 4 GiB.
+- Location: `kernel/src/arch/x86_64/paging.rs` (`setup`)
+- The LAPIC base (typically `0xFEE00000`) falls within `min_end = 4 GiB`.
+- No dedicated `NO_CACHE` flag is applied to the APIC range (left as
+  `WRITABLE | NO_EXECUTE`; MTRRs handle uncacheability on real hardware).
 
 ### Boot Loader State
 
@@ -114,16 +157,28 @@ it needs no `forget`.
 **INIT-03**: Physical allocator must exist before page table setup.
 - Location: `kernel/src/lib.rs` (`Kernel::new` then `Kernel::init`)
 
-**INIT-04**: Page tables must be set up before framebuffer use.
-- Location: `kernel/src/lib.rs` (`Kernel::init` runs `virt_mem::setup` before `run`)
+**INIT-04**: Physical allocator must exist before heap init.
+- Location: `kernel/src/lib.rs` (`Kernel::new`: bitmap allocator created, then `heap::init` called)
 
-**INIT-05**: UEFI boot services must be exited before bare metal code runs.
+**INIT-05**: Heap allocator must exist before any `alloc`-based code runs.
+- Location: `kernel/src/lib.rs` (`Kernel::new` returns; modules in `run()` use `alloc`)
+
+**INIT-06**: APIC must be initialised after IDT (timer handler registered in IDT).
+- Location: `kernel/src/arch/x86_64/mod.rs` (`init`: `gdt::init` → `idt::init` → `apic::init`)
+
+**INIT-07**: Interrupts must be enabled after APIC init and page table setup.
+- Location: `kernel/src/lib.rs` (`Kernel::init`: APIC in `CurrentArch::init`, then page tables, then `CurrentArch::enable_interrupts`)
+
+**INIT-08**: Page tables must be set up before framebuffer use.
+- Location: `kernel/src/lib.rs` (`Kernel::init` runs `setup_virt_mem` before `run`)
+
+**INIT-09**: UEFI boot services must be exited before bare metal code runs.
 - Location: `boot/src/main.rs` (`exit_boot_services`)
 
-**INIT-06**: Kernel ELF must be loaded into physical memory before exit_boot_services.
+**INIT-10**: Kernel ELF must be loaded into physical memory before exit_boot_services.
 - Location: `boot/src/main.rs` (`elf::load_elf`)
 
-**INIT-07**: Transfer buffers and the kernel stack must be allocated before
+**INIT-11**: Transfer buffers and the kernel stack must be allocated before
 exit_boot_services.
 - Location: `boot/src/main.rs`
 
@@ -186,7 +241,7 @@ framebuffer_ptr, stack_guard).
 phys_offset=0 over a freshly allocated PML4. Identity mapping: virtual == phys.
 Bulk RAM is mapped with 2 MiB huge pages; the kernel image / NULL / guard chunks
 use 4 KiB pages for per-section W^X and to punch holes.
-- Location: `kernel/src/mm/virt_mem.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs`
 
 **NOTE-04**: GDT has null (implicit), code, data, and TSS segments. The TSS
 provides an IST entry (index 0) used by the double-fault handler so it always
@@ -213,9 +268,31 @@ loaded from disk at runtime by the bootloader (not embedded at build time).
 
 **NOTE-09**: IDT registers handlers for divide-error, breakpoint, invalid-opcode,
 invalid-TSS, segment-not-present, stack-segment-fault, general-protection-fault,
-page-fault, and double-fault. The double-fault handler uses the GDT/TSS IST
-stack. All handlers (except breakpoint) log the fault and halt.
+page-fault, double-fault, and APIC timer (vector 32). The double-fault handler
+uses the GDT/TSS IST stack. The timer handler calls `apic::apic_eoi()`. All
+exception handlers (except breakpoint) log the fault and halt.
 - Location: `kernel/src/arch/x86_64/idt.rs`
+
+**NOTE-10**: Kernel heap allocator is a linked-list free-list allocator.
+- 64 pages (256 KB) initial pool; grows by 16 pages per exhaustion.
+- Protected by `spin::Mutex`. Physical pages obtained from `BitmapAllocator`.
+- All physical RAM is identity-mapped, so heap pages are accessed at their
+  physical addresses (virtual == physical).
+- Location: `kernel/src/mm/heap.rs`
+
+**NOTE-11**: APIC timer uses raw MMIO access to LAPIC registers.
+- The LAPIC base address is read from `IA32_APIC_BASE` MSR (0x1B).
+- Calibration uses PIT channel 0 in one-shot mode; raw `in`/`out` port I/O.
+- Formula: `count = elapsed_ticks * 1193182 / 6553500` for 10 ms period.
+- Falls back to a hard-coded value of 1,000,000 (QEMU default 100 MHz) if PIT
+  calibration times out or yields zero.
+- Location: `kernel/src/arch/x86_64/apic.rs`
+
+**NOTE-12**: The `Arch` trait in `kernel/src/arch/mod.rs` abstracts architecture
+differences. `CurrentArch` resolves to `X86_64` or `Riscv64` based on
+`cfg(target_arch = ...)`. The x86_64 `Arch` impl calls:
+  `gdt::init()` → `idt::init()` → `apic::init()`.
+- All arch-specific modules live under `kernel/src/arch/<arch>/`.
 
 ---
 
@@ -223,12 +300,14 @@ stack. All handlers (except breakpoint) log the fault and halt.
 
 When modifying code:
 
-- [ ] ALLOC-01 through ALLOC-03 still hold
+- [ ] ALLOC-01 through ALLOC-06 still hold
 - [ ] PAGING-01 through PAGING-04 still hold (incl. W^X and NULL/guard holes)
+- [ ] APIC-01 through APIC-04 still hold
 - [ ] MOD-01 and MOD-02 still hold
 - [ ] DISP-01 still holds (pixel format propagated correctly)
 - [ ] BOOT-01 through BOOT-06 still hold
-- [ ] INIT-01 through INIT-07 ordering maintained
+- [ ] INIT-01 through INIT-11 ordering maintained
 - [ ] No new unsafe blocks without safety comment
 - [ ] No new panics in non-test code
 - [ ] If boot types changed, update both boot/src/main.rs AND kernel/src/boot.rs
+- [ ] Heap changes: verify free-list integrity, coalesce logic, `Send`/`Sync` impls

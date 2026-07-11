@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-x86_64 = "0.14"
 spin = "0.9"
 common = { path = "../common" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+x86_64 = "0.14"
 

@@ -1,5 +1,6 @@
 #![no_std]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
+extern crate alloc;
 
 pub mod arch;
 pub mod boot;
@@ -8,8 +9,10 @@ pub mod drivers;
 pub mod mm;
 pub mod module;
 
+use arch::{Arch, CurrentArch};
 use boot::{FramebufferInfo, MemoryRegion};
 use display::framebuffer::Framebuffer;
+use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use module::registry::init_all;
 
@@ -88,6 +91,8 @@ impl Kernel {
         // Reserve the kernel image so allocator won't hand out those frames
         allocator.reserve_region(layout.kernel_start, layout.kernel_end);
 
+        heap::init(&mut allocator);
+
         Kernel {
             framebuffer: display,
             allocator,
@@ -98,8 +103,8 @@ impl Kernel {
     }
 
     pub fn init(&mut self) {
-        arch::x86_64::init();
-        mm::virt_mem::setup(
+        CurrentArch::init();
+        CurrentArch::setup_virt_mem(
             &mut self.allocator,
             &self.layout,
             self.stack_guard,
@@ -107,6 +112,8 @@ impl Kernel {
             self.framebuffer.height(),
             self.framebuffer.stride(),
         );
+        // Enable interrupts after arch init and page tables are live.
+        CurrentArch::enable_interrupts();
     }
 
     pub fn run(&mut self) -> ! {
@@ -114,7 +121,7 @@ impl Kernel {
         self.framebuffer.clear();
         init_all(&mut self.framebuffer);
         loop {
-            x86_64::instructions::hlt();
+            CurrentArch::halt();
         }
     }
 }

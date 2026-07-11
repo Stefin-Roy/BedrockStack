@@ -25,7 +25,7 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr as XPhysAddr, VirtAddr};
 
-use super::phys_alloc::BitmapAllocator;
+use crate::mm::phys_alloc::BitmapAllocator;
 use crate::KernelLayout;
 
 const PAGE_4K: u64 = 4096;
