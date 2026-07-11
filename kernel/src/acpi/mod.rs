@@ -198,6 +198,7 @@ pub struct AcpiSubsystem {
 impl AcpiSubsystem {
     /// Parse all ACPI tables starting from the RSDP at `rsdp_addr`.
     pub fn new(rsdp_addr: u64) -> Result<Self, AcpiError> {
+        log::info!("ACPI: RSDP at 0x{:x}", rsdp_addr);
         let handler = AcpiHandler;
         let tables = unsafe { AcpiTables::from_rsdp(handler.clone(), rsdp_addr as usize)? };
         let platform = Arc::new(AcpiPlatform::new(tables, handler)?);
