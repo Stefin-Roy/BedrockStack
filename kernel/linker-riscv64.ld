@@ -47,6 +47,12 @@ SECTIONS
         __bss_end = .;
     }
 
+    .stack : {
+        __stack_start = .;
+        . += 0x8000;
+        __stack_end = .;
+    }
+
     . = ALIGN(4096);
     __kernel_end = .;
 

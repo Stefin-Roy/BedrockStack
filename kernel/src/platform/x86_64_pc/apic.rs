@@ -47,22 +47,33 @@ fn lapic_read(reg: u32) -> u32 {
 pub fn apic_eoi() {
     lapic_write(LAPIC_EOI, 0);
 }
+const PIT_HZ: u64 = 1_193_182;
+const PIT_RELOAD: u64 = 0xFFFF;
+const TIMER_HZ: u64 = 100; // Change to 1000 for a 1 kHz timer.
 
 fn calibrate_via_pit() -> u32 {
     SerialPort::puts("[apic] calibrating via PIT\n");
 
-    pit::program_one_shot(0xFFFF);
+    // Program the PIT for a one-shot interval.
+    pit::program_one_shot(PIT_RELOAD as u16);
 
-    lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000);
+    // Start the LAPIC timer in one-shot mode with the largest possible count.
+    lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000); // masked
     lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
     lapic_write(LAPIC_INIT_COUNT, 0xFFFF_FFFF);
+
+    // Unmask and let it begin counting.
     let mut lvt = lapic_read(LAPIC_LVT_TIMER);
     lvt &= !0x10000;
     lapic_write(LAPIC_LVT_TIMER, lvt);
 
+    // Wait for the PIT to expire.
     let mut timed_out = true;
     for _ in 0..2_000_000 {
-        if pit::has_fired() { timed_out = false; break; }
+        if pit::has_fired() {
+            timed_out = false;
+            break;
+        }
     }
 
     if timed_out {
@@ -70,11 +81,12 @@ fn calibrate_via_pit() -> u32 {
         return 1_000_000;
     }
 
+    // Number of LAPIC ticks during the PIT interval.
     let current = lapic_read(LAPIC_CURR_COUNT);
-    let elapsed = 0xFFFF_FFFFu32.wrapping_sub(current);
+    let elapsed = 0xFFFF_FFFFu32.wrapping_sub(current) as u64;
 
     SerialPort::puts("[apic] PIT elapsed APIC ticks: ");
-    SerialPort::put_u64(elapsed as u64);
+    SerialPort::put_u64(elapsed);
     SerialPort::puts("\n");
 
     if elapsed == 0 {
@@ -82,11 +94,26 @@ fn calibrate_via_pit() -> u32 {
         return 1_000_000;
     }
 
-    let count = ((elapsed as u64) * 1_193_182 / 6_553_500) as u32;
+    // APIC frequency (Hz):
+    //
+    //   elapsed_ticks
+    //   -------------  * PIT_HZ
+    //    PIT_RELOAD
+    //
+    let apic_hz = elapsed * PIT_HZ / PIT_RELOAD;
+
+    SerialPort::puts("[apic] estimated APIC frequency: ");
+    SerialPort::put_u64(apic_hz);
+    SerialPort::puts(" Hz\n");
+
+    // Initial LAPIC count for the requested interrupt frequency.
+    let count = (apic_hz / TIMER_HZ) as u32;
 
     SerialPort::puts("[apic] calibrated timer count: ");
     SerialPort::put_u64(count as u64);
-    SerialPort::puts(" (for 100 Hz)\n");
+    SerialPort::puts(" (for ");
+    SerialPort::put_u64(TIMER_HZ);
+    SerialPort::puts(" Hz)\n");
 
     if count == 0 {
         SerialPort::puts("[apic] WARN: zero calibrated count, using fallback\n");
@@ -95,7 +122,6 @@ fn calibrate_via_pit() -> u32 {
 
     count
 }
-
 pub fn init() {
     if !cpu_has_apic() {
         SerialPort::puts("[apic] FATAL: CPU has no local APIC\n");

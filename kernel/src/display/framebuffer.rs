@@ -29,9 +29,10 @@ impl Framebuffer {
     /// - memory at addr must be writable
     /// - stride is in PIXELS per scanline (bytes per row = stride * 4)
     pub unsafe fn new(addr: u64, width: usize, height: usize, stride: usize, pixel_format: PixelFormat) -> Self {
-        // INV-FB-01: ptr is non-null and 4-byte aligned
-        assert!(addr != 0, "framebuffer address must not be null");
-        assert!(addr % 4 == 0, "framebuffer address must be 4-byte aligned");
+        // INV-FB-01: ptr is non-null and 4-byte aligned (skip check when addr==0 — no display)
+        if addr != 0 {
+            assert!(addr % 4 == 0, "framebuffer address must be 4-byte aligned");
+        }
 
         // INV-FB-02: ptr valid for stride * height * 4 bytes
         // (caller must ensure this)
@@ -82,7 +83,7 @@ impl Display for Framebuffer {
     /// Writes directly to framebuffer memory. Caller must ensure
     /// framebuffer is mapped and writable.
     fn draw_char(&mut self, x: usize, y: usize, ch: u8) -> bool {
-        if x >= self.width || y >= self.height || ch >= 128 {
+        if self.ptr.is_null() || x >= self.width || y >= self.height || ch >= 128 {
             return false;
         }
 
@@ -132,6 +133,7 @@ impl Display for Framebuffer {
     }
 
     fn clear(&mut self) {
+        if self.ptr.is_null() { return; }
         let total = self.stride * self.height * 4;
         unsafe {
             core::ptr::write_bytes(self.ptr, 0, total);

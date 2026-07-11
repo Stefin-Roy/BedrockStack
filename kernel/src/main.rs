@@ -1,6 +1,8 @@
 #![no_std]
 #![no_main]
 
+#[cfg(target_arch = "riscv64")]
+use core::arch::global_asm;
 use core::panic::PanicInfo;
 use kernel::arch::{Arch, CurrentArch};
 use kernel::boot::{FramebufferInfo, MemoryRegion};
@@ -41,17 +43,51 @@ pub extern "sysv64" fn _start(
 }
 
 #[cfg(target_arch = "riscv64")]
+global_asm!(
+    r#"
+.section .text.boot, "ax"
+.globl _start
+_start:
+    /* Write '>' directly to UART at 0x10000000 */
+    li t0, 0x10000000
+1:  lbu t1, 5(t0)
+    andi t1, t1, 0x20
+    beqz t1, 1b
+    li t1, 62
+    sb t1, 0(t0)
+
+    /* Set stack pointer */
+    la sp, __stack_end
+    mv s0, zero
+
+    /* Zero BSS */
+    la t0, __bss_start
+    la t1, __bss_end
+2:  beq t0, t1, 3f
+    sd zero, 0(t0)
+    addi t0, t0, 8
+    j 2b
+3:
+    /* Jump to the Rust entry point (a0=hart_id, a1=dtb). */
+    tail rust_entry
+"#,
+);
+
+#[cfg(target_arch = "riscv64")]
 #[no_mangle]
-pub extern "C" fn _start(hart_id: u64, _dtb_ptr: *const u8) -> ! {
+pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
     use kernel::boot::{MemoryRegionKind, PixelFormat};
     SerialPort::init();
     SerialPort::puts("[kernel] riscv64 _start entered, hart_id=");
     SerialPort::put_u64(hart_id);
     SerialPort::puts("\n");
 
-    static MEMORY_REGIONS: [MemoryRegion; 2] = [
-        MemoryRegion { base: 0x80000000, size: 0x0F000000, kind: MemoryRegionKind::Usable },
+    // RAM: 256MB at 0x80000000. OpenSBI firmware lives in 0x80000000–0x8004FFFF
+    // (PMP-protected, S-mode cannot access).  Start usable memory after it.
+    static MEMORY_REGIONS: [MemoryRegion; 3] = [
+        MemoryRegion { base: 0x80050000, size: 0x0FFB0000, kind: MemoryRegionKind::Usable },
         MemoryRegion { base: 0x00100000, size: 0x00001000, kind: MemoryRegionKind::Reserved },
+        MemoryRegion { base: 0x80000000, size: 0x00050000, kind: MemoryRegionKind::Reserved },
     ];
     static FB_INFO: FramebufferInfo = FramebufferInfo {
         address: 0, width: 0, height: 0, stride: 0,

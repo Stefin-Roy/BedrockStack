@@ -25,6 +25,10 @@ impl BitmapAllocator {
     /// overlap the kernel image `[kernel_start, kernel_end)`, in which case it
     /// is moved to just after the kernel (still within `bitmap_region`).
     ///
+    /// All frames start as "used". Only frames within Usable memory regions
+    /// are cleared to "free", so the allocator can never hand out frames
+    /// that belong to MMIO devices, firmware, or non-existent memory.
+    ///
     /// # Safety
     /// - bitmap_region is a valid (base, size) pair within a Usable region
     /// - memory_map is valid and describes physical memory
@@ -68,17 +72,17 @@ impl BitmapAllocator {
 
         let bitmap = base as *mut u8;
 
-        // Zero the bitmap
-        core::ptr::write_bytes(bitmap, 0, bitmap_len);
+        // Start with ALL frames marked as used.
+        core::ptr::write_bytes(bitmap, 0xFF, bitmap_len);
 
-        // Mark reserved frames
+        // Then clear (free) frames that belong to Usable regions.
         for region in memory_map {
-            if region.kind != MemoryRegionKind::Usable {
-                mark_region_used(bitmap, region, total_frames);
+            if region.kind == MemoryRegionKind::Usable {
+                clear_region(bitmap, region, total_frames);
             }
         }
 
-        // Also mark the bitmap region itself as used
+        // Re-mark the bitmap region itself as used (it was cleared above).
         mark_region_used(
             bitmap,
             &MemoryRegion {
@@ -89,8 +93,7 @@ impl BitmapAllocator {
             total_frames,
         );
 
-        // Explicitly mark frame 0 as used (NULL page). next_free = 1 prevents
-        // allocation but the bitmap bit must be consistent (1 = used).
+        // Explicitly mark frame 0 as used (NULL page).
         if 0 < total_frames {
             unsafe { *bitmap.add(0) |= 1; }
         }
@@ -99,7 +102,7 @@ impl BitmapAllocator {
             bitmap,
             total_frames,
             alloc_end: max_addr,
-            next_free: 1, // Skip frame 0 (NULL page, BIOS/UEFI low memory)
+            next_free: (base / 4096) as usize,
         }
     }
 
@@ -188,6 +191,26 @@ impl BitmapAllocator {
 
     fn set_free(&mut self, idx: usize) {
         unsafe { *self.bitmap.add(idx / 8) &= !(1 << (idx % 8)); }
+    }
+}
+
+/// Mark a memory region as free in the bitmap (clear bits).
+///
+/// `total_frames` bounds the write so a region reported above managed RAM
+/// can never write past the end of the bitmap.
+fn clear_region(bitmap: *mut u8, region: &MemoryRegion, total_frames: usize) {
+    let start_frame = (region.base / 4096) as usize;
+    let end = region.base.saturating_add(region.size);
+    let end_frame = if end == u64::MAX {
+        total_frames
+    } else {
+        ((end + 4095) / 4096).min(total_frames as u64) as usize
+    };
+
+    for frame in start_frame..end_frame {
+        unsafe {
+            *bitmap.add(frame / 8) &= !(1 << (frame % 8));
+        }
     }
 }
 
