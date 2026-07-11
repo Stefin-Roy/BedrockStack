@@ -10,3 +10,11 @@ rustflags = [
     "-C", "link-arg=-no-pie",
     "-C", "link-arg=-static",
 ]
+
+[target.riscv64gc-unknown-none-elf]
+# OpenSBI loads the raw kernel binary at 0x80200000 and jumps there in S-mode.
+# The binary must be a fixed-position ET_EXEC (no PIE) with a flat linker script.
+rustflags = [
+    "-C", "link-arg=-Tkernel/linker-riscv64.ld",
+    "-C", "link-arg=-static",
+]
