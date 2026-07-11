@@ -4,7 +4,11 @@ use acpi::{
     AcpiError, AcpiTables, Handler, Handle, PciAddress, PhysicalMapping,
 };
 use acpi::platform::AcpiPlatform;
-use acpi::aml::{AmlError, Interpreter as AmlInterpreter};
+use acpi::registers::Pm1ControlBit;
+use acpi::aml::AmlError;
+use acpi::aml::Interpreter as AmlInterpreter;
+use acpi::address::MappedGas;
+use acpi::sdt::fadt::Fadt;
 
 pub use acpi::platform::pci::PciConfigRegions;
 pub use acpi::platform::interrupt::InterruptModel;
@@ -212,5 +216,132 @@ impl AcpiSubsystem {
         log::info!("ACPI: AML interpreter initialized");
         self.aml = Some(aml);
         Ok(())
+    }
+
+    // ── Reset ──────────────────────────────────────────────────────────
+
+    /// Attempt a system reset via the FADT reset register.
+    ///
+    /// Falls back to the legacy 8042 PS/2 controller method on x86, then
+    /// enters an infinite halt loop if neither works.
+    pub fn reset(&self) -> ! {
+        log::info!("ACPI: system reset requested");
+
+        // 1. FADT reset register method
+        if let Some(fadt) = self.platform.tables.find_table::<Fadt>() {
+            // Copy fields from the packed struct to avoid unaligned references.
+            let reset_val = fadt.reset_value;
+            let flags = fadt.flags;
+            if flags.supports_system_reset_via_fadt() {
+                log::info!("ACPI: reset via FADT reset register");
+                if let Ok(reset_gas) = fadt.reset_register() {
+                    let handler = AcpiHandler;
+                    if let Ok(mapped) = unsafe { MappedGas::map_gas(reset_gas, &handler) } {
+                        let _ = mapped.write(reset_val as u64);
+                        // If reset succeeded the CPU should be gone by now.
+                    }
+                }
+            }
+        }
+
+        // 2. Legacy 8042 keyboard controller reset (x86 only)
+        #[cfg(target_arch = "x86_64")]
+        {
+            log::info!("ACPI: reset via 8042 keyboard controller");
+            let handler = AcpiHandler;
+            // Wait for the keyboard controller to be ready (status bit 1 must be 0).
+            for _ in 0..100_000 {
+                if handler.read_io_u8(0x64) & 0x02 == 0 {
+                    break;
+                }
+            }
+            handler.write_io_u8(0x64, 0xFE);
+        }
+
+        // 3. Last resort: halt forever.
+        log::error!("ACPI: reset failed — halting");
+        loop {
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+        }
+    }
+
+    // ── Shutdown ───────────────────────────────────────────────────────
+
+    /// Attempt a graceful system shutdown (S5 soft-off) via the ACPI PM1
+    /// control registers.
+    ///
+    /// The SLP_TYP value for S5 is read from the AML namespace (`\_S5`) if
+    /// the interpreter is available, otherwise a default value of 0 is used
+    /// (works on most QEMU / Bochs / common virtual hardware).
+    ///
+    /// On x86 a legacy PM IO-port write is also tried as a fallback.
+    pub fn shutdown(&self) -> ! {
+        log::info!("ACPI: system shutdown requested");
+
+        // Determine the SLP_TYP value for S5.
+        // In the ACPI specification the \_S5 object contains a package
+        //   Package { 0x05, 0x00, 0x00, 0x00 }
+        // where the second element is the SLP_TYPa value for S5.
+        let slp_typ_s5: u8 = self.s5_slp_typ().unwrap_or(0x00);
+        log::info!("ACPI: S5 SLP_TYP = 0x{:02x}", slp_typ_s5);
+
+        // Write SLP_TYP and then assert SLP_EN in the PM1 control register.
+        let ctrl = &self.platform.registers.pm1_control_registers;
+        if ctrl.set_sleep_typ(slp_typ_s5).is_ok() {
+            if ctrl.set_bit(Pm1ControlBit::SleepEnable, true).is_ok() {
+                // If shutdown succeeded we should never reach here.
+            }
+        }
+
+        // Fallback: QEMU / legacy PM IO port on x86.
+        #[cfg(target_arch = "x86_64")]
+        {
+            log::info!("ACPI: shutdown fallback — QEMU PM IO port");
+            // PM1a_CNT (IO port) — write SLP_TYP=0, SLP_EN=1
+            let pm1a_port = {
+                let fadt_opt = self.platform.tables.find_table::<Fadt>();
+                if let Some(fadt_ref) = fadt_opt {
+                    // Copy to avoid unaligned access on the packed struct.
+                    let fadt = *fadt_ref;
+                    fadt.pm1a_control_block().ok().map(|gas| gas.address as u16)
+                } else {
+                    None
+                }
+            }.unwrap_or(0x600); // QEMU ICH9 default
+            let val: u16 = (0x00u16 << 10) | (1u16 << 13); // SLP_TYP=0 + SLP_EN
+            let handler = AcpiHandler;
+            handler.write_io_u16(pm1a_port, val);
+        }
+
+        // Last resort: halt forever.
+        log::error!("ACPI: shutdown failed — halting");
+        loop {
+            #[cfg(target_arch = "x86_64")]
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            #[cfg(target_arch = "riscv64")]
+            unsafe { core::arch::asm!("wfi", options(nomem, nostack)) }
+        }
+    }
+
+    /// Try to read the SLP_TYP value for S5 from the AML namespace.
+    fn s5_slp_typ(&self) -> Option<u8> {
+        use acpi::aml::namespace::AmlName;
+        use core::str::FromStr;
+        let aml = self.aml.as_ref()?;
+        let path = AmlName::from_str("\\_S5").ok()?;
+        let result = aml.evaluate(path, alloc::vec![]).ok()?;
+        // \_S5 is a Package of { Integer, Integer, Integer, Integer }.
+        // The second element (index 1) is the SLP_TYPa value for S5.
+        if let acpi::aml::object::Object::Package(elements) = &*result {
+            if elements.len() >= 2 {
+                if let Ok(val) = elements[1].as_integer() {
+                    return Some(val as u8);
+                }
+            }
+        }
+        None
     }
 }
