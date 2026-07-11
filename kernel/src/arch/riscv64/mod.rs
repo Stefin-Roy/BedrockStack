@@ -18,7 +18,7 @@ impl Arch for Riscv64 {
         trap::init();
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: enabling supervisor interrupts\n");
         unsafe {
-            asm!("csrw sie, {}", in(reg) trap::MIE_SEIE | trap::MIE_SSIE);
+            asm!("csrw sie, {}", in(reg) trap::MIE_SEIE | trap::MIE_SSIE | trap::MIE_STIE);
         }
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init done\n");
     }

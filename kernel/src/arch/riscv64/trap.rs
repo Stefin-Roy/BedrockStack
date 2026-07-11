@@ -1,5 +1,8 @@
 use core::arch::asm;
 
+use crate::arch::riscv64::sbi;
+use crate::arch::riscv64::time;
+
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 
 const SUPV_SOFTWARE: u64 = 1;
@@ -9,6 +12,12 @@ const SUPV_EXTERNAL: u64 = 9;
 pub const MIE_SSIE: u64 = 1 << 1;
 pub const MIE_STIE: u64 = 1 << 5;
 pub const MIE_SEIE: u64 = 1 << 9;
+
+/// Interval between timer ticks, in `time` CSR units.
+///
+/// QEMU riscv-virt typically provides a 10 MHz timebase, so 100,000
+/// ticks ≈ 10 ms → 100 Hz (matching the x86_64 APIC timer rate).
+const TICK_INTERVAL: u64 = 100_000;
 
 core::arch::global_asm!(
     ".align 4",
@@ -104,7 +113,9 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
     if scause & SCAUSE_INTERRUPT != 0 {
         let interrupt = scause & !SCAUSE_INTERRUPT;
         match interrupt {
-            SUPV_TIMER => {}
+            SUPV_TIMER => {
+                sbi::set_timer(time::read_time() + TICK_INTERVAL);
+            }
             SUPV_EXTERNAL => {}
             SUPV_SOFTWARE => {}
             _ => {
