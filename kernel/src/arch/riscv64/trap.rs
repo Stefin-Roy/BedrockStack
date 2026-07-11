@@ -2,6 +2,7 @@ use core::arch::asm;
 
 use crate::arch::riscv64::sbi;
 use crate::arch::riscv64::time;
+use crate::platform::riscv_virt::plic;
 
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 
@@ -116,7 +117,12 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
             SUPV_TIMER => {
                 sbi::set_timer(time::read_time() + TICK_INTERVAL);
             }
-            SUPV_EXTERNAL => {}
+            SUPV_EXTERNAL => {
+                let irq = plic::claim();
+                if irq != 0 {
+                    plic::complete(irq);
+                }
+            }
             SUPV_SOFTWARE => {}
             _ => {
                 panic!("unhandled interrupt: scause={:#x}, sepc={:#x}", scause, frame.sepc);

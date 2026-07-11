@@ -9,6 +9,7 @@ pub struct Riscv64;
 use core::arch::asm;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::Vmm;
+use crate::platform::riscv_virt::plic;
 use crate::KernelLayout;
 use super::Arch;
 
@@ -16,6 +17,8 @@ impl Arch for Riscv64 {
     fn init() {
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: trap handler\n");
         trap::init();
+        crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: PLIC\n");
+        plic::init();
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: enabling supervisor interrupts\n");
         unsafe {
             asm!("csrw sie, {}", in(reg) trap::MIE_SEIE | trap::MIE_SSIE | trap::MIE_STIE);
