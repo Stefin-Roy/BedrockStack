@@ -49,6 +49,21 @@ pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
     });
 }
 
+/// Map a physical MMIO region through the ACPI VMM.
+///
+/// Used by IOAPIC and other device drivers to map MMIO regions into the
+/// reserved virtual address range.  Returns the virtual address.
+pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
+    let mut guard = ACPI_STATE.lock();
+    let state = guard.as_mut().expect("ACPI VMM not initialized — call init_vmm first");
+    let vaddr = state.next_vaddr - size;
+    state.next_vaddr = vaddr;
+    let mut vmm = Vmm::from_root(state.root);
+    let alloc = unsafe { &mut *state.alloc };
+    vmm.map(alloc, vaddr, paddr, size, flags);
+    vaddr
+}
+
 // ── ACPI handler ───────────────────────────────────────────────────────
 
 /// ACPI handler for BedrockOS.
@@ -190,31 +205,28 @@ impl Handler for AcpiHandler {
     #[cfg(not(target_arch = "x86_64"))]
     fn write_io_u32(&self, _port: u16, _value: u32) {}
 
-    fn read_pci_u8(&self, _address: PciAddress, _offset: u16) -> u8 {
-        log::warn!("ACPI: PCI config read not implemented");
-        0
+    fn read_pci_u8(&self, address: PciAddress, offset: u16) -> u8 {
+        crate::pci::ecam::read_u8(address.segment(), address.bus(), address.device(), address.function(), offset)
     }
 
-    fn read_pci_u16(&self, _address: PciAddress, _offset: u16) -> u16 {
-        log::warn!("ACPI: PCI config read not implemented");
-        0
+    fn read_pci_u16(&self, address: PciAddress, offset: u16) -> u16 {
+        crate::pci::ecam::read_u16(address.segment(), address.bus(), address.device(), address.function(), offset)
     }
 
-    fn read_pci_u32(&self, _address: PciAddress, _offset: u16) -> u32 {
-        log::warn!("ACPI: PCI config read not implemented");
-        0
+    fn read_pci_u32(&self, address: PciAddress, offset: u16) -> u32 {
+        crate::pci::ecam::read_u32(address.segment(), address.bus(), address.device(), address.function(), offset)
     }
 
-    fn write_pci_u8(&self, _address: PciAddress, _offset: u16, _value: u8) {
-        log::warn!("ACPI: PCI config write not implemented");
+    fn write_pci_u8(&self, address: PciAddress, offset: u16, value: u8) {
+        crate::pci::ecam::write_u8(address.segment(), address.bus(), address.device(), address.function(), offset, value);
     }
 
-    fn write_pci_u16(&self, _address: PciAddress, _offset: u16, _value: u16) {
-        log::warn!("ACPI: PCI config write not implemented");
+    fn write_pci_u16(&self, address: PciAddress, offset: u16, value: u16) {
+        crate::pci::ecam::write_u16(address.segment(), address.bus(), address.device(), address.function(), offset, value);
     }
 
-    fn write_pci_u32(&self, _address: PciAddress, _offset: u16, _value: u32) {
-        log::warn!("ACPI: PCI config write not implemented");
+    fn write_pci_u32(&self, address: PciAddress, offset: u16, value: u32) {
+        crate::pci::ecam::write_u32(address.segment(), address.bus(), address.device(), address.function(), offset, value);
     }
 
     fn nanos_since_boot(&self) -> u64 {

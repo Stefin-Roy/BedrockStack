@@ -10,6 +10,7 @@ pub mod drivers;
 pub mod acpi_log;
 pub mod mm;
 pub mod module;
+pub mod pci;
 pub mod platform;
 
 use acpi::AcpiSubsystem;
@@ -58,6 +59,7 @@ pub struct Kernel {
     memory_map: &'static [MemoryRegion],
     rsdp_addr: u64,
     acpi: Option<AcpiSubsystem>,
+    page_table_root: u64,
 }
 
 impl Kernel {
@@ -120,6 +122,7 @@ impl Kernel {
             memory_map,
             rsdp_addr,
             acpi: None,
+            page_table_root: 0,
         }
     }
 
@@ -137,8 +140,29 @@ impl Kernel {
             }
         }
 
+        // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
+        #[cfg(target_arch = "x86_64")]
+        self.init_ioapic();
+
         // Enable interrupts after arch init and page tables are live.
         CurrentArch::enable_interrupts();
+    }
+
+    /// Parse the ACPI interrupt model and initialise I/O APIC(s).
+    #[cfg(target_arch = "x86_64")]
+    fn init_ioapic(&mut self) {
+        let acpi = match self.acpi.as_ref() {
+            Some(a) => a,
+            None => return,
+        };
+        if let crate::acpi::InterruptModel::Apic(apic) = &acpi.platform.interrupt_model {
+            for io_apic in &apic.io_apics {
+                crate::platform::x86_64_pc::ioapic::init(
+                    io_apic.address as u64,
+                    io_apic.global_system_interrupt_base,
+                );
+            }
+        }
     }
 
     /// Build page tables with identity maps + a higher-half kernel alias,
@@ -152,10 +176,12 @@ impl Kernel {
             self.framebuffer.height(),
             self.framebuffer.stride(),
         );
+        let root = vmm.root();
         unsafe {
-            vmm::activate(vmm.root());
-            crate::acpi::init_vmm(vmm.root(), &mut self.allocator as *mut _);
+            vmm::activate(root);
+            crate::acpi::init_vmm(root, &mut self.allocator as *mut _);
         }
+        self.page_table_root = root;
         log::info!("Higher-half page tables activated");
     }
 
@@ -182,6 +208,16 @@ impl Kernel {
     pub fn run(&mut self) -> ! {
         use display::Display;
         self.framebuffer.clear();
+
+        // Initialise PCI subsystem (ECAM mapping + bus enumeration).
+        if let Some(ref acpi) = self.acpi {
+            crate::pci::init(
+                &acpi.pci_config_regions,
+                self.page_table_root,
+                &mut self.allocator as *mut _,
+            );
+        }
+
         init_all(&mut self.framebuffer);
         loop {
             CurrentArch::halt();
