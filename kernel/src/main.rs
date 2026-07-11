@@ -91,13 +91,19 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     let memory_map = riscv_parse_dtb(dtb_ptr);
     let rsdp_addr = riscv_find_rsdp(dtb_ptr);
 
+    // Compute stack guard: one unmapped page just below the stack area.
+    let stack_guard = unsafe {
+        let stack_start = &kernel::__stack_start as *const u8 as u64;
+        stack_start - 4096
+    };
+
     static FB_INFO: FramebufferInfo = FramebufferInfo {
         address: 0, width: 0, height: 0, stride: 0,
         pixel_format: PixelFormat::Bgr,
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, 0, rsdp_addr) };
+    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");

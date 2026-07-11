@@ -31,6 +31,8 @@ unsafe extern "C" {
     static __rela_dyn_end: u8;
     static __rodata_start: u8;
     static __rodata_end: u8;
+    pub static __stack_start: u8;
+    pub static __stack_end: u8;
 }
 
 /// Physical-address boundaries of the kernel image sections, used to apply
