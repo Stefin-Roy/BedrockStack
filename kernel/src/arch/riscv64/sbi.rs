@@ -11,6 +11,15 @@ const SBI_EXT_LEGACY_CONSOLE_GETCHAR: u64 = 2;
 const SBI_EXT_LEGACY_SET_TIMER: u64 = 0;
 const SBI_EXT_LEGACY_SHUTDOWN: u64 = 8;
 
+const SBI_EXT_IPI: u64 = 0x735049;
+const SBI_EXT_SEND_IPI: u64 = 0;
+
+const SRST_TYPE_SHUTDOWN: u64 = 0;
+const SRST_TYPE_COLD_REBOOT: u64 = 1;
+const SRST_TYPE_WARM_REBOOT: u64 = 2;
+const SRST_REASON_NONE: u64 = 0;
+const SRST_FUNCTION: u64 = 0;
+
 const DBCN_WRITE: u64 = 0;
 const DBCN_READ: u64 = 1;
 
@@ -48,6 +57,20 @@ pub fn set_timer(stime_value: u64) {
 
 pub fn shutdown() -> ! {
     ecall(SBI_EXT_LEGACY, SBI_EXT_LEGACY_SHUTDOWN, 0, 0, 0);
+    loop { unsafe { asm!("wfi"); } }
+}
+
+pub fn send_ipi(hart_mask: u64) {
+    ecall(SBI_EXT_IPI, SBI_EXT_SEND_IPI, hart_mask, 0, 0);
+}
+
+pub fn system_reset() -> ! {
+    ecall(SBI_EXT_SRST, SRST_FUNCTION, SRST_TYPE_SHUTDOWN, SRST_REASON_NONE, 0);
+    loop { unsafe { asm!("wfi"); } }
+}
+
+pub fn cold_reboot() -> ! {
+    ecall(SBI_EXT_SRST, SRST_FUNCTION, SRST_TYPE_COLD_REBOOT, SRST_REASON_NONE, 0);
     loop { unsafe { asm!("wfi"); } }
 }
 
