@@ -4,10 +4,34 @@ use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::arch::{Arch, CurrentArch};
-use crate::platform::x86_64_pc::apic;
 use crate::drivers::serial::SerialPort;
+use crate::platform::x86_64_pc::apic;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+// ── Device interrupt stubs (vectors 33-48) ─────────────────────────
+
+fn device_irq_handler(_vector: u8) {
+    // Future: dispatch to registered driver handlers
+    apic::apic_eoi();
+}
+
+extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(33); }
+extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) { device_irq_handler(34); }
+extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(35); }
+extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(36); }
+extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(37); }
+extern "x86-interrupt" fn irq_38(_sf: InterruptStackFrame) { device_irq_handler(38); }
+extern "x86-interrupt" fn irq_39(_sf: InterruptStackFrame) { device_irq_handler(39); }
+extern "x86-interrupt" fn irq_40(_sf: InterruptStackFrame) { device_irq_handler(40); }
+extern "x86-interrupt" fn irq_41(_sf: InterruptStackFrame) { device_irq_handler(41); }
+extern "x86-interrupt" fn irq_42(_sf: InterruptStackFrame) { device_irq_handler(42); }
+extern "x86-interrupt" fn irq_43(_sf: InterruptStackFrame) { device_irq_handler(43); }
+extern "x86-interrupt" fn irq_44(_sf: InterruptStackFrame) { device_irq_handler(44); }
+extern "x86-interrupt" fn irq_45(_sf: InterruptStackFrame) { device_irq_handler(45); }
+extern "x86-interrupt" fn irq_46(_sf: InterruptStackFrame) { device_irq_handler(46); }
+extern "x86-interrupt" fn irq_47(_sf: InterruptStackFrame) { device_irq_handler(47); }
+extern "x86-interrupt" fn irq_48(_sf: InterruptStackFrame) { device_irq_handler(48); }
 
 /// Initialize and load the IDT.
 ///
@@ -37,6 +61,24 @@ pub fn init() {
 
         // Register APIC timer interrupt at vector 32.
         idt[32].set_handler_fn(timer_handler);
+
+        // Register device interrupt vectors 33-48.
+        idt[33].set_handler_fn(irq_33);
+        idt[34].set_handler_fn(irq_34);
+        idt[35].set_handler_fn(irq_35);
+        idt[36].set_handler_fn(irq_36);
+        idt[37].set_handler_fn(irq_37);
+        idt[38].set_handler_fn(irq_38);
+        idt[39].set_handler_fn(irq_39);
+        idt[40].set_handler_fn(irq_40);
+        idt[41].set_handler_fn(irq_41);
+        idt[42].set_handler_fn(irq_42);
+        idt[43].set_handler_fn(irq_43);
+        idt[44].set_handler_fn(irq_44);
+        idt[45].set_handler_fn(irq_45);
+        idt[46].set_handler_fn(irq_46);
+        idt[47].set_handler_fn(irq_47);
+        idt[48].set_handler_fn(irq_48);
 
         idt
     });
