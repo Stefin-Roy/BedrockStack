@@ -124,3 +124,28 @@ pub mod x86_64 {
     /// Concrete serial port type for x86_64 (port-mapped I/O at 0x3F8).
     pub type SerialPort = super::SerialPort<PortIo>;
 }
+
+#[cfg(target_arch = "riscv64")]
+pub mod riscv64 {
+    use super::IoBackend;
+
+    /// QEMU virt machine UART base address.
+    const UART_BASE: u64 = 0x10000000;
+
+    pub struct MmioIo;
+
+    impl IoBackend for MmioIo {
+        fn read_reg(offset: u16) -> u8 {
+            let addr = (UART_BASE + offset as u64) as *const u8;
+            unsafe { addr.read_volatile() }
+        }
+
+        fn write_reg(offset: u16, val: u8) {
+            let addr = (UART_BASE + offset as u64) as *mut u8;
+            unsafe { addr.write_volatile(val); }
+        }
+    }
+
+    /// Concrete serial port type for riscv64 (MMIO at 0x10000000).
+    pub type SerialPort = super::SerialPort<MmioIo>;
+}
