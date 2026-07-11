@@ -7,14 +7,16 @@ pub mod arch;
 pub mod boot;
 pub mod display;
 pub mod drivers;
-pub mod log;
+pub mod acpi_log;
 pub mod mm;
 pub mod module;
 pub mod platform;
 
+use acpi::AcpiSubsystem;
 use arch::{Arch, CurrentArch};
 use boot::{FramebufferInfo, MemoryRegion};
 use display::framebuffer::Framebuffer;
+
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use module::registry::init_all;
@@ -51,6 +53,7 @@ pub struct Kernel {
     stack_guard: u64,
     #[allow(dead_code)]
     memory_map: &'static [MemoryRegion],
+    acpi: Option<AcpiSubsystem>,
 }
 
 impl Kernel {
@@ -62,8 +65,9 @@ impl Kernel {
         memory_map: &'static [MemoryRegion],
         framebuffer: &FramebufferInfo,
         stack_guard: u64,
+        rsdp_addr: u64,
     ) -> Self {
-        crate::log::init();
+        crate::acpi_log::init();
 
         let display = unsafe {
             Framebuffer::new(
@@ -104,12 +108,30 @@ impl Kernel {
 
         unsafe { heap::init(&mut allocator) };
 
+        // Initialise ACPI subsystem from the RSDP address.
+        let acpi = if rsdp_addr != 0 {
+            match AcpiSubsystem::new(rsdp_addr) {
+                Ok(a) => {
+                    log::info!("ACPI subsystem initialised");
+                    Some(a)
+                }
+                Err(e) => {
+                    log::warn!("ACPI init failed: {:?}", e);
+                    None
+                }
+            }
+        } else {
+            log::info!("No RSDP address provided — ACPI disabled");
+            None
+        };
+
         Kernel {
             framebuffer: display,
             allocator,
             layout,
             stack_guard,
             memory_map,
+            acpi,
         }
     }
 
@@ -123,6 +145,14 @@ impl Kernel {
             self.framebuffer.height(),
             self.framebuffer.stride(),
         );
+
+        // Initialise AML interpreter (needs page tables live for MMIO).
+        if let Some(ref mut acpi) = self.acpi {
+            if let Err(e) = acpi.init_aml() {
+                log::warn!("ACPI AML init failed: {:?}", e);
+            }
+        }
+
         // Enable interrupts after arch init and page tables are live.
         CurrentArch::enable_interrupts();
     }

@@ -16,6 +16,7 @@ mod elf;
 
 use common::serial::x86_64::SerialPort;
 use common::types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
+use uefi::table::cfg::ConfigTableEntry;
 
 #[global_allocator]
 static ALLOCATOR: allocator::OsDataAllocator = allocator::OsDataAllocator;
@@ -114,6 +115,10 @@ fn main() -> Status {
     // function entry (RSP % 16 == 8 on x86_64 SysV; RISC-V uses a0-a7).
     let stack_top = (((stack_region_top) & !0xF) - 8) as *const u8;
 
+    // 5. Find ACPI RSDP in the UEFI configuration table (before exit_boot_services).
+    let rsdp_addr = find_rsdp();
+
+    // 6. Exiting boot services...
     let _ = output.output_string(uefi::cstr16!("Exiting boot services..."));
     SerialPort::puts("[boot] Calling exit_boot_services...\n");
 
@@ -121,7 +126,7 @@ fn main() -> Status {
     //    The returned map is the authoritative post-exit memory map.
     let mmap = unsafe { uefi::boot::exit_boot_services(Some(allocator::OS_DATA)) };
 
-    // 6. Build the region list from the FINAL map into the pre-allocated buffer.
+    // 7. Build the region list from the FINAL map into the pre-allocated buffer.
     //    No allocation happens here (we stay within reserved capacity), which is
     //    required since boot services (and thus the allocator) are gone.
     for desc in mmap.entries() {
@@ -162,12 +167,12 @@ fn main() -> Status {
     core::mem::forget(regions_buf);
     core::mem::forget(fb_buf);
 
-    // 7. We are now bare metal. Jump to kernel.
+    // 8. We are now bare metal. Jump to kernel.
     // NOTE: Serial I/O still works after exit_boot_services (bare metal port I/O).
     SerialPort::puts("[boot] Boot services exited. Jumping to kernel...\n");
 
     unsafe {
-        jump_to_kernel(entry, stack_top, regions_ptr, regions_len, fb_ptr, stack_guard);
+        jump_to_kernel(entry, stack_top, regions_ptr, regions_len, fb_ptr, stack_guard, rsdp_addr);
     }
 }
 
@@ -188,6 +193,24 @@ fn classify_memory(ty: MemoryType) -> MemoryRegionKind {
         MemoryType::LOADER_DATA => MemoryRegionKind::LoaderData,
         _ => MemoryRegionKind::Reserved,
     }
+}
+
+/// Find the physical address of the ACPI 2.0 RSDP from the UEFI config table.
+/// Returns 0 if not found.
+fn find_rsdp() -> u64 {
+    uefi::system::with_config_table(|entries| {
+        for entry in entries {
+            if entry.guid == ConfigTableEntry::ACPI2_GUID {
+                let addr = entry.address as u64;
+                SerialPort::puts("[boot] ACPI RSDP at 0x");
+                SerialPort::put_hex(addr);
+                SerialPort::puts("\n");
+                return addr;
+            }
+        }
+        SerialPort::puts("[boot] WARNING: ACPI RSDP not found in UEFI config table\n");
+        0
+    })
 }
 
 /// Get framebuffer information from UEFI GOP.
@@ -241,6 +264,7 @@ fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
 /// - regions_ptr must point to valid MemoryRegion array of length regions_len
 /// - fb_ptr must point to valid FramebufferInfo
 /// - stack_guard is the physical address of the (unmapped-by-kernel) guard page
+/// - rsdp_addr is the physical address of the ACPI RSDP (0 if unknown)
 /// - This function does not return
 unsafe fn jump_to_kernel(
     entry: u64,
@@ -249,6 +273,7 @@ unsafe fn jump_to_kernel(
     regions_len: usize,
     fb_ptr: *const FramebufferInfo,
     stack_guard: u64,
+    rsdp_addr: u64,
 ) -> ! {
     #[cfg(target_arch = "x86_64")]
     {
@@ -262,6 +287,7 @@ unsafe fn jump_to_kernel(
             in("rsi") regions_len,
             in("rdx") fb_ptr,
             in("rcx") stack_guard,
+            in("r10") rsdp_addr,
             options(noreturn)
         );
     }
@@ -274,12 +300,14 @@ unsafe fn jump_to_kernel(
             "mv a1, {regions_len}",
             "mv a2, {fb_ptr}",
             "mv a3, {stack_guard}",
+            "mv a4, {rsdp_addr}",
             "jalr zero, {entry}, 0",
             stack_top = in(reg) stack_top,
             regions_ptr = in(reg) regions_ptr,
             regions_len = in(reg) regions_len,
             fb_ptr = in(reg) fb_ptr,
             stack_guard = in(reg) stack_guard,
+            rsdp_addr = in(reg) rsdp_addr,
             entry = in(reg) entry,
             options(noreturn)
         );

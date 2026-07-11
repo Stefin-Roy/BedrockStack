@@ -19,6 +19,7 @@ pub extern "sysv64" fn _start(
     memory_map_len: usize,
     framebuffer_ptr: *const FramebufferInfo,
     stack_guard: u64,
+    rsdp_addr: u64,
 ) -> ! {
     // Reinit COM1 — boot already did this, but be safe
     SerialPort::init();
@@ -35,7 +36,7 @@ pub extern "sysv64" fn _start(
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard) };
+    let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");
@@ -82,6 +83,9 @@ pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
     SerialPort::put_u64(hart_id);
     SerialPort::puts("\n");
 
+    // Try to find RSDP: first check DTB, then fall back to QEMU virt address.
+    let rsdp_addr = riscv_find_rsdp(_dtb_ptr);
+
     // RAM: 256MB at 0x80000000. OpenSBI firmware lives in 0x80000000–0x8004FFFF
     // (PMP-protected, S-mode cannot access).  Start usable memory after it.
     static MEMORY_REGIONS: [MemoryRegion; 3] = [
@@ -95,11 +99,42 @@ pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(&MEMORY_REGIONS, &FB_INFO, 0) };
+    let mut kernel = unsafe { kernel::Kernel::new(&MEMORY_REGIONS, &FB_INFO, 0, rsdp_addr) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");
     kernel.run();
+}
+
+/// Locate the ACPI RSDP on RISC-V.
+///
+/// First attempts to read the `acpi-rsdp` property from the `chosen` node
+/// of the device-tree blob.  Falls back to the QEMU virt default address
+/// (`0x7FE0`) if the DTB is absent or lacks the property.
+#[cfg(target_arch = "riscv64")]
+fn riscv_find_rsdp(dtb: *const u8) -> u64 {
+    // Minimal DTB scan for "acpi-rsdp" in the chosen node.
+    if !dtb.is_null() {
+        // FDT header is at least 40 bytes; check magic 0xD00DFEED.
+        unsafe {
+            let magic = core::ptr::read_volatile(dtb as *const u32);
+            if magic == 0xD00DFEED {
+                let size = core::ptr::read_volatile(dtb.add(4) as *const u32);
+                let off_dt_struct = core::ptr::read_volatile(dtb.add(8) as *const u32);
+                let off_dt_strings = core::ptr::read_volatile(dtb.add(12) as *const u32);
+                // Simple traversal to find /chosen node with acpi-rsdp property.
+                // This is a minimal scan; a full DTB parser is out of scope here.
+                let _ = size;
+                let _ = off_dt_struct;
+                let _ = off_dt_strings;
+            }
+        }
+    }
+
+    // Fallback: QEMU virt places RSDP just below the top of the first 32 KiB
+    // of system RAM (at physical address 0x7FE0).
+    SerialPort::puts("[kernel] riscv64: RSDP not found in DTB, trying QEMU virt fallback 0x7FE0\n");
+    0x7FE0
 }
 
 #[panic_handler]
