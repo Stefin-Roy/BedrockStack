@@ -2,7 +2,7 @@
 
 **Version**: 0.2.0
 **Date**: 2026-07-11
-**Status**: Added kernel heap allocator + APIC timer with PIT calibration
+**Status**: ACPI subsystem — RSDP discovery, table parsing, AML, reset/shutdown
 
 ---
 
@@ -77,6 +77,44 @@ null derefs and stack overflows fault instead of corrupting memory.
 - Location: `kernel/src/display/framebuffer.rs`
 - `Framebuffer::new()` stores the pixel format from `FramebufferInfo`.
 - `draw_char()` writes pixel bytes in the correct order (BGR or RGB).
+
+### ACPI State
+
+**ACPI-01**: ACPI tables are parsed from the RSDP during `Kernel::new()`, before page tables are rebuilt.
+- Location: `kernel/src/acpi/mod.rs` (`AcpiSubsystem::new`)
+- The RSDP physical address is discovered by the bootloader from the UEFI config table
+  (`ACPI2_GUID`) and passed to the kernel in register `r10` (x86_64) or `a4` (RISC-V).
+- On RISC-V when booted by OpenSBI, the RSDP is read from the DTB `chosen` node
+  `acpi-rsdp` property, with a QEMU virt fallback of `0x7FE0`.
+
+**ACPI-02**: `AcpiSubsystem` is stored as `Option<AcpiSubsystem>` in `Kernel`. If
+RSDP discovery or table parsing fails, the kernel continues without ACPI.
+- Location: `kernel/src/lib.rs` (`Kernel.acpi`)
+- `reset()` and `shutdown()` are no-ops if `self.acpi` is `None`.
+
+**ACPI-03**: The AML interpreter is initialised after page tables are live but before
+interrupts are enabled.
+- Location: `kernel/src/lib.rs` (`Kernel::init`)
+- Requires the heap allocator (AML uses `alloc`).
+- `init_aml()` is called via `AcpiSubsystem::init_aml()` which also executes
+  `\_INI` and `\_SB._INI` AML methods automatically.
+
+**ACPI-04**: System reset uses the FADT `reset_reg` register if the FADT flags
+indicate support (bit 10 of `FixedFeatureFlags`). Falls back to the 8042 PS/2
+keyboard controller method on x86. Ultimate fallback is an infinite halt.
+- Location: `kernel/src/acpi/mod.rs` (`AcpiSubsystem::reset`)
+
+**ACPI-05**: System shutdown (S5 soft-off) writes SLP_TYP + SLP_EN to the
+PM1 control registers. The SLP_TYP value for S5 is obtained from evaluating
+`\_S5` in the AML namespace, falling back to `0x00` if AML is unavailable.
+- Location: `kernel/src/acpi/mod.rs` (`AcpiSubsystem::shutdown`, `s5_slp_typ`)
+- Second fallback on x86: direct write to the PM1a_CNT IO port with
+  `SLP_TYP=0, SLP_EN=1` (works on QEMU ICH9/PIIX4).
+
+**ACPI-06**: The identity-mapped `AcpiHandler` maps physical addresses directly as
+virtual addresses, and never unmaps them. IO-port access delegates to x86 `in`/`out`
+instructions (RISC-V returns 0).
+- Location: `kernel/src/acpi/mod.rs` (`AcpiHandler`)
 
 ### APIC / Timer State
 
@@ -172,13 +210,17 @@ it needs no `forget`.
 **INIT-08**: Page tables must be set up before framebuffer use.
 - Location: `kernel/src/lib.rs` (`Kernel::init` runs `setup_virt_mem` before `run`)
 
-**INIT-09**: UEFI boot services must be exited before bare metal code runs.
+**INIT-09**: ACPI RSDP must be discovered from the UEFI configuration table before
+`exit_boot_services`, because the config table entries are invalid after boot services end.
+- Location: `boot/src/main.rs` (`find_rsdp`)
+
+**INIT-11**: UEFI boot services must be exited before bare metal code runs.
 - Location: `boot/src/main.rs` (`exit_boot_services`)
 
-**INIT-10**: Kernel ELF must be loaded into physical memory before exit_boot_services.
+**INIT-12**: Kernel ELF must be loaded into physical memory before exit_boot_services.
 - Location: `boot/src/main.rs` (`elf::load_elf`)
 
-**INIT-11**: Transfer buffers and the kernel stack must be allocated before
+**INIT-13**: Transfer buffers and the kernel stack must be allocated before
 exit_boot_services.
 - Location: `boot/src/main.rs`
 
@@ -195,11 +237,15 @@ exit_boot_services.
 **API-03**: `Module::name()` must return a valid UTF-8 string.
 - Location: `kernel/src/module/mod.rs`
 
-**API-04**: Kernel `_start` receives (memory_map_ptr, memory_map_len,
-framebuffer_ptr, stack_guard).
+**API-04**: Kernel `_start` (x86_64) receives (memory_map_ptr, memory_map_len,
+framebuffer_ptr, stack_guard, rsdp_addr).
 - Location: `kernel/src/main.rs`
 - sysv64 ABI: rdi=memory_map_ptr, rsi=memory_map_len, rdx=framebuffer_ptr,
-  rcx=stack_guard. Callers must provide valid, non-null pointers.
+  rcx=stack_guard, r10=rsdp_addr. Callers must provide valid, non-null pointers.
+  `rsdp_addr` is 0 if the RSDP was not found.
+
+**API-05**: RISC-V `rust_entry` receives (hart_id, dtb_ptr) with `rsdp_addr`
+discovered internally from the DTB or QEMU virt fallback.
 
 ---
 
@@ -288,7 +334,14 @@ exception handlers (except breakpoint) log the fault and halt.
   calibration times out or yields zero.
 - Location: `kernel/src/arch/x86_64/apic.rs`
 
-**NOTE-12**: The `Arch` trait in `kernel/src/arch/mod.rs` abstracts architecture
+**NOTE-12**: ACPI is an independent subsystem, not part of the `Arch` trait.
+The `acpi` crate v6.1.1 provides ACPI table parsing and AML interpretation.
+The `AcpiHandler` identity-maps physical memory and delegates port I/O to
+x86 `in`/`out` instructions. The `aml` feature flag enables the built-in AML
+interpreter (no separate `aml` crate).
+- Location: `kernel/src/acpi/mod.rs`, `kernel/Cargo.toml`
+
+**NOTE-13**: The `Arch` trait in `kernel/src/arch/mod.rs` abstracts architecture
 differences. `CurrentArch` resolves to `X86_64` or `Riscv64` based on
 `cfg(target_arch = ...)`. The x86_64 `Arch` impl calls:
   `gdt::init()` → `idt::init()` → `apic::init()`.
@@ -306,7 +359,8 @@ When modifying code:
 - [ ] MOD-01 and MOD-02 still hold
 - [ ] DISP-01 still holds (pixel format propagated correctly)
 - [ ] BOOT-01 through BOOT-06 still hold
-- [ ] INIT-01 through INIT-11 ordering maintained
+- [ ] INIT-01 through INIT-13 ordering maintained
+- [ ] ACPI-01 through ACPI-06 still hold
 - [ ] No new unsafe blocks without safety comment
 - [ ] No new panics in non-test code
 - [ ] If boot types changed, update both boot/src/main.rs AND kernel/src/boot.rs
