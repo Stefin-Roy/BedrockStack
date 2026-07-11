@@ -73,7 +73,7 @@ impl BitmapAllocator {
         let bitmap = base as *mut u8;
 
         // Start with ALL frames marked as used.
-        core::ptr::write_bytes(bitmap, 0xFF, bitmap_len);
+        unsafe { core::ptr::write_bytes(bitmap, 0xFF, bitmap_len) };
 
         // Then clear (free) frames that belong to Usable regions.
         for region in memory_map {

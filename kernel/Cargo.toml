@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 spin = "0.9"
+log = "0.4"
 common = { path = "../common" }
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]

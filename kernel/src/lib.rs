@@ -2,10 +2,12 @@
 #![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 extern crate alloc;
 
+pub mod acpi;
 pub mod arch;
 pub mod boot;
 pub mod display;
 pub mod drivers;
+pub mod log;
 pub mod mm;
 pub mod module;
 pub mod platform;
@@ -17,7 +19,7 @@ use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use module::registry::init_all;
 
-extern "C" {
+unsafe extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
     static __text_start: u8;
@@ -61,38 +63,46 @@ impl Kernel {
         framebuffer: &FramebufferInfo,
         stack_guard: u64,
     ) -> Self {
-        let display = Framebuffer::new(
-            framebuffer.address,
-            framebuffer.width,
-            framebuffer.height,
-            framebuffer.stride,
-            framebuffer.pixel_format,
-        );
+        crate::log::init();
+
+        let display = unsafe {
+            Framebuffer::new(
+                framebuffer.address,
+                framebuffer.width,
+                framebuffer.height,
+                framebuffer.stride,
+                framebuffer.pixel_format,
+            )
+        };
 
         let bitmap_region = find_bitmap_region(memory_map);
 
-        let layout = KernelLayout {
-            kernel_start: &__kernel_start as *const u8 as u64,
-            kernel_end: &__kernel_end as *const u8 as u64,
-            text_start: &__text_start as *const u8 as u64,
-            text_end: &__text_end as *const u8 as u64,
-            rela_dyn_start: &__rela_dyn_start as *const u8 as u64,
-            rela_dyn_end: &__rela_dyn_end as *const u8 as u64,
-            rodata_start: &__rodata_start as *const u8 as u64,
-            rodata_end: &__rodata_end as *const u8 as u64,
+        let layout = unsafe {
+            KernelLayout {
+                kernel_start: &__kernel_start as *const u8 as u64,
+                kernel_end: &__kernel_end as *const u8 as u64,
+                text_start: &__text_start as *const u8 as u64,
+                text_end: &__text_end as *const u8 as u64,
+                rela_dyn_start: &__rela_dyn_start as *const u8 as u64,
+                rela_dyn_end: &__rela_dyn_end as *const u8 as u64,
+                rodata_start: &__rodata_start as *const u8 as u64,
+                rodata_end: &__rodata_end as *const u8 as u64,
+            }
         };
 
-        let mut allocator = BitmapAllocator::new(
-            bitmap_region,
-            memory_map,
-            layout.kernel_start,
-            layout.kernel_end,
-        );
+        let mut allocator = unsafe {
+            BitmapAllocator::new(
+                bitmap_region,
+                memory_map,
+                layout.kernel_start,
+                layout.kernel_end,
+            )
+        };
 
         // Reserve the kernel image so allocator won't hand out those frames
         allocator.reserve_region(layout.kernel_start, layout.kernel_end);
 
-        heap::init(&mut allocator);
+        unsafe { heap::init(&mut allocator) };
 
         Kernel {
             framebuffer: display,

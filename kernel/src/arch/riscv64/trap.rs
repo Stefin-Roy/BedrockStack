@@ -88,11 +88,11 @@ core::arch::global_asm!(
     "sret",
 );
 
-extern "C" {
+unsafe extern "C" {
     fn __trap_entry();
 }
 
-#[no_mangle]
+#[unsafe(no_mangle)]
 extern "C" fn __trap_handler(frame: &TrapFrame) {
     let scause: u64;
     let stval: u64;

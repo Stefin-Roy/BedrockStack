@@ -12,7 +12,7 @@ use kernel::drivers::serial::SerialPort;
 ///
 /// # Safety
 /// Called from boot after exit_boot_services.
-#[no_mangle]
+#[unsafe(no_mangle)]
 #[cfg(target_arch = "x86_64")]
 pub extern "sysv64" fn _start(
     memory_map_ptr: *const MemoryRegion,
@@ -74,7 +74,7 @@ _start:
 );
 
 #[cfg(target_arch = "riscv64")]
-#[no_mangle]
+#[unsafe(no_mangle)]
 pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
     use kernel::boot::{MemoryRegionKind, PixelFormat};
     SerialPort::init();
