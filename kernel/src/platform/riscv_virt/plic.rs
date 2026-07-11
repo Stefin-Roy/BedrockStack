@@ -1,4 +1,5 @@
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 const PLIC_BASE: u64 = 0x0C000000;
 const PLIC_PRIORITY: u64 = 0x000000;
@@ -43,7 +44,7 @@ pub fn init() {
     }
 
     // Clear all enable bits for our context.
-    // QEMU virt: hart 0 S-mode context = (0 * 2) + 1 = 1
+    // QEMU virt: hart N S-mode context = (N * 2) + 1
     let context = scontext();
     for word in 0..4 {
         unsafe { write_volatile(enable_addr(context, word), 0); }
@@ -96,12 +97,13 @@ pub fn complete(irq: u32) {
     unsafe { write_volatile(context_claim(context), irq); }
 }
 
+pub static HART_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
+
 /// Return the S-mode PLIC context for the current hart.
 ///
 /// QEMU riscv-virt provides 2 contexts per hart (M-mode and S-mode).
 /// Context = hart_id * 2 + 1 for S-mode.
 fn scontext() -> usize {
-    let hart: u64;
-    unsafe { core::arch::asm!("csrr {}, mhartid", out(reg) hart); }
-    (hart as usize) * 2 + 1
+    let hart = HART_ID.load(Ordering::Relaxed);
+    hart * 2 + 1
 }

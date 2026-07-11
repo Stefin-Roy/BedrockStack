@@ -88,6 +88,28 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     SerialPort::put_u64(hart_id);
     SerialPort::puts("\n");
 
+    // Store hart_id for PLIC (reads mhartid are illegal in S-mode).
+    use core::sync::atomic::Ordering;
+    kernel::platform::riscv_virt::plic::HART_ID.store(hart_id as usize, Ordering::Relaxed);
+
+    // Debug: print DTB pointer and first 8 bytes.
+    SerialPort::puts("[kernel] DTB ptr=0x");
+    SerialPort::put_hex(dtb_ptr as u64);
+    SerialPort::puts(", magic=0x");
+    if !dtb_ptr.is_null() {
+        SerialPort::put_hex(unsafe {
+            u64::from(
+                (core::ptr::read_volatile(dtb_ptr) as u32) << 24
+                    | (core::ptr::read_volatile(dtb_ptr.add(1)) as u32) << 16
+                    | (core::ptr::read_volatile(dtb_ptr.add(2)) as u32) << 8
+                    | (core::ptr::read_volatile(dtb_ptr.add(3)) as u32)
+            )
+        });
+    } else {
+        SerialPort::puts("NULL");
+    }
+    SerialPort::puts("\n");
+
     // Parse memory map and RSDP from DTB.
     let memory_map = riscv_parse_dtb(dtb_ptr);
     let rsdp_addr = riscv_find_rsdp(dtb_ptr);
@@ -139,26 +161,35 @@ struct FdtHeader {
 }
 
 #[cfg(target_arch = "riscv64")]
+fn read_be_u32(ptr: *const u8) -> u32 {
+    unsafe {
+        let b0 = core::ptr::read_volatile(ptr) as u32;
+        let b1 = core::ptr::read_volatile(ptr.add(1)) as u32;
+        let b2 = core::ptr::read_volatile(ptr.add(2)) as u32;
+        let b3 = core::ptr::read_volatile(ptr.add(3)) as u32;
+        (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
 fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
     if dtb.is_null() {
         return None;
     }
-    unsafe {
-        let magic = u32::from_be(core::ptr::read_volatile(dtb as *const u32));
-        if magic != FDT_MAGIC {
-            return None;
-        }
-        Some(FdtHeader {
-            magic,
-            totalsize: u32::from_be(core::ptr::read_volatile(dtb.add(4) as *const u32)),
-            off_dt_struct: u32::from_be(core::ptr::read_volatile(dtb.add(8) as *const u32)),
-            off_dt_strings: u32::from_be(core::ptr::read_volatile(dtb.add(12) as *const u32)),
-            off_mem_rsvmap: u32::from_be(core::ptr::read_volatile(dtb.add(16) as *const u32)),
-            version: u32::from_be(core::ptr::read_volatile(dtb.add(20) as *const u32)),
-            size_dt_strings: u32::from_be(core::ptr::read_volatile(dtb.add(32) as *const u32)),
-            size_dt_struct: u32::from_be(core::ptr::read_volatile(dtb.add(36) as *const u32)),
-        })
+    let magic = read_be_u32(dtb);
+    if magic != FDT_MAGIC {
+        return None;
     }
+    Some(FdtHeader {
+        magic,
+        totalsize: read_be_u32(unsafe { dtb.add(4) }),
+        off_dt_struct: read_be_u32(unsafe { dtb.add(8) }),
+        off_dt_strings: read_be_u32(unsafe { dtb.add(12) }),
+        off_mem_rsvmap: read_be_u32(unsafe { dtb.add(16) }),
+        version: read_be_u32(unsafe { dtb.add(20) }),
+        size_dt_strings: read_be_u32(unsafe { dtb.add(32) }),
+        size_dt_struct: read_be_u32(unsafe { dtb.add(36) }),
+    })
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -206,20 +237,20 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
 
     // Scan root properties for #address-cells and #size-cells.
     loop {
-        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        let token = read_be_u32(pos);
         match token {
             FDT_PROP => {
                 pos = unsafe { pos.add(4) };
-                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let len = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
-                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let nameoff = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
                 let name_ptr = fdt_string(&hdr, dtb, nameoff);
                 let val_ptr = pos;
                 if fdt_str_eq(name_ptr, b"#address-cells") && len >= 4 {
-                    addr_cells = u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) });
+                    addr_cells = read_be_u32(val_ptr);
                 } else if fdt_str_eq(name_ptr, b"#size-cells") && len >= 4 {
-                    size_cells = u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) });
+                    size_cells = read_be_u32(val_ptr);
                 }
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
@@ -237,7 +268,7 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
     let mut in_memory = false;
 
     loop {
-        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        let token = read_be_u32(pos);
         pos = unsafe { pos.add(4) };
         match token {
             FDT_BEGIN_NODE => {
@@ -260,9 +291,9 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
                 }
             }
             FDT_PROP if in_memory => {
-                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let len = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
-                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let nameoff = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
                 let name_ptr = fdt_string(&hdr, dtb, nameoff);
                 let val_ptr = pos;
@@ -290,9 +321,9 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
                 pos = unsafe { pos.add(padded as usize) };
             }
             FDT_PROP => {
-                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let len = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
-                let _ = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let _ = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
@@ -311,14 +342,12 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
 
 #[cfg(target_arch = "riscv64")]
 fn read_be_n(ptr: *const u8, cells: u32) -> u64 {
-    unsafe {
-        let mut val: u64 = 0;
-        for i in 0..cells {
-            let word = u32::from_be(core::ptr::read_volatile(ptr.add(i as usize * 4) as *const u32));
-            val = (val << 32) | word as u64;
-        }
-        val
+    let mut val: u64 = 0;
+    for i in 0..cells {
+        let word = read_be_u32(unsafe { ptr.add(i as usize * 4) });
+        val = (val << 32) | word as u64;
     }
+    val
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -368,7 +397,7 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
     let mut in_chosen = false;
 
     loop {
-        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        let token = read_be_u32(pos);
         pos = unsafe { pos.add(4) };
         match token {
             FDT_BEGIN_NODE => {
@@ -388,16 +417,20 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
                 if depth == 1 { in_chosen = false; }
             }
             FDT_PROP if in_chosen => {
-                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let len = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
-                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let nameoff = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
                 let name_ptr = fdt_string(&hdr, dtb, nameoff);
                 let val_ptr = pos;
                 if fdt_str_eq(name_ptr, b"acpi-rsdp") && len >= 4 {
                     let rsdp = match len {
-                        8 => u64::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u64) }),
-                        _ => u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) }) as u64,
+                        8 => {
+                            let hi = read_be_u32(val_ptr) as u64;
+                            let lo = read_be_u32(unsafe { val_ptr.add(4) }) as u64;
+                            (hi << 32) | lo
+                        }
+                        _ => read_be_u32(val_ptr) as u64,
                     };
                     return rsdp;
                 }
@@ -405,9 +438,9 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
                 pos = unsafe { pos.add(padded as usize) };
             }
             FDT_PROP => {
-                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let len = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
-                let _ = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                let _ = read_be_u32(pos);
                 pos = unsafe { pos.add(4) };
                 let padded = (len + 3) & !3;
                 pos = unsafe { pos.add(padded as usize) };
@@ -433,8 +466,13 @@ fn panic(info: &PanicInfo) -> ! {
     use core::fmt::Write;
     let _ = write!(SerialPort::new(), "{}", info.message());
     SerialPort::puts("\n");
+    // Disable interrupts and spin forever with wfi to prevent reboot.
+    CurrentArch::disable_interrupts();
     loop {
-        CurrentArch::disable_interrupts();
+        // wfi may be a NOP when interrupts are disabled on some implementations;
+        // busy-wait with a fence to prevent the compiler from optimising the
+        // loop away entirely.
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         CurrentArch::halt();
     }
 }
