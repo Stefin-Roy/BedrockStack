@@ -104,7 +104,8 @@ pub mod x86_64 {
     pub struct PortIo;
 
     impl IoBackend for PortIo {
-        fn read_reg(port: u16) -> u8 {
+        fn read_reg(offset: u16) -> u8 {
+            let port = 0x3F8 + offset;
             let val: u8;
             unsafe {
                 core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
@@ -112,7 +113,8 @@ pub mod x86_64 {
             val
         }
 
-        fn write_reg(port: u16, val: u8) {
+        fn write_reg(offset: u16, val: u8) {
+            let port = 0x3F8 + offset;
             unsafe {
                 core::arch::asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
             }
