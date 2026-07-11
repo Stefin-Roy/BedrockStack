@@ -313,7 +313,11 @@ impl AcpiSubsystem {
             handler.write_io_u8(0x64, 0xFE);
         }
 
-        // 3. Last resort: halt forever.
+        // 3. RISC-V: try SBI SRST cold reboot.
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::sbi::cold_reboot();
+
+        // 4. Last resort: halt forever.
         log::error!("ACPI: reset failed — halting");
         loop {
             #[cfg(target_arch = "x86_64")]
@@ -370,6 +374,10 @@ impl AcpiSubsystem {
             let handler = AcpiHandler;
             handler.write_io_u16(pm1a_port, val);
         }
+
+        // RISC-V: try SBI SRST shutdown.
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::sbi::system_reset();
 
         // Last resort: halt forever.
         log::error!("ACPI: shutdown failed — halting");
