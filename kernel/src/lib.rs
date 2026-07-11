@@ -8,6 +8,7 @@ pub mod display;
 pub mod drivers;
 pub mod mm;
 pub mod module;
+pub mod platform;
 
 use arch::{Arch, CurrentArch};
 use boot::{FramebufferInfo, MemoryRegion};

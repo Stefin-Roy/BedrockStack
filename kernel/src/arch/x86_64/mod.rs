@@ -1,8 +1,9 @@
-pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
 pub mod serial;
+
+use crate::platform::x86_64_pc::apic;
 
 pub struct X86_64;
 

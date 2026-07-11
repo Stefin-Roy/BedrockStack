@@ -4,7 +4,7 @@ use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
 use crate::arch::{Arch, CurrentArch};
-use crate::arch::x86_64::apic;
+use crate::platform::x86_64_pc::apic;
 use crate::drivers::serial::SerialPort;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
