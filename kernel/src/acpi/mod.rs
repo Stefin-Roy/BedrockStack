@@ -9,15 +9,53 @@ use acpi::aml::AmlError;
 use acpi::aml::Interpreter as AmlInterpreter;
 use acpi::address::MappedGas;
 use acpi::sdt::fadt::Fadt;
+use spin::Mutex;
 
 pub use acpi::platform::pci::PciConfigRegions;
 pub use acpi::platform::interrupt::InterruptModel;
 
-/// Identity-mapped ACPI handler for BedrockOS.
+use crate::mm::phys_alloc::BitmapAllocator;
+use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
+
+// ── VMM state for ACPI mapping ─────────────────────────────────────────
+
+/// Virtual address floor for ACPI-mapped tables.
+/// 256 MB below the kernel VMA base → ~0xFFFFFF7F00000000.
+const ACPI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x10000000;
+
+struct AcpiVmmState {
+    root: u64,
+    alloc: *mut BitmapAllocator,
+    next_vaddr: u64,
+}
+
+// Safety: AcpiVmmState is always accessed behind a Mutex; the raw allocator
+// pointer is only dereferenced while the lock is held and the kernel is
+// single-threaded during init.
+unsafe impl Send for AcpiVmmState {}
+unsafe impl Sync for AcpiVmmState {}
+
+static ACPI_STATE: Mutex<Option<AcpiVmmState>> = Mutex::new(None);
+
+/// Initialise the ACPI VMM state.
 ///
-/// Since the kernel maps all physical memory with identity page tables,
-/// `map_physical_region` returns the physical address as the virtual
-/// address.  Unmap is a no-op.
+/// Must be called once after the higher-half page tables are activated and
+/// before any `AcpiSubsystem::new()` call.
+pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
+    *ACPI_STATE.lock() = Some(AcpiVmmState {
+        root,
+        alloc,
+        next_vaddr: ACPI_VADDR_BASE,
+    });
+}
+
+// ── ACPI handler ───────────────────────────────────────────────────────
+
+/// ACPI handler for BedrockOS.
+///
+/// `map_physical_region` uses the VMM to create page-table entries inside
+/// a reserved virtual address range just below `KERNEL_VMA_BASE`.  Unmap is
+/// a no-op (the range is large and never reused).
 #[derive(Clone)]
 pub struct AcpiHandler;
 
@@ -27,11 +65,27 @@ impl Handler for AcpiHandler {
         physical_address: usize,
         size: usize,
     ) -> PhysicalMapping<Self, T> {
+        let page_offset = (physical_address & 0xFFF) as u64;
+        let aligned_phys = (physical_address & !0xFFF) as u64;
+        let aligned_size = ((page_offset + size as u64) + 0xFFF) & !0xFFF;
+
+        let mut state_guard = ACPI_STATE.lock();
+        let state = state_guard.as_mut()
+            .expect("ACPI VMM state not initialised — call acpi::init_vmm() first");
+        let vaddr = state.next_vaddr - aligned_size;
+        state.next_vaddr = vaddr;
+
+        let mut vmm = Vmm::from_root(state.root);
+        // Safety: we hold the Mutex and interrupts are not enabled yet during
+        // init; the raw allocator pointer is valid for the kernel's lifetime.
+        let alloc = unsafe { &mut *state.alloc };
+        vmm.map(alloc, vaddr, aligned_phys, aligned_size, PageFlags::READ | PageFlags::WRITE);
+
         PhysicalMapping {
             physical_start: physical_address,
-            virtual_start: NonNull::new(physical_address as *mut T).unwrap(),
+            virtual_start: NonNull::new((vaddr + page_offset) as *mut T).unwrap(),
             region_length: size,
-            mapped_length: size,
+            mapped_length: aligned_size as usize,
             handler: self.clone(),
         }
     }

@@ -54,6 +54,7 @@ pub struct Kernel {
     stack_guard: u64,
     #[allow(dead_code)]
     memory_map: &'static [MemoryRegion],
+    rsdp_addr: u64,
     acpi: Option<AcpiSubsystem>,
 }
 
@@ -109,30 +110,14 @@ impl Kernel {
 
         unsafe { heap::init(&mut allocator) };
 
-        // Initialise ACPI subsystem from the RSDP address.
-        let acpi = if rsdp_addr != 0 {
-            match AcpiSubsystem::new(rsdp_addr) {
-                Ok(a) => {
-                    log::info!("ACPI subsystem initialised");
-                    Some(a)
-                }
-                Err(e) => {
-                    log::warn!("ACPI init failed: {:?}", e);
-                    None
-                }
-            }
-        } else {
-            log::info!("No RSDP address provided — ACPI disabled");
-            None
-        };
-
         Kernel {
             framebuffer: display,
             allocator,
             layout,
             stack_guard,
             memory_map,
-            acpi,
+            rsdp_addr,
+            acpi: None,
         }
     }
 
@@ -140,7 +125,10 @@ impl Kernel {
         CurrentArch::init();
         self.switch_to_higher_half();
 
-        // Initialise AML interpreter (needs page tables live for MMIO).
+        // Parse ACPI tables (needs VMM live for mapped physical regions).
+        self.init_acpi();
+
+        // Initialise AML interpreter (needs heap and page tables).
         if let Some(ref mut acpi) = self.acpi {
             if let Err(e) = acpi.init_aml() {
                 log::warn!("ACPI AML init failed: {:?}", e);
@@ -162,8 +150,31 @@ impl Kernel {
             self.framebuffer.height(),
             self.framebuffer.stride(),
         );
-        unsafe { vmm::activate(vmm.root()); }
+        unsafe {
+            vmm::activate(vmm.root());
+            crate::acpi::init_vmm(vmm.root(), &mut self.allocator as *mut _);
+        }
         log::info!("Higher-half page tables activated");
+    }
+
+    /// Parse ACPI tables from the RSDP.
+    ///
+    /// Runs after page tables are live so the VMM-backed `AcpiHandler` can
+    /// map physical regions.
+    fn init_acpi(&mut self) {
+        if self.rsdp_addr == 0 {
+            log::info!("No RSDP address provided — ACPI disabled");
+            return;
+        }
+        match AcpiSubsystem::new(self.rsdp_addr) {
+            Ok(a) => {
+                log::info!("ACPI subsystem initialised");
+                self.acpi = Some(a);
+            }
+            Err(e) => {
+                log::warn!("ACPI init failed: {:?}", e);
+            }
+        }
     }
 
     pub fn run(&mut self) -> ! {

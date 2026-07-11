@@ -80,8 +80,9 @@ null derefs and stack overflows fault instead of corrupting memory.
 
 ### ACPI State
 
-**ACPI-01**: ACPI tables are parsed from the RSDP during `Kernel::new()`, before page tables are rebuilt.
-- Location: `kernel/src/acpi/mod.rs` (`AcpiSubsystem::new`)
+**ACPI-01**: ACPI tables are parsed from the RSDP during `Kernel::init()`, after
+page tables are built and the higher-half VMM is activated.
+- Location: `kernel/src/lib.rs` (`Kernel::init_acpi`)
 - The RSDP physical address is discovered by the bootloader from the UEFI config table
   (`ACPI2_GUID`) and passed to the kernel in register `r10` (x86_64) or `a4` (RISC-V).
 - On RISC-V when booted by OpenSBI, the RSDP is read from the DTB `chosen` node
@@ -111,10 +112,17 @@ PM1 control registers. The SLP_TYP value for S5 is obtained from evaluating
 - Second fallback on x86: direct write to the PM1a_CNT IO port with
   `SLP_TYP=0, SLP_EN=1` (works on QEMU ICH9/PIIX4).
 
-**ACPI-06**: The identity-mapped `AcpiHandler` maps physical addresses directly as
-virtual addresses, and never unmaps them. IO-port access delegates to x86 `in`/`out`
-instructions (RISC-V returns 0).
-- Location: `kernel/src/acpi/mod.rs` (`AcpiHandler`)
+**ACPI-06**: The VMM-backed `AcpiHandler` uses the active page table to map physical
+regions inside a reserved virtual address range (`ACPI_VADDR_BASE`, 256 MB below
+`KERNEL_VMA_BASE`).  A bump allocator advances `next_vaddr` downward; mappings are
+never unmapped.  IO-port access delegates to x86 `in`/`out` instructions (RISC-V
+returns 0).
+- Location: `kernel/src/acpi/mod.rs` (`AcpiHandler`, `AcpiVmmState`, `init_vmm`)
+
+**ACPI-07**: The ACPI VMM state (`ACPI_STATE`) holds a raw pointer to the kernel's
+`BitmapAllocator`.  It is always accessed behind a `Mutex`.  The raw pointer is
+valid for the kernel's lifetime because the allocator lives in `Kernel`.
+- Location: `kernel/src/acpi/mod.rs` (`AcpiVmmState.alloc`, `map_physical_region`)
 
 ### APIC / Timer State
 
@@ -205,7 +213,8 @@ it needs no `forget`.
 - Location: `kernel/src/arch/x86_64/mod.rs` (`init`: `gdt::init` → `idt::init` → `apic::init`)
 
 **INIT-07**: Interrupts must be enabled after APIC init and page table setup.
-- Location: `kernel/src/lib.rs` (`Kernel::init`: APIC in `CurrentArch::init`, then page tables, then `CurrentArch::enable_interrupts`)
+- Location: `kernel/src/lib.rs` (`Kernel::init`: APIC in `CurrentArch::init`, then page tables,
+  then ACPI init, then `CurrentArch::enable_interrupts`)
 
 **INIT-08**: Page tables must be set up before framebuffer use.
 - Location: `kernel/src/lib.rs` (`Kernel::init` runs `setup_virt_mem` before `run`)
@@ -223,6 +232,12 @@ it needs no `forget`.
 **INIT-13**: Transfer buffers and the kernel stack must be allocated before
 exit_boot_services.
 - Location: `boot/src/main.rs`
+
+**INIT-14**: ACPI tables must be parsed after the higher-half page tables are
+activated (the VMM-backed `AcpiHandler` requires live page tables with a
+reserved virtual address range).
+- Location: `kernel/src/lib.rs` (`Kernel::init`:
+  `CurrentArch::init` → `switch_to_higher_half` → `init_acpi` → `enable_interrupts`)
 
 ---
 
@@ -336,9 +351,10 @@ exception handlers (except breakpoint) log the fault and halt.
 
 **NOTE-12**: ACPI is an independent subsystem, not part of the `Arch` trait.
 The `acpi` crate v6.1.1 provides ACPI table parsing and AML interpretation.
-The `AcpiHandler` identity-maps physical memory and delegates port I/O to
-x86 `in`/`out` instructions. The `aml` feature flag enables the built-in AML
-interpreter (no separate `aml` crate).
+The `AcpiHandler` uses the VMM to map physical regions inside a reserved range
+below `KERNEL_VMA_BASE` and delegates port I/O to x86 `in`/`out` instructions.
+The `aml` feature flag enables the built-in AML interpreter (no separate `aml`
+crate).
 - Location: `kernel/src/acpi/mod.rs`, `kernel/Cargo.toml`
 
 **NOTE-13**: The `Arch` trait in `kernel/src/arch/mod.rs` abstracts architecture
@@ -360,7 +376,7 @@ When modifying code:
 - [ ] DISP-01 still holds (pixel format propagated correctly)
 - [ ] BOOT-01 through BOOT-06 still hold
 - [ ] INIT-01 through INIT-13 ordering maintained
-- [ ] ACPI-01 through ACPI-06 still hold
+- [ ] ACPI-01 through ACPI-07 still hold
 - [ ] No new unsafe blocks without safety comment
 - [ ] No new panics in non-test code
 - [ ] If boot types changed, update both boot/src/main.rs AND kernel/src/boot.rs

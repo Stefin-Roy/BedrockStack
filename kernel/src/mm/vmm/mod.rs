@@ -93,6 +93,11 @@ impl Vmm {
         Vmm { root }
     }
 
+    /// Wrap an existing root frame — no allocation.
+    pub fn from_root(root: u64) -> Self {
+        Vmm { root }
+    }
+
     pub fn root(&self) -> u64 { self.root }
 
     // ── Mapping ─────────────────────────────────────────────────────
