@@ -310,7 +310,7 @@ fn read_be_n(ptr: *const u8, cells: u32) -> u64 {
 
 fn align_ptr(p: *const u8) -> *const u8 {
     let addr = p as usize;
-    unsafe { (addr + 3) & !3 } as *const u8
+    ((addr + 3) & !3) as *const u8
 }
 
 fn riscv_fallback_memory() -> &'static [MemoryRegion] {
