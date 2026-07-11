@@ -74,36 +74,281 @@ _start:
 "#,
 );
 
+const MAX_MEMORY_REGIONS: usize = 8;
+static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { core::mem::zeroed() };
+static mut DTB_MEMORY_COUNT: usize = 0;
+
 #[cfg(target_arch = "riscv64")]
 #[unsafe(no_mangle)]
-pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
+pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     use kernel::boot::{MemoryRegionKind, PixelFormat};
     SerialPort::init();
     SerialPort::puts("[kernel] riscv64 _start entered, hart_id=");
     SerialPort::put_u64(hart_id);
     SerialPort::puts("\n");
 
-    // Try to find RSDP: first check DTB, then fall back to QEMU virt address.
-    let rsdp_addr = riscv_find_rsdp(_dtb_ptr);
+    // Parse memory map and RSDP from DTB.
+    let memory_map = riscv_parse_dtb(dtb_ptr);
+    let rsdp_addr = riscv_find_rsdp(dtb_ptr);
 
-    // RAM: 256MB at 0x80000000. OpenSBI firmware lives in 0x80000000–0x8004FFFF
-    // (PMP-protected, S-mode cannot access).  Start usable memory after it.
-    static MEMORY_REGIONS: [MemoryRegion; 3] = [
-        MemoryRegion { base: 0x80050000, size: 0x0FFB0000, kind: MemoryRegionKind::Usable },
-        MemoryRegion { base: 0x00100000, size: 0x00001000, kind: MemoryRegionKind::Reserved },
-        MemoryRegion { base: 0x80000000, size: 0x00050000, kind: MemoryRegionKind::Reserved },
-    ];
     static FB_INFO: FramebufferInfo = FramebufferInfo {
         address: 0, width: 0, height: 0, stride: 0,
         pixel_format: PixelFormat::Bgr,
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(&MEMORY_REGIONS, &FB_INFO, 0, rsdp_addr) };
+    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, 0, rsdp_addr) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");
     kernel.run();
+}
+
+// ── Minimal DTB parser ──────────────────────────────────────────────
+
+const FDT_MAGIC: u32 = 0xD00DFEED;
+const FDT_BEGIN_NODE: u32 = 0x00000001;
+const FDT_END_NODE: u32 = 0x00000002;
+const FDT_PROP: u32 = 0x00000003;
+const FDT_END: u32 = 0x00000009;
+
+#[derive(Clone, Copy, Default)]
+struct FdtHeader {
+    magic: u32,
+    totalsize: u32,
+    off_dt_struct: u32,
+    off_dt_strings: u32,
+    off_mem_rsvmap: u32,
+    version: u32,
+    size_dt_strings: u32,
+    size_dt_struct: u32,
+}
+
+fn fdt_read_u32_base(base: *const u8, offset: u32) -> u32 {
+    unsafe {
+        let ptr = base.add(offset as usize) as *const u32;
+        u32::from_be(core::ptr::read_volatile(ptr))
+    }
+}
+
+fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
+    if dtb.is_null() {
+        return None;
+    }
+    unsafe {
+        let magic = u32::from_be(core::ptr::read_volatile(dtb as *const u32));
+        if magic != FDT_MAGIC {
+            return None;
+        }
+        Some(FdtHeader {
+            magic,
+            totalsize: u32::from_be(core::ptr::read_volatile(dtb.add(4) as *const u32)),
+            off_dt_struct: u32::from_be(core::ptr::read_volatile(dtb.add(8) as *const u32)),
+            off_dt_strings: u32::from_be(core::ptr::read_volatile(dtb.add(12) as *const u32)),
+            off_mem_rsvmap: u32::from_be(core::ptr::read_volatile(dtb.add(16) as *const u32)),
+            version: u32::from_be(core::ptr::read_volatile(dtb.add(20) as *const u32)),
+            size_dt_strings: u32::from_be(core::ptr::read_volatile(dtb.add(32) as *const u32)),
+            size_dt_struct: u32::from_be(core::ptr::read_volatile(dtb.add(36) as *const u32)),
+        })
+    }
+}
+
+fn fdt_string(hdr: &FdtHeader, dtb: *const u8, nameoff: u32) -> *const u8 {
+    unsafe { dtb.add(hdr.off_dt_strings as usize + nameoff as usize) }
+}
+
+fn fdt_str_eq(ptr: *const u8, expected: &[u8]) -> bool {
+    unsafe {
+        for (i, &c) in expected.iter().enumerate() {
+            if core::ptr::read_volatile(ptr.add(i)) != c {
+                return false;
+            }
+        }
+        core::ptr::read_volatile(ptr.add(expected.len())) == 0
+    }
+}
+
+fn fdt_next_prop(ptr: &mut *const u8) -> Option<(u32, u32)> {
+    let token = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
+    if token != FDT_PROP {
+        return None;
+    }
+    *ptr = unsafe { ptr.add(4) };
+    let len = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
+    *ptr = unsafe { ptr.add(4) };
+    let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(*ptr as *const u32) });
+    *ptr = unsafe { ptr.add(4) };
+    Some((len, nameoff))
+}
+
+fn fdt_skip_prop_value(ptr: &mut *const u8, len: u32) {
+    let padded = (len + 3) & !3;
+    *ptr = unsafe { ptr.add(padded as usize) };
+}
+
+/// Parse the DTB to populate memory regions and return a slice.
+///
+/// Falls back to the hardcoded 256 MB QEMU virt layout on failure.
+#[cfg(target_arch = "riscv64")]
+fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
+    use kernel::boot::MemoryRegionKind;
+    let hdr = match fdt_parse_header(dtb) {
+        Some(h) => h,
+        None => return riscv_fallback_memory(),
+    };
+
+    // Read #address-cells and #size-cells from the root node.
+    let mut addr_cells: u32 = 2;
+    let mut size_cells: u32 = 2;
+
+    let struct_base = unsafe { dtb.add(hdr.off_dt_struct as usize) };
+    let mut pos: *const u8 = struct_base;
+
+    // Skip past the root node's name.
+    let _token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+    pos = unsafe { pos.add(4) };
+    while unsafe { core::ptr::read_volatile(pos) } != 0 {
+        pos = unsafe { pos.add(1) };
+    }
+    pos = unsafe { pos.add(1) };
+    pos = align_ptr(pos);
+
+    // Scan root properties for #address-cells and #size-cells.
+    loop {
+        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        match token {
+            FDT_PROP => {
+                pos = unsafe { pos.add(4) };
+                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let name_ptr = fdt_string(&hdr, dtb, nameoff);
+                let val_ptr = pos;
+                if fdt_str_eq(name_ptr, b"#address-cells") && len >= 4 {
+                    addr_cells = u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) });
+                } else if fdt_str_eq(name_ptr, b"#size-cells") && len >= 4 {
+                    size_cells = u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) });
+                }
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_BEGIN_NODE => {
+                break;
+            }
+            FDT_END_NODE => {
+                break;
+            }
+            FDT_END => break,
+            _ => { pos = unsafe { pos.add(4) }; }
+        }
+    }
+
+    // Now scan for /memory node.
+    let mut region_count: usize = 0;
+    let mut depth: u32 = 1;
+    let mut in_memory = false;
+
+    loop {
+        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        pos = unsafe { pos.add(4) };
+        match token {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                let node_name = pos;
+                while unsafe { core::ptr::read_volatile(pos) } != 0 {
+                    pos = unsafe { pos.add(1) };
+                }
+                pos = unsafe { pos.add(1) };
+                pos = align_ptr(pos);
+                if depth == 2 {
+                    in_memory = fdt_str_eq(node_name, b"memory")
+                        || fdt_str_eq(node_name, b"memory@80000000");
+                }
+            }
+            FDT_END_NODE => {
+                depth -= 1;
+                if depth == 1 {
+                    in_memory = false;
+                }
+            }
+            FDT_PROP if in_memory => {
+                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let name_ptr = fdt_string(&hdr, dtb, nameoff);
+                let val_ptr = pos;
+                if fdt_str_eq(name_ptr, b"reg") && region_count < MAX_MEMORY_REGIONS {
+                    let mut offset = 0usize;
+                    while (offset as u32) < len {
+                        let addr = read_be_n(val_ptr.add(offset), addr_cells);
+                        offset += addr_cells as usize * 4;
+                        let size = read_be_n(val_ptr.add(offset), size_cells);
+                        offset += size_cells as usize * 4;
+                        if size > 0 {
+                            let kind = if addr == 0x80000000 && size <= 0x100000 {
+                                MemoryRegionKind::Reserved
+                            } else {
+                                MemoryRegionKind::Usable
+                            };
+                            unsafe {
+                                DTB_MEMORY_REGIONS[region_count] = MemoryRegion { base: addr, size, kind };
+                            }
+                            region_count += 1;
+                        }
+                    }
+                }
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_PROP => {
+                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let _nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_END => break,
+            _ => {}
+        }
+    }
+
+    if region_count > 0 {
+        unsafe {
+            DTB_MEMORY_COUNT = region_count;
+            &DTB_MEMORY_REGIONS[..region_count]
+        }
+    } else {
+        riscv_fallback_memory()
+    }
+}
+
+fn read_be_n(ptr: *const u8, cells: u32) -> u64 {
+    unsafe {
+        let mut val: u64 = 0;
+        for i in 0..cells {
+            let word = u32::from_be(core::ptr::read_volatile(ptr.add(i as usize * 4) as *const u32));
+            val = (val << 32) | word as u64;
+        }
+        val
+    }
+}
+
+fn align_ptr(p: *const u8) -> *const u8 {
+    let addr = p as usize;
+    unsafe { (addr + 3) & !3 } as *const u8
+}
+
+fn riscv_fallback_memory() -> &'static [MemoryRegion] {
+    use kernel::boot::MemoryRegionKind;
+    static FALLBACK: [MemoryRegion; 3] = [
+        MemoryRegion { base: 0x80050000, size: 0x0FFB0000, kind: MemoryRegionKind::Usable },
+        MemoryRegion { base: 0x00100000, size: 0x00001000, kind: MemoryRegionKind::Reserved },
+        MemoryRegion { base: 0x80000000, size: 0x00050000, kind: MemoryRegionKind::Reserved },
+    ];
+    &FALLBACK
 }
 
 /// Locate the ACPI RSDP on RISC-V.
@@ -113,26 +358,79 @@ pub extern "C" fn rust_entry(hart_id: u64, _dtb_ptr: *const u8) -> ! {
 /// (`0x7FE0`) if the DTB is absent or lacks the property.
 #[cfg(target_arch = "riscv64")]
 fn riscv_find_rsdp(dtb: *const u8) -> u64 {
-    // Minimal DTB scan for "acpi-rsdp" in the chosen node.
-    if !dtb.is_null() {
-        // FDT header is at least 40 bytes; check magic 0xD00DFEED.
-        unsafe {
-            let magic = core::ptr::read_volatile(dtb as *const u32);
-            if magic == 0xD00DFEED {
-                let size = core::ptr::read_volatile(dtb.add(4) as *const u32);
-                let off_dt_struct = core::ptr::read_volatile(dtb.add(8) as *const u32);
-                let off_dt_strings = core::ptr::read_volatile(dtb.add(12) as *const u32);
-                // Simple traversal to find /chosen node with acpi-rsdp property.
-                // This is a minimal scan; a full DTB parser is out of scope here.
-                let _ = size;
-                let _ = off_dt_struct;
-                let _ = off_dt_strings;
+    let hdr = match fdt_parse_header(dtb) {
+        Some(h) => h,
+        None => {
+            SerialPort::puts("[kernel] riscv64: RSDP not found in DTB, trying QEMU virt fallback 0x7FE0\n");
+            return 0x7FE0;
+        }
+    };
+
+    let struct_base = unsafe { dtb.add(hdr.off_dt_struct as usize) };
+    let mut pos: *const u8 = struct_base;
+
+    // Skip root node name.
+    let _token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+    pos = unsafe { pos.add(4) };
+    while unsafe { core::ptr::read_volatile(pos) } != 0 {
+        pos = unsafe { pos.add(1) };
+    }
+    pos = unsafe { pos.add(1) };
+    pos = align_ptr(pos);
+
+    let mut depth: u32 = 1;
+    let mut in_chosen = false;
+
+    loop {
+        let token = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+        pos = unsafe { pos.add(4) };
+        match token {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                let node_name = pos;
+                while unsafe { core::ptr::read_volatile(pos) } != 0 {
+                    pos = unsafe { pos.add(1) };
+                }
+                pos = unsafe { pos.add(1) };
+                pos = align_ptr(pos);
+                if depth == 2 {
+                    in_chosen = fdt_str_eq(node_name, b"chosen");
+                }
             }
+            FDT_END_NODE => {
+                depth -= 1;
+                if depth == 1 { in_chosen = false; }
+            }
+            FDT_PROP if in_chosen => {
+                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let name_ptr = fdt_string(&hdr, dtb, nameoff);
+                let val_ptr = pos;
+                if fdt_str_eq(name_ptr, b"acpi-rsdp") && len >= 4 {
+                    let rsdp = match len {
+                        8 => u64::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u64) }),
+                        _ => u32::from_be(unsafe { core::ptr::read_volatile(val_ptr as *const u32) }) as u64,
+                    };
+                    return rsdp;
+                }
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_PROP => {
+                let len = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let _nameoff = u32::from_be(unsafe { core::ptr::read_volatile(pos as *const u32) });
+                pos = unsafe { pos.add(4) };
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_END => break,
+            _ => {}
         }
     }
 
-    // Fallback: QEMU virt places RSDP just below the top of the first 32 KiB
-    // of system RAM (at physical address 0x7FE0).
     SerialPort::puts("[kernel] riscv64: RSDP not found in DTB, trying QEMU virt fallback 0x7FE0\n");
     0x7FE0
 }
