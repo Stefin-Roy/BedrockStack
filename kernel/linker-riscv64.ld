@@ -17,6 +17,9 @@ SECTIONS
     . = ALIGN(4096);
     __text_end = .;
 
+    __rela_dyn_start = .;
+    __rela_dyn_end = .;
+
     . = ALIGN(4096);
 
     __rodata_start = .;

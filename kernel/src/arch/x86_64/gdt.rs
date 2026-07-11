@@ -43,9 +43,9 @@ pub fn init() {
 
     let (gdt, selectors) = GDT.call_once(|| {
         let mut gdt = GlobalDescriptorTable::new();
-        let code = gdt.add_entry(Descriptor::kernel_code_segment());
-        let data = gdt.add_entry(Descriptor::kernel_data_segment());
-        let tss = gdt.add_entry(Descriptor::tss_segment(tss));
+        let code = gdt.append(Descriptor::kernel_code_segment());
+        let data = gdt.append(Descriptor::kernel_data_segment());
+        let tss = gdt.append(Descriptor::tss_segment(tss));
         (gdt, Selectors { code, data, tss })
     });
 
