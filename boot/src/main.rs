@@ -276,7 +276,7 @@ unsafe fn jump_to_kernel(
     rsdp_addr: u64,
 ) -> ! {
     #[cfg(target_arch = "x86_64")]
-    {
+    unsafe {
         core::arch::asm!(
             "mov rsp, r8",
             "xor rbp, rbp",
@@ -293,7 +293,7 @@ unsafe fn jump_to_kernel(
     }
 
     #[cfg(target_arch = "riscv64")]
-    {
+    unsafe {
         core::arch::asm!(
             "mv sp, {stack_top}",
             "mv a0, {regions_ptr}",

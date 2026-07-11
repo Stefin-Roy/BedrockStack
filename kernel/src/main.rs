@@ -74,7 +74,9 @@ _start:
 "#,
 );
 
+#[cfg(target_arch = "riscv64")]
 const MAX_MEMORY_REGIONS: usize = 8;
+#[cfg(target_arch = "riscv64")]
 static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { core::mem::zeroed() };
 
 #[cfg(target_arch = "riscv64")]
@@ -109,14 +111,20 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     kernel.run();
 }
 
-// ── Minimal DTB parser ──────────────────────────────────────────────
+// ── Minimal DTB parser (RISC-V only) ─────────────────────────────────
 
+#[cfg(target_arch = "riscv64")]
 const FDT_MAGIC: u32 = 0xD00DFEED;
+#[cfg(target_arch = "riscv64")]
 const FDT_BEGIN_NODE: u32 = 0x00000001;
+#[cfg(target_arch = "riscv64")]
 const FDT_END_NODE: u32 = 0x00000002;
+#[cfg(target_arch = "riscv64")]
 const FDT_PROP: u32 = 0x00000003;
+#[cfg(target_arch = "riscv64")]
 const FDT_END: u32 = 0x00000009;
 
+#[cfg(target_arch = "riscv64")]
 #[derive(Clone, Copy, Default)]
 struct FdtHeader {
     magic: u32,
@@ -129,6 +137,7 @@ struct FdtHeader {
     size_dt_struct: u32,
 }
 
+#[cfg(target_arch = "riscv64")]
 fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
     if dtb.is_null() {
         return None;
@@ -151,10 +160,12 @@ fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn fdt_string(hdr: &FdtHeader, dtb: *const u8, nameoff: u32) -> *const u8 {
     unsafe { dtb.add(hdr.off_dt_strings as usize + nameoff as usize) }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn fdt_str_eq(ptr: *const u8, expected: &[u8]) -> bool {
     unsafe {
         for (i, &c) in expected.iter().enumerate() {
@@ -297,6 +308,7 @@ fn riscv_parse_dtb(dtb: *const u8) -> &'static [MemoryRegion] {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn read_be_n(ptr: *const u8, cells: u32) -> u64 {
     unsafe {
         let mut val: u64 = 0;
@@ -308,11 +320,13 @@ fn read_be_n(ptr: *const u8, cells: u32) -> u64 {
     }
 }
 
+#[cfg(target_arch = "riscv64")]
 fn align_ptr(p: *const u8) -> *const u8 {
     let addr = p as usize;
     ((addr + 3) & !3) as *const u8
 }
 
+#[cfg(target_arch = "riscv64")]
 fn riscv_fallback_memory() -> &'static [MemoryRegion] {
     use kernel::boot::MemoryRegionKind;
     static FALLBACK: [MemoryRegion; 3] = [

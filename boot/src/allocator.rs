@@ -23,15 +23,12 @@ unsafe impl GlobalAlloc for OsDataAllocator {
 
         // Fast path: UEFI pools are always at least 8-byte aligned.
         if align <= POOL_ALIGN {
-            return match boot::allocate_pool(OS_DATA, layout.size()) {
+            return match unsafe { boot::allocate_pool(OS_DATA, layout.size()) } {
                 Ok(ptr) => ptr.as_ptr(),
                 Err(_) => core::ptr::null_mut(),
             };
         }
 
-        // Over-align path: request extra space so we can round up, and stash the
-        // original pool pointer immediately before the aligned pointer so
-        // `dealloc` can recover it.
         let total = match layout
             .size()
             .checked_add(align)
@@ -41,14 +38,14 @@ unsafe impl GlobalAlloc for OsDataAllocator {
             None => return core::ptr::null_mut(),
         };
 
-        let base = match boot::allocate_pool(OS_DATA, total) {
+        let base = match unsafe { boot::allocate_pool(OS_DATA, total) } {
             Ok(ptr) => ptr.as_ptr() as usize,
             Err(_) => return core::ptr::null_mut(),
         };
 
         let aligned = (base + size_of::<usize>() + align - 1) & !(align - 1);
         // Store the original pool pointer just below the aligned address.
-        *((aligned - size_of::<usize>()) as *mut usize) = base;
+        unsafe { *((aligned - size_of::<usize>()) as *mut usize) = base; }
         aligned as *mut u8
     }
 
@@ -60,11 +57,11 @@ unsafe impl GlobalAlloc for OsDataAllocator {
         let base = if layout.align() <= POOL_ALIGN {
             ptr as usize
         } else {
-            *((ptr as usize - size_of::<usize>()) as *const usize)
+            unsafe { *((ptr as usize - size_of::<usize>()) as *const usize) }
         };
 
         if let Some(nn) = core::ptr::NonNull::new(base as *mut u8) {
-            let _ = boot::free_pool(nn);
+            let _ = unsafe { boot::free_pool(nn) };
         }
     }
 }

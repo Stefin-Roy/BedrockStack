@@ -201,13 +201,14 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
 
         let dest = p_paddr as *mut u8;
 
-        // copy_nonoverlapping handles unaligned source/dest correctly and is far
-        // faster than a byte loop for a multi-hundred-KB kernel image.
-        core::ptr::copy_nonoverlapping(elf_data.as_ptr().add(p_offset), dest, p_filesz);
+        unsafe {
+            core::ptr::copy_nonoverlapping(elf_data.as_ptr().add(p_offset), dest, p_filesz);
+        }
 
-        // Zero BSS (memsz > filesz).
         if p_memsz > p_filesz {
-            core::ptr::write_bytes(dest.add(p_filesz), 0, p_memsz - p_filesz);
+            unsafe {
+                core::ptr::write_bytes(dest.add(p_filesz), 0, p_memsz - p_filesz);
+            }
         }
     }
 
