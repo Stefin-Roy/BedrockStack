@@ -56,6 +56,24 @@ impl core::ops::BitAnd for PageFlags {
     type Output = Self;
     fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
 }
+impl core::ops::Not for PageFlags {
+    type Output = Self;
+    fn not(self) -> Self { Self(!self.0) }
+}
+impl core::ops::BitAndAssign for PageFlags {
+    fn bitand_assign(&mut self, rhs: Self) { self.0 &= rhs.0; }
+}
+
+// ── Constants ─────────────────────────────────────────────────────────
+
+/// Base address for the higher-half kernel alias mapping.
+///
+/// The kernel image is linked at its physical address (e.g. `0x400000` on
+/// x86_64).  Phase 2 of the VMM adds an *alias* mapping so that every kernel
+/// page is also reachable at `KERNEL_VMA_BASE + phys_addr`.  This gives us a
+/// higher-half view without changing the linker script or the code's
+/// compiled addresses.
+pub const KERNEL_VMA_BASE: u64 = 0xFFFFFF8000000000;
 
 // ── Vmm ─────────────────────────────────────────────────────────────
 

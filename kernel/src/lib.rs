@@ -19,6 +19,7 @@ use display::framebuffer::Framebuffer;
 
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
+use mm::vmm;
 use module::registry::init_all;
 
 unsafe extern "C" {
@@ -137,14 +138,7 @@ impl Kernel {
 
     pub fn init(&mut self) {
         CurrentArch::init();
-        CurrentArch::setup_virt_mem(
-            &mut self.allocator,
-            &self.layout,
-            self.stack_guard,
-            self.framebuffer.ptr() as u64,
-            self.framebuffer.height(),
-            self.framebuffer.stride(),
-        );
+        self.switch_to_higher_half();
 
         // Initialise AML interpreter (needs page tables live for MMIO).
         if let Some(ref mut acpi) = self.acpi {
@@ -155,6 +149,21 @@ impl Kernel {
 
         // Enable interrupts after arch init and page tables are live.
         CurrentArch::enable_interrupts();
+    }
+
+    /// Build page tables with identity maps + a higher-half kernel alias,
+    /// then activate them (switch CR3 / SATP).
+    fn switch_to_higher_half(&mut self) {
+        let vmm = CurrentArch::setup_virt_mem(
+            &mut self.allocator,
+            &self.layout,
+            self.stack_guard,
+            self.framebuffer.ptr() as u64,
+            self.framebuffer.height(),
+            self.framebuffer.stride(),
+        );
+        unsafe { vmm::activate(vmm.root()); }
+        log::info!("Higher-half page tables activated");
     }
 
     pub fn run(&mut self) -> ! {

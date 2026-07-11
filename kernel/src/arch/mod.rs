@@ -1,4 +1,5 @@
 use crate::mm::phys_alloc::BitmapAllocator;
+use crate::mm::vmm::Vmm;
 use crate::KernelLayout;
 
 /// Architecture-specific operations.
@@ -20,12 +21,14 @@ pub trait Arch {
     /// Enable interrupts.
     fn enable_interrupts();
 
-    /// Build new identity-mapped page tables and switch to them.
+    /// Build page tables with identity-mapped RAM and a higher-half kernel
+    /// alias at `KERNEL_VMA_BASE + phys`.
+    ///
+    /// Returns the `Vmm` (page-table root) **without** activating it — the
+    /// caller is responsible for `Vmm::activate()` after.
     ///
     /// # Safety
     /// - `allocator` is initialised and has free frames.
-    /// - After this call the current instruction and stack must remain
-    ///   identity-mapped (which holds because all RAM is mapped).
     fn setup_virt_mem(
         allocator: &mut BitmapAllocator,
         layout: &KernelLayout,
@@ -33,7 +36,7 @@ pub trait Arch {
         fb_addr: u64,
         fb_height: usize,
         fb_stride: usize,
-    );
+    ) -> Vmm;
 }
 
 #[cfg(target_arch = "x86_64")]

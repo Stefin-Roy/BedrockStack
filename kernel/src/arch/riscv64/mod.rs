@@ -8,6 +8,7 @@ pub struct Riscv64;
 
 use core::arch::asm;
 use crate::mm::phys_alloc::BitmapAllocator;
+use crate::mm::vmm::Vmm;
 use crate::KernelLayout;
 use super::Arch;
 
@@ -41,7 +42,7 @@ impl Arch for Riscv64 {
         fb_addr: u64,
         fb_height: usize,
         fb_stride: usize,
-    ) {
-        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride);
+    ) -> Vmm {
+        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride)
     }
 }
