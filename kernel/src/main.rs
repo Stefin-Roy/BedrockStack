@@ -46,9 +46,12 @@ pub extern "sysv64" fn _start(
 #[cfg(target_arch = "riscv64")]
 global_asm!(
     r#"
-.section .text.boot, "ax"
+    .section .text.boot, "ax"
 .globl _start
 _start:
+    /* Park non-boot harts (only hart 0 proceeds) */
+    bnez a0, park
+
     /* Write '>' directly to UART at 0x10000000 */
     li t0, 0x10000000
 1:  lbu t1, 5(t0)
@@ -71,6 +74,10 @@ _start:
 3:
     /* Jump to the Rust entry point (a0=hart_id, a1=dtb). */
     tail rust_entry
+
+park:
+    wfi
+    j park
 "#,
 );
 
@@ -370,15 +377,15 @@ fn riscv_fallback_memory() -> &'static [MemoryRegion] {
 /// Locate the ACPI RSDP on RISC-V.
 ///
 /// First attempts to read the `acpi-rsdp` property from the `chosen` node
-/// of the device-tree blob.  Falls back to the QEMU virt default address
-/// (`0x7FE0`) if the DTB is absent or lacks the property.
+/// of the device-tree blob.  Returns `0` (ACPI unavailable) if the DTB
+/// is absent or lacks the property.
 #[cfg(target_arch = "riscv64")]
 fn riscv_find_rsdp(dtb: *const u8) -> u64 {
     let hdr = match fdt_parse_header(dtb) {
         Some(h) => h,
         None => {
-            SerialPort::puts("[kernel] riscv64: RSDP not found in DTB, trying QEMU virt fallback 0x7FE0\n");
-            return 0x7FE0;
+            SerialPort::puts("[kernel] riscv64: RSDP not found in DTB (ACPI not available)\n");
+            return 0;
         }
     };
 
@@ -450,8 +457,8 @@ fn riscv_find_rsdp(dtb: *const u8) -> u64 {
         }
     }
 
-    SerialPort::puts("[kernel] riscv64: RSDP not found in DTB, trying QEMU virt fallback 0x7FE0\n");
-    0x7FE0
+    SerialPort::puts("[kernel] riscv64: RSDP not found in DTB (ACPI not available)\n");
+    0
 }
 
 #[panic_handler]
