@@ -7,6 +7,8 @@ pub mod arch;
 pub mod boot;
 pub mod display;
 pub mod drivers;
+#[cfg(target_arch = "riscv64")]
+pub mod dtb;
 pub mod acpi_log;
 pub mod mm;
 pub mod module;
