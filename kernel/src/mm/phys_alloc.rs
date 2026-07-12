@@ -32,6 +32,18 @@ impl BitmapAllocator {
     /// # Safety
     /// - bitmap_region is a valid (base, size) pair within a Usable region
     /// - memory_map is valid and describes physical memory
+    /// Find the highest physical address of any Usable memory region.
+    fn find_max_addr(memory_map: &[MemoryRegion]) -> u64 {
+        let mut max_addr = 0u64;
+        for region in memory_map {
+            if region.kind == MemoryRegionKind::Usable {
+                let end = region.base.saturating_add(region.size);
+                if end > max_addr { max_addr = end; }
+            }
+        }
+        max_addr
+    }
+
     pub unsafe fn new(
         bitmap_region: (u64, u64),
         memory_map: &[MemoryRegion],
@@ -43,33 +55,28 @@ impl BitmapAllocator {
         assert!(region_size > 0, "no usable memory region for bitmap");
         let region_end = region_base + region_size;
 
-        SerialPort::puts("[alloc] finding max_addr...\n");
-        let mut max_addr = 0u64;
-        for region in memory_map {
-            if region.kind == MemoryRegionKind::Usable {
-                let end = region.base.saturating_add(region.size);
-                if end > max_addr {
-                    max_addr = end;
-                }
-            }
-        }
-
+        let max_addr = Self::find_max_addr(memory_map);
         let total_frames = (max_addr as usize + 4095) / 4096;
         let bitmap_len = (total_frames + 7) / 8;
 
         SerialPort::puts("[alloc] max_addr=");
         SerialPort::put_hex(max_addr);
-        SerialPort::puts(" total_frames=");
+        SerialPort::puts(" frames=");
         SerialPort::put_u64(total_frames as u64);
         SerialPort::puts(" bitmap_len=");
         SerialPort::put_u64(bitmap_len as u64);
         SerialPort::puts("\n");
 
-        let mut base = if region_base < kernel_end {
+        let base = if region_base < kernel_end {
             (kernel_end + 4095) & !4095
         } else {
             region_base
         };
+
+        assert!(
+            base >= region_base && base + bitmap_len as u64 <= region_end,
+            "bitmap does not fit in usable region"
+        );
 
         SerialPort::puts("[alloc] base=");
         SerialPort::put_hex(base);
@@ -77,26 +84,15 @@ impl BitmapAllocator {
         SerialPort::put_hex(region_end);
         SerialPort::puts("\n");
 
-        assert!(
-            base >= region_base && base + bitmap_len as u64 <= region_end,
-            "bitmap does not fit in usable region"
-        );
-
         let bitmap = base as *mut u8;
-
-        SerialPort::puts("[alloc] write_bytes bitmap...\n");
         unsafe { core::ptr::write_bytes(bitmap, 0xFF, bitmap_len) };
-        SerialPort::puts("[alloc] write_bytes done\n");
 
-        SerialPort::puts("[alloc] clear_region...\n");
         for region in memory_map {
             if region.kind == MemoryRegionKind::Usable {
                 clear_region(bitmap, region, total_frames);
             }
         }
-        SerialPort::puts("[alloc] clear_region done\n");
 
-        SerialPort::puts("[alloc] mark_region_used...\n");
         mark_region_used(
             bitmap,
             &MemoryRegion {
@@ -106,7 +102,6 @@ impl BitmapAllocator {
             },
             total_frames,
         );
-        SerialPort::puts("[alloc] mark_region_used done\n");
 
         if 0 < total_frames {
             unsafe { *bitmap.add(0) |= 1; }
