@@ -47,7 +47,7 @@ loaded via a single `Cr3::write`.
   flags (e.g. framebuffer `NO_CACHE`).
 
 **PAGING-02**: Identity mapping covers all physical memory from 0 to
-max(4GB, framebuffer_end, allocator.managed_end()).
+max(4GB, framebuffer_end, allocator.alloc_end()).
 - Location: `kernel/src/arch/x86_64/paging.rs`
 - Bulk RAM uses 2 MiB huge pages (fast, compact). The kernel image, the NULL
   page's 2 MiB chunk, and the guard page's chunk use 4 KiB pages.
@@ -86,7 +86,7 @@ page tables are built and the higher-half VMM is activated.
 - The RSDP physical address is discovered by the bootloader from the UEFI config table
   (`ACPI2_GUID`) and passed to the kernel in register `r10` (x86_64) or `a4` (RISC-V).
 - On RISC-V when booted by OpenSBI, the RSDP is read from the DTB `chosen` node
-  `acpi-rsdp` property, with a QEMU virt fallback of `0x7FE0`.
+  `acpi-rsdp` property.
 
 **ACPI-02**: `AcpiSubsystem` is stored as `Option<AcpiSubsystem>` in `Kernel`. If
 RSDP discovery or table parsing fails, the kernel continues without ACPI.
@@ -223,17 +223,17 @@ it needs no `forget`.
 `exit_boot_services`, because the config table entries are invalid after boot services end.
 - Location: `boot/src/main.rs` (`find_rsdp`)
 
-**INIT-11**: UEFI boot services must be exited before bare metal code runs.
+**INIT-10**: UEFI boot services must be exited before bare metal code runs.
 - Location: `boot/src/main.rs` (`exit_boot_services`)
 
-**INIT-12**: Kernel ELF must be loaded into physical memory before exit_boot_services.
+**INIT-11**: Kernel ELF must be loaded into physical memory before exit_boot_services.
 - Location: `boot/src/main.rs` (`elf::load_elf`)
 
-**INIT-13**: Transfer buffers and the kernel stack must be allocated before
+**INIT-12**: Transfer buffers and the kernel stack must be allocated before
 exit_boot_services.
 - Location: `boot/src/main.rs`
 
-**INIT-14**: ACPI tables must be parsed after the higher-half page tables are
+**INIT-13**: ACPI tables must be parsed after the higher-half page tables are
 activated (the VMM-backed `AcpiHandler` requires live page tables with a
 reserved virtual address range).
 - Location: `kernel/src/lib.rs` (`Kernel::init`:
@@ -319,9 +319,9 @@ layout compatibility across the two separately-compiled binaries.
 loaded from disk at runtime by the bootloader (not embedded at build time).
 - Location: `create_image.py`, `boot/src/main.rs`
 
-**NOTE-07**: Boot crate uses sysv64 calling convention for kernel entry.
+**NOTE-07**: Boot crate uses sysv64 calling convention for kernel entry (x86_64).
 - Location: `boot/src/main.rs`
-- rdi=regions_ptr, rsi=regions_len, rdx=fb_ptr, rcx=stack_guard.
+- rdi=regions_ptr, rsi=regions_len, rdx=fb_ptr, rcx=stack_guard, r10=rsdp_addr.
 
 **NOTE-08**: Custom allocator in boot/src/allocator.rs uses OS_DATA memory type.
 - All `Vec` allocations in boot crate use this allocator.

@@ -51,7 +51,11 @@ pub fn setup(
                 page_addr += PAGE_SIZE;
             }
         } else {
-            vmm.map_2m(allocator, chunk, chunk, PageFlags::READ | PageFlags::WRITE);
+            let mut flags = PageFlags::READ | PageFlags::WRITE;
+            if chunk < fb_end && chunk_end > fb_start {
+                flags |= PageFlags::NO_CACHE;
+            }
+            vmm.map_2m(allocator, chunk, chunk, flags);
         }
 
         chunk = chunk_end;

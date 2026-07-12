@@ -291,25 +291,4 @@ unsafe fn jump_to_kernel(
             options(noreturn)
         );
     }
-
-    #[cfg(target_arch = "riscv64")]
-    unsafe {
-        core::arch::asm!(
-            "mv sp, {stack_top}",
-            "mv a0, {regions_ptr}",
-            "mv a1, {regions_len}",
-            "mv a2, {fb_ptr}",
-            "mv a3, {stack_guard}",
-            "mv a4, {rsdp_addr}",
-            "jalr zero, {entry}, 0",
-            stack_top = in(reg) stack_top,
-            regions_ptr = in(reg) regions_ptr,
-            regions_len = in(reg) regions_len,
-            fb_ptr = in(reg) fb_ptr,
-            stack_guard = in(reg) stack_guard,
-            rsdp_addr = in(reg) rsdp_addr,
-            entry = in(reg) entry,
-            options(noreturn)
-        );
-    }
 }
