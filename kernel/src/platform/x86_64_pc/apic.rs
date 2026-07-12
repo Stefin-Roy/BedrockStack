@@ -12,6 +12,9 @@ const LAPIC_LVT_TIMER: u32 = 0x320;
 const LAPIC_INIT_COUNT: u32 = 0x380;
 const LAPIC_CURR_COUNT: u32 = 0x390;
 const LAPIC_DIVIDE_CONFIG: u32 = 0x3E0;
+const LAPIC_ID: u32 = 0x20;
+const LAPIC_ICR_LOW: u32 = 0x300;
+const LAPIC_ICR_HIGH: u32 = 0x310;
 
 const TIMER_VECTOR: u8 = 32;
 
@@ -47,9 +50,88 @@ fn lapic_read(reg: u32) -> u32 {
 pub fn apic_eoi() {
     lapic_write(LAPIC_EOI, 0);
 }
+pub fn read_apic_id() -> u8 {
+    (lapic_read(LAPIC_ID) >> 24) as u8
+}
+
+pub fn lapic_base() -> u64 {
+    unsafe { LAPIC_BASE }
+}
+
+/// Send a fixed IPI to a specific APIC ID.
+pub fn send_ipi(dest_apic_id: u8, vector: u8) {
+    // Wait for previous IPI to complete (delivery status bit = 0)
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    // Write destination APIC ID to ICR high
+    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+    // Write vector + delivery mode (fixed = 000) + assert
+    lapic_write(LAPIC_ICR_LOW, vector as u32);
+}
+
+/// Send INIT IPI to a specific APIC ID (assert).
+pub fn send_init_ipi(dest_apic_id: u8) {
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+    // delivery mode = 101 (INIT), level = 1, trigger mode = 1 (level)
+    lapic_write(LAPIC_ICR_LOW, (5 << 8) | (1 << 14) | (1 << 15));
+}
+
+/// Send INIT de-assert IPI to a specific APIC ID.
+///
+/// Completes the INIT-INIT-SIPI sequence required by the MP specification.
+pub fn send_init_deassert(dest_apic_id: u8) {
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+    // delivery mode = 101 (INIT), level = 0, trigger mode = 1 (level)
+    lapic_write(LAPIC_ICR_LOW, (5 << 8) | (0 << 14) | (1 << 15));
+}
+
+/// Send SIPI (Startup IPI) to a specific APIC ID.
+///
+/// `page` is the 4K-aligned physical address >> 12 of the trampoline code.
+pub fn send_sipi_ipi(dest_apic_id: u8, page: u8) {
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+    // delivery mode = 110 (SIPI), vector = page
+    lapic_write(LAPIC_ICR_LOW, (6 << 8) | (page as u32));
+}
+
+/// Send IPI to all CPUs except self (broadcast to all-but-self).
+pub fn send_ipi_all_except_self(vector: u8) {
+    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+        core::hint::spin_loop();
+    }
+    // destination shorthand = 10 (all except self)
+    lapic_write(LAPIC_ICR_HIGH, 0);
+    lapic_write(LAPIC_ICR_LOW, (3 << 18) | (vector as u32));
+}
+
+pub const IPI_RESCHEDULE: u8 = 49;
+pub const IPI_TLB_SHOOTDOWN: u8 = 50;
+pub const IPI_HALT: u8 = 51;
+
+pub fn send_resched(cpu_id: u8) {
+    send_ipi(cpu_id, IPI_RESCHEDULE);
+}
+
+pub fn send_tlb_shootdown(cpu_id: u8) {
+    send_ipi(cpu_id, IPI_TLB_SHOOTDOWN);
+}
+
 const PIT_HZ: u64 = 1_193_182;
 const PIT_RELOAD: u64 = 0xFFFF;
 const TIMER_HZ: u64 = 100; // Change to 1000 for a 1 kHz timer.
+
+/// Calibrated APIC timer count shared between BSP and APs.
+static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn calibrate_via_pit() -> u32 {
     SerialPort::puts("[apic] calibrating via PIT\n");
@@ -122,6 +204,34 @@ fn calibrate_via_pit() -> u32 {
 
     count
 }
+/// Initialize the LAPIC on an AP (secondary CPU).
+///
+/// Called once per AP during startup. Skips PIT calibration (the timer is
+/// already running from BSP init).
+pub fn init_ap() {
+    SerialPort::puts("[apic] AP init\n");
+    let base = rdmsr(IA32_APIC_BASE_MSR);
+    let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
+    unsafe { LAPIC_BASE = base_addr; }
+
+    if base & (1 << 11) == 0 {
+        wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11));
+    }
+
+    let svr = lapic_read(LAPIC_SVR);
+    lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);
+
+    lapic_write(LAPIC_TPR, 0);
+
+    // AP LAPIC timer: use the calibrated count from BSP (same frequency).
+    let lvt = (TIMER_VECTOR as u32) | (1 << 17);
+    lapic_write(LAPIC_LVT_TIMER, lvt);
+    lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
+    lapic_write(LAPIC_INIT_COUNT, BSP_TIMER_COUNT.load(core::sync::atomic::Ordering::Relaxed));
+
+    SerialPort::puts("[apic] AP init done\n");
+}
+
 pub fn init() {
     if !cpu_has_apic() {
         SerialPort::puts("[apic] FATAL: CPU has no local APIC\n");
@@ -149,6 +259,7 @@ pub fn init() {
     lapic_write(LAPIC_TPR, 0);
 
     let init_count = calibrate_via_pit();
+    BSP_TIMER_COUNT.store(init_count, core::sync::atomic::Ordering::Relaxed);
 
     let lvt = (TIMER_VECTOR as u32) | (1 << 17);
     lapic_write(LAPIC_LVT_TIMER, lvt);

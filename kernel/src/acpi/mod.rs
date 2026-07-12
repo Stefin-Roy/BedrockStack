@@ -17,6 +17,8 @@ pub use acpi::platform::interrupt::InterruptModel;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
 
+
+
 // ── VMM state for ACPI mapping ─────────────────────────────────────────
 
 /// Virtual address floor for ACPI-mapped tables.
@@ -107,63 +109,80 @@ impl Handler for AcpiHandler {
 
     fn unmap_physical_region<T>(_region: &PhysicalMapping<Self, T>) {}
 
-    macro_rules! acpi_mem_read {
-        ($name:ident, $ty:ty) => {
-            fn $name(&self, address: usize) -> $ty {
-                unsafe { read_volatile(address as *const $ty) }
-            }
-        };
+    // ── Memory read/write implementations ──────────────────────────
+    fn read_u8(&self, address: usize) -> u8 {
+        unsafe { read_volatile(address as *const u8) }
     }
-    macro_rules! acpi_mem_write {
-        ($name:ident, $ty:ty) => {
-            fn $name(&self, address: usize, value: $ty) {
-                unsafe { write_volatile(address as *mut $ty, value) }
-            }
-        };
+    fn read_u16(&self, address: usize) -> u16 {
+        unsafe { read_volatile(address as *const u16) }
     }
-
-    acpi_mem_read!(read_u8, u8);
-    acpi_mem_read!(read_u16, u16);
-    acpi_mem_read!(read_u32, u32);
-    acpi_mem_read!(read_u64, u64);
-    acpi_mem_write!(write_u8, u8);
-    acpi_mem_write!(write_u16, u16);
-    acpi_mem_write!(write_u32, u32);
-    acpi_mem_write!(write_u64, u64);
-
-    macro_rules! acpi_io_read {
-        ($name:ident, $ty:ty, $instr:literal, $reg:literal) => {
-            #[cfg(target_arch = "x86_64")]
-            fn $name(&self, port: u16) -> $ty {
-                let mut val: $ty;
-                unsafe {
-                    core::arch::asm!($instr, in("dx") port, out($reg) val, options(nomem, nostack, preserves_flags));
-                }
-                val
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            fn $name(&self, _port: u16) -> $ty { 0 }
-        };
+    fn read_u32(&self, address: usize) -> u32 {
+        unsafe { read_volatile(address as *const u32) }
     }
-    macro_rules! acpi_io_write {
-        ($name:ident, $ty:ty, $instr:literal, $reg:literal) => {
-            #[cfg(target_arch = "x86_64")]
-            fn $name(&self, port: u16, value: $ty) {
-                unsafe {
-                    core::arch::asm!($instr, in("dx") port, in($reg) value, options(nomem, nostack, preserves_flags));
-                }
-            }
-            #[cfg(not(target_arch = "x86_64"))]
-            fn $name(&self, _port: u16, _value: $ty) {}
-        };
+    fn read_u64(&self, address: usize) -> u64 {
+        unsafe { read_volatile(address as *const u64) }
+    }
+    fn write_u8(&self, address: usize, value: u8) {
+        unsafe { write_volatile(address as *mut u8, value) }
+    }
+    fn write_u16(&self, address: usize, value: u16) {
+        unsafe { write_volatile(address as *mut u16, value) }
+    }
+    fn write_u32(&self, address: usize, value: u32) {
+        unsafe { write_volatile(address as *mut u32, value) }
+    }
+    fn write_u64(&self, address: usize, value: u64) {
+        unsafe { write_volatile(address as *mut u64, value) }
     }
 
-    acpi_io_read!(read_io_u8, u8, "in al, dx", "al");
-    acpi_io_read!(read_io_u16, u16, "in ax, dx", "ax");
-    acpi_io_read!(read_io_u32, u32, "in eax, dx", "eax");
-    acpi_io_write!(write_io_u8, u8, "out dx, al", "al");
-    acpi_io_write!(write_io_u16, u16, "out dx, ax", "ax");
-    acpi_io_write!(write_io_u32, u32, "out dx, eax", "eax");
+    // ── Port I/O implementations (x86_64 only) ──────────────────────
+    #[cfg(target_arch = "x86_64")]
+    fn read_io_u8(&self, port: u16) -> u8 {
+        let mut val: u8;
+        unsafe { core::arch::asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags)); }
+        val
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn read_io_u8(&self, _port: u16) -> u8 { 0 }
+
+    #[cfg(target_arch = "x86_64")]
+    fn read_io_u16(&self, port: u16) -> u16 {
+        let mut val: u16;
+        unsafe { core::arch::asm!("in ax, dx", in("dx") port, out("ax") val, options(nomem, nostack, preserves_flags)); }
+        val
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn read_io_u16(&self, _port: u16) -> u16 { 0 }
+
+    #[cfg(target_arch = "x86_64")]
+    fn read_io_u32(&self, port: u16) -> u32 {
+        let mut val: u32;
+        unsafe { core::arch::asm!("in eax, dx", in("dx") port, out("eax") val, options(nomem, nostack, preserves_flags)); }
+        val
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn read_io_u32(&self, _port: u16) -> u32 { 0 }
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_io_u8(&self, port: u16, value: u8) {
+        unsafe { core::arch::asm!("out dx, al", in("dx") port, in("al") value, options(nomem, nostack, preserves_flags)); }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn write_io_u8(&self, _port: u16, _value: u8) {}
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_io_u16(&self, port: u16, value: u16) {
+        unsafe { core::arch::asm!("out dx, ax", in("dx") port, in("ax") value, options(nomem, nostack, preserves_flags)); }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn write_io_u16(&self, _port: u16, _value: u16) {}
+
+    #[cfg(target_arch = "x86_64")]
+    fn write_io_u32(&self, port: u16, value: u32) {
+        unsafe { core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)); }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn write_io_u32(&self, _port: u16, _value: u32) {}
 
     fn read_pci_u8(&self, address: PciAddress, offset: u16) -> u8 {
         crate::pci::ecam::read_u8(address.segment(), address.bus(), address.device(), address.function(), offset)
@@ -231,7 +250,10 @@ impl AcpiSubsystem {
         log::info!("ACPI: platform info parsed (interrupt model: {:?})",
             platform.interrupt_model);
 
-        let pci_config_regions = PciConfigRegions::new(&platform.tables)?;
+        let pci_config_regions = PciConfigRegions::new(&platform.tables).unwrap_or_else(|e| {
+            log::warn!("ACPI: PCI config regions init failed (non-fatal): {:?}", e);
+            PciConfigRegions { regions: alloc::vec::Vec::new() }
+        });
         log::info!("ACPI: {} PCI config regions", pci_config_regions.regions.len());
 
         Ok(Self { platform, pci_config_regions, aml: None })

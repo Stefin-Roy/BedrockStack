@@ -18,8 +18,14 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-    fn from_payload(ptr: *mut u8) -> *mut BlockHeader {
-        (ptr as usize - HEADER_SIZE) as *mut BlockHeader
+    /// Recover the block header from a payload pointer and its allocation layout.
+    ///
+    /// `alloc_inner` places the payload at the next `align`-aligned address
+    /// after the header, so we scan backward from `payload - HEADER_SIZE` to
+    /// the previous `align`-aligned boundary to find the real block base.
+    fn from_payload(ptr: *mut u8, align: usize) -> *mut BlockHeader {
+        let align = align.max(HEADER_SIZE);
+        ((ptr as usize - HEADER_SIZE) & !(align - 1)) as *mut BlockHeader
     }
 
     fn end(&self) -> usize {
@@ -206,12 +212,12 @@ unsafe impl GlobalAlloc for HeapAllocator {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if ptr.is_null() {
             return;
         }
         let mut heap = HEAP.lock();
-        let block = BlockHeader::from_payload(ptr);
+        let block = BlockHeader::from_payload(ptr, layout.align());
         unsafe { (*block).next = core::ptr::null_mut() }
         heap.push_free(block);
     }

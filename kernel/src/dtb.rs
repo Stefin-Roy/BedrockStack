@@ -454,3 +454,107 @@ pub fn find_rsdp(dtb: *const u8) -> u64 {
     SerialPort::puts("[kernel] riscv64: RSDP not found in DTB (ACPI not available)\n");
     0
 }
+
+/// Parse CPU nodes from the DTB.
+///
+/// Returns a vector of `(hart_id, enabled)` for each cpu node found under
+/// `/cpus`.  Hart IDs are taken from the `reg` property; enabled = true when
+/// the `status` property is `"okay"` (or absent).
+pub fn parse_cpus(dtb: *const u8) -> alloc::vec::Vec<(u32, bool)> {
+    let mut cpus = alloc::vec::Vec::new();
+
+    let hdr = match fdt_parse_header(dtb) {
+        Some(h) => h,
+        None => return cpus,
+    };
+
+    let struct_base = unsafe { dtb.add(hdr.off_dt_struct as usize) };
+    let mut pos = struct_base;
+
+    // Skip root node token + name.
+    pos = unsafe { pos.add(4) };
+    pos = skip_name(pos);
+    pos = align_ptr(pos);
+
+    let mut depth: u32 = 1;
+    let mut in_cpus = false;
+
+    loop {
+        let token = read_be_u32(pos);
+        pos = unsafe { pos.add(4) };
+        match token {
+            FDT_BEGIN_NODE => {
+                depth += 1;
+                let node_name = pos;
+                pos = skip_name(pos);
+                pos = align_ptr(pos);
+                if depth == 2 && fdt_str_eq(node_name, b"cpus") {
+                    in_cpus = true;
+                } else if depth == 3 && in_cpus {
+                    // This is a cpu@N node — collect reg, status, device_type.
+                    let mut hart_id: u32 = 0;
+                    let mut enabled = true;
+                    let mut is_cpu = false;
+                    let saved_pos = pos;
+                    // Walk properties of this node.
+                    let mut prop_pos = saved_pos;
+                    loop {
+                        let t = read_be_u32(prop_pos);
+                        if t == FDT_PROP {
+                            prop_pos = unsafe { prop_pos.add(4) };
+                            let len = read_be_u32(prop_pos);
+                            prop_pos = unsafe { prop_pos.add(4) };
+                            let nameoff = read_be_u32(prop_pos);
+                            prop_pos = unsafe { prop_pos.add(4) };
+                            let name_ptr = fdt_string(&hdr, dtb, nameoff);
+                            let val_ptr = prop_pos;
+                            if fdt_str_eq(name_ptr, b"device_type") && len >= 3 {
+                                is_cpu = unsafe {
+                                    core::ptr::read_volatile(val_ptr) == b'c'
+                                        && core::ptr::read_volatile(val_ptr.add(1)) == b'p'
+                                        && core::ptr::read_volatile(val_ptr.add(2)) == b'u'
+                                };
+                            }
+                            if fdt_str_eq(name_ptr, b"reg") && len >= 4 {
+                                hart_id = read_be_u32(val_ptr);
+                            } else if fdt_str_eq(name_ptr, b"status") && len >= 1 {
+                                enabled = unsafe { *val_ptr } == b'o';
+                            }
+                            let padded = (len + 3) & !3;
+                            prop_pos = unsafe { prop_pos.add(padded as usize) };
+                        } else if t == FDT_BEGIN_NODE || t == FDT_END_NODE || t == FDT_END {
+                            break;
+                        } else {
+                            prop_pos = unsafe { prop_pos.add(4) };
+                        }
+                    }
+                    pos = prop_pos;
+                    if is_cpu {
+                        cpus.push((hart_id, enabled));
+                    }
+                }
+            }
+            FDT_END_NODE => {
+                if depth == 0 {
+                    break;
+                }
+                depth -= 1;
+                if depth == 1 {
+                    in_cpus = false;
+                }
+            }
+            FDT_PROP => {
+                let len = read_be_u32(pos);
+                pos = unsafe { pos.add(4) };
+                let _ = read_be_u32(pos);
+                pos = unsafe { pos.add(4) };
+                let padded = (len + 3) & !3;
+                pos = unsafe { pos.add(padded as usize) };
+            }
+            FDT_END => break,
+            _ => {}
+        }
+    }
+
+    cpus
+}

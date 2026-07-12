@@ -278,16 +278,16 @@ unsafe fn jump_to_kernel(
     #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
-            "mov rsp, r8",
+            "mov rsp, r10",
             "xor rbp, rbp",
             "jmp r9",
-            in("r8") stack_top,
+            in("r10") stack_top,
             in("r9") entry,
             in("rdi") regions_ptr,
             in("rsi") regions_len,
             in("rdx") fb_ptr,
             in("rcx") stack_guard,
-            in("r10") rsdp_addr,
+            in("r8") rsdp_addr,
             options(noreturn)
         );
     }

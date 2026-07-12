@@ -14,6 +14,7 @@ pub mod mm;
 pub mod module;
 pub mod pci;
 pub mod platform;
+pub mod smp;
 
 use acpi::AcpiSubsystem;
 use arch::{Arch, CurrentArch};
@@ -134,24 +135,34 @@ impl Kernel {
     }
 
     pub fn init(&mut self) {
+        unsafe { crate::smp::early_init_bsp(); }
         CurrentArch::init();
         self.switch_to_higher_half();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
         self.init_acpi();
 
-        // Initialise AML interpreter (needs heap and page tables).
-        if let Some(ref mut acpi) = self.acpi {
-            if let Err(e) = acpi.init_aml() {
-                log::warn!("ACPI AML init failed: {:?}", e);
-            }
-        }
+        // NOTE: AML interpreter init (DSDT/SSDT parse) hangs on QEMU;
+        // AML is only used for SLP_TYP detection on shutdown, and the
+        // default (0x00) works fine on virtual hardware — skip for now.
+        // if let Some(ref mut acpi) = self.acpi {
+        //     if let Err(e) = acpi.init_aml() {
+        //         log::warn!("ACPI AML init failed: {:?}", e);
+        //     }
+        // }
 
         // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();
 
-        // Enable interrupts after arch init and page tables are live.
+        // Initialise SMP — discover and start Application Processors.
+        let ncpus = unsafe {
+            crate::smp::init(&mut self.allocator, self.page_table_root, self.acpi.as_ref())
+        };
+        log::info!("SMP: {} CPU(s) online", ncpus);
+        crate::drivers::serial::SerialPort::puts("[init] SMP done, enabling interrupts\n");
+
+        // Enable interrupts after arch init, page tables, and SMP are live.
         CurrentArch::enable_interrupts();
     }
 

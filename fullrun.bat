@@ -111,7 +111,8 @@ if not exist "%QEMU_PATH%" (
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -drive format=raw,file="%IMAGE_PATH%" ^
     -serial stdio ^
-    -m 256M
+    -m 256M ^
+    -smp 4
 echo QEMU exited with code %errorlevel% >> "%LOG_FILE%"
 echo [fullrun] QEMU exited with code %errorlevel%.
 goto :done
@@ -176,14 +177,16 @@ if exist "%OPENSBI%" (
         -kernel "%KERNEL_PATH%" ^
         -bios "%OPENSBI%" ^
         -nographic ^
-        -serial mon:stdio
+        -serial mon:stdio ^
+        -smp 4
 ) else (
     "%QEMU_PATH%" ^
         -machine virt ^
         -m 256M ^
         -kernel "%KERNEL_PATH%" ^
         -nographic ^
-        -serial mon:stdio
+        -serial mon:stdio ^
+        -smp 4
 )
 echo QEMU exited with code %errorlevel% >> "%LOG_FILE%"
 echo [fullrun] QEMU exited with code %errorlevel%.

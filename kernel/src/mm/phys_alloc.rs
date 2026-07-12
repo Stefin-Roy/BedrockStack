@@ -47,7 +47,7 @@ impl BitmapAllocator {
     pub unsafe fn new(
         bitmap_region: (u64, u64),
         memory_map: &[MemoryRegion],
-        kernel_start: u64,
+        _kernel_start: u64,
         kernel_end: u64,
     ) -> Self {
         use crate::drivers::serial::SerialPort;
@@ -153,6 +153,31 @@ impl BitmapAllocator {
         None
     }
 
+    /// Allocate `count` contiguous physical frames.
+    ///
+    /// Returns the physical address of the first frame, or `None` if
+    /// insufficient contiguous frames are available.
+    pub fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
+        let mut run_start = self.next_free;
+        let mut run_len = 0;
+        for i in self.next_free..self.total_frames {
+            if self.is_free(i) {
+                if run_len == 0 { run_start = i; }
+                run_len += 1;
+                if run_len >= count {
+                    for j in run_start..run_start + count {
+                        self.set_used(j);
+                    }
+                    self.next_free = run_start + count;
+                    return Some((run_start as u64) * 4096);
+                }
+            } else {
+                run_len = 0;
+            }
+        }
+        None
+    }
+
     /// Mark a physical address range as used (reserved).
     ///
     /// Used to prevent the allocator from handing out frames that contain
@@ -160,7 +185,11 @@ impl BitmapAllocator {
     pub fn reserve_region(&mut self, start: u64, end: u64) {
         debug_assert!(start <= end, "reserve_region: start > end");
         let start_frame = (start / 4096) as usize;
-        let end_frame = ((end + 4095) / 4096) as usize;
+        let end_frame = if end == u64::MAX {
+            self.total_frames
+        } else {
+            ((end + 4095) / 4096).min(self.total_frames as u64) as usize
+        };
         for frame in start_frame..end_frame {
             if frame < self.total_frames {
                 self.set_used(frame);

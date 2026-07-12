@@ -8,6 +8,10 @@ const SBI_EXT_LEGACY_CONSOLE_GETCHAR: u64 = 2;
 const SBI_EXT_LEGACY_SET_TIMER: u64 = 0;
 const SBI_EXT_LEGACY_SHUTDOWN: u64 = 8;
 
+const SBI_EXT_HSM: u64 = 0x48534D;
+const SBI_EXT_HSM_HART_START: u64 = 1;
+const SBI_EXT_HSM_HART_STOP: u64 = 2;
+
 const SBI_EXT_IPI: u64 = 0x735049;
 const SBI_EXT_SEND_IPI: u64 = 0;
 
@@ -70,4 +74,18 @@ pub fn cold_reboot() -> ! {
 pub fn probe_extension(extension_id: u64) -> bool {
     let (error, _) = ecall(0x12, 0x12, extension_id, 0, 0);
     error >= 0
+}
+
+/// Start a hart via SBI HSM.
+/// `hart_id` is the hart to start, `start_addr` is a physical address,
+/// `priv` is passed in `a1`.
+pub fn hart_start(hart_id: u64, start_addr: u64, priv_val: u64) -> bool {
+    let (error, _) = ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START, hart_id, start_addr, priv_val);
+    error == 0
+}
+
+/// Stop the current hart via SBI HSM.  Does not return.
+pub fn hart_stop() -> ! {
+    ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STOP, 0, 0, 0);
+    loop { unsafe { core::arch::asm!("wfi"); } }
 }

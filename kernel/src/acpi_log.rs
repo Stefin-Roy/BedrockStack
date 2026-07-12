@@ -12,14 +12,21 @@ impl log::Log for AcpiLogger {
     fn log(&self, record: &Record) {
         if self.enabled(record.metadata()) {
             let msg = record.args().as_str().unwrap_or("");
-            if msg.is_empty() {
-                return;
+            if !msg.is_empty() {
+                SerialPort::puts("[acpi] ");
+                SerialPort::puts(record.level().as_str());
+                SerialPort::puts(": ");
+                SerialPort::puts(msg);
+                SerialPort::puts("\n");
+            } else {
+                // Dynamic format args — use fmt::Write to render them.
+                SerialPort::puts("[acpi] ");
+                SerialPort::puts(record.level().as_str());
+                SerialPort::puts(": ");
+                use core::fmt::Write;
+                let _ = write!(SerialPort::new(), "{}", record.args());
+                SerialPort::puts("\n");
             }
-            SerialPort::puts("[acpi] ");
-            SerialPort::puts(record.level().as_str());
-            SerialPort::puts(": ");
-            SerialPort::puts(msg);
-            SerialPort::puts("\n");
         }
     }
 

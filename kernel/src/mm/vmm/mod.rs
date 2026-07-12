@@ -160,7 +160,8 @@ impl Vmm {
     ) {
         assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not page-aligned");
         assert_eq!(paddr & 0xFFF, 0, "VMM: paddr not page-aligned");
-        assert!(size > 0);
+        assert!(size > 0, "VMM: size must be > 0");
+        assert_eq!(size & 0xFFF, 0, "VMM: size must be page-aligned");
 
         let mut remaining = size;
         let mut v = vaddr;

@@ -49,8 +49,11 @@ global_asm!(
     .section .text.boot, "ax"
 .globl _start
 _start:
-    /* Park non-boot harts (only hart 0 proceeds) */
-    bnez a0, park
+    /* Atomic boot lock: only the first hart to claim this proceeds */
+    la t0, _boot_lock
+    li t1, 1
+    amoswap.w t2, t1, 0(t0)
+    bnez t2, park
 
     /* Write '>' directly to UART at 0x10000000 */
     li t0, 0x10000000
@@ -76,8 +79,17 @@ _start:
     tail rust_entry
 
 park:
+    /* Stop this hart via SBI HSM so the BSP can wake us with hart_start */
+    li a7, 0x48534D
+    li a6, 2
+    ecall
     wfi
     j park
+
+    .section .data
+    .balign 4
+_boot_lock:
+    .word 0
 "#,
 );
 
@@ -90,6 +102,8 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     SerialPort::put_u64(hart_id);
     SerialPort::puts("\n");
 
+    // Store DTB pointer for later use (SMP discovery, etc.).
+    kernel::platform::riscv_virt::set_dtb_ptr(dtb_ptr);
     // Store hart_id for PLIC (reads mhartid are illegal in S-mode).
     use core::sync::atomic::Ordering;
     kernel::platform::riscv_virt::plic::HART_ID.store(hart_id as usize, Ordering::Relaxed);

@@ -1,5 +1,5 @@
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::AtomicUsize;
 
 const PLIC_BASE: u64 = 0x0C000000;
 const PLIC_PRIORITY: u64 = 0x000000;
@@ -104,6 +104,6 @@ pub static HART_ID: AtomicUsize = AtomicUsize::new(usize::MAX);
 /// QEMU riscv-virt provides 2 contexts per hart (M-mode and S-mode).
 /// Context = hart_id * 2 + 1 for S-mode.
 fn scontext() -> usize {
-    let hart = HART_ID.load(Ordering::Relaxed);
+    let hart = crate::smp::current_per_cpu().apic_id as usize;
     hart * 2 + 1
 }

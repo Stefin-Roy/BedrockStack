@@ -11,20 +11,26 @@ static IDT: Once<InterruptDescriptorTable> = Once::new();
 
 // ── Device interrupt stubs (vectors 33-48) ─────────────────────────
 
-fn device_irq_handler(_vector: u8) {
+fn device_irq_handler() {
     apic::apic_eoi();
 }
 
-macro_rules! irq_stub {
-    ($n:literal) => {
-        extern "x86-interrupt" fn irq_$n(_sf: InterruptStackFrame) { device_irq_handler($n); }
-    };
-}
-
-irq_stub!(33); irq_stub!(34); irq_stub!(35); irq_stub!(36);
-irq_stub!(37); irq_stub!(38); irq_stub!(39); irq_stub!(40);
-irq_stub!(41); irq_stub!(42); irq_stub!(43); irq_stub!(44);
-irq_stub!(45); irq_stub!(46); irq_stub!(47); irq_stub!(48);
+extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_38(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_39(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_40(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_41(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_42(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_43(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_44(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_45(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_46(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_47(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_48(_sf: InterruptStackFrame) { device_irq_handler(); }
 
 /// Initialize and load the IDT.
 ///
@@ -52,17 +58,26 @@ pub fn init() {
                 .set_stack_index(crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX);
         }
 
-        // Register APIC timer interrupt at vector 32.
-        idt[32].set_handler_fn(timer_handler);
+        // Register APIC timer interrupt at vector 32 (interrupt gate, clears IF).
+        idt[32].set_handler_fn(timer_handler).disable_interrupts(true);
 
-        // Register device interrupt vectors 33-48.
-        macro_rules! set_irq {
-            ($n:literal) => { idt[$n].set_handler_fn(irq_$n); };
-        }
-        set_irq!(33); set_irq!(34); set_irq!(35); set_irq!(36);
-        set_irq!(37); set_irq!(38); set_irq!(39); set_irq!(40);
-        set_irq!(41); set_irq!(42); set_irq!(43); set_irq!(44);
-        set_irq!(45); set_irq!(46); set_irq!(47); set_irq!(48);
+        // Register device interrupt vectors 33-48 (interrupt gates, clears IF).
+        idt[33].set_handler_fn(irq_33).disable_interrupts(true);
+        idt[34].set_handler_fn(irq_34).disable_interrupts(true);
+        idt[35].set_handler_fn(irq_35).disable_interrupts(true);
+        idt[36].set_handler_fn(irq_36).disable_interrupts(true);
+        idt[37].set_handler_fn(irq_37).disable_interrupts(true);
+        idt[38].set_handler_fn(irq_38).disable_interrupts(true);
+        idt[39].set_handler_fn(irq_39).disable_interrupts(true);
+        idt[40].set_handler_fn(irq_40).disable_interrupts(true);
+        idt[41].set_handler_fn(irq_41).disable_interrupts(true);
+        idt[42].set_handler_fn(irq_42).disable_interrupts(true);
+        idt[43].set_handler_fn(irq_43).disable_interrupts(true);
+        idt[44].set_handler_fn(irq_44).disable_interrupts(true);
+        idt[45].set_handler_fn(irq_45).disable_interrupts(true);
+        idt[46].set_handler_fn(irq_46).disable_interrupts(true);
+        idt[47].set_handler_fn(irq_47).disable_interrupts(true);
+        idt[48].set_handler_fn(irq_48).disable_interrupts(true);
 
         idt
     });

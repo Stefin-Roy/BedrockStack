@@ -35,7 +35,7 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -drive format=raw,file="%IMAGE_PATH%" ^
     -m 256M ^
-    -nographic ^
+    -smp 4 ^
     -serial mon:stdio
 goto :done
 
