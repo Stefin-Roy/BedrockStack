@@ -26,9 +26,7 @@ mod riscv64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageFlags(u8);
 
-#[allow(dead_code)]
 impl PageFlags {
-    pub const EMPTY:   Self = Self(0);
     pub const READ:    Self = Self(1 << 0);
     pub const WRITE:   Self = Self(1 << 1);
     pub const EXECUTE: Self = Self(1 << 2);

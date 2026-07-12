@@ -55,8 +55,6 @@ pub struct Kernel {
     allocator: BitmapAllocator,
     layout: KernelLayout,
     stack_guard: u64,
-    #[allow(dead_code)]
-    memory_map: &'static [MemoryRegion],
     rsdp_addr: u64,
     acpi: Option<AcpiSubsystem>,
     page_table_root: u64,
@@ -127,7 +125,6 @@ impl Kernel {
             allocator,
             layout,
             stack_guard,
-            memory_map,
             rsdp_addr,
             acpi: None,
             page_table_root: 0,

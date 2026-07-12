@@ -33,10 +33,6 @@ impl BlockHeader {
 
 pub struct HeapInner {
     free_list: *mut BlockHeader,
-    #[allow(dead_code)]
-    heap_start: usize,
-    #[allow(dead_code)]
-    heap_end: usize,
 }
 
 unsafe impl Send for HeapInner {}
@@ -46,8 +42,6 @@ impl HeapInner {
     pub const fn empty() -> Self {
         HeapInner {
             free_list: core::ptr::null_mut(),
-            heap_start: 0,
-            heap_end: 0,
         }
     }
 
@@ -61,14 +55,6 @@ impl HeapInner {
         let block = start as *mut BlockHeader;
         unsafe { *block = BlockHeader { size, next: core::ptr::null_mut() } }
         self.push_free(block);
-
-        if self.heap_start == 0 || start < self.heap_start {
-            self.heap_start = start;
-        }
-        let end = start + size;
-        if end > self.heap_end {
-            self.heap_end = end;
-        }
     }
 
     fn push_free(&mut self, block: *mut BlockHeader) {
