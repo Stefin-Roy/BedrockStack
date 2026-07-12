@@ -11,22 +11,26 @@ fn map_phys(paddr: u64, size: u64) -> u64 {
 }
 
 unsafe fn mmio_read(addr: u64, width: u8) -> u64 {
-    match width {
-        8  => (addr as *const u8).read_volatile() as u64,
-        16 => (addr as *const u16).read_volatile() as u64,
-        32 => (addr as *const u32).read_volatile() as u64,
-        64 => (addr as *const u64).read_volatile() as u64,
-        _  => 0,
+    unsafe {
+        match width {
+            8  => (addr as *const u8).read_volatile() as u64,
+            16 => (addr as *const u16).read_volatile() as u64,
+            32 => (addr as *const u32).read_volatile() as u64,
+            64 => (addr as *const u64).read_volatile() as u64,
+            _  => 0,
+        }
     }
 }
 
 unsafe fn mmio_write(addr: u64, value: u64, width: u8) {
-    match width {
-        8  => (addr as *mut u8).write_volatile(value as u8),
-        16 => (addr as *mut u16).write_volatile(value as u16),
-        32 => (addr as *mut u32).write_volatile(value as u32),
-        64 => (addr as *mut u64).write_volatile(value),
-        _  => {}
+    unsafe {
+        match width {
+            8  => (addr as *mut u8).write_volatile(value as u8),
+            16 => (addr as *mut u16).write_volatile(value as u16),
+            32 => (addr as *mut u32).write_volatile(value as u32),
+            64 => (addr as *mut u64).write_volatile(value),
+            _  => {},
+        }
     }
 }
 
@@ -49,23 +53,22 @@ fn port_out(port: u16, value: u32, width: u8) {
             8  => core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8, options(nomem, nostack, preserves_flags)),
             16 => core::arch::asm!("out dx, ax", in("dx") port, in("ax") value as u16, options(nomem, nostack, preserves_flags)),
             32 => core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags)),
-            _  => {}
+            _  => {},
         }
     }
 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn port_in(_port: u16, _width: u8) -> u32 { 0 }
+
+#[cfg(not(target_arch = "x86_64"))]
+fn port_out(_port: u16, _value: u32, _width: u8) {}
 
 pub fn gas_read(gas: &Gas) -> u64 {
     let width = if gas.register_bit_width > 0 { gas.register_bit_width } else { 16 };
     match gas.address_space_id {
         0 => {
-            #[cfg(target_arch = "x86_64")]
-            let size = (width as u64 + 7) / 8;
-            #[cfg(target_arch = "x86_64")]
-            let size = if size < 1 { 1 } else { size };
-            #[cfg(not(target_arch = "x86_64"))]
-            let size = (width as u64 + 7) / 8;
-            #[cfg(not(target_arch = "x86_64"))]
-            let size = if size < 1 { 1 } else { size };
+            let size = ((width as u64 + 7) / 8).max(1);
             let vaddr = map_phys(gas.address, size);
             unsafe { mmio_read(vaddr, width) }
         }
@@ -78,19 +81,12 @@ pub fn gas_write(gas: &Gas, value: u64) {
     let width = if gas.register_bit_width > 0 { gas.register_bit_width } else { 16 };
     match gas.address_space_id {
         0 => {
-            #[cfg(target_arch = "x86_64")]
-            let size = (width as u64 + 7) / 8;
-            #[cfg(target_arch = "x86_64")]
-            let size = if size < 1 { 1 } else { size };
-            #[cfg(not(target_arch = "x86_64"))]
-            let size = (width as u64 + 7) / 8;
-            #[cfg(not(target_arch = "x86_64"))]
-            let size = if size < 1 { 1 } else { size };
+            let size = ((width as u64 + 7) / 8).max(1);
             let vaddr = map_phys(gas.address, size);
             unsafe { mmio_write(vaddr, value, width); }
         }
         1 => port_out(gas.address as u16, value as u32, width),
-        _ => {}
+        _ => {},
     }
 }
 

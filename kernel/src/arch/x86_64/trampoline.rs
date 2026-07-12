@@ -56,8 +56,9 @@ core::arch::global_asm!(
     "mov  es, ax",
     "mov  ss, ax",
 
-    "mov  eax, [0x8700]",
-    "mov  cr3, eax",
+    // CR3 is NOT loaded here — in 32-bit mode `mov cr3, eax` only writes the
+    // low 32 bits, which would truncate a PML4 above 4 GiB.  CR3 is loaded
+    // *after* entering long mode where the full 64-bit value can be written.
 
     "mov  eax, cr4",
     "or   eax, 1 << 5",
@@ -79,22 +80,30 @@ core::arch::global_asm!(
 
     ".code64",
     "_trampoline_lm:",
-    "mov  rsp, [0x8708]",
 
-    // Reload CR3 with full 64-bit value (in 32-bit mode only low 32 bits were loaded).
+    // Load CR3 *after* entering long mode (full 64-bit write).
     "mov  rax, [0x8700]",
     "mov  cr3, rax",
 
+    // Set GS base to per-CPU pointer (the `ap_entry64` function reads
+    // `current_per_cpu()` via `mov %gs:0, %rax`).
     "mov  ecx, 0xC0000101",
     "mov  rax, [0x8718]",
     "mov  rdx, rax",
     "shr  rdx, 32",
     "wrmsr",
 
-    "mov  rax, [0x8720]",
-    "mfence",
-    "mov  qword ptr [rax], 1",
+    // Set stack pointer *after* GS base so that a stack probe that faults
+    // can still walk the per-CPU data.
+    "mov  rsp, [0x8708]",
 
+    // Align stack: x86-64 SysV ABI requires RSP % 16 == 8 at function
+    // entry.  `jmp` does not push a return address, so adjust from
+    // 16-aligned (typical for a page-aligned stack_top) to 8-below.
+    "and  rsp, -16",
+    "sub  rsp, 8",
+
+    // Jump into Rust — `ap_entry64` will signal `started` atomically.
     "mov  rax, [0x8710]",
     "jmp  rax",
 
@@ -155,16 +164,16 @@ pub unsafe fn start_aps(
         let pc: &mut PerCpu = per_cpu_by_id(ap.cpu_id);
         let started_addr = &pc.started as *const core::sync::atomic::AtomicU64 as u64;
 
-        unsafe {
-            data.write(TrampolineData {
-                cr3: page_table_root,
-                stack_top: ap.stack_top,
-                entry,
-                per_cpu_ptr: pc as *const PerCpu as u64,
-                started_flag_addr: started_addr,
-                lm_entry: lm_phys,
-            });
-        }
+            unsafe {
+                data.write(TrampolineData {
+                    cr3: page_table_root,
+                    stack_top: ap.stack_top,
+                    entry,
+                    per_cpu_ptr: pc as *const PerCpu as u64,
+                    started_flag_addr: started_addr, // kept for layout stability
+                    lm_entry: lm_phys,
+                });
+            }
 
         // Ensure all TrampolineData and PerCpu writes are visible before AP wakes.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -199,14 +208,26 @@ pub unsafe fn start_aps(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry64() -> ! {
+    // Signal to the BSP that this AP is past the trampoline hand-off.
     let pc = current_per_cpu();
     let cpu_id = pc.cpu_id;
+    pc.started.store(1, core::sync::atomic::Ordering::Release);
 
     SerialPort::puts("[AP] cpu ");
     SerialPort::put_u64(cpu_id as u64);
     SerialPort::puts(" online\n");
 
+    // Per-CPU GDT + TSS (double-fault IST stack).  This reloads CS/DS/ES/SS
+    // from the real kernel GDT and loads the task register.
+    crate::arch::x86_64::gdt::init();
+
+    // Reload the BSP's IDT on this AP (IDTR is per-CPU).
+    crate::arch::x86_64::idt::init_ap();
+
+    // Initialise this CPU's local APIC.
     crate::arch::CurrentArch::init_ap(cpu_id);
+
+    // Now safe to enable interrupts — GDT, TSS, and IDT are all set.
     crate::arch::CurrentArch::enable_interrupts();
 
     loop {

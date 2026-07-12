@@ -39,48 +39,7 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     }
 
     let revision = raw[15];
-    let xsdt_addr: u64;
-    let rsdt_addr: u32;
 
-    if revision >= 2 && raw.len() >= 36 {
-        if !checksum(&raw[..raw[16] as usize]) {
-            return Err(AcpiError::BadChecksum);
-        }
-        rsdt_addr = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]); // wait
-        // Actually RSDT address is at bytes 16-19 in ACPI 1.0 RSDP
-        // In ACPI 2.0+, the RSDP has: signature[8], checksum[1], oem_id[6], revision[1], rsdt_address[4], length[4], xsdt_address[8], ext_checksum[1], reserved[3]
-        // Wait, let me re-check...
-    }
-
-    // Actually my byte offset calculations are off. Let me redo.
-
-    // Let me re-read the RSDP structure correctly:
-    // ACPI 1.0 RSDP (20 bytes):
-    //   Bytes 0-7:   Signature "RSD PTR "
-    //   Byte 8:      Checksum (bytes 0-19 sum to 0)
-    //   Bytes 9-15:  OEM ID (6 bytes, but actually 9-14? Let me double check)
-    //   Byte 15:     Revision
-    //   Bytes 16-19: RSDT Address
-    // 
-    // ACPI 2.0+ RSDP extends to 36 bytes:
-    //   Bytes 20-23: Length
-    //   Bytes 24-31: XSDT Address
-    //   Byte 32:     Extended Checksum
-    //   Bytes 33-35: Reserved
-
-    // Hmm, the OEM ID is at offset 9, length 6, so 9-14 are OEM ID, byte 15 is revision.
-    // Let me verify: RSDP signature is "RSD PTR " at offset 0 (8 bytes).
-    // Byte 8: checksum
-    // Bytes 9-14: OEM ID (6 bytes)  
-    // Byte 15: Revision
-    // Bytes 16-19: RSDT Address (u32)
-    // (ACPI 1.0 ends here at byte 20)
-    // Byte 20-23: Length (u32) - only if Revision >= 2
-    // Bytes 24-31: XSDT Address (u64)
-    // Byte 32: Extended Checksum
-    // Bytes 33-35: Reserved
-
-    // So for ACPI 1.0:
     let rsdt_addr_u32 = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
 
     // For ACPI 2.0+:
@@ -109,13 +68,7 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
 }
 
 fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
-    let len = 8; // enough to read length from header
-    let vaddr = map_region(xsdt_addr, len);
-    let min_len_bytes = unsafe { (*((vaddr + 4) as *const u32)) };
-    // Actually, SdtHeader has signature[4], length[4], ...
-    // To read length, I need the 4 bytes at offset 4.
-    // But I need to read length to know how much to map.
-    // So I read the first 8 bytes (signature + length) first.
+    let vaddr = map_region(xsdt_addr, 8);
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
@@ -136,9 +89,19 @@ fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
 
     let mut result = Vec::new();
     for i in 0..entry_count {
+        // XSDT entries are at offset 36 from the table base; 36 is not a
+        // multiple of 8 so the u64 may be misaligned.  Read byte-by-byte
+        // to avoid panicking on alignment-check.
         let entry_raw = unsafe {
-            let p = (entries_addr + (i * 8) as u64) as *const u64;
-            p.read_volatile()
+            let p = (entries_addr + (i * 8) as u64) as *const u8;
+            (p.add(0).read_volatile() as u64)
+                | (p.add(1).read_volatile() as u64) << 8
+                | (p.add(2).read_volatile() as u64) << 16
+                | (p.add(3).read_volatile() as u64) << 24
+                | (p.add(4).read_volatile() as u64) << 32
+                | (p.add(5).read_volatile() as u64) << 40
+                | (p.add(6).read_volatile() as u64) << 48
+                | (p.add(7).read_volatile() as u64) << 56
         };
         result.extend(map_sdt(entry_raw)?);
     }

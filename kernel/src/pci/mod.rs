@@ -2,7 +2,7 @@ pub mod ecam;
 pub mod enumerate;
 
 use crate::mm::phys_alloc::BitmapAllocator;
-use acpi::platform::pci::PciConfigRegions;
+use crate::acpi::PciConfigRegions;
 
 /// A discovered PCI(e) device / function.
 #[derive(Debug, Clone)]

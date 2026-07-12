@@ -60,7 +60,7 @@ impl Arch for X86_64 {
     fn discover_cpus(acpi: Option<&AcpiSubsystem>) -> alloc::vec::Vec<(u32, bool)> {
         let mut cpus = alloc::vec::Vec::new();
 
-        let Some(ref processor_info) = acpi.and_then(|a| a.platform.processor_info.as_ref()) else {
+        let Some(ref processor_info) = acpi.and_then(|a| a.processor_info.as_ref()) else {
             SerialPort::puts("[arch] no processor info from ACPI\n");
             // At least report the BSP
             return cpus;
@@ -73,7 +73,7 @@ impl Arch for X86_64 {
         cpus.push((processor_info.boot_processor.local_apic_id as u32, true));
 
         for proc in &processor_info.application_processors {
-            let enabled = proc.state != ::acpi::platform::ProcessorState::Disabled;
+            let enabled = proc.state != crate::acpi::ProcessorState::Disabled;
             if !enabled {
                 SerialPort::puts("[arch] skipping disabled AP: apic_id=");
                 SerialPort::put_u64(proc.local_apic_id as u64);

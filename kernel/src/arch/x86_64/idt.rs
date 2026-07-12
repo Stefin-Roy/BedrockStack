@@ -3,8 +3,6 @@
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
-use crate::arch::{Arch, CurrentArch};
-use crate::drivers::serial::SerialPort;
 use crate::platform::x86_64_pc::apic;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
@@ -90,61 +88,59 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
     apic::apic_eoi();
 }
 
-/// Print a short message then halt forever.
-fn fault_halt(name: &str) -> ! {
-    SerialPort::puts("\n*** CPU EXCEPTION: ");
-    SerialPort::puts(name);
-    SerialPort::puts("\n");
-    loop {
-        CurrentArch::disable_interrupts();
-        CurrentArch::halt();
-    }
+extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    crate::kerneldump::dump_full_fault(&frame, 0, 0);
 }
 
-extern "x86-interrupt" fn divide_error_handler(_stack_frame: InterruptStackFrame) {
-    fault_halt("divide error");
+extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
+    crate::kerneldump::dump_full_fault(&frame, 0, 3);
 }
 
-extern "x86-interrupt" fn breakpoint_handler(_stack_frame: InterruptStackFrame) {
-    SerialPort::puts("\n*** breakpoint\n");
+extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    crate::kerneldump::dump_full_fault(&frame, 0, 6);
 }
 
-extern "x86-interrupt" fn invalid_opcode_handler(_stack_frame: InterruptStackFrame) {
-    fault_halt("invalid opcode");
-}
-
-extern "x86-interrupt" fn invalid_tss_handler(_stack_frame: InterruptStackFrame, _error_code: u64) {
-    fault_halt("invalid TSS");
+extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_code: u64) {
+    crate::kerneldump::dump_full_fault(&frame, error_code, 10);
 }
 
 extern "x86-interrupt" fn segment_not_present_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    frame: InterruptStackFrame,
+    error_code: u64,
 ) {
-    fault_halt("segment not present");
+    crate::kerneldump::dump_full_fault(&frame, error_code, 11);
 }
 
 extern "x86-interrupt" fn stack_segment_fault_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    frame: InterruptStackFrame,
+    error_code: u64,
 ) {
-    fault_halt("stack-segment fault");
+    crate::kerneldump::dump_full_fault(&frame, error_code, 12);
 }
 
 extern "x86-interrupt" fn double_fault_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: u64,
+    frame: InterruptStackFrame,
+    error_code: u64,
 ) -> ! {
-    fault_halt("double fault");
+    crate::kerneldump::dump_full_fault(&frame, error_code, 8);
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    _stack_frame: InterruptStackFrame,
-    _error_code: PageFaultErrorCode,
+    frame: InterruptStackFrame,
+    error_code: PageFaultErrorCode,
 ) {
-    fault_halt("page fault");
+    crate::kerneldump::dump_full_fault(&frame, error_code.bits(), 14);
 }
 
-extern "x86-interrupt" fn gpf_handler(_stack_frame: InterruptStackFrame, _error_code: u64) {
-    fault_halt("general protection fault");
+extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error_code: u64) {
+    crate::kerneldump::dump_full_fault(&frame, error_code, 13);
+}
+
+/// Reload the IDT on an Application Processor (IDTR is per-CPU).
+///
+/// Must be called after the BSP has called `init()` and before the AP
+/// enables interrupts.
+pub fn init_ap() {
+    let idt = IDT.get().expect("IDT not initialised on BSP");
+    idt.load();
 }

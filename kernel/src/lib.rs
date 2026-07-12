@@ -10,6 +10,8 @@ pub mod drivers;
 #[cfg(target_arch = "riscv64")]
 pub mod dtb;
 pub mod acpi_log;
+#[cfg(target_arch = "x86_64")]
+pub mod kerneldump;
 pub mod mm;
 pub mod module;
 pub mod pci;
@@ -173,7 +175,7 @@ impl Kernel {
             Some(a) => a,
             None => return,
         };
-        if let crate::acpi::InterruptModel::Apic(apic) = &acpi.platform.interrupt_model {
+        if let crate::acpi::InterruptModel::Apic(apic) = &acpi.interrupt_model {
             for io_apic in &apic.io_apics {
                 crate::platform::x86_64_pc::ioapic::init(
                     io_apic.address as u64,

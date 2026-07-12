@@ -3,7 +3,7 @@ use spin::Mutex;
 
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
-use acpi::platform::pci::PciConfigRegions;
+use crate::acpi::PciConfigRegions;
 
 const PCI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000;
 

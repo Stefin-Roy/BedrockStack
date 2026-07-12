@@ -13,7 +13,7 @@ use spin::Mutex;
 use crate::drivers::serial::SerialPort;
 use crate::mm::vmm::PageFlags;
 
-use acpi::platform::interrupt::{Polarity, TriggerMode};
+use crate::acpi::{Polarity, TriggerMode};
 
 const REG_IOAPIC_VER: u32 = 0x01;
 const REDIR_MASK: u64 = 1 << 16;

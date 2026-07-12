@@ -34,8 +34,9 @@ pub enum AcpiError {
 
 #[derive(Clone, Debug)]
 pub struct Processor {
-    pub id: u32,
+    pub local_apic_id: u32,
     pub state: ProcessorState,
+    pub is_ap: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,6 +66,7 @@ pub struct Apic {
 #[derive(Clone, Debug)]
 pub enum InterruptModel {
     Apic(Apic),
+    Unknown,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -82,4 +84,12 @@ pub enum Polarity {
 pub enum TriggerMode {
     Edge,
     Level,
+}
+
+/// Platform-level ACPI information parsed from FADT.
+pub struct PlatformInfo {
+    pub reset_gas: Option<Gas>,
+    pub reset_value: u8,
+    pub reset_supported: bool,
+    pub pm1_control: crate::acpi::fadt::Pm1ControlRegisters,
 }
