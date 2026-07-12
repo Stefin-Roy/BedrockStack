@@ -244,36 +244,20 @@ class BuildApp(App):
             self.write_log(f"[red]QEMU error: {e}[/]")
 
     def create_disk_image(self):
-        # Delegate to create_image.py, the single source of truth for producing
-        # a proper GPT + FAT32 ESP image (via WSL mtools). The previous inline
-        # implementation shelled out to mtools as native Windows commands (which
-        # don't exist here) and produced a partition-table-less image that OVMF
-        # would not boot.
-        script = os.path.join(WORKSPACE, "create_image.py")
-        cmd = [sys.executable, script]
-        self.write_log(f"  $ {' '.join(cmd)}")
+        self.write_log("[bold blue]Creating GPT disk image via build_image.py...[/]")
+        import build_image
+        boot = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "debug", "boot.efi")
+        if not os.path.exists(boot):
+            boot = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "release", "boot.efi")
+        kernel = os.path.join(TARGET_DIR, "x86_64-unknown-none", "debug", "kernel")
+        if not os.path.exists(kernel):
+            kernel = os.path.join(TARGET_DIR, "x86_64-unknown-none", "release", "kernel")
+        if not os.path.exists(boot) or not os.path.exists(kernel):
+            self.write_log("[red]Boot or kernel binary not found — build first[/]")
+            return
         try:
-            result = subprocess.run(
-                cmd,
-                cwd=WORKSPACE,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-            for stream in (result.stdout, result.stderr):
-                if stream:
-                    for line in stream.strip().split("\n"):
-                        self.write_log(f"  {line}")
-            if result.returncode != 0:
-                self.write_log(
-                    f"[red]Disk image creation failed (exit {result.returncode})[/]"
-                )
-            else:
-                self.write_log(
-                    f"[green]Disk image created: {os.path.join(TARGET_DIR, 'os.img')}[/]"
-                )
-        except subprocess.TimeoutExpired:
-            self.write_log("[red]Disk image creation timed out[/]")
+            build_image.create_gpt_image(boot, kernel)
+            self.write_log("[green]Disk image created[/]")
         except Exception as e:
             self.write_log(f"[red]Disk image creation error: {e}[/]")
 
