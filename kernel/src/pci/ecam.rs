@@ -88,53 +88,36 @@ fn find_region(segment: u16, bus: u8) -> Option<&'static MappedRegion> {
     None
 }
 
-pub fn read_u32(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u32 {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return 0xFFFF_FFFF,
+macro_rules! ecam_read {
+    ($name:ident, $ty:ty, $default:expr) => {
+        pub fn $name(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> $ty {
+            let r = match find_region(segment, bus) {
+                Some(r) => r,
+                None => return $default,
+            };
+            unsafe { (r.virt_addr(bus, device, function, offset) as *const $ty).read_volatile() }
+        }
     };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *const u32).read_volatile() }
 }
 
-pub fn read_u16(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u16 {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return 0xFFFF,
+macro_rules! ecam_write {
+    ($name:ident, $ty:ty) => {
+        pub fn $name(segment: u16, bus: u8, device: u8, function: u8, offset: u16, val: $ty) {
+            let r = match find_region(segment, bus) {
+                Some(r) => r,
+                None => return,
+            };
+            unsafe { (r.virt_addr(bus, device, function, offset) as *mut $ty).write_volatile(val); }
+        }
     };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *const u16).read_volatile() }
 }
 
-pub fn read_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16) -> u8 {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return 0xFF,
-    };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *const u8).read_volatile() }
-}
-
-pub fn write_u32(segment: u16, bus: u8, device: u8, function: u8, offset: u16, val: u32) {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return,
-    };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *mut u32).write_volatile(val); }
-}
-
-pub fn write_u16(segment: u16, bus: u8, device: u8, function: u8, offset: u16, val: u16) {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return,
-    };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *mut u16).write_volatile(val); }
-}
-
-pub fn write_u8(segment: u16, bus: u8, device: u8, function: u8, offset: u16, val: u8) {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return,
-    };
-    unsafe { (r.virt_addr(bus, device, function, offset) as *mut u8).write_volatile(val); }
-}
+ecam_read!(read_u32, u32, 0xFFFF_FFFF);
+ecam_read!(read_u16, u16, 0xFFFF);
+ecam_read!(read_u8, u8, 0xFF);
+ecam_write!(write_u32, u32);
+ecam_write!(write_u16, u16);
+ecam_write!(write_u8, u8);
 
 /// Read entire 256-byte config header into a buffer.
 pub fn read_header(segment: u16, bus: u8, device: u8, function: u8, buf: &mut [u8; 256]) {
