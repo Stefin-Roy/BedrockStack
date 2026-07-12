@@ -73,8 +73,11 @@ impl Kernel {
         stack_guard: u64,
         rsdp_addr: u64,
     ) -> Self {
+        use crate::drivers::serial::SerialPort;
+        SerialPort::puts("[kernel] Kernel::new: acpi_log init\n");
         crate::acpi_log::init();
 
+        SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
         let display = unsafe {
             Framebuffer::new(
                 framebuffer.address,
@@ -85,8 +88,10 @@ impl Kernel {
             )
         };
 
+        SerialPort::puts("[kernel] Kernel::new: find_bitmap_region\n");
         let bitmap_region = find_bitmap_region(memory_map);
 
+        SerialPort::puts("[kernel] Kernel::new: layout\n");
         let layout = unsafe {
             KernelLayout {
                 kernel_start: &__kernel_start as *const u8 as u64,
@@ -100,6 +105,7 @@ impl Kernel {
             }
         };
 
+        SerialPort::puts("[kernel] Kernel::new: BitmapAllocator::new\n");
         let mut allocator = unsafe {
             BitmapAllocator::new(
                 bitmap_region,
@@ -109,10 +115,12 @@ impl Kernel {
             )
         };
 
-        // Reserve the kernel image so allocator won't hand out those frames
+        SerialPort::puts("[kernel] Kernel::new: reserve_region\n");
         allocator.reserve_region(layout.kernel_start, layout.kernel_end);
 
+        SerialPort::puts("[kernel] Kernel::new: heap::init\n");
         unsafe { heap::init(&mut allocator) };
+        SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {
             framebuffer: display,
