@@ -27,6 +27,9 @@ pub trait Arch {
     /// Enable interrupts.
     fn enable_interrupts();
 
+    /// Returns whether interrupts are currently enabled.
+    fn are_interrupts_enabled() -> bool;
+
     /// Build page tables with identity-mapped RAM and a higher-half kernel
     /// alias at `KERNEL_VMA_BASE + phys`.
     ///

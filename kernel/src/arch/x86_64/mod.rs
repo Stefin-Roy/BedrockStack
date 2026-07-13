@@ -46,6 +46,10 @@ impl Arch for X86_64 {
         x86_64::instructions::interrupts::enable();
     }
 
+    fn are_interrupts_enabled() -> bool {
+        x86_64::instructions::interrupts::are_enabled()
+    }
+
     fn setup_virt_mem(
         allocator: &mut BitmapAllocator,
         layout: &KernelLayout,

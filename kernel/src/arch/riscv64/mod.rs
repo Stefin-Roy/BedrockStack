@@ -54,6 +54,12 @@ impl Arch for Riscv64 {
         unsafe { asm!("csrsi sstatus, 2"); }
     }
 
+    fn are_interrupts_enabled() -> bool {
+        let stval: u64;
+        unsafe { asm!("csrr {}, sstatus", out(reg) stval); }
+        (stval & 2) != 0
+    }
+
     fn setup_virt_mem(
         allocator: &mut BitmapAllocator,
         layout: &KernelLayout,
