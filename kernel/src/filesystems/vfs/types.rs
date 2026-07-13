@@ -1,3 +1,5 @@
+use core::ops::BitOr;
+
 use alloc::string::String;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +24,13 @@ impl OpenFlags {
 
     pub fn new(val: u8) -> Self {
         OpenFlags(val)
+    }
+}
+
+impl BitOr for OpenFlags {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        OpenFlags(self.0 | rhs.0)
     }
 }
 

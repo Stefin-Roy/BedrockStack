@@ -1,4 +1,5 @@
 pub mod registry;
+pub mod vfs_test;
 
 use crate::display::framebuffer::Framebuffer;
 

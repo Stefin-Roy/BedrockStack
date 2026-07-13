@@ -118,6 +118,7 @@ if not exist "%QEMU_PATH%" (
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
+    -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
     -device nvme,serial=1234,drive=nvme_disk ^

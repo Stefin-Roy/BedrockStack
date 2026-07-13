@@ -1,6 +1,7 @@
 //! Module registry for static module dispatch.
 
 use super::Module;
+use super::vfs_test::VfsTest;
 use crate::display::framebuffer::Framebuffer;
 use crate::display::Display as _;
 
@@ -27,6 +28,7 @@ impl Module for HelloModule {
 
 static MODULES: &[&dyn Module] = &[
     &HelloModule,
+    &VfsTest,
 ];
 
 pub fn init_all(display: &mut Framebuffer) {
