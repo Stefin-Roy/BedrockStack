@@ -21,7 +21,7 @@ impl IoCompletions {
     }
 }
 
-pub trait BlockDevice: Sync {
+pub trait BlockDevice: Send + Sync {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str>;
     fn sector_count(&self) -> u64;
     fn model_string(&self) -> &str;

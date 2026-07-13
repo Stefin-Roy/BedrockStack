@@ -38,8 +38,6 @@ impl FileSystem for Tmpfs {
         let super_ops = Arc::new(TmpfsSuperOps);
         let sb = Arc::new(SuperBlock::new(super_ops, root_inode.clone()));
 
-        root_inode.set_sb(sb.clone());
-
         Ok((sb, root_ops))
     }
 }

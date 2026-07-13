@@ -5,12 +5,13 @@ use alloc::vec::Vec;
 use alloc::string::String;
 
 use hashbrown::HashMap;
+use spin::Once;
 
 use super::inode::Inode;
 use super::irq::IrqMutex;
 
 pub struct Dentry {
-    pub name: String,
+    pub name: IrqMutex<String>,
     pub inode: IrqMutex<Option<Arc<Inode>>>,
     pub parent: IrqMutex<Weak<Dentry>>,
     pub children: IrqMutex<Vec<Arc<Dentry>>>,
@@ -20,7 +21,7 @@ pub struct Dentry {
 impl Dentry {
     pub fn new(name: &str, inode: Option<Arc<Inode>>) -> Arc<Self> {
         Arc::new(Dentry {
-            name: String::from(name),
+            name: IrqMutex::new(String::from(name)),
             inode: IrqMutex::new(inode),
             parent: IrqMutex::new(Weak::new()),
             children: IrqMutex::new(Vec::new()),
@@ -42,16 +43,18 @@ impl Dentry {
 }
 
 pub struct Dcache {
-    map: IrqMutex<HashMap<(u64, String), Weak<Dentry>>>,
+    map: spin::Mutex<HashMap<(u64, String), Weak<Dentry>>>,
+}
+
+static DCACHE: Once<Dcache> = Once::new();
+
+pub fn dcache() -> &'static Dcache {
+    DCACHE.call_once(|| Dcache {
+        map: spin::Mutex::new(HashMap::new()),
+    })
 }
 
 impl Dcache {
-    pub const fn new() -> Self {
-        Dcache {
-            map: IrqMutex::new(HashMap::new()),
-        }
-    }
-
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<Arc<Dentry>> {
         let map = self.map.lock();
         map.get(&(parent_ino, String::from(name)))

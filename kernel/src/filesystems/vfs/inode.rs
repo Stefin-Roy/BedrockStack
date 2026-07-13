@@ -1,11 +1,10 @@
 use core::sync::atomic::{AtomicU64, Ordering};
-use core::sync::atomic::OnceLock;
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::error::VfsError;
 use super::irq::IrqMutex;
-use super::superblock::SuperBlock;
 use super::types::{DirEntry, FileType, Stat};
 
 pub trait InodeOps: Send + Sync {
@@ -32,7 +31,6 @@ pub struct InodeMeta {
 
 pub struct Inode {
     pub ops: Arc<dyn InodeOps>,
-    pub sb: OnceLock<Arc<SuperBlock>>,
     pub ino: u64,
     pub file_type: FileType,
     pub size: AtomicU64,
@@ -46,16 +44,11 @@ impl Inode {
         let size = ops.size();
         Inode {
             ops,
-            sb: OnceLock::new(),
             ino,
             file_type,
             size: AtomicU64::new(size),
             meta: IrqMutex::new(InodeMeta { nlink: 1, mtime: 0 }),
         }
-    }
-
-    pub fn set_sb(&self, sb: Arc<SuperBlock>) {
-        let _ = self.sb.set(sb);
     }
 
     pub fn update_attr_from_stat(&self, stat: &Stat) {

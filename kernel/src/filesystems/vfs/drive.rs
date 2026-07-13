@@ -1,4 +1,5 @@
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 use super::error::VfsError;
 use super::irq::IrqMutex;

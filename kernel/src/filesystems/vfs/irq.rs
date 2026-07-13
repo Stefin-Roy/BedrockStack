@@ -1,6 +1,8 @@
 use core::ops::{Deref, DerefMut};
 use spin::Mutex;
 
+use crate::arch::Arch;
+
 pub struct IrqMutex<T> {
     inner: Mutex<T>,
 }
@@ -10,7 +12,7 @@ impl<T> IrqMutex<T> {
         IrqMutex { inner: Mutex::new(val) }
     }
 
-    pub fn lock(&self) -> IrqGuard<T> {
+    pub fn lock(&self) -> IrqGuard<'_, T> {
         let was = crate::arch::CurrentArch::are_interrupts_enabled();
         if was {
             crate::arch::CurrentArch::disable_interrupts();
