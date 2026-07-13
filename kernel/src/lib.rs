@@ -7,6 +7,7 @@ pub mod arch;
 pub mod boot;
 pub mod display;
 pub mod drivers;
+pub mod filesystems;
 #[cfg(target_arch = "riscv64")]
 pub mod dtb;
 pub mod acpi_log;
@@ -239,10 +240,13 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
-        crate::drivers::ahci::init(
+        crate::filesystems::blockdriver::ahci::init(
             self.page_table_root,
             &mut self.allocator as *mut _,
         );
+
+        #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+        crate::filesystems::vfs::init().expect("VFS init failed");
 
         init_all(&mut self.framebuffer);
         loop {
