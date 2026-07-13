@@ -169,7 +169,10 @@ unsafe impl Sync for VmmState {}
 fn map_mmio(paddr: u64, size: u64) -> u64 {
     let mut g = VMM_STATE.lock();
     let s = g.as_mut().expect("VMM not init");
-    let va = s.next_vaddr - size;
+    let va = s.next_vaddr.checked_sub(size).expect("AHCI VMM: address space exhausted (overflow)");
+    if va < VMM_VADDR_FLOOR {
+        panic!("AHCI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", va);
+    }
     s.next_vaddr = va;
     Vmm::from_root(s.root)
         .map(unsafe { &mut *s.alloc }, va, paddr, size,
@@ -593,6 +596,8 @@ impl BlockDevice for AhciPort {
 // ── Initialisation ──────────────────────────────────────────────
 
 const VMM_VADDR: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000 - 0x20000000;
+/// AHCI VMM floor — 512 MB of virtual space for AHCI MMIO.
+const VMM_VADDR_FLOOR: u64 = VMM_VADDR - 0x2000_0000;
 
 pub fn init(root: u64, alloc: *mut BitmapAllocator) {
     use crate::drivers::serial::SerialPort;

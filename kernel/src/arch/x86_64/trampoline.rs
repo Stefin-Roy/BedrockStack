@@ -173,6 +173,9 @@ pub unsafe fn start_aps(
         SerialPort::puts("\n");
 
         let pc: &mut PerCpu = per_cpu_by_id(ap.cpu_id);
+        assert!(!pc.self_ptr.is_null(), "AP {}: PerCpu self_ptr is null", ap.cpu_id);
+        assert!(ap.stack_top > 0x1000, "AP {}: stack_top too low ({:#x})", ap.cpu_id, ap.stack_top);
+        assert!(ap.stack_top & 0xF == 0, "AP {}: stack_top not aligned ({:#x})", ap.cpu_id, ap.stack_top);
         let started_addr = &pc.started as *const core::sync::atomic::AtomicU64 as u64;
 
             unsafe {

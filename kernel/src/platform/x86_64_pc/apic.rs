@@ -1,7 +1,7 @@
 use crate::drivers::serial::SerialPort;
 use crate::platform::x86_64_pc::pit;
 use core::arch::asm;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const CPUID_APIC_BIT: u32 = 1 << 9;
 const CPUID_X2APIC_BIT: u32 = 1 << 21;
@@ -23,7 +23,7 @@ const LAPIC_ICR_HIGH: u32 = 0x310;
 const TIMER_VECTOR: u8 = 32;
 
 /// Set when the local APIC is operating in x2APIC mode (IA32_APIC_BASE[10]).
-static mut X2APIC_MODE: bool = false;
+static X2APIC_MODE: AtomicBool = AtomicBool::new(false);
 
 fn cpu_has_apic() -> bool {
     let result = core::arch::x86_64::__cpuid(1);
@@ -49,7 +49,7 @@ fn is_x2apic_enabled() -> bool {
 /// ICR MSR directly.
 fn send_ipi_raw(dest_apic_id: u32, icr_low: u32) {
     unsafe {
-        if X2APIC_MODE {
+        if X2APIC_MODE.load(Ordering::Relaxed) {
             let icr = ((dest_apic_id as u64) << 32) | (icr_low as u64);
             wrmsr(IA32_X2APIC_ICR_MSR, icr);
         } else {
@@ -75,7 +75,7 @@ fn wrmsr(msr: u32, val: u64) {
     unsafe { asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack)); }
 }
 
-static mut LAPIC_BASE: u64 = 0;
+static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Map an xAPIC MMIO register offset to its x2APIC MSR index.
 ///
@@ -85,24 +85,20 @@ fn x2apic_msr(reg: u32) -> u32 {
 }
 
 fn lapic_write(reg: u32, val: u32) {
-    unsafe {
-        if X2APIC_MODE {
-            wrmsr(x2apic_msr(reg), val as u64);
-        } else {
-            let addr = LAPIC_BASE + reg as u64;
-            (addr as *mut u32).write_volatile(val);
-        }
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        wrmsr(x2apic_msr(reg), val as u64);
+    } else {
+        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
+        unsafe { (addr as *mut u32).write_volatile(val); }
     }
 }
 
 fn lapic_read(reg: u32) -> u32 {
-    unsafe {
-        if X2APIC_MODE {
-            rdmsr(x2apic_msr(reg)) as u32
-        } else {
-            let addr = LAPIC_BASE + reg as u64;
-            (addr as *const u32).read_volatile()
-        }
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        rdmsr(x2apic_msr(reg)) as u32
+    } else {
+        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
+        unsafe { (addr as *const u32).read_volatile() }
     }
 }
 
@@ -132,17 +128,15 @@ pub fn read_x2apic_id() -> u32 {
 /// Read the current CPU's APIC ID as a 32-bit value, working in both xAPIC
 /// and x2APIC modes.
 pub fn read_full_apic_id() -> u32 {
-    unsafe {
-        if X2APIC_MODE {
-            read_x2apic_id()
-        } else {
-            (lapic_read(LAPIC_ID) >> 24) as u32
-        }
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        read_x2apic_id()
+    } else {
+        (lapic_read(LAPIC_ID) >> 24) as u32
     }
 }
 
 pub fn lapic_base() -> u64 {
-    unsafe { LAPIC_BASE }
+    LAPIC_BASE.load(Ordering::Relaxed)
 }
 
 /// Send a fixed IPI to a specific APIC ID.
@@ -176,7 +170,7 @@ pub fn send_sipi_ipi(dest_apic_id: u32, page: u8) {
 /// Send IPI to all CPUs except self (broadcast to all-but-self).
 pub fn send_ipi_all_except_self(vector: u8) {
     unsafe {
-        if X2APIC_MODE {
+        if X2APIC_MODE.load(Ordering::Relaxed) {
             // x2APIC shorthand lives in ICR bits 18:16. Delivery mode 000
             // (fixed) is implicit. destination shorthand = 11 (all excluding self)
             let icr = (vector as u64) | (3 << 18);
@@ -291,9 +285,9 @@ pub fn init_ap() {
     SerialPort::puts("[apic] AP init\n");
     let base = rdmsr(IA32_APIC_BASE_MSR);
     let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
-    unsafe { LAPIC_BASE = base_addr; }
+    LAPIC_BASE.store(base_addr, Ordering::Relaxed);
 
-    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
+    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
 
     if base & (1 << 11) == 0 {
         wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11));
@@ -305,7 +299,7 @@ pub fn init_ap() {
         let cur = rdmsr(IA32_APIC_BASE_MSR);
         wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
     }
-    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
+    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
 
     let svr = lapic_read(LAPIC_SVR);
     lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);
@@ -330,7 +324,7 @@ pub fn init() {
 
     let base = rdmsr(IA32_APIC_BASE_MSR);
     let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
-    unsafe { LAPIC_BASE = base_addr; }
+    LAPIC_BASE.store(base_addr, Ordering::Relaxed);
 
     SerialPort::puts("[apic] base=0x");
     SerialPort::put_hex(base_addr);
@@ -348,9 +342,9 @@ pub fn init() {
         wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
         SerialPort::puts("[apic] x2APIC mode enabled\n");
     }
-    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
+    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
     SerialPort::puts("[apic] x2APIC mode: ");
-    SerialPort::put_u64(if unsafe { X2APIC_MODE } { 1 } else { 0 });
+    SerialPort::put_u64(if X2APIC_MODE.load(Ordering::Relaxed) { 1 } else { 0 });
     SerialPort::puts("\n");
 
     let svr = lapic_read(LAPIC_SVR);

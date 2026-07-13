@@ -99,6 +99,12 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 
     let index = 0x10 + 2 * (gsi - state.gsi_base);
     let vector = state.next_vector;
+    if vector < 32 {
+        SerialPort::puts("[ioapic] WARN: interrupt vectors exhausted, cannot enable GSI ");
+        SerialPort::put_u64(gsi as u64);
+        SerialPort::puts("\n");
+        return None;
+    }
     state.next_vector += 1;
 
     let mut low = vector as u32;
@@ -112,8 +118,10 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 
     let high: u32 = 0;
 
-    ioapic_write(state, index, low);
+    // Per Intel IOAPIC spec: write high DWORD first, then low DWORD
+    // (low DWORD write triggers the update).
     ioapic_write(state, index + 1, high);
+    ioapic_write(state, index, low);
 
     SerialPort::puts("[ioapic] enabled GSI ");
     SerialPort::put_u64(gsi as u64);

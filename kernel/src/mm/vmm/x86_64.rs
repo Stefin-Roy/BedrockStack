@@ -109,9 +109,13 @@ pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     match mapper.unmap(page) {
-        Ok((_freed_frame, flush)) => {
+        Ok((_ref_frame, flush)) => {
             flush.flush();
-            // TODO: free `_freed_frame` back when it's an intermediate table frame.
+            // NB: `_ref_frame` is the page frame that was mapped at this VA,
+            // NOT an intermediate page-table frame.  Freeing it here would
+            // release memory that another component may still be using.
+            // A future enhancement should track empty intermediate page tables
+            // and free them back to the physical allocator.
             true
         }
         Err(_) => false,

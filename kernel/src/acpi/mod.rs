@@ -37,11 +37,17 @@ pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
     *ACPI_STATE.lock() = Some(AcpiVmmState { root, alloc, next_vaddr: ACPI_VADDR_BASE });
 }
 
+/// ACPI VMM floor — 512 MB of virtual space for ACPI tables (generous).
+const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
+
 /// Map a physical MMIO region through the ACPI VMM.
 pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
     let mut guard = ACPI_STATE.lock();
     let state = guard.as_mut().expect("ACPI VMM not initialized — call init_vmm first");
-    let vaddr = state.next_vaddr - size;
+    let vaddr = state.next_vaddr.checked_sub(size).expect("ACPI VMM: address space exhausted (overflow)");
+    if vaddr < ACPI_VADDR_FLOOR {
+        panic!("ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", vaddr);
+    }
     state.next_vaddr = vaddr;
     let mut vmm = Vmm::from_root(state.root);
     let alloc = unsafe { &mut *state.alloc };
