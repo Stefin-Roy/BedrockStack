@@ -1,6 +1,7 @@
 use crate::drivers::serial::SerialPort;
 use crate::platform::x86_64_pc::pit;
 use core::arch::asm;
+use core::sync::atomic::Ordering;
 
 const CPUID_APIC_BIT: u32 = 1 << 9;
 const CPUID_X2APIC_BIT: u32 = 1 << 21;
@@ -108,6 +109,18 @@ fn lapic_read(reg: u32) -> u32 {
 pub fn apic_eoi() {
     lapic_write(LAPIC_EOI, 0);
 }
+
+/// Returns the current LAPIC timer count (decrements from init_count to 0).
+/// The timer fires every ~10ms, reloading init_count each period.
+pub fn timer_current_count() -> u32 {
+    lapic_read(LAPIC_CURR_COUNT)
+}
+
+/// Returns the initial LAPIC timer count loaded each period.
+pub fn timer_init_count() -> u32 {
+    BSP_TIMER_COUNT.load(Ordering::Relaxed)
+}
+
 pub fn read_apic_id() -> u8 {
     (lapic_read(LAPIC_ID) >> 24) as u8
 }
@@ -193,10 +206,11 @@ pub fn send_tlb_shootdown(cpu_id: u8) {
 
 const PIT_HZ: u64 = 1_193_182;
 const PIT_RELOAD: u64 = 0xFFFF;
-const TIMER_HZ: u64 = 100; // Change to 1000 for a 1 kHz timer.
+pub const TIMER_HZ: u64 = 1000;
+pub const TIMER_PERIOD_MS: u32 = (1000 / TIMER_HZ) as u32;
 
 /// Calibrated APIC timer count shared between BSP and APs.
-static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 fn calibrate_via_pit() -> u32 {
     SerialPort::puts("[apic] calibrating via PIT\n");
@@ -353,5 +367,5 @@ pub fn init() {
     lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
     lapic_write(LAPIC_INIT_COUNT, init_count);
 
-    SerialPort::puts("[apic] timer started at 100 Hz\n");
+    SerialPort::puts("[apic] timer started at 1000 Hz\n");
 }

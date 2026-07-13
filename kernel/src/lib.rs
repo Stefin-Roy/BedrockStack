@@ -238,6 +238,12 @@ impl Kernel {
             );
         }
 
+        #[cfg(target_arch = "x86_64")]
+        crate::drivers::ahci::init(
+            self.page_table_root,
+            &mut self.allocator as *mut _,
+        );
+
         init_all(&mut self.framebuffer);
         loop {
             CurrentArch::halt();

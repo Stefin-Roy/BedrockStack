@@ -30,8 +30,15 @@ if not exist "%OVMF_VARS_SOURCE%" set OVMF_VARS_SOURCE=%QEMU_DIR%\share\edk2-i38
 set OVMF_PATH=%TARGET_DIR%\ovmf_code.fd
 set OVMF_VARS=%TARGET_DIR%\ovmf_vars.fd
 set IMAGE_PATH=%TARGET_DIR%\os.img
+set NVME_IMAGE=%TARGET_DIR%\nvme.img
 
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
+
+REM Create a blank NVMe test disk image if missing
+if not exist "%NVME_IMAGE%" (
+    echo [fullrun] Creating NVMe test disk image...
+    "%QEMU_DIR%\qemu-img" create -f raw "%NVME_IMAGE%" 64M >nul 2>&1
+)
 
 echo ============================================> "%LOG_FILE%"
 echo  BedrockOS fullrun (x86_64) - %date% %time%>> "%LOG_FILE%"
@@ -107,9 +114,13 @@ if not exist "%QEMU_PATH%" (
     exit /b 1
 )
 "%QEMU_PATH%" ^
+    -machine q35 ^
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
-    -drive format=raw,file="%IMAGE_PATH%" ^
+    -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
+    -device ide-hd,drive=disk0,bus=ahci.0 ^
+    -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
+    -device nvme,serial=1234,drive=nvme_disk ^
     -serial stdio ^
     -m 256M ^
     -smp 4

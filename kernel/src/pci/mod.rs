@@ -5,7 +5,7 @@ use crate::mm::phys_alloc::BitmapAllocator;
 use crate::acpi::PciConfigRegions;
 
 /// A discovered PCI(e) device / function.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct PciDevice {
     pub segment: u16,
     pub bus: u8,

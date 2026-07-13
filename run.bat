@@ -21,6 +21,7 @@ set OVMF_VARS_SRC=%QEMU_DIR%\share\edk2-x86_64-vars.fd
 set OVMF_PATH=%~dp0target\ovmf_code.fd
 set OVMF_VARS=%~dp0target\ovmf_vars.fd
 set IMAGE_PATH=%~dp0target\os.img
+set NVME_IMAGE=%~dp0target\nvme.img
 
 if not exist "%IMAGE_PATH%" (
     echo ERROR: Disk image not found at %IMAGE_PATH%
@@ -29,11 +30,18 @@ if not exist "%IMAGE_PATH%" (
 )
 if not exist "%OVMF_PATH%" copy /Y "%OVMF_CODE_SRC%" "%OVMF_PATH%" >nul
 copy /Y "%OVMF_VARS_SRC%" "%OVMF_VARS%" >nul
+if not exist "%NVME_IMAGE%" (
+    "%QEMU_DIR%\qemu-img" create -f raw "%NVME_IMAGE%" 64M >nul 2>&1
+)
 echo Running QEMU with BedrockOS (x86_64^)...
 "%QEMU_PATH%" ^
+    -machine q35 ^
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
-    -drive format=raw,file="%IMAGE_PATH%" ^
+    -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
+    -device ide-hd,drive=disk0,bus=ahci.0 ^
+    -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
+    -device nvme,serial=1234,drive=nvme_disk ^
     -m 256M ^
     -smp 4 ^
     -serial mon:stdio ^
