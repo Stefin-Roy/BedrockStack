@@ -1,7 +1,6 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 use alloc::string::String;
 
 use hashbrown::HashMap;
@@ -10,11 +9,13 @@ use spin::Once;
 use super::inode::Inode;
 use super::irq::IrqMutex;
 
+const DCACHE_MAX: usize = 4096;
+
 pub struct Dentry {
     pub name: IrqMutex<String>,
     pub inode: IrqMutex<Option<Arc<Inode>>>,
     pub parent: IrqMutex<Weak<Dentry>>,
-    pub children: IrqMutex<Vec<Arc<Dentry>>>,
+    pub children: IrqMutex<HashMap<String, Arc<Dentry>>>,
     pub flags: AtomicBool,
 }
 
@@ -24,7 +25,7 @@ impl Dentry {
             name: IrqMutex::new(String::from(name)),
             inode: IrqMutex::new(inode),
             parent: IrqMutex::new(Weak::new()),
-            children: IrqMutex::new(Vec::new()),
+            children: IrqMutex::new(HashMap::new()),
             flags: AtomicBool::new(false),
         })
     }
@@ -57,18 +58,18 @@ pub fn dcache() -> &'static Dcache {
 impl Dcache {
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Option<Arc<Dentry>> {
         let map = self.map.lock();
-        map.get(&(parent_ino, String::from(name)))
-            .and_then(|w| w.upgrade())
+        let key = (parent_ino, String::from(name));
+        map.get(&key).and_then(|w| w.upgrade())
     }
 
     pub fn insert(&self, parent_ino: u64, name: String, dentry: Weak<Dentry>) {
         let mut map = self.map.lock();
+        if map.len() >= DCACHE_MAX {
+            if let Some(key) = map.keys().next().cloned() {
+                map.remove(&key);
+            }
+        }
         map.insert((parent_ino, name), dentry);
-    }
-
-    pub fn remove(&self, parent_ino: u64, name: &str) {
-        let mut map = self.map.lock();
-        map.remove(&(parent_ino, String::from(name)));
     }
 
     pub fn evict(&self, parent_ino: u64, name: &str) {
