@@ -3,7 +3,10 @@ use crate::platform::x86_64_pc::pit;
 use core::arch::asm;
 
 const CPUID_APIC_BIT: u32 = 1 << 9;
+const CPUID_X2APIC_BIT: u32 = 1 << 21;
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
+const IA32_X2APIC_ID_MSR: u32 = 0x802;
+const IA32_X2APIC_ICR_MSR: u32 = 0x830;
 
 const LAPIC_SVR: u32 = 0xF0;
 const LAPIC_TPR: u32 = 0x80;
@@ -18,9 +21,45 @@ const LAPIC_ICR_HIGH: u32 = 0x310;
 
 const TIMER_VECTOR: u8 = 32;
 
+/// Set when the local APIC is operating in x2APIC mode (IA32_APIC_BASE[10]).
+static mut X2APIC_MODE: bool = false;
+
 fn cpu_has_apic() -> bool {
     let result = core::arch::x86_64::__cpuid(1);
     result.edx & CPUID_APIC_BIT != 0
+}
+
+fn cpu_has_x2apic() -> bool {
+    let result = core::arch::x86_64::__cpuid(1);
+    result.ecx & CPUID_X2APIC_BIT != 0
+}
+
+fn is_x2apic_enabled() -> bool {
+    unsafe {
+        let base = rdmsr(IA32_APIC_BASE_MSR);
+        base & (1 << 10) != 0
+    }
+}
+
+/// Send an IPI via the appropriate path for the current APIC mode.
+///
+/// In xAPIC mode the destination is written to ICR high bits 31:24 (8-bit
+/// destination field). In x2APIC mode the full 32-bit ID is written to the
+/// ICR MSR directly.
+fn send_ipi_raw(dest_apic_id: u32, icr_low: u32) {
+    unsafe {
+        if X2APIC_MODE {
+            let icr = ((dest_apic_id as u64) << 32) | (icr_low as u64);
+            wrmsr(IA32_X2APIC_ICR_MSR, icr);
+        } else {
+            // Wait for previous IPI to complete (delivery status bit = 0)
+            while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+                core::hint::spin_loop();
+            }
+            lapic_write(LAPIC_ICR_HIGH, (dest_apic_id & 0xFF) << 24);
+            lapic_write(LAPIC_ICR_LOW, icr_low);
+        }
+    }
 }
 
 fn rdmsr(msr: u32) -> u64 {
@@ -37,14 +76,33 @@ fn wrmsr(msr: u32, val: u64) {
 
 static mut LAPIC_BASE: u64 = 0;
 
+/// Map an xAPIC MMIO register offset to its x2APIC MSR index.
+///
+/// x2APIC registers live at MSR `0x800 + (offset >> 4)` (e.g. SVR 0xF0 -> 0x80F).
+fn x2apic_msr(reg: u32) -> u32 {
+    0x800 + (reg >> 4)
+}
+
 fn lapic_write(reg: u32, val: u32) {
-    let addr = unsafe { LAPIC_BASE + reg as u64 };
-    unsafe { (addr as *mut u32).write_volatile(val); }
+    unsafe {
+        if X2APIC_MODE {
+            wrmsr(x2apic_msr(reg), val as u64);
+        } else {
+            let addr = LAPIC_BASE + reg as u64;
+            (addr as *mut u32).write_volatile(val);
+        }
+    }
 }
 
 fn lapic_read(reg: u32) -> u32 {
-    let addr = unsafe { LAPIC_BASE + reg as u64 };
-    unsafe { (addr as *const u32).read_volatile() }
+    unsafe {
+        if X2APIC_MODE {
+            rdmsr(x2apic_msr(reg)) as u32
+        } else {
+            let addr = LAPIC_BASE + reg as u64;
+            (addr as *const u32).read_volatile()
+        }
+    }
 }
 
 pub fn apic_eoi() {
@@ -54,64 +112,71 @@ pub fn read_apic_id() -> u8 {
     (lapic_read(LAPIC_ID) >> 24) as u8
 }
 
+pub fn read_x2apic_id() -> u32 {
+    rdmsr(IA32_X2APIC_ID_MSR) as u32
+}
+
+/// Read the current CPU's APIC ID as a 32-bit value, working in both xAPIC
+/// and x2APIC modes.
+pub fn read_full_apic_id() -> u32 {
+    unsafe {
+        if X2APIC_MODE {
+            read_x2apic_id()
+        } else {
+            (lapic_read(LAPIC_ID) >> 24) as u32
+        }
+    }
+}
+
 pub fn lapic_base() -> u64 {
     unsafe { LAPIC_BASE }
 }
 
 /// Send a fixed IPI to a specific APIC ID.
-pub fn send_ipi(dest_apic_id: u8, vector: u8) {
-    // Wait for previous IPI to complete (delivery status bit = 0)
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
-    }
-    // Write destination APIC ID to ICR high
-    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
-    // Write vector + delivery mode (fixed = 000) + assert
-    lapic_write(LAPIC_ICR_LOW, vector as u32);
+pub fn send_ipi(dest_apic_id: u32, vector: u8) {
+    // delivery mode = 000 (fixed), assert, edge trigger, physical destination
+    send_ipi_raw(dest_apic_id, vector as u32);
 }
 
 /// Send INIT IPI to a specific APIC ID (assert).
-pub fn send_init_ipi(dest_apic_id: u8) {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
-    }
-    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+pub fn send_init_ipi(dest_apic_id: u32) {
     // delivery mode = 101 (INIT), level = 1, trigger mode = 1 (level)
-    lapic_write(LAPIC_ICR_LOW, (5 << 8) | (1 << 14) | (1 << 15));
+    send_ipi_raw(dest_apic_id, (5 << 8) | (1 << 14) | (1 << 15));
 }
 
 /// Send INIT de-assert IPI to a specific APIC ID.
 ///
 /// Completes the INIT-INIT-SIPI sequence required by the MP specification.
-pub fn send_init_deassert(dest_apic_id: u8) {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
-    }
-    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+pub fn send_init_deassert(dest_apic_id: u32) {
     // delivery mode = 101 (INIT), level = 0, trigger mode = 1 (level)
-    lapic_write(LAPIC_ICR_LOW, (5 << 8) | (0 << 14) | (1 << 15));
+    send_ipi_raw(dest_apic_id, (5 << 8) | (0 << 14) | (1 << 15));
 }
 
 /// Send SIPI (Startup IPI) to a specific APIC ID.
 ///
 /// `page` is the 4K-aligned physical address >> 12 of the trampoline code.
-pub fn send_sipi_ipi(dest_apic_id: u8, page: u8) {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
-    }
-    lapic_write(LAPIC_ICR_HIGH, (dest_apic_id as u32) << 24);
+pub fn send_sipi_ipi(dest_apic_id: u32, page: u8) {
     // delivery mode = 110 (SIPI), vector = page
-    lapic_write(LAPIC_ICR_LOW, (6 << 8) | (page as u32));
+    send_ipi_raw(dest_apic_id, (6 << 8) | (page as u32));
 }
 
 /// Send IPI to all CPUs except self (broadcast to all-but-self).
 pub fn send_ipi_all_except_self(vector: u8) {
-    while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-        core::hint::spin_loop();
+    unsafe {
+        if X2APIC_MODE {
+            // x2APIC shorthand lives in ICR bits 18:16. Delivery mode 000
+            // (fixed) is implicit. destination shorthand = 11 (all excluding self)
+            let icr = (vector as u64) | (3 << 18);
+            wrmsr(IA32_X2APIC_ICR_MSR, icr);
+        } else {
+            while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+                core::hint::spin_loop();
+            }
+            // destination shorthand = 10 (all except self)
+            lapic_write(LAPIC_ICR_HIGH, 0);
+            lapic_write(LAPIC_ICR_LOW, (3 << 18) | (vector as u32));
+        }
     }
-    // destination shorthand = 10 (all except self)
-    lapic_write(LAPIC_ICR_HIGH, 0);
-    lapic_write(LAPIC_ICR_LOW, (3 << 18) | (vector as u32));
 }
 
 pub const IPI_RESCHEDULE: u8 = 49;
@@ -119,11 +184,11 @@ pub const IPI_TLB_SHOOTDOWN: u8 = 50;
 pub const IPI_HALT: u8 = 51;
 
 pub fn send_resched(cpu_id: u8) {
-    send_ipi(cpu_id, IPI_RESCHEDULE);
+    send_ipi(cpu_id as u32, IPI_RESCHEDULE);
 }
 
 pub fn send_tlb_shootdown(cpu_id: u8) {
-    send_ipi(cpu_id, IPI_TLB_SHOOTDOWN);
+    send_ipi(cpu_id as u32, IPI_TLB_SHOOTDOWN);
 }
 
 const PIT_HZ: u64 = 1_193_182;
@@ -214,9 +279,19 @@ pub fn init_ap() {
     let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
     unsafe { LAPIC_BASE = base_addr; }
 
+    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
+
     if base & (1 << 11) == 0 {
         wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11));
     }
+
+    // x2APIC enable is per-logical-processor; the BSP enabled it for itself,
+    // but each AP must enable it on its own local APIC.
+    if cpu_has_x2apic() && !is_x2apic_enabled() {
+        let cur = rdmsr(IA32_APIC_BASE_MSR);
+        wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
+    }
+    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
 
     let svr = lapic_read(LAPIC_SVR);
     lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);
@@ -251,6 +326,18 @@ pub fn init() {
         wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11));
         SerialPort::puts("[apic] enabled via MSR\n");
     }
+
+    // Enable x2APIC mode when the CPU supports it. This makes ICR accesses and
+    // APIC ID reads use MSRs, which is required for APIC IDs wider than 8 bits.
+    if cpu_has_x2apic() && !is_x2apic_enabled() {
+        let cur = rdmsr(IA32_APIC_BASE_MSR);
+        wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
+        SerialPort::puts("[apic] x2APIC mode enabled\n");
+    }
+    unsafe { X2APIC_MODE = is_x2apic_enabled(); }
+    SerialPort::puts("[apic] x2APIC mode: ");
+    SerialPort::put_u64(if unsafe { X2APIC_MODE } { 1 } else { 0 });
+    SerialPort::puts("\n");
 
     let svr = lapic_read(LAPIC_SVR);
     lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);

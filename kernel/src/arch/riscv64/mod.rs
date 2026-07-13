@@ -75,14 +75,8 @@ impl Arch for Riscv64 {
         }
         // Fall back to ACPI MADT if available.
         if let Some(ref acpi) = acpi {
-            if let Some(ref pi) = acpi.processor_info {
-                let mut cpus = alloc::vec::Vec::new();
-                cpus.push((pi.boot_processor.local_apic_id as u32, true));
-                for proc in &pi.application_processors {
-                    let enabled = proc.state != crate::acpi::ProcessorState::Disabled;
-                    cpus.push((proc.local_apic_id as u32, enabled));
-                }
-                return cpus;
+            if !acpi.cpus.is_empty() {
+                return acpi.cpus.clone();
             }
         }
         alloc::vec::Vec::new()

@@ -1,5 +1,7 @@
+use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
 
@@ -55,6 +57,7 @@ fn sig(s: &[u8; 4]) -> u32 {
 pub struct AcpiSubsystem {
     pub interrupt_model: InterruptModel,
     pub processor_info: Option<ProcessorInfo>,
+    pub cpus: Vec<(u32, bool)>,
     pub pci_config_regions: PciConfigRegions,
     pub platform_info: PlatformInfo,
 }
@@ -84,6 +87,30 @@ impl AcpiSubsystem {
             .and_then(|e| madt::parse_madt(e.vaddr, e.length).ok())
             .unwrap_or((InterruptModel::Unknown, None));
 
+        if let Some(ref pi) = processor_info {
+            SerialPort::puts("[acpi] after parse_madt: boot=");
+            SerialPort::put_u64(pi.boot_processor.local_apic_id as u64);
+            SerialPort::puts(" aps=");
+            for p in &pi.application_processors {
+                SerialPort::put_u64(p.local_apic_id as u64);
+                SerialPort::puts(" ");
+            }
+            SerialPort::puts("\n");
+        } else {
+            SerialPort::puts("[acpi] after parse_madt: processor_info is None\n");
+        }
+
+        // Build a direct CPU list that bypasses the ProcessorInfo struct
+        // to avoid potential layout/corruption issues when reading later.
+        let mut cpus: Vec<(u32, bool)> = Vec::new();
+        if let Some(ref pi) = processor_info {
+            cpus.push((pi.boot_processor.local_apic_id, true));
+            for p in &pi.application_processors {
+                let enabled = p.state != ProcessorState::Disabled;
+                cpus.push((p.local_apic_id, enabled));
+            }
+        }
+
         let platform_info = PlatformInfo {
             reset_gas: fadt_fields.reset_gas,
             reset_value: fadt_fields.reset_value,
@@ -93,7 +120,7 @@ impl AcpiSubsystem {
 
         log::info!("ACPI: platform info parsed (interrupt model: {:?})", interrupt_model);
 
-        Ok(Self { interrupt_model, processor_info, pci_config_regions, platform_info })
+        Ok(Self { interrupt_model, processor_info, cpus, pci_config_regions, platform_info })
     }
 
     /// Attempt a system reset via the FADT reset register, with fallbacks.

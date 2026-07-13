@@ -52,12 +52,6 @@ impl HeapInner {
     }
 
     pub unsafe fn add_region(&mut self, start: usize, size: usize) {
-        SerialPort::puts("[heap] add region 0x");
-        SerialPort::put_hex(start as u64);
-        SerialPort::puts(" + ");
-        SerialPort::put_u64(size as u64);
-        SerialPort::puts(" bytes\n");
-
         let block = start as *mut BlockHeader;
         unsafe { *block = BlockHeader { size, next: core::ptr::null_mut() } }
         self.push_free(block);
@@ -176,7 +170,11 @@ pub unsafe fn init(phys: &mut BitmapAllocator) {
     let mut heap = HEAP.lock();
     allocate_pages(&mut heap, HEAP_INIT_PAGES);
     HEAP_INITIALIZED.store(true, Ordering::SeqCst);
-    SerialPort::puts("[heap] init done\n");
+    SerialPort::puts("[heap] init done, pages=0x");
+    SerialPort::put_hex(HEAP_INIT_PAGES as u64);
+    SerialPort::puts(" total=");
+    SerialPort::put_u64((HEAP_INIT_PAGES * 4096) as u64);
+    SerialPort::puts(" bytes\n");
 }
 
 fn allocate_pages(heap: &mut HeapInner, count: usize) {

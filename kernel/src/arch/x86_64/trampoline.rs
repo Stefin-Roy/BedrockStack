@@ -56,9 +56,11 @@ core::arch::global_asm!(
     "mov  es, ax",
     "mov  ss, ax",
 
-    // CR3 is NOT loaded here — in 32-bit mode `mov cr3, eax` only writes the
-    // low 32 bits, which would truncate a PML4 above 4 GiB.  CR3 is loaded
-    // *after* entering long mode where the full 64-bit value can be written.
+    // Load CR3 *before* enabling paging (32-bit mode).  On INIT+SIPI the AP's
+    // CR3 is 0 (from reset); enabling paging without a valid PML4 would fault.
+    // We load again in 64-bit mode below in case the value was truncated.
+    "mov  eax, [0x8700]",
+    "mov  cr3, eax",
 
     "mov  eax, cr4",
     "or   eax, 1 << 5",
@@ -66,13 +68,22 @@ core::arch::global_asm!(
 
     "mov  ecx, 0xC0000080",
     "rdmsr",
-    "or   eax, 1 << 8",
+    "or   eax, 1 << 8",                   // LME
     "wrmsr",
 
     "mov  eax, cr0",
     "or   eax, 0x80000000",
     "mov  cr0, eax",
 
+    // Now LMA = 1 (set automatically when paging enabled with LME=1), so we
+    // can safely set NXE (IA32_EFER[11]) without a #GP.
+    "mov  ecx, 0xC0000080",
+    "rdmsr",
+    "or   eax, 1 << 11",                  // NXE
+    "wrmsr",
+
+    // The trampoline data (0x8700–0x872F) is identity-mapped in the kernel
+    // page table, so it is still accessible here in compatibility mode.
     "mov  eax, [0x8728]",
     "push 0x18",
     "push eax",
@@ -81,7 +92,7 @@ core::arch::global_asm!(
     ".code64",
     "_trampoline_lm:",
 
-    // Load CR3 *after* entering long mode (full 64-bit write).
+    // Re-load CR3 with the full 64-bit value in case step above truncated it.
     "mov  rax, [0x8700]",
     "mov  cr3, rax",
 
@@ -178,16 +189,24 @@ pub unsafe fn start_aps(
         // Ensure all TrampolineData and PerCpu writes are visible before AP wakes.
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
-        crate::platform::x86_64_pc::apic::send_init_ipi(ap.hardware_id as u8);
+        SerialPort::puts("[trampoline] >>> send_init_ipi\n");
+        crate::platform::x86_64_pc::apic::send_init_ipi(ap.hardware_id);
+        SerialPort::puts("[trampoline] >>> init_ipi done\n");
         delay_ms(10);
 
-        crate::platform::x86_64_pc::apic::send_init_deassert(ap.hardware_id as u8);
+        SerialPort::puts("[trampoline] >>> send_init_deassert\n");
+        crate::platform::x86_64_pc::apic::send_init_deassert(ap.hardware_id);
+        SerialPort::puts("[trampoline] >>> deassert done\n");
         delay_us(200);
 
-        crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id as u8, TRAMPOLINE_PAGE);
+        SerialPort::puts("[trampoline] >>> send_sipi\n");
+        crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id, TRAMPOLINE_PAGE);
+        SerialPort::puts("[trampoline] >>> sipi 1 done\n");
         delay_us(200);
-        crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id as u8, TRAMPOLINE_PAGE);
+        crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id, TRAMPOLINE_PAGE);
+        SerialPort::puts("[trampoline] >>> sipi 2 done\n");
 
+        SerialPort::puts("[trampoline] >>> polling started\n");
         for _ in 0..200_000_000 {
             if pc.started.load(core::sync::atomic::Ordering::Acquire) != 0 {
                 break;

@@ -36,7 +36,8 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -drive format=raw,file="%IMAGE_PATH%" ^
     -m 256M ^
     -smp 4 ^
-    -serial mon:stdio
+    -serial mon:stdio ^
+    -d int,cpu_reset -D qemu_smp.log 
 goto :done
 
 :arch_riscv64

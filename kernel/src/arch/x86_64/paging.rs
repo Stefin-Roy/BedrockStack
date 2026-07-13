@@ -8,6 +8,8 @@ use crate::KernelLayout;
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
 
+const TRAMPOLINE_PHYS: u64 = 0x8000;
+
 /// Build identity-mapped page tables together with a higher-half alias of
 /// the kernel image at `KERNEL_VMA_BASE + phys_addr`.
 ///
@@ -60,7 +62,10 @@ pub fn setup(
                     page_addr += PAGE_4K;
                     continue;
                 }
-                let flags = leaf_flags(page_addr, layout, fb_start, fb_end);
+                let mut flags = leaf_flags(page_addr, layout, fb_start, fb_end);
+                if page_addr == TRAMPOLINE_PHYS {
+                    flags |= PageFlags::EXECUTE;
+                }
                 vmm.map_4k(allocator, page_addr, page_addr, flags);
                 page_addr += PAGE_4K;
             }

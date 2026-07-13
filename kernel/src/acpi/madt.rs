@@ -1,5 +1,6 @@
 use alloc::vec::Vec;
 use crate::acpi::platform::{AcpiError, Apic, InterruptModel, IoApic, Processor, ProcessorInfo, ProcessorState};
+use log::info;
 
 fn r8(buf: &[u8], off: usize) -> u8 { buf[off] }
 fn r32(buf: &[u8], off: usize) -> u32 { u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) }
@@ -16,8 +17,10 @@ pub fn parse_madt(vaddr: u64, length: u32) -> Result<(InterruptModel, Option<Pro
     let _flags = r32(raw, 40);
 
     let mut io_apics: Vec<IoApic> = Vec::new();
-    let mut processors: Vec<Processor> = Vec::new();
-    let mut has_boot = false;
+    let mut xapic_processors: Vec<Processor> = Vec::new();
+    let mut x2apic_processors: Vec<Processor> = Vec::new();
+    let mut has_boot_xapic = false;
+    let mut has_boot_x2apic = false;
 
     let mut offset = 44;
     while offset + 2 <= length as usize {
@@ -37,8 +40,24 @@ pub fn parse_madt(vaddr: u64, length: u32) -> Result<(InterruptModel, Option<Pro
                     let flags = r32(raw, offset + 4);
                     let enabled = (flags & 1) != 0;
                     let state = if enabled { ProcessorState::Enabled } else { ProcessorState::Disabled };
-                    processors.push(Processor { local_apic_id: apic_id as u32, state, is_ap: has_boot });
-                    has_boot = true;
+                    info!("[madt] type 0 (Local APIC): apic_id={} enabled={}", apic_id, enabled);
+                    xapic_processors.push(Processor { local_apic_id: apic_id as u32, state, is_ap: has_boot_xapic });
+                    has_boot_xapic = true;
+                }
+            }
+            0x9 => {
+                // Processor Local x2APIC entry (16 bytes)
+                //   offset+2 = 2 bytes reserved
+                //   offset+4 = 4 bytes x2APIC ID (u32, little-endian)
+                //   offset+8 = 4 bytes flags
+                if entry_len >= 16 {
+                    let apic_id = r32(raw, offset + 4);
+                    let flags = r32(raw, offset + 8);
+                    let enabled = (flags & 1) != 0;
+                    let state = if enabled { ProcessorState::Enabled } else { ProcessorState::Disabled };
+                    info!("[madt] type 9 (x2APIC): apic_id={} enabled={}", apic_id, enabled);
+                    x2apic_processors.push(Processor { local_apic_id: apic_id, state, is_ap: has_boot_x2apic });
+                    has_boot_x2apic = true;
                 }
             }
             0x1 => {
@@ -68,6 +87,16 @@ pub fn parse_madt(vaddr: u64, length: u32) -> Result<(InterruptModel, Option<Pro
         io_apics,
         local_apic_address,
     });
+
+    // Prefer x2APIC entries when present. On x2APIC-capable firmware the type 0
+    // entries are emitted as legacy compatibility stubs with APIC ID 0, so the
+    // authoritative IDs live in the type 9 entries.
+    let mut processors = if !x2apic_processors.is_empty() {
+        info!("[madt] using x2APIC (type 9) processor entries");
+        x2apic_processors
+    } else {
+        xapic_processors
+    };
 
     let processor_info = if processors.is_empty() {
         None

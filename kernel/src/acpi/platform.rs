@@ -33,6 +33,7 @@ pub enum AcpiError {
 }
 
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Processor {
     pub local_apic_id: u32,
     pub state: ProcessorState,
@@ -40,12 +41,14 @@ pub struct Processor {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ProcessorState {
     Disabled,
     Enabled,
 }
 
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct ProcessorInfo {
     pub boot_processor: Processor,
     pub application_processors: Vec<Processor>,

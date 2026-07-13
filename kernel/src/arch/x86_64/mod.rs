@@ -25,7 +25,7 @@ impl Arch for X86_64 {
         SerialPort::puts("[arch] x86_64 init: APIC\n");
         apic::init();
         // Record the BSP's APIC ID after APIC init.
-        crate::smp::set_bsp_hardware_id(apic::read_apic_id() as u32);
+        crate::smp::set_bsp_hardware_id(apic::read_full_apic_id());
     }
 
     fn init_ap(_cpu_id: u32) {
@@ -58,31 +58,26 @@ impl Arch for X86_64 {
     }
 
     fn discover_cpus(acpi: Option<&AcpiSubsystem>) -> alloc::vec::Vec<(u32, bool)> {
-        let mut cpus = alloc::vec::Vec::new();
-
-        let Some(ref processor_info) = acpi.and_then(|a| a.processor_info.as_ref()) else {
-            SerialPort::puts("[arch] no processor info from ACPI\n");
-            // At least report the BSP
-            return cpus;
+        let Some(acpi) = acpi else {
+            SerialPort::puts("[arch] no ACPI subsystem\n");
+            return alloc::vec::Vec::new();
         };
 
-        SerialPort::puts("[arch] boot processor: apic_id=");
-        SerialPort::put_u64(processor_info.boot_processor.local_apic_id as u64);
+        SerialPort::puts("[arch] total CPUs: ");
+        SerialPort::put_u64(acpi.cpus.len() as u64);
         SerialPort::puts("\n");
 
-        cpus.push((processor_info.boot_processor.local_apic_id as u32, true));
-
-        for proc in &processor_info.application_processors {
-            let enabled = proc.state != crate::acpi::ProcessorState::Disabled;
-            if !enabled {
-                SerialPort::puts("[arch] skipping disabled AP: apic_id=");
-                SerialPort::put_u64(proc.local_apic_id as u64);
-                SerialPort::puts("\n");
-            }
-            cpus.push((proc.local_apic_id as u32, enabled));
+        for (i, &(hardware_id, enabled)) in acpi.cpus.iter().enumerate() {
+            SerialPort::puts("[arch] CPU ");
+            SerialPort::put_u64(i as u64);
+            SerialPort::puts(": local_apic_id=");
+            SerialPort::put_u64(hardware_id as u64);
+            SerialPort::puts(" enabled=");
+            SerialPort::put_u64(enabled as u64);
+            SerialPort::puts("\n");
         }
 
-        cpus
+        acpi.cpus.clone()
     }
 
     unsafe fn wake_aps(
