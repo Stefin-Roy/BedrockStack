@@ -98,6 +98,7 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
 
         let child_inode = Arc::new(Inode::new(child_ops));
         let child = Dentry::new(name, Some(child_inode));
+        *child.parent.lock() = Arc::downgrade(&current);
         {
             let mut children = current.children.lock();
             children.insert(String::from(name), child.clone());

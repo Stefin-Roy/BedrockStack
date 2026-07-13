@@ -6,8 +6,10 @@ use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 
 const HEADER_SIZE: usize = size_of::<BlockHeader>();
+const BLOCK_ALIGN: usize = core::mem::align_of::<BlockHeader>();
+const BACKPTR_SIZE: usize = size_of::<*mut BlockHeader>();
 const MIN_ALLOC: usize = 8;
-const MIN_BLOCK_SIZE: usize = HEADER_SIZE + MIN_ALLOC;
+const MIN_BLOCK_SIZE: usize = HEADER_SIZE + BACKPTR_SIZE + MIN_ALLOC;
 const HEAP_INIT_PAGES: usize = 64;
 const HEAP_GROW_PAGES: usize = 16;
 
@@ -18,14 +20,13 @@ struct BlockHeader {
 }
 
 impl BlockHeader {
-    /// Recover the block header from a payload pointer and its allocation layout.
+    /// Recover the block header recorded immediately before the payload.
     ///
-    /// `alloc_inner` places the payload at the next `align`-aligned address
-    /// after the header, so we scan backward from `payload - HEADER_SIZE` to
-    /// the previous `align`-aligned boundary to find the real block base.
-    fn from_payload(ptr: *mut u8, align: usize) -> *mut BlockHeader {
-        let align = align.max(HEADER_SIZE);
-        ((ptr as usize - HEADER_SIZE) & !(align - 1)) as *mut BlockHeader
+    /// A header cannot in general be recovered by rounding a payload address:
+    /// an allocation with a large alignment can have padding between its
+    /// header and payload.  `alloc_inner` stores this back-pointer instead.
+    unsafe fn from_payload(ptr: *mut u8) -> *mut BlockHeader {
+        unsafe { *((ptr as usize - BACKPTR_SIZE) as *const *mut BlockHeader) }
     }
 
     fn end(&self) -> usize {
@@ -100,7 +101,7 @@ impl HeapInner {
     }
 
     fn alloc_inner(&mut self, layout: Layout) -> *mut u8 {
-        let align = layout.align().max(HEADER_SIZE);
+        let align = layout.align().max(BLOCK_ALIGN);
         let needed = layout.size().max(MIN_ALLOC);
 
         let mut prev: *mut BlockHeader = core::ptr::null_mut();
@@ -111,27 +112,45 @@ impl HeapInner {
             let next = unsafe { (*curr).next };
             let block_addr = curr as usize;
             let block_end = block_addr + size;
-            let payload_addr = (block_addr + HEADER_SIZE + align - 1) & !(align - 1);
+            let payload_addr = (block_addr + HEADER_SIZE + BACKPTR_SIZE + align - 1) & !(align - 1);
             let payload_end = payload_addr + needed;
+            // Every free block begins with a `BlockHeader`, so the split
+            // point must preserve that alignment even when `needed` is small.
+            let alloc_end = (payload_end + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
 
-            if payload_end <= block_end {
-                let remaining = block_end - payload_end;
+            if alloc_end <= block_end {
+                let remaining = block_end - alloc_end;
 
                 if remaining >= MIN_BLOCK_SIZE {
-                    // Split: allocate from start, leave remainder as free.
-                    let alloc_size = payload_end - block_addr;
+                    // Split: allocate from the start of `curr`, replacing it
+                    // in the free list with the remainder.  Do not use
+                    // `push_free` here: it makes the remainder the head and
+                    // `remove_next(prev)` would then remove that remainder,
+                    // leaving the allocated block on the free list.
+                    let alloc_size = alloc_end - block_addr;
                     unsafe { (*curr).size = alloc_size; }
 
                     let remainder_addr = block_addr + alloc_size;
                     let remainder = remainder_addr as *mut BlockHeader;
                     unsafe {
-                        *remainder = BlockHeader { size: remaining, next: core::ptr::null_mut() };
+                        *remainder = BlockHeader { size: remaining, next };
                     }
-                    self.push_free(remainder);
+                    if prev.is_null() {
+                        self.free_list = remainder;
+                    } else {
+                        unsafe { (*prev).next = remainder; }
+                    }
+                } else {
+                    // The tail is too small to become a valid free block, so
+                    // consume the whole block.
+                    self.remove_next(prev);
                 }
 
-                // Remove the allocated block from the free list.
-                self.remove_next(prev);
+                // Keep the allocation header address explicitly.  The
+                // payload may be more strictly aligned than the header.
+                unsafe {
+                    ((payload_addr - BACKPTR_SIZE) as *mut *mut BlockHeader).write(curr);
+                }
                 return payload_addr as *mut u8;
             }
 
@@ -210,12 +229,12 @@ unsafe impl GlobalAlloc for HeapAllocator {
         }
     }
 
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
         }
         let mut heap = HEAP.lock();
-        let block = BlockHeader::from_payload(ptr, layout.align());
+        let block = unsafe { BlockHeader::from_payload(ptr) };
         unsafe { (*block).next = core::ptr::null_mut() }
         heap.push_free(block);
     }

@@ -74,6 +74,33 @@ impl AcpiSubsystem {
         log::info!("ACPI: RSDP at 0x{:x}", rsdp_addr);
         let entries = tables::parse_tables(rsdp_addr)?;
 
+        // DEBUG: dump all parsed table entries and their signatures
+        for (i, e) in entries.iter().enumerate() {
+            let sig_bytes = [
+                e.signature as u8,
+                (e.signature >> 8) as u8,
+                (e.signature >> 16) as u8,
+                (e.signature >> 24) as u8,
+            ];
+            SerialPort::puts("[acpi] entry ");
+            SerialPort::put_u64(i as u64);
+            SerialPort::puts(": sig=0x");
+            SerialPort::put_hex(e.signature as u64);
+            SerialPort::puts(" \"");
+            for &b in &sig_bytes {
+                if b >= 0x20 && b < 0x7f {
+                    SerialPort::putc(b);
+                } else {
+                    SerialPort::putc(b'.');
+                }
+            }
+            SerialPort::puts("\" vaddr=");
+            SerialPort::put_hex(e.vaddr);
+            SerialPort::puts(" len=");
+            SerialPort::put_u64(e.length as u64);
+            SerialPort::puts("\n");
+        }
+
         let fadt_fields = entries
             .iter()
             .find(|e| e.signature == sig(b"FACP"))
@@ -90,7 +117,7 @@ impl AcpiSubsystem {
         let (interrupt_model, processor_info) = entries
             .iter()
             .find(|e| e.signature == sig(b"APIC"))
-            .and_then(|e| madt::parse_madt(e.vaddr, e.length).ok())
+            .and_then(|e| madt::parse_madt(e.vaddr, e.phys_addr, e.length).ok())
             .unwrap_or((InterruptModel::Unknown, None));
 
         if let Some(ref pi) = processor_info {

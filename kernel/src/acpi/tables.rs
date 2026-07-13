@@ -22,6 +22,7 @@ fn map_region(paddr: u64, size: u64) -> u64 {
 pub struct SdtEntry {
     pub signature: u32,
     pub vaddr: u64,
+    pub phys_addr: u64,
     pub length: u32,
 }
 
@@ -169,6 +170,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
     Ok(Some(SdtEntry {
         signature: sig_u32,
         vaddr,
+        phys_addr,
         length: hdr_len,
     }))
 }

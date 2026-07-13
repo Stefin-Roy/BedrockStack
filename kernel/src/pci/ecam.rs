@@ -69,7 +69,7 @@ static MAPPED: Mutex<Option<Vec<MappedRegion>>> = Mutex::new(None);
 pub fn map_all(regions: &PciConfigRegions) {
     let mut mapped = Vec::new();
     for entry in &regions.regions {
-        let num_buses = (entry.bus_number_end - entry.bus_number_start + 1) as u64;
+        let num_buses = entry.bus_number_end as u64 - entry.bus_number_start as u64 + 1;
         let size = num_buses << 20;
         let vaddr = map_ecam(entry.base_address, size);
         mapped.push(MappedRegion {

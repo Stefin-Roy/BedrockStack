@@ -254,6 +254,7 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
             };
             let inode = Arc::new(Inode::new(child_ops));
             let child_dentry = Dentry::new(&leaf_name, Some(inode.clone()));
+            *child_dentry.parent.lock() = Arc::downgrade(&parent);
             parent.children.lock().insert(leaf_name.clone(), child_dentry.clone());
             let parent_ino = parent.inode.lock()
                 .as_ref().map(|i| i.ino).unwrap_or(0);
@@ -341,6 +342,7 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
 
     let child_inode = Arc::new(Inode::new(child_ops));
     let child = Dentry::new(&name, Some(child_inode));
+    *child.parent.lock() = Arc::downgrade(&parent);
     parent.children.lock().insert(name.clone(), child.clone());
 
     let parent_ino = parent.inode.lock()
@@ -440,7 +442,14 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
 
     let same_parent = Arc::ptr_eq(&old_parent, &new_parent);
 
-    let (old_ino, old_ops, new_ops) = {
+    let (old_ino, old_ops, new_ops) = if same_parent {
+        // `old_parent` and `new_parent` are the same Arc here.  Locking
+        // their inode fields separately would try to re-lock a non-reentrant
+        // spin mutex and deadlock the BSP.
+        let inode = old_parent.inode.lock();
+        let inode = inode.as_ref().ok_or(VfsError::NotFound)?;
+        (inode.ino, inode.ops.clone(), inode.ops.clone())
+    } else {
         let o = old_parent.inode.lock();
         let n = new_parent.inode.lock();
         (
