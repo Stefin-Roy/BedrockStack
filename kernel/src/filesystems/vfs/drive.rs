@@ -1,5 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use hashbrown::HashMap;
+use spin::Once;
 
 use super::error::VfsError;
 use super::irq::IrqMutex;
@@ -7,6 +9,7 @@ use super::mount::DriveMount;
 
 pub struct DriveMap {
     drives: IrqMutex<[Option<Arc<DriveMount>>; 26]>,
+    by_id: Once<IrqMutex<HashMap<u64, (char, Arc<DriveMount>)>>>,
 }
 
 impl DriveMap {
@@ -14,7 +17,12 @@ impl DriveMap {
         const NONE: Option<Arc<DriveMount>> = None;
         DriveMap {
             drives: IrqMutex::new([NONE; 26]),
+            by_id: Once::new(),
         }
+    }
+
+    fn by_id_map(&self) -> &IrqMutex<HashMap<u64, (char, Arc<DriveMount>)>> {
+        self.by_id.call_once(|| IrqMutex::new(HashMap::new()))
     }
 
     fn letter_index(letter: char) -> Result<usize, VfsError> {
@@ -31,7 +39,8 @@ impl DriveMap {
         if drives[idx].is_some() {
             return Err(VfsError::AlreadyExists);
         }
-        drives[idx] = Some(mount);
+        drives[idx] = Some(mount.clone());
+        self.by_id_map().lock().insert(mount.id, (letter, mount));
         Ok(())
     }
 
@@ -41,10 +50,16 @@ impl DriveMap {
         drives[idx].clone().ok_or(VfsError::NotFound)
     }
 
+    pub fn lookup_by_id(&self, id: u64) -> Option<(char, Arc<DriveMount>)> {
+        self.by_id_map().lock().get(&id).cloned()
+    }
+
     pub fn remove(&self, letter: char) -> Result<Arc<DriveMount>, VfsError> {
         let idx = Self::letter_index(letter)?;
         let mut drives = self.drives.lock();
-        drives[idx].take().ok_or(VfsError::NotFound)
+        let mount = drives[idx].take().ok_or(VfsError::NotFound)?;
+        self.by_id_map().lock().remove(&mount.id);
+        Ok(mount)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (char, Arc<DriveMount>)> {

@@ -46,6 +46,9 @@ pub static CWD: irq::IrqMutex<Option<CurrentWorkingDirectory>> = irq::IrqMutex::
 /// Resolve a path to its drive letter and target dentry.
 /// Absolute: `X>rest/of/path`. Relative: resolved against CWD.
 pub fn resolve_path(path: &str) -> Result<(char, Arc<Dentry>), VfsError> {
+    if path.is_empty() {
+        return Err(VfsError::InvalidInput);
+    }
     if let Ok((letter, inner)) = path::split_drive_path(path) {
         let mount = DRIVE_MAP.lookup(letter)?;
         if inner.is_empty() {
@@ -57,9 +60,6 @@ pub fn resolve_path(path: &str) -> Result<(char, Arc<Dentry>), VfsError> {
     } else {
         let cwd = CWD.lock();
         let cwd = cwd.as_ref().ok_or(VfsError::NotFound)?;
-        if path.is_empty() {
-            return Ok((cwd.drive, cwd.dentry.clone()));
-        }
         let components = path::split_components(path);
         let dentry = path::walk_from(cwd.dentry.clone(), &components)?;
         Ok((cwd.drive, dentry))
@@ -163,6 +163,43 @@ pub fn mount_virtual(source: &str, drive: char) -> Result<(), VfsError> {
     Ok(())
 }
 
+pub fn mount_at(
+    fstype: &str,
+    device: Option<Arc<dyn crate::filesystems::blockdriver::traits::BlockDevice>>,
+    target_path: &str,
+    drive: char,
+) -> Result<(), VfsError> {
+    // Resolve and verify the target mount point
+    let (_, target) = resolve_path(target_path)?;
+    {
+        let lock = target.inode.lock();
+        let inode = lock.as_ref().ok_or(VfsError::NotFound)?;
+        if inode.file_type != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+    }
+    if target.get_mount_id() != 0 {
+        return Err(VfsError::AlreadyExists);
+    }
+
+    // Mount the filesystem
+    let fs = fstypes::lookup(fstype).ok_or(VfsError::NotFound)?;
+    let (sb, root_ops) = fs.mount(device.clone())?;
+    let root_inode = Arc::new(Inode::new(root_ops));
+    let root_dentry = Dentry::new("", Some(root_inode));
+    root_dentry.set_mount_point(true);
+
+    let mid = path::next_mount_id();
+    let mount = DriveMount::new(mid, root_dentry, sb, device);
+    *mount.covered.lock() = Some(Arc::downgrade(&target));
+    let mount = Arc::new(mount);
+
+    DRIVE_MAP.assign(drive, mount)?;
+    target.set_mount_id(mid);
+    log::info!("VFS: mounted {} on {}> (at {})", fstype, drive, target_path);
+    Ok(())
+}
+
 pub fn unmount(drive: char) -> Result<(), VfsError> {
     // Check CWD not on this drive
     {
@@ -178,6 +215,14 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
     for fd in FD_TABLE.iter_active() {
         if dentry_belongs_to_mount(&fd.dentry, &mount.root) {
             return Err(VfsError::MountBusy);
+        }
+    }
+
+    // Clear the covered dentry's mount_id before removal
+    if let Some(weak) = mount.covered.lock().take() {
+        if let Some(d) = weak.upgrade() {
+            d.set_mount_id(0);
+            d.set_mount_point(false);
         }
     }
 

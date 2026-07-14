@@ -26,8 +26,17 @@ The `rename()` function detects when `old_parent == new_parent` (same
 
 **VFS-003 — Dentry children are stored in `HashMap<String, Arc<Dentry>>`:**
 Protected by `IrqMutex`. Each child stores its name, optional inode,
-weak parent reference, and mount-point flag.
+weak parent reference, mount-point flag, and optional `mount_id`
+pointing to a `DriveMount` covering this dentry.
 - Location: `kernel/src/filesystems/vfs/dentry.rs`
+
+**VFS-013 — Mount point crossing in path resolution:**
+`walk_from()` calls `attempt_mount_cross()` after resolving each path
+component. If the dentry has a non-zero `mount_id`, it looks up the
+corresponding `DriveMount` via `DriveMap::lookup_by_id()` and switches
+to that mount's root dentry, enabling transparent traversal into
+subdirectory-mounted filesystems.
+- Location: `kernel/src/filesystems/vfs/path.rs:41-130`
 
 **VFS-004 — Dcache is initialized exactly once via `spin::Once`:**
 The dentry cache (`Dcache`) maps `(parent_ino, name) → Weak<Dentry>`.
@@ -83,7 +92,7 @@ can see stale values between the write and store.
 
 **VFS-009 — Absolute path format: `X>rest/of/path`:**
 Drive letter, `>`, then path components separated by `/`. Relative
-paths are resolved against CWD.
+paths are resolved against CWD. Empty paths return `InvalidInput`.
 - Location: `kernel/src/filesystems/vfs/mod.rs:46-66`
 
 **VFS-010 — VFS init is idempotent:**
@@ -118,6 +127,13 @@ Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
 
 **VFS-API-003 — `SuperOps` trait:**
 Required operations: `statfs`, `sync_fs`.
+
+**VFS-API-003a — Mount operations:**
+`mount` mounts a filesystem as a new drive letter. `mount_at` mounts
+a filesystem on a subdirectory of an existing drive, setting the
+target dentry's `mount_id` to enable cross-drive path traversal.
+`mount_virtual` creates a bind-mount sharing an existing inode tree.
+`unmount` removes a drive, clearing any covered dentry's `mount_id`.
 
 **VFS-API-004 — Open file operations:**
 `open`, `close`, `read`, `write`, `seek`, `truncate`, `ftruncate`,

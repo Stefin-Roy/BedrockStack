@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use alloc::sync::{Arc, Weak};
 use alloc::string::String;
@@ -17,6 +17,7 @@ pub struct Dentry {
     pub parent: IrqMutex<Weak<Dentry>>,
     pub children: IrqMutex<HashMap<String, Arc<Dentry>>>,
     pub flags: AtomicBool,
+    pub mount_id: AtomicU64,
 }
 
 impl Dentry {
@@ -27,6 +28,7 @@ impl Dentry {
             parent: IrqMutex::new(Weak::new()),
             children: IrqMutex::new(HashMap::new()),
             flags: AtomicBool::new(false),
+            mount_id: AtomicU64::new(0),
         })
     }
 
@@ -40,6 +42,14 @@ impl Dentry {
 
     pub fn set_mount_point(&self, val: bool) {
         self.flags.store(val, Ordering::Relaxed);
+    }
+
+    pub fn get_mount_id(&self) -> u64 {
+        self.mount_id.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mount_id(&self, id: u64) {
+        self.mount_id.store(id, Ordering::Relaxed);
     }
 }
 

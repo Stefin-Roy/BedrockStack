@@ -38,6 +38,7 @@ pub fn split_components(path: &str) -> Vec<&str> {
 
 /// Walk the dentry tree from `start`, resolving each component.
 /// Supports `.` (skip) and `..` (go to parent, clamped at root).
+/// Automatically crosses into mount points (dentries with non-zero `mount_id`).
 pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>, VfsError> {
     let mut current = start;
 
@@ -63,7 +64,7 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
             children.get(name).cloned()
         };
         if let Some(child) = found {
-            current = child;
+            current = attempt_mount_cross(child);
             continue;
         }
 
@@ -84,7 +85,7 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
                     children.insert(String::from(name), cached.clone());
                 }
             }
-            current = cached;
+            current = attempt_mount_cross(cached);
             continue;
         }
 
@@ -105,8 +106,22 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
         }
         dcache().insert(cur_ino, String::from(name), Arc::downgrade(&child));
 
-        current = child;
+        current = attempt_mount_cross(child);
     }
 
     Ok(current)
+}
+
+/// If `dentry` is a mount point, return the root dentry of the mounted
+/// drive. Otherwise return `dentry` unchanged.
+fn attempt_mount_cross(dentry: Arc<Dentry>) -> Arc<Dentry> {
+    let mid = dentry.get_mount_id();
+    if mid == 0 {
+        return dentry;
+    }
+    if let Some((_, mount)) = super::DRIVE_MAP.lookup_by_id(mid) {
+        mount.root.clone()
+    } else {
+        dentry
+    }
 }
