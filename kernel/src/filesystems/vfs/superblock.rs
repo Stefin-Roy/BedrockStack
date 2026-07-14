@@ -2,7 +2,6 @@ use alloc::sync::Arc;
 
 use super::error::VfsError;
 use super::inode::Inode;
-use super::irq::IrqMutex;
 
 pub trait SuperOps: Send + Sync {
     fn statfs(&self) -> Result<StatFs, VfsError>;
@@ -12,16 +11,11 @@ pub trait SuperOps: Send + Sync {
 pub struct SuperBlock {
     pub ops: Arc<dyn SuperOps>,
     pub root_inode: Arc<Inode>,
-    pub private: IrqMutex<u64>,
 }
 
 impl SuperBlock {
     pub fn new(ops: Arc<dyn SuperOps>, root_inode: Arc<Inode>) -> Self {
-        SuperBlock {
-            ops,
-            root_inode,
-            private: IrqMutex::new(0),
-        }
+        SuperBlock { ops, root_inode }
     }
 }
 

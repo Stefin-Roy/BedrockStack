@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use super::error::VfsError;
 use super::irq::IrqMutex;
@@ -25,7 +26,6 @@ pub trait InodeOps: Send + Sync {
 }
 
 pub struct InodeMeta {
-    pub nlink: u32,
     pub mtime: u64,
 }
 
@@ -35,6 +35,7 @@ pub struct Inode {
     pub file_type: FileType,
     pub size: AtomicU64,
     pub meta: IrqMutex<InodeMeta>,
+    pub append_lock: Mutex<()>,
 }
 
 impl Inode {
@@ -47,7 +48,8 @@ impl Inode {
             ino,
             file_type,
             size: AtomicU64::new(size),
-            meta: IrqMutex::new(InodeMeta { nlink: 1, mtime: 0 }),
+            meta: IrqMutex::new(InodeMeta { mtime: 0 }),
+            append_lock: Mutex::new(()),
         }
     }
 

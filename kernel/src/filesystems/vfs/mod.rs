@@ -292,9 +292,15 @@ pub fn write(fd: u32, buf: &[u8]) -> Result<usize, VfsError> {
     let file = FD_TABLE.get(fd)?;
     let result = {
         let mut pos = file.pos.lock();
-        // APPEND: always write at the current end of file
+        let _append_guard = if file.flags.contains(OpenFlags::APPEND) {
+            Some(file.inode.append_lock.lock())
+        } else {
+            None
+        };
+        // APPEND: serialize read-size + write_at (uses ops.size() to read the
+        // authoritative FS size, not the VFS-level cached size)
         let cur = if file.flags.contains(OpenFlags::APPEND) {
-            file.inode.size.load(Ordering::Relaxed)
+            file.inode.ops.size()
         } else {
             *pos
         };
@@ -408,6 +414,24 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     let parent_ino = parent.inode.lock()
         .as_ref().map(|i| i.ino).ok_or(VfsError::NotFound)?;
 
+    // Reject unlinking directories (use rmdir instead)
+    if let Some(child) = parent.children.lock().get(&name) {
+        let guard = child.inode.lock();
+        if let Some(inode) = guard.as_ref() {
+            if inode.file_type == FileType::Directory {
+                return Err(VfsError::IsADirectory);
+            }
+        }
+    } else {
+        let lock = parent.inode.lock();
+        let p = lock.as_ref().ok_or(VfsError::NotFound)?;
+        if let Ok(child_ops) = p.ops.lookup(&name) {
+            if child_ops.file_type() == FileType::Directory {
+                return Err(VfsError::IsADirectory);
+            }
+        }
+    }
+
     if let Some(child) = parent.children.lock().remove(&name) {
         child.inode.lock().take();
     }
@@ -464,10 +488,14 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
         let mut children = old_parent.children.lock();
         if let Some(child) = children.remove(&old_name) {
             *child.name.lock() = new_name.clone();
-            children.insert(new_name.clone(), child);
+            children.insert(new_name.clone(), child.clone());
+            drop(children);
+            dcache().evict(old_ino, &old_name);
+            dcache().insert(old_ino, new_name, Arc::downgrade(&child));
+        } else {
+            drop(children);
+            dcache().evict(old_ino, &old_name);
         }
-        drop(children);
-        dcache().evict(old_ino, &old_name);
     } else {
         let child_ops = old_ops.lookup(&old_name)?;
         if child_ops.file_type() == FileType::Directory {
@@ -502,7 +530,9 @@ pub fn stat(path: &str) -> Result<Stat, VfsError> {
     let (_, dentry) = resolve_path(path)?;
     let inode_lock = dentry.inode.lock();
     let inode = inode_lock.as_ref().ok_or(VfsError::NotFound)?;
-    inode.ops.getattr()
+    let st = inode.ops.getattr()?;
+    inode.update_attr_from_stat(&st);
+    Ok(st)
 }
 
 // ---------------------------------------------------------------------------
