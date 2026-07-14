@@ -8,6 +8,7 @@ use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::superblock::SuperBlock;
 
 pub mod tmpfs;
+pub mod fat32;
 
 pub trait FileSystem: Send + Sync {
     fn name(&self) -> &str;
@@ -27,4 +28,5 @@ pub fn lookup(name: &str) -> Option<&'static dyn FileSystem> {
 
 pub fn register_all() {
     register(&tmpfs::Tmpfs);
+    register(&fat32::Fat32FileSystem);
 }

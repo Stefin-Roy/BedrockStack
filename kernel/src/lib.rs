@@ -248,6 +248,15 @@ impl Kernel {
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");
 
+        // Mount the ESP (first partition on AHCI device) as B> (fat32)
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ahci_dev) = crate::filesystems::blockdriver::ahci::device() {
+            match crate::filesystems::partition::mount_first_partition(ahci_dev, "fat32", 'B') {
+                Ok(()) => log::info!("Mounted ESP as B> (fat32)"),
+                Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
+            }
+        }
+
         init_all(&mut self.framebuffer);
         loop {
             CurrentArch::halt();

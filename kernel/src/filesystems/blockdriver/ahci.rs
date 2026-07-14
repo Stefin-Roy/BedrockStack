@@ -16,6 +16,7 @@
 //!   - Proper MMIO region sizing from CAP.NP
 
 use core::ptr::{read_volatile, write_volatile};
+use alloc::sync::Arc;
 use spin::Mutex;
 
 use crate::mm::phys_alloc::BitmapAllocator;
@@ -211,7 +212,7 @@ fn ms_to_ticks(ms: u32) -> u32 {
 
 // ── Port state ──────────────────────────────────────────────────
 
-static PORT: Mutex<Option<AhciPort>> = Mutex::new(None);
+static PORT: Mutex<Option<Arc<AhciPort>>> = Mutex::new(None);
 
 struct AhciPort {
     hba: Hba,
@@ -670,7 +671,7 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
 
         match init_one(p, &mmio, alloc, max_prdt_raw.min(MAX_PRDT), n_slots_raw) {
             Ok(port) => {
-                *PORT.lock() = Some(port);
+                *PORT.lock() = Some(Arc::new(port));
                 SerialPort::puts("[ahci] port ");
                 SerialPort::put_u64(p as u64);
                 SerialPort::puts(" ready\n");
@@ -778,8 +779,7 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     Ok(port)
 }
 
-pub fn device() -> &'static dyn BlockDevice {
+pub fn device() -> Option<Arc<dyn BlockDevice>> {
     let g = PORT.lock();
-    let p = g.as_ref().expect("ahci not init");
-    unsafe { core::mem::transmute::<&AhciPort, &'static AhciPort>(p) }
+    g.as_ref().map(|p| p.clone() as Arc<dyn BlockDevice>)
 }
