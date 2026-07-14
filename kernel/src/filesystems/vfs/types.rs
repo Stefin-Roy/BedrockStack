@@ -17,6 +17,7 @@ impl OpenFlags {
     pub const CREATE: OpenFlags = OpenFlags(0x04);
     pub const TRUNC: OpenFlags = OpenFlags(0x08);
     pub const APPEND: OpenFlags = OpenFlags(0x10);
+    pub const EXCL: OpenFlags = OpenFlags(0x20);
 
     pub fn contains(&self, flag: OpenFlags) -> bool {
         (self.0 & flag.0) != 0

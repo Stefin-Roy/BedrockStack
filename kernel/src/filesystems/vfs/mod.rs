@@ -25,6 +25,7 @@ use fdtable::FdTable;
 use file::FileDescription;
 use inode::Inode;
 use mount::DriveMount;
+use superblock::StatFs;
 use types::{DirEntry, FileType, OpenFlags, SeekFrom, Stat};
 
 static VFS_INIT: AtomicBool = AtomicBool::new(false);
@@ -100,17 +101,24 @@ pub fn init() -> Result<(), VfsError> {
     if VFS_INIT.load(Ordering::SeqCst) {
         return Ok(());
     }
-    VFS_INIT.store(true, Ordering::SeqCst);
 
     fstypes::register_all();
     mount("tmpfs", None, 'A')?;
     mkdir("A>tmp")?;
-    mkdir("A>dev")?;
+
+    // Standard FDs 0/1/2 (placeholder files — replaced by real console later)
+    {
+        let _fd0 = open("A>tmp/stdin", OpenFlags::CREATE | OpenFlags::READ)?;
+        let _fd1 = open("A>tmp/stdout", OpenFlags::CREATE | OpenFlags::WRITE)?;
+        let _fd2 = open("A>tmp/stderr", OpenFlags::CREATE | OpenFlags::WRITE)?;
+        debug_assert!(_fd0 == 0 && _fd1 == 1 && _fd2 == 2);
+    }
 
     // Set CWD to A> root
     let root = DRIVE_MAP.lookup('A')?.root.clone();
     *CWD.lock() = Some(CurrentWorkingDirectory { drive: 'A', dentry: root });
 
+    VFS_INIT.store(true, Ordering::SeqCst);
     log::info!("VFS: A> (tmpfs) ready");
     Ok(())
 }
@@ -156,9 +164,47 @@ pub fn mount_virtual(source: &str, drive: char) -> Result<(), VfsError> {
 }
 
 pub fn unmount(drive: char) -> Result<(), VfsError> {
+    // Check CWD not on this drive
+    {
+        let cwd = CWD.lock();
+        if let Some(ref cwd) = *cwd {
+            if cwd.drive == drive {
+                return Err(VfsError::MountBusy);
+            }
+        }
+    }
+    // Check no open FDs reference this drive
+    let mount = DRIVE_MAP.lookup(drive)?;
+    for fd in FD_TABLE.iter_active() {
+        if dentry_belongs_to_mount(&fd.dentry, &mount.root) {
+            return Err(VfsError::MountBusy);
+        }
+    }
+
     DRIVE_MAP.remove(drive)?;
     log::info!("VFS: unmounted {}>", drive);
     Ok(())
+}
+
+/// Check whether a dentry is in the tree rooted at `mount_root`.
+fn dentry_belongs_to_mount(dentry: &Arc<Dentry>, mount_root: &Arc<Dentry>) -> bool {
+    if Arc::ptr_eq(dentry, mount_root) {
+        return true;
+    }
+    // Walk up to the root
+    let mut current = dentry.clone();
+    loop {
+        let parent = current.parent.lock().upgrade();
+        match parent {
+            Some(p) => {
+                if Arc::ptr_eq(&p, mount_root) {
+                    return true;
+                }
+                current = p;
+            }
+            None => return false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,6 +276,11 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
         inode_lock.as_ref().and_then(|p| p.ops.lookup(&leaf_name).ok())
     };
 
+    // O_EXCL: fail if file already exists
+    if flags.contains(OpenFlags::EXCL) && existing.is_some() {
+        return Err(VfsError::AlreadyExists);
+    }
+
     let inode: Arc<Inode> = match existing {
         Some(child_ops) => {
             let inode = Arc::new(Inode::new(child_ops));
@@ -278,6 +329,9 @@ pub fn close(fd: u32) -> Result<(), VfsError> {
 
 pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, VfsError> {
     let file = FD_TABLE.get(fd)?;
+    if !file.flags.contains(OpenFlags::READ) {
+        return Err(VfsError::BadFileDescriptor);
+    }
     let result = {
         let mut pos = file.pos.lock();
         let cur = *pos;
@@ -290,6 +344,9 @@ pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, VfsError> {
 
 pub fn write(fd: u32, buf: &[u8]) -> Result<usize, VfsError> {
     let file = FD_TABLE.get(fd)?;
+    if !file.flags.contains(OpenFlags::WRITE) {
+        return Err(VfsError::BadFileDescriptor);
+    }
     let result = {
         let mut pos = file.pos.lock();
         let _append_guard = if file.flags.contains(OpenFlags::APPEND) {
@@ -508,9 +565,15 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
         }
         let new_child_ops = new_ops.create(&new_name)?;
         if size > 0 {
-            new_child_ops.write_at(0, &buf)?;
+            if new_child_ops.write_at(0, &buf).is_err() {
+                let _ = new_ops.unlink(&new_name);
+                return Err(VfsError::IOError);
+            }
         }
-        old_ops.unlink(&old_name)?;
+        old_ops.unlink(&old_name).map_err(|e| {
+            let _ = new_ops.unlink(&new_name);
+            e
+        })?;
 
         if let Some(child) = old_parent.children.lock().remove(&old_name) {
             *child.name.lock() = new_name.clone();
@@ -533,6 +596,34 @@ pub fn stat(path: &str) -> Result<Stat, VfsError> {
     let st = inode.ops.getattr()?;
     inode.update_attr_from_stat(&st);
     Ok(st)
+}
+
+pub fn fstat(fd: u32) -> Result<Stat, VfsError> {
+    let file = FD_TABLE.get(fd)?;
+    let st = file.inode.ops.getattr()?;
+    file.inode.update_attr_from_stat(&st);
+    Ok(st)
+}
+
+pub fn dup(old_fd: u32) -> Result<u32, VfsError> {
+    FD_TABLE.dup(old_fd)
+}
+
+pub fn dup2(old_fd: u32, new_fd: u32) -> Result<(), VfsError> {
+    FD_TABLE.dup2(old_fd, new_fd)
+}
+
+pub fn sync_all() -> Result<(), VfsError> {
+    for (_letter, mount) in DRIVE_MAP.iter() {
+        mount.sb.ops.sync_fs()?;
+    }
+    Ok(())
+}
+
+pub fn statfs(path: &str) -> Result<StatFs, VfsError> {
+    let (letter, _) = resolve_path(path)?;
+    let mount = DRIVE_MAP.lookup(letter)?;
+    mount.sb.ops.statfs()
 }
 
 // ---------------------------------------------------------------------------

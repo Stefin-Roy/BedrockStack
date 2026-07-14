@@ -45,16 +45,33 @@ superblock, and optional block device. Protected by `IrqMutex`.
 
 **VFS-006 — FD table allocates monotonically increasing indices:**
 `FdTable` wraps a `Vec<Option<FileDescription>>` behind `IrqMutex`.
-New FDs are allocated at the lowest available index.
+New FDs are allocated at the lowest available index. `dup()` and
+`dup2()` create a new `Arc` reference sharing the same
+`FileDescription`.
 - Location: `kernel/src/filesystems/vfs/fdtable.rs`
+
+### Unmount
+
+**VFS-012 — `unmount()` checks for active references:**
+Before removing a drive, `unmount()` verifies that (a) CWD is not
+on that drive and (b) no open FDs reference the drive's dentry
+tree. Returns `MountBusy` if either check fails.
+- Location: `kernel/src/filesystems/vfs/mod.rs:158-185`
 
 ### File Operations
 
 **VFS-007 — `read()` / `write()` use `IrqMutex` for position:**
 File position (`FileDescription.pos`) is protected by `IrqMutex`.
-`write()` with `APPEND` flag always writes at the current end-of-file
-(size) rather than the current position.
-- Location: `kernel/src/filesystems/vfs/mod.rs:279-311`
+`read()` checks the `READ` flag; `write()` checks the `WRITE` flag.
+- Location: `kernel/src/filesystems/vfs/mod.rs:279-317`
+
+**VFS-011 — APPEND writes are serialized with per-inode lock:**
+`write()` with `APPEND` flag reads `ops.size()` (the authoritative FS
+size, not the VFS-cached size) and is serialized by
+`Inode::append_lock` to prevent TOCTOU races between two concurrent
+APPEND writers.
+- Location: `kernel/src/filesystems/vfs/inode.rs:38`,
+  `kernel/src/filesystems/vfs/mod.rs:301-314`
 
 **VFS-008 — Inode size is an `AtomicU64`:**
 Updated atomically during writes. Read without locks. This is safe
@@ -70,8 +87,10 @@ paths are resolved against CWD.
 - Location: `kernel/src/filesystems/vfs/mod.rs:46-66`
 
 **VFS-010 — VFS init is idempotent:**
-`VFS_INIT` AtomicBool prevents double initialization.
-- Location: `kernel/src/filesystems/vfs/mod.rs:30,99-103`
+`VFS_INIT` AtomicBool is set to `true` only after all mount and
+directory-creation operations succeed, preventing a broken partial
+init from being treated as ready.
+- Location: `kernel/src/filesystems/vfs/mod.rs:30,99-116`
 
 ---
 
@@ -89,9 +108,9 @@ implementation passes `Arc::as_ptr()` which is valid for the
 ## API Contracts
 
 **VFS-API-001 — `vfs::init()`:**
-Registers all filesystems, mounts `tmpfs` on `A>`, creates `A>tmp`
-and `A>dev` directories, sets CWD to `A>`. Returns `Err(VfsError)`
-on failure.
+Registers all filesystems, mounts `tmpfs` on `A>`, creates `A>tmp`,
+allocates placeholder FDs 0/1/2 pointing to empty files in `A>tmp`,
+sets CWD to `A>`. Returns `Err(VfsError)` on failure.
 
 **VFS-API-002 — `InodeOps` trait:**
 Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
@@ -101,11 +120,18 @@ Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
 Required operations: `statfs`, `sync_fs`.
 
 **VFS-API-004 — Open file operations:**
-`open`, `close`, `read`, `write`, `seek`, `truncate`, `ftruncate`.
-All operate on file descriptor indices from `FD_TABLE`.
+`open`, `close`, `read`, `write`, `seek`, `truncate`, `ftruncate`,
+`fstat`, `dup`, `dup2`. All operate on file descriptor indices from
+`FD_TABLE`. `open()` supports `O_EXCL` flag which returns
+`AlreadyExists` if `CREATE|EXCL` and the file already exists.
 
 **VFS-API-005 — Directory operations:**
 `mkdir`, `rmdir`, `readdir`, `chdir`, `getcwd`, `unlink`, `rename`, `stat`.
+
+**VFS-API-006 — Superblock operations:**
+`sync_all` iterates all mounted drives and calls `sync_fs()` on each.
+`statfs(path)` resolves the drive for a path and returns filesystem
+statistics via `statfs()`.
 
 ---
 
@@ -113,6 +139,10 @@ All operate on file descriptor indices from `FD_TABLE`.
 
 - VFS currently only supports `tmpfs`. Block-backed filesystems are for
   future implementation.
+- `/dev` is not populated; no device special file type exists. Console
+  I/O goes through `SerialPort` and `Framebuffer` directly, not through VFS.
+- Standard FDs 0/1/2 are placeholder files in `A>tmp/`. They will be
+  replaced by console device nodes when a devfs is implemented.
 - `rename()` across different drives (cross-device) copies data through
   a userspace-style buffer. Directories cannot be renamed across devices
   (`CrossDeviceLink` error).
