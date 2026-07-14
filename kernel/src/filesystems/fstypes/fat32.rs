@@ -1,6 +1,7 @@
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use alloc::string::String;
+use alloc::string::ToString;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
@@ -27,6 +28,10 @@ const DIR_END: u8 = 0x00;
 const EOC_MARKER: u32 = 0x0FFFFFF8;
 const FREE_CLUSTER: u32 = 0x00000000;
 
+const FSINFO_LEAD_SIG: u32 = 0x41615252;
+const FSINFO_STRUCT_SIG: u32 = 0x61417272;
+const FSINFO_TRAIL_SIG: u32 = 0xAA550000;
+
 // ── BPB (BIOS Parameter Block) ──────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -37,6 +42,7 @@ struct Bpb {
     num_fats: u8,
     fat_sz32: u32,
     root_clus: u32,
+    fsinfo_sec: u16,
     byts_per_clus: u32,
     first_data_sec: u64,
     total_clus: u32,
@@ -61,6 +67,7 @@ fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let num_fats = sector[0x10];
     let fat_sz32 = u32::from_le_bytes([sector[0x24], sector[0x25], sector[0x26], sector[0x27]]);
     let root_clus = u32::from_le_bytes([sector[0x2C], sector[0x2D], sector[0x2E], sector[0x2F]]);
+    let fsinfo_sec = u16::from_le_bytes([sector[0x30], sector[0x31]]);
     let first_data_sec = rsvd_sec_cnt as u64 + (num_fats as u64) * fat_sz32 as u64;
 
     let total_sectors = {
@@ -75,7 +82,7 @@ fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
 
     Ok(Bpb {
         bytes_per_sec, sec_per_clus, rsvd_sec_cnt, num_fats,
-        fat_sz32, root_clus,
+        fat_sz32, root_clus, fsinfo_sec,
         byts_per_clus, first_data_sec, total_clus,
     })
 }
@@ -96,6 +103,10 @@ impl Bpb {
         let sector_idx = byte_off / self.bytes_per_sec as u32;
         let offset = byte_off % self.bytes_per_sec as u32;
         (sector_idx, offset)
+    }
+
+    fn fsinfo_is_valid(&self) -> bool {
+        self.fsinfo_sec != 0 && self.fsinfo_sec != 0xFFFF
     }
 }
 
@@ -152,6 +163,7 @@ pub struct Fat32SuperBlock {
     fat_cache: Mutex<FatCache>,
     next_ino: AtomicU64,
     next_alloc_hint: Mutex<u32>,
+    free_clus_count: AtomicU32,
 }
 
 impl Fat32SuperBlock {
@@ -185,6 +197,7 @@ impl Fat32SuperBlock {
             if self.read_fat_entry(clus)? == FREE_CLUSTER {
                 self.write_fat_entry(clus, EOC_MARKER)?;
                 *hint = clus + 1;
+                self.free_clus_count.fetch_sub(1, Ordering::Relaxed);
                 return Ok(clus);
             }
         }
@@ -195,6 +208,7 @@ impl Fat32SuperBlock {
         while cluster >= 2 && cluster < EOC_MARKER {
             let next = self.read_fat_entry(cluster)?;
             self.write_fat_entry(cluster, FREE_CLUSTER)?;
+            self.free_clus_count.fetch_add(1, Ordering::Relaxed);
             cluster = next;
         }
         Ok(())
@@ -256,9 +270,36 @@ impl Fat32SuperBlock {
         Ok(())
     }
 
+    fn scan_free_clusters(&self) -> Result<u32, VfsError> {
+        let n = self.bpb.total_clus;
+        let mut count = 0u32;
+        for c in 2..2 + n {
+            if self.read_fat_entry(c)? == FREE_CLUSTER {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    fn write_fsinfo(&self) -> Result<(), VfsError> {
+        if !self.bpb.fsinfo_is_valid() { return Ok(()); }
+        let sec = self.bpb.fsinfo_sec as u64;
+        let mut buf = [0u8; SECTOR_SIZE];
+        let _ = read_sectors(&*self.device, sec, 1, &mut buf);
+
+        buf[0..4].copy_from_slice(&FSINFO_LEAD_SIG.to_le_bytes());
+        buf[484..488].copy_from_slice(&FSINFO_STRUCT_SIG.to_le_bytes());
+        buf[488..492].copy_from_slice(&self.free_clus_count.load(Ordering::Relaxed).to_le_bytes());
+        buf[492..496].copy_from_slice(&(*self.next_alloc_hint.lock()).to_le_bytes());
+        buf[508..512].copy_from_slice(&FSINFO_TRAIL_SIG.to_le_bytes());
+        write_sectors(&*self.device, sec, 1, &buf)
+    }
+
     fn sync_all(&self) -> Result<(), VfsError> {
         let mut cache = self.fat_cache.lock();
-        cache.flush(&*self.device, &self.bpb)
+        cache.flush(&*self.device, &self.bpb)?;
+        drop(cache);
+        self.write_fsinfo()
     }
 }
 
@@ -267,7 +308,7 @@ impl SuperOps for Fat32SuperBlock {
         Ok(StatFs {
             block_size: self.bpb.byts_per_clus,
             total_blocks: self.bpb.total_clus as u64,
-            free_blocks: 0,
+            free_blocks: self.free_clus_count.load(Ordering::Relaxed) as u64,
         })
     }
     fn sync_fs(&self) -> Result<(), VfsError> {
@@ -308,6 +349,17 @@ fn zero_cluster(sb: &Fat32SuperBlock, cluster: u32) -> Result<(), VfsError> {
     write_cluster(sb, cluster, &zeros)
 }
 
+// ── Timestamp helpers (always 0 — no RTC) ────────────────────────────────────
+
+fn set_timestamps(entry: &mut [u8; DIR_ENTRY_SIZE]) {
+    entry[0x0D] = 0;
+    entry[0x0E..0x10].copy_from_slice(&[0, 0]);
+    entry[0x10..0x12].copy_from_slice(&[0, 0]);
+    entry[0x12..0x14].copy_from_slice(&[0, 0]);
+    entry[0x16..0x18].copy_from_slice(&[0, 0]);
+    entry[0x18..0x1A].copy_from_slice(&[0, 0]);
+}
+
 // ── Name encoding/decoding ──────────────────────────────────────────────────
 
 fn decode_sfn(sfn: &[u8; MAX_SFN_LEN]) -> String {
@@ -320,6 +372,11 @@ fn decode_sfn(sfn: &[u8; MAX_SFN_LEN]) -> String {
         name.push_str(core::str::from_utf8(&sfn[8..8 + ext_start]).unwrap_or(""));
     }
     name
+}
+
+fn decode_volume_label(sfn: &[u8; MAX_SFN_LEN]) -> String {
+    let end = sfn.iter().rposition(|&b| b != b' ').map(|p| p + 1).unwrap_or(0);
+    core::str::from_utf8(&sfn[..end]).unwrap_or("").trim_end_matches('\0').to_string()
 }
 
 fn sfn_from_name(name: &str) -> Option<[u8; MAX_SFN_LEN]> {
@@ -428,6 +485,7 @@ fn set_file_size_in_entry(entry: &mut [u8; DIR_ENTRY_SIZE], size: u32) {
 
 // ── Directory reading ───────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct DirEntrySlot {
     vfat_entries: Vec<[u8; DIR_ENTRY_SIZE]>,
     sfn_entry: [u8; DIR_ENTRY_SIZE],
@@ -450,7 +508,12 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
             if entry[0] == DIR_DELETED { vfat_chain.clear(); continue; }
             let attr = entry[0x0B];
             if attr == ATTR_LONG_NAME { vfat_chain.push(*entry); continue; }
-            if attr & ATTR_VOLUME_ID != 0 { vfat_chain.clear(); continue; }
+            // Keep volume labels so readdir can expose them
+            if attr & ATTR_VOLUME_ID != 0 {
+                vfat_chain.clear();
+                slots.push(DirEntrySlot { vfat_entries: Vec::new(), sfn_entry: *entry });
+                continue;
+            }
             slots.push(DirEntrySlot { vfat_entries: core::mem::take(&mut vfat_chain), sfn_entry: *entry });
         }
         let next = sb.read_fat_entry(cluster)?;
@@ -461,7 +524,10 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
 }
 
 fn decode_entry_name(slot: &DirEntrySlot) -> String {
-    if !slot.vfat_entries.is_empty() {
+    let attr = slot.sfn_entry[0x0B];
+    if attr & ATTR_VOLUME_ID != 0 {
+        decode_volume_label(&slot.sfn_entry[..MAX_SFN_LEN].try_into().unwrap_or([b' '; MAX_SFN_LEN]))
+    } else if !slot.vfat_entries.is_empty() {
         decode_vfat_name(&slot.vfat_entries)
     } else {
         decode_sfn(&slot.sfn_entry[..MAX_SFN_LEN].try_into().unwrap_or([b' '; MAX_SFN_LEN]))
@@ -470,8 +536,6 @@ fn decode_entry_name(slot: &DirEntrySlot) -> String {
 
 // ── Directory writing / updating helpers ────────────────────────────────────
 
-/// Write a chain of directory entries (VFAT + SFN) into a directory cluster chain.
-/// Extends the chain if needed. Updates `dir_clus` if the starting cluster changes.
 fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &mut u32,
                      entries: &[[u8; DIR_ENTRY_SIZE]]) -> Result<(), VfsError>
 {
@@ -536,8 +600,6 @@ fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &mut u32,
     }
 }
 
-/// Find the sector/cluster containing the named entry and apply a mutation
-/// closure to the SFN entry.
 fn find_and_update_entry<F>(sb: &Fat32SuperBlock, dir_clus: u32, name: &str,
                              mut f: F) -> Result<(), VfsError>
 where
@@ -561,13 +623,11 @@ where
             if attr == ATTR_LONG_NAME { i += 1; continue; }
             if attr & ATTR_VOLUME_ID != 0 { i += 1; continue; }
 
-            // Find chain start
             let mut chain_start = i;
             while chain_start > 0 && buf[(chain_start - 1) * DIR_ENTRY_SIZE + 0x0B] == ATTR_LONG_NAME {
                 chain_start -= 1;
             }
 
-            // Collect VFAT entries
             let mut vfat_buf: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
             for j in chain_start..i {
                 let e: &[u8; DIR_ENTRY_SIZE] = &buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE].try_into().unwrap();
@@ -597,7 +657,6 @@ where
     Err(VfsError::NotFound)
 }
 
-/// Update the first_clus and/or size fields of a directory entry on disk.
 fn update_entry_cluster_and_size(sb: &Fat32SuperBlock, dir_clus: u32,
                                   name: &str, new_clus: Option<u32>,
                                   new_size: Option<u32>) -> Result<(), VfsError>
@@ -605,10 +664,10 @@ fn update_entry_cluster_and_size(sb: &Fat32SuperBlock, dir_clus: u32,
     find_and_update_entry(sb, dir_clus, name, |entry| {
         if let Some(c) = new_clus { set_first_clus_in_entry(entry, c); }
         if let Some(s) = new_size { set_file_size_in_entry(entry, s); }
+        set_timestamps(entry);
     })
 }
 
-/// Remove a named entry's directory entries (VFAT + SFN) by marking them deleted.
 fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str) -> Result<(), VfsError> {
     let clus_bytes = sb.bpb.byts_per_clus as usize;
     let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
@@ -665,35 +724,59 @@ fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str) -> Result
 
 pub struct Fat32Inode {
     sb: Arc<Fat32SuperBlock>,
-    first_clus: u32,
-    size: u32,
+    first_clus: AtomicU32,
+    size: AtomicU32,
     file_type: FileType,
     ino: u64,
     parent_clus: u32,
     entry_name: String,
+    dir_cache: Mutex<Option<(u64, Vec<DirEntrySlot>)>>,
+    dir_generation: AtomicU64,
 }
 
 impl Fat32Inode {
     fn sync_clus_and_size(&self) -> Result<(), VfsError> {
         update_entry_cluster_and_size(
             &self.sb, self.parent_clus, &self.entry_name,
-            Some(self.first_clus), Some(self.size),
+            Some(self.first_clus.load(Ordering::Relaxed)),
+            Some(self.size.load(Ordering::Relaxed)),
         )
+    }
+
+    fn invalidate_dir_cache(&self) {
+        self.dir_generation.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn get_dir_slots(&self) -> Result<Vec<DirEntrySlot>, VfsError> {
+        let generation = self.dir_generation.load(Ordering::Relaxed);
+        {
+            let cache = self.dir_cache.lock();
+            if let Some((g, ref slots)) = *cache {
+                if g == generation {
+                    return Ok(slots.clone());
+                }
+            }
+        }
+        let slots = read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?;
+        *self.dir_cache.lock() = Some((generation, slots.clone()));
+        Ok(slots)
     }
 }
 
 impl InodeOps for Fat32Inode {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
-        if offset >= self.size as u64 || buf.is_empty() || self.first_clus == 0 { return Ok(0); }
+        let file_size = self.size.load(Ordering::Relaxed) as u64;
+        let first = self.first_clus.load(Ordering::Relaxed);
+        if offset >= file_size || buf.is_empty() || first == 0 { return Ok(0); }
 
         let clus_size = self.sb.bpb.byts_per_clus as u64;
-        let total = (buf.len() as u64).min(self.size as u64 - offset) as usize;
+        let total = (buf.len() as u64).min(file_size - offset) as usize;
         let start_idx = (offset / clus_size) as u32;
         let mut current = if start_idx == 0 {
-            self.first_clus
+            first
         } else {
-            self.sb.chain_cluster_at(self.first_clus, start_idx).unwrap_or(self.first_clus)
+            self.sb.chain_cluster_at(first, start_idx).unwrap_or(first)
         };
 
         if current >= EOC_MARKER || current < 2 { return Ok(0); }
@@ -725,8 +808,7 @@ impl InodeOps for Fat32Inode {
         let end_byte = offset + buf.len() as u64;
         let needed_clus = if end_byte == 0 { 0 } else { ((end_byte - 1) / clus_size + 1) as u32 };
 
-        // Ensure we have enough clusters
-        let mut current_first_clus = self.first_clus;
+        let mut current_first_clus = self.first_clus.load(Ordering::Relaxed);
         if needed_clus > 0 {
             let have = self.sb.chain_len(current_first_clus)?;
             if have < needed_clus {
@@ -736,7 +818,7 @@ impl InodeOps for Fat32Inode {
                     if needed_clus > 1 {
                         self.sb.extend_chain(current_first_clus, needed_clus - 1)?;
                     }
-                    // Update the on-disk directory entry with the new first_clus
+                    self.first_clus.store(current_first_clus, Ordering::Relaxed);
                     self.sync_clus_and_size()?;
                 } else {
                     self.sb.extend_chain(current_first_clus, needed_clus - have)?;
@@ -744,7 +826,6 @@ impl InodeOps for Fat32Inode {
             }
         }
 
-        // Walk to the starting cluster
         let start_idx = (offset / clus_size) as u32;
         let mut current = if start_idx == 0 {
             current_first_clus
@@ -777,9 +858,15 @@ impl InodeOps for Fat32Inode {
             clus_off = 0;
         }
 
-        // Update size on disk
-        let new_size = self.size.max(end_byte as u32);
-        if new_size > self.size {
+        let mut need_size_update = false;
+        let cur_size = self.size.load(Ordering::Relaxed);
+        let new_size = cur_size.max(end_byte as u32);
+        if new_size > cur_size {
+            self.size.store(new_size, Ordering::Relaxed);
+            need_size_update = true;
+        }
+
+        if need_size_update || current_first_clus != self.first_clus.load(Ordering::Relaxed) {
             update_entry_cluster_and_size(
                 &self.sb, self.parent_clus, &self.entry_name,
                 None, Some(new_size),
@@ -791,7 +878,7 @@ impl InodeOps for Fat32Inode {
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        let slots = read_dir_slots(&self.sb, self.first_clus)?;
+        let slots = self.get_dir_slots()?;
         for slot in &slots {
             if decode_entry_name(slot) == name {
                 let fc = first_clus_from_entry(&slot.sfn_entry);
@@ -801,12 +888,14 @@ impl InodeOps for Fat32Inode {
                 let ft = if attr & ATTR_DIRECTORY != 0 { FileType::Directory } else { FileType::Regular };
                 return Ok(Arc::new(Fat32Inode {
                     sb: self.sb.clone(),
-                    first_clus: actual_clus,
-                    size: sz,
+                    first_clus: AtomicU32::new(actual_clus),
+                    size: AtomicU32::new(sz),
                     file_type: ft,
                     ino: self.sb.next_ino.fetch_add(1, Ordering::Relaxed),
-                    parent_clus: self.first_clus,
+                    parent_clus: self.first_clus.load(Ordering::Relaxed),
                     entry_name: String::from(name),
+                    dir_cache: Mutex::new(None),
+                    dir_generation: AtomicU64::new(0),
                 }) as Arc<dyn InodeOps>);
             }
         }
@@ -815,8 +904,7 @@ impl InodeOps for Fat32Inode {
 
     fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        // Check for existing entry
-        if read_dir_slots(&self.sb, self.first_clus)?.iter().any(|s| decode_entry_name(s) == name) {
+        if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
             return Err(VfsError::AlreadyExists);
         }
 
@@ -831,28 +919,31 @@ impl InodeOps for Fat32Inode {
         sfn_entry[0x0B] = ATTR_ARCHIVE;
         set_first_clus_in_entry(&mut sfn_entry, 0);
         set_file_size_in_entry(&mut sfn_entry, 0);
+        set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
-        let mut parent = self.first_clus;
+        let mut parent = self.first_clus.load(Ordering::Relaxed);
         write_dir_entries(&self.sb, &mut parent, &new_entries)?;
+        self.invalidate_dir_cache();
 
         let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Fat32Inode {
             sb: self.sb.clone(),
-            first_clus: 0,
-            size: 0,
+            first_clus: AtomicU32::new(0),
+            size: AtomicU32::new(0),
             file_type: FileType::Regular,
             ino,
-            parent_clus: self.first_clus,
+            parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
+            dir_cache: Mutex::new(None),
+            dir_generation: AtomicU64::new(0),
         }) as Arc<dyn InodeOps>)
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
 
-        // Find the target's first cluster to free its chain
-        let slots = read_dir_slots(&self.sb, self.first_clus)?;
+        let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
         let mut found = false;
         for slot in &slots {
@@ -867,12 +958,15 @@ impl InodeOps for Fat32Inode {
         if target_clus >= 2 && target_clus < EOC_MARKER {
             self.sb.free_chain(target_clus)?;
         }
-        remove_dir_entries(&self.sb, self.first_clus, name)
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        remove_dir_entries(&self.sb, parent, name)?;
+        self.invalidate_dir_cache();
+        Ok(())
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        if read_dir_slots(&self.sb, self.first_clus)?.iter().any(|s| decode_entry_name(s) == name) {
+        if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
             return Err(VfsError::AlreadyExists);
         }
 
@@ -886,11 +980,13 @@ impl InodeOps for Fat32Inode {
         dot_entry[..MAX_SFN_LEN].copy_from_slice(&dot_sfn);
         dot_entry[0x0B] = ATTR_DIRECTORY;
         set_first_clus_in_entry(&mut dot_entry, new_clus);
+        set_timestamps(&mut dot_entry);
 
         let mut dotdot_entry = [0u8; DIR_ENTRY_SIZE];
         dotdot_entry[..MAX_SFN_LEN].copy_from_slice(&dotdot_sfn);
         dotdot_entry[0x0B] = ATTR_DIRECTORY;
-        set_first_clus_in_entry(&mut dotdot_entry, self.first_clus);
+        set_first_clus_in_entry(&mut dotdot_entry, self.first_clus.load(Ordering::Relaxed));
+        set_timestamps(&mut dotdot_entry);
 
         let clus_bytes = self.sb.bpb.byts_per_clus as usize;
         let mut clus_buf = alloc::vec![0u8; clus_bytes];
@@ -898,7 +994,6 @@ impl InodeOps for Fat32Inode {
         clus_buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot_entry);
         write_cluster(&self.sb, new_clus, &clus_buf)?;
 
-        // Create directory entry in parent
         let sfn = sfn_from_name(name).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
@@ -909,27 +1004,31 @@ impl InodeOps for Fat32Inode {
         sfn_entry[..MAX_SFN_LEN].copy_from_slice(&sfn);
         sfn_entry[0x0B] = ATTR_DIRECTORY;
         set_first_clus_in_entry(&mut sfn_entry, new_clus);
+        set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
-        let mut parent = self.first_clus;
+        let mut parent = self.first_clus.load(Ordering::Relaxed);
         write_dir_entries(&self.sb, &mut parent, &new_entries)?;
+        self.invalidate_dir_cache();
 
         let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Fat32Inode {
             sb: self.sb.clone(),
-            first_clus: new_clus,
-            size: 0,
+            first_clus: AtomicU32::new(new_clus),
+            size: AtomicU32::new(0),
             file_type: FileType::Directory,
             ino,
-            parent_clus: self.first_clus,
+            parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
+            dir_cache: Mutex::new(None),
+            dir_generation: AtomicU64::new(0),
         }) as Arc<dyn InodeOps>)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
 
-        let slots = read_dir_slots(&self.sb, self.first_clus)?;
+        let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
         let mut found = false;
         for slot in &slots {
@@ -949,12 +1048,15 @@ impl InodeOps for Fat32Inode {
         if target_clus >= 2 && target_clus < EOC_MARKER {
             self.sb.free_chain(target_clus)?;
         }
-        remove_dir_entries(&self.sb, self.first_clus, name)
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        remove_dir_entries(&self.sb, parent, name)?;
+        self.invalidate_dir_cache();
+        Ok(())
     }
 
     fn readdir(&self) -> Result<Vec<DirEntry>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        let slots = read_dir_slots(&self.sb, self.first_clus)?;
+        let slots = self.get_dir_slots()?;
         let mut entries = Vec::with_capacity(slots.len());
         for slot in &slots {
             let name = decode_entry_name(slot);
@@ -970,7 +1072,7 @@ impl InodeOps for Fat32Inode {
     fn getattr(&self) -> Result<Stat, VfsError> {
         Ok(Stat {
             ino: self.ino,
-            size: if self.file_type == FileType::Directory { 0 } else { self.size as u64 },
+            size: if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 },
             file_type: self.file_type,
             mtime: 0,
         })
@@ -979,8 +1081,7 @@ impl InodeOps for Fat32Inode {
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
 
-        // Read target entry data
-        let slots = read_dir_slots(&self.sb, self.first_clus)?;
+        let slots = self.get_dir_slots()?;
         let mut target = None;
         for slot in &slots {
             if decode_entry_name(slot) == old_name {
@@ -994,12 +1095,10 @@ impl InodeOps for Fat32Inode {
         let attr = target.sfn_entry[0x0B];
         let is_dir = (attr & ATTR_DIRECTORY) != 0;
 
-        // If new_name exists, unlink it first
         if slots.iter().any(|s| decode_entry_name(s) == new_name) {
             self.unlink(new_name)?;
         }
 
-        // Create new entry
         let sfn = sfn_from_name(new_name).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
@@ -1011,20 +1110,21 @@ impl InodeOps for Fat32Inode {
         sfn_entry[0x0B] = attr;
         set_first_clus_in_entry(&mut sfn_entry, fc);
         set_file_size_in_entry(&mut sfn_entry, sz);
+        set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
-        let mut parent = self.first_clus;
-        write_dir_entries(&self.sb, &mut parent, &new_entries)?;
-        remove_dir_entries(&self.sb, self.first_clus, old_name)?;
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        let mut p = parent;
+        write_dir_entries(&self.sb, &mut p, &new_entries)?;
+        remove_dir_entries(&self.sb, parent, old_name)?;
+        self.invalidate_dir_cache();
 
-        // If renaming a directory, update its ".." entry to point to us
         if is_dir && fc >= 2 && fc < EOC_MARKER {
             let clus_bytes = self.sb.bpb.byts_per_clus as usize;
             let mut buf = alloc::vec![0u8; clus_bytes];
             read_cluster(&self.sb, fc, &mut buf)?;
-            // ".." is the second entry
             let dotdot_off = DIR_ENTRY_SIZE;
-            set_first_clus_in_entry(&mut buf[dotdot_off..dotdot_off + DIR_ENTRY_SIZE].try_into().unwrap(), self.first_clus);
+            set_first_clus_in_entry(&mut buf[dotdot_off..dotdot_off + DIR_ENTRY_SIZE].try_into().unwrap(), parent);
             write_cluster(&self.sb, fc, &buf)?;
         }
 
@@ -1038,24 +1138,28 @@ impl InodeOps for Fat32Inode {
         let new_size = len as u32;
         let clus_size = self.sb.bpb.byts_per_clus;
         let needed = if new_size == 0 { 0 } else { ((new_size as u64 - 1) / clus_size as u64 + 1) as u32 };
-        let have = self.sb.chain_len(self.first_clus)?;
+        let current_first = self.first_clus.load(Ordering::Relaxed);
+        let have = self.sb.chain_len(current_first)?;
 
-        if new_size == 0 && self.first_clus != 0 {
-            self.sb.free_chain(self.first_clus)?;
-        } else if needed < have && self.first_clus != 0 {
-            self.sb.truncate_chain(self.first_clus, needed)?;
-        } else if needed > have {
-            if self.first_clus == 0 { return Err(VfsError::NoSpace); }
-            self.sb.extend_chain(self.first_clus, needed - have)?;
-        }
-
-        // Update on-disk size (first_clus unchanged for truncate unless freeing all)
-        if new_size == 0 && self.first_clus != 0 {
+        if new_size == 0 && current_first != 0 {
+            self.sb.free_chain(current_first)?;
+            self.first_clus.store(0, Ordering::Relaxed);
+            self.size.store(0, Ordering::Relaxed);
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            Some(0), Some(0))?;
-        } else {
+        } else if needed < have && current_first != 0 {
+            self.sb.truncate_chain(current_first, needed)?;
+            self.size.store(new_size, Ordering::Relaxed);
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            None, Some(new_size))?;
+        } else if needed > have {
+            if current_first == 0 { return Err(VfsError::NoSpace); }
+            self.sb.extend_chain(current_first, needed - have)?;
+            self.size.store(new_size, Ordering::Relaxed);
+            update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
+                                           None, Some(new_size))?;
+        } else {
+            self.size.store(new_size, Ordering::Relaxed);
         }
 
         Ok(())
@@ -1063,7 +1167,9 @@ impl InodeOps for Fat32Inode {
 
     fn file_type(&self) -> FileType { self.file_type }
     fn ino(&self) -> u64 { self.ino }
-    fn size(&self) -> u64 { if self.file_type == FileType::Directory { 0 } else { self.size as u64 } }
+    fn size(&self) -> u64 {
+        if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 }
+    }
 }
 
 // ── Fat32FileSystem (implements FileSystem) ──────────────────────────────────
@@ -1081,21 +1187,28 @@ impl FileSystem for Fat32FileSystem {
 
         let sb = Arc::new(Fat32SuperBlock {
             device: dev,
-            bpb,
+            bpb: bpb.clone(),
             fat_cache: Mutex::new(FatCache::new()),
             next_ino: AtomicU64::new(2),
             next_alloc_hint: Mutex::new(2),
+            free_clus_count: AtomicU32::new(0),
         });
+
+        // Scan free clusters on mount for accurate statfs + FSInfo
+        let free = sb.scan_free_clusters()?;
+        sb.free_clus_count.store(free, Ordering::Relaxed);
 
         let root_clus = sb.bpb.root_clus;
         let root_ops = Arc::new(Fat32Inode {
             sb: sb.clone(),
-            first_clus: root_clus,
-            size: 0,
+            first_clus: AtomicU32::new(root_clus),
+            size: AtomicU32::new(0),
             file_type: FileType::Directory,
             ino: 1,
             parent_clus: root_clus,
             entry_name: String::new(),
+            dir_cache: Mutex::new(None),
+            dir_generation: AtomicU64::new(0),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(crate::filesystems::vfs::inode::Inode::new(root_ops.clone()));
