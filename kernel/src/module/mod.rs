@@ -1,3 +1,4 @@
+pub mod fat32_test;
 pub mod registry;
 pub mod vfs_test;
 

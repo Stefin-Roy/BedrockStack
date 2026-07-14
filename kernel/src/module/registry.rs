@@ -1,6 +1,7 @@
 //! Module registry for static module dispatch.
 
 use super::Module;
+use super::fat32_test::Fat32Test;
 use super::vfs_test::VfsTest;
 use crate::display::framebuffer::Framebuffer;
 use crate::display::Display as _;
@@ -28,6 +29,7 @@ impl Module for HelloModule {
 
 static MODULES: &[&dyn Module] = &[
     &HelloModule,
+    &Fat32Test,
     &VfsTest,
 ];
 
