@@ -78,6 +78,7 @@ impl BlockDevice for PartitionDevice {
                     let len = buf.len();
                     IoBuffer::Buf(unsafe { &mut *core::ptr::slice_from_raw_parts_mut(ptr, len) })
                 }
+                IoBuffer::ConstBuf(buf) => IoBuffer::ConstBuf(*buf),
                 IoBuffer::Phys(pa, sz) => IoBuffer::Phys(*pa, *sz),
             };
             adjusted.push(IoRequest {

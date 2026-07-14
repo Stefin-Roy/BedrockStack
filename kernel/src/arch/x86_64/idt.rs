@@ -1,5 +1,7 @@
 //! Interrupt Descriptor Table for x86_64.
 
+use core::sync::atomic::{AtomicPtr, Ordering};
+
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
 
@@ -7,28 +9,72 @@ use crate::platform::x86_64_pc::apic;
 
 static IDT: Once<InterruptDescriptorTable> = Once::new();
 
-// ── Device interrupt stubs (vectors 33-48) ─────────────────────────
+// ── Device interrupt dispatch (vectors 33-48) ─────────────────────
+//
+// Drivers can register a handler for one of the 16 available device
+// interrupt vectors. The handler is called with interrupts disabled
+// and must not block. EOI is sent automatically after the handler.
 
-fn device_irq_handler() {
+const NUM_DEVICE_VECTORS: usize = 16;
+const DEVICE_VECTOR_BASE: u8 = 33;
+static DEVICE_HANDLERS: [AtomicPtr<fn()>; NUM_DEVICE_VECTORS] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_DEVICE_VECTORS];
+
+/// Register a handler for a device interrupt vector (index 0-15, mapping to
+/// IDT vectors 33-48). Returns the allocated vector number or `None` if the
+/// slot is already taken.
+pub fn register_device_handler(handler: fn()) -> Option<u8> {
+    for (i, slot) in DEVICE_HANDLERS.iter().enumerate() {
+        if slot.load(Ordering::Acquire).is_null() {
+            let ptr = handler as *mut fn();
+            if slot.compare_exchange(
+                core::ptr::null_mut(), ptr,
+                Ordering::Release, Ordering::Relaxed,
+            ).is_ok() {
+                return Some(DEVICE_VECTOR_BASE + i as u8);
+            }
+        }
+    }
+    None
+}
+
+/// Unregister a previously registered device interrupt handler.
+pub fn unregister_device_handler(vector: u8) {
+    if vector < DEVICE_VECTOR_BASE || vector >= DEVICE_VECTOR_BASE + NUM_DEVICE_VECTORS as u8 {
+        return;
+    }
+    let idx = (vector - DEVICE_VECTOR_BASE) as usize;
+    DEVICE_HANDLERS[idx].store(core::ptr::null_mut(), Ordering::Release);
+}
+
+fn device_irq_handler(vector: u8) {
+    let idx = (vector - DEVICE_VECTOR_BASE) as usize;
+    if idx < NUM_DEVICE_VECTORS {
+        let ptr = DEVICE_HANDLERS[idx].load(Ordering::Acquire);
+        if !ptr.is_null() {
+            let handler: fn() = unsafe { core::mem::transmute(ptr) };
+            handler();
+        }
+    }
     apic::apic_eoi();
 }
 
-extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_38(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_39(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_40(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_41(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_42(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_43(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_44(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_45(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_46(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_47(_sf: InterruptStackFrame) { device_irq_handler(); }
-extern "x86-interrupt" fn irq_48(_sf: InterruptStackFrame) { device_irq_handler(); }
+extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(33); }
+extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) { device_irq_handler(34); }
+extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(35); }
+extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(36); }
+extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(37); }
+extern "x86-interrupt" fn irq_38(_sf: InterruptStackFrame) { device_irq_handler(38); }
+extern "x86-interrupt" fn irq_39(_sf: InterruptStackFrame) { device_irq_handler(39); }
+extern "x86-interrupt" fn irq_40(_sf: InterruptStackFrame) { device_irq_handler(40); }
+extern "x86-interrupt" fn irq_41(_sf: InterruptStackFrame) { device_irq_handler(41); }
+extern "x86-interrupt" fn irq_42(_sf: InterruptStackFrame) { device_irq_handler(42); }
+extern "x86-interrupt" fn irq_43(_sf: InterruptStackFrame) { device_irq_handler(43); }
+extern "x86-interrupt" fn irq_44(_sf: InterruptStackFrame) { device_irq_handler(44); }
+extern "x86-interrupt" fn irq_45(_sf: InterruptStackFrame) { device_irq_handler(45); }
+extern "x86-interrupt" fn irq_46(_sf: InterruptStackFrame) { device_irq_handler(46); }
+extern "x86-interrupt" fn irq_47(_sf: InterruptStackFrame) { device_irq_handler(47); }
+extern "x86-interrupt" fn irq_48(_sf: InterruptStackFrame) { device_irq_handler(48); }
 
 /// Initialize and load the IDT.
 ///

@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::string::String;
 use alloc::string::ToString;
@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 use hashbrown::{HashMap, HashSet};
 use spin::Mutex;
 
+use crate::filesystems::blockdriver::block_cache::CachedDevice;
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoRequest};
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
@@ -46,6 +47,7 @@ struct Bpb {
     byts_per_clus: u32,
     first_data_sec: u64,
     total_clus: u32,
+    active_fat: u8,          // byte 0x42: bit 7=1 means single-FAT mode, bits 0-3 = active FAT
 }
 
 fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
@@ -80,16 +82,22 @@ fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let total_clus = (total_data_sectors / sec_per_clus as u64) as u32;
     let byts_per_clus = (bytes_per_sec as u32) * (sec_per_clus as u32);
 
+    let active_fat = sector[0x42];
+
     Ok(Bpb {
         bytes_per_sec, sec_per_clus, rsvd_sec_cnt, num_fats,
         fat_sz32, root_clus, fsinfo_sec,
-        byts_per_clus, first_data_sec, total_clus,
+        byts_per_clus, first_data_sec, total_clus, active_fat,
     })
 }
 
 impl Bpb {
     fn cluster_to_lba(&self, cluster: u32) -> u64 {
         self.first_data_sec + ((cluster - 2) as u64) * (self.sec_per_clus as u64)
+    }
+
+    fn active_fat_idx(&self) -> u8 {
+        if self.active_fat & 0x80 != 0 { self.active_fat & 0x0F } else { 0 }
     }
 
     fn fat_sector_lba(&self, fat_num: u8, sector_idx: u32) -> u64 {
@@ -112,22 +120,59 @@ impl Bpb {
 
 // ── FAT cache ───────────────────────────────────────────────────────────────
 
+const MAX_FAT_CACHE_ENTRIES: usize = 4096;
+
 struct FatCache {
     sectors: HashMap<u64, [u8; SECTOR_SIZE]>,
     dirty: HashSet<u64>,
+    access_gen: HashMap<u64, u64>,
+    gen_counter: u64,
 }
 
 impl FatCache {
     fn new() -> Self {
-        FatCache { sectors: HashMap::new(), dirty: HashSet::new() }
+        FatCache {
+            sectors: HashMap::new(),
+            dirty: HashSet::new(),
+            access_gen: HashMap::new(),
+            gen_counter: 0,
+        }
+    }
+
+    fn touch(&mut self, lba: u64) {
+        let gen_val = self.gen_counter;
+        self.gen_counter = gen_val.wrapping_add(1);
+        self.access_gen.insert(lba, gen_val);
+    }
+
+    fn maybe_evict(&mut self) {
+        if self.sectors.len() < MAX_FAT_CACHE_ENTRIES {
+            return;
+        }
+        // Evict oldest clean entries down to 75% capacity
+        let target = MAX_FAT_CACHE_ENTRIES - MAX_FAT_CACHE_ENTRIES / 4;
+        let mut evictable: Vec<(u64, u64)> = self.sectors.keys()
+            .filter_map(|lba| {
+                if self.dirty.iter().any(|d| d == lba) { return None; }
+                Some((*lba, self.access_gen.get(lba).copied().unwrap_or(0)))
+            })
+            .collect();
+        evictable.sort_by_key(|(_, g)| *g);
+        let n_evict = self.sectors.len().saturating_sub(target);
+        for (lba, _) in evictable.iter().take(n_evict) {
+            self.sectors.remove(lba);
+            self.access_gen.remove(lba);
+        }
     }
 
     fn get_or_read(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&[u8; SECTOR_SIZE], VfsError> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
+            self.maybe_evict();
             self.sectors.insert(lba, buf);
         }
+        self.touch(lba);
         Ok(self.sectors.get(&lba).unwrap())
     }
 
@@ -135,19 +180,24 @@ impl FatCache {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
+            self.maybe_evict();
             self.sectors.insert(lba, buf);
         }
         self.dirty.insert(lba);
+        self.touch(lba);
         Ok(self.sectors.get_mut(&lba).unwrap())
     }
 
     fn flush(&mut self, device: &dyn BlockDevice, bpb: &Bpb) -> Result<(), VfsError> {
+        let is_mirrored = bpb.active_fat & 0x80 == 0;
         for &lba in self.dirty.iter() {
             let data = self.sectors.get(&lba).unwrap();
             write_sectors(device, lba, 1, data)?;
-            for fat_num in 1..bpb.num_fats {
-                let local_idx = (lba - bpb.rsvd_sec_cnt as u64) % bpb.fat_sz32 as u64;
-                write_sectors(device, bpb.fat_sector_lba(fat_num, local_idx as u32), 1, data)?;
+            if is_mirrored {
+                for fat_num in 1..bpb.num_fats {
+                    let local_idx = (lba - bpb.fat_sector_lba(0, 0)) % bpb.fat_sz32 as u64;
+                    write_sectors(device, bpb.fat_sector_lba(fat_num, local_idx as u32), 1, data)?;
+                }
             }
         }
         self.dirty.clear();
@@ -164,12 +214,14 @@ pub struct Fat32SuperBlock {
     next_ino: AtomicU64,
     next_alloc_hint: Mutex<u32>,
     free_clus_count: AtomicU32,
+    volume_dirty: AtomicBool,
 }
 
 impl Fat32SuperBlock {
     fn read_fat_entry(&self, cluster: u32) -> Result<u32, VfsError> {
         let (sector_idx, offset) = self.bpb.fat_entry_position(cluster);
-        let lba = self.bpb.fat_sector_lba(0, sector_idx);
+        let fat_idx = self.bpb.active_fat_idx();
+        let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
         let sector = cache.get_or_read(&*self.device, lba)?;
         let val = u32::from_le_bytes([
@@ -181,7 +233,8 @@ impl Fat32SuperBlock {
 
     fn write_fat_entry(&self, cluster: u32, value: u32) -> Result<(), VfsError> {
         let (sector_idx, offset) = self.bpb.fat_entry_position(cluster);
-        let lba = self.bpb.fat_sector_lba(0, sector_idx);
+        let fat_idx = self.bpb.active_fat_idx();
+        let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
         let sector = cache.get_or_read_mut(&*self.device, lba)?;
         let bytes = (value & 0x0FFFFFFF).to_le_bytes();
@@ -295,11 +348,38 @@ impl Fat32SuperBlock {
         write_sectors(&*self.device, sec, 1, &buf)
     }
 
+    fn set_volume_dirty_flag(&self) -> Result<(), VfsError> {
+        if self.volume_dirty.load(Ordering::Relaxed) { return Ok(()); }
+        let mut sector = [0u8; SECTOR_SIZE];
+        read_sectors(&*self.device, 0, 1, &mut sector)?;
+        sector[0x41] |= 1;
+        write_sectors(&*self.device, 0, 1, &sector)?;
+        self.volume_dirty.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn clear_volume_dirty_flag(&self) -> Result<(), VfsError> {
+        if !self.volume_dirty.load(Ordering::Relaxed) { return Ok(()); }
+        let mut sector = [0u8; SECTOR_SIZE];
+        read_sectors(&*self.device, 0, 1, &mut sector)?;
+        sector[0x41] &= !1u8;
+        write_sectors(&*self.device, 0, 1, &sector)?;
+        self.volume_dirty.store(false, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn flush_fat_cache(&self) -> Result<(), VfsError> {
+        let mut cache = self.fat_cache.lock();
+        cache.flush(&*self.device, &self.bpb)
+    }
+
     fn sync_all(&self) -> Result<(), VfsError> {
+        self.set_volume_dirty_flag()?;
         let mut cache = self.fat_cache.lock();
         cache.flush(&*self.device, &self.bpb)?;
         drop(cache);
-        self.write_fsinfo()
+        self.write_fsinfo()?;
+        self.clear_volume_dirty_flag()
     }
 }
 
@@ -326,9 +406,7 @@ fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) 
 }
 
 fn write_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), VfsError> {
-    let ptr = buf.as_ptr() as *mut u8;
-    let mut_buf = unsafe { &mut *core::ptr::slice_from_raw_parts_mut(ptr, buf.len()) };
-    let req = IoRequest { lba, count, buffer: IoBuffer::Buf(mut_buf), is_write: true };
+    let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
     let c = device.submit(&[req]).map_err(|_| VfsError::IOError)?;
     if !c.all_ok() { return Err(VfsError::IOError); }
     Ok(())
@@ -732,6 +810,7 @@ pub struct Fat32Inode {
     entry_name: String,
     dir_cache: Mutex<Option<(u64, Vec<DirEntrySlot>)>>,
     dir_generation: AtomicU64,
+    dir_lock: Mutex<()>,
 }
 
 impl Fat32Inode {
@@ -803,6 +882,9 @@ impl InodeOps for Fat32Inode {
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
         if buf.is_empty() { return Ok(0); }
+        if offset.saturating_add(buf.len() as u64) > u32::MAX as u64 {
+            return Err(VfsError::FileTooLarge);
+        }
 
         let clus_size = self.sb.bpb.byts_per_clus as u64;
         let end_byte = offset + buf.len() as u64;
@@ -858,6 +940,11 @@ impl InodeOps for Fat32Inode {
             clus_off = 0;
         }
 
+        // Flush FAT changes to disk before updating directory entry.
+        // Order: data → FAT flush → dir entry.  A crash before the flush
+        // orphans only data; a crash after leaves a consistent chain.
+        self.sb.flush_fat_cache()?;
+
         let mut need_size_update = false;
         let cur_size = self.size.load(Ordering::Relaxed);
         let new_size = cur_size.max(end_byte as u32);
@@ -896,6 +983,7 @@ impl InodeOps for Fat32Inode {
                     entry_name: String::from(name),
                     dir_cache: Mutex::new(None),
                     dir_generation: AtomicU64::new(0),
+                    dir_lock: Mutex::new(()),
                 }) as Arc<dyn InodeOps>);
             }
         }
@@ -904,6 +992,7 @@ impl InodeOps for Fat32Inode {
 
     fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        let _lock = self.dir_lock.lock();
         if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
             return Err(VfsError::AlreadyExists);
         }
@@ -925,6 +1014,7 @@ impl InodeOps for Fat32Inode {
         let mut parent = self.first_clus.load(Ordering::Relaxed);
         write_dir_entries(&self.sb, &mut parent, &new_entries)?;
         self.invalidate_dir_cache();
+        drop(_lock);
 
         let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Fat32Inode {
@@ -937,11 +1027,13 @@ impl InodeOps for Fat32Inode {
             entry_name: String::from(name),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
+            dir_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>)
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
@@ -955,17 +1047,26 @@ impl InodeOps for Fat32Inode {
         }
         if !found { return Err(VfsError::NotFound); }
 
+        // Remove directory entry first, then free clusters.
+        // Order: dir entry → FAT flush → free chain.
+        // A crash after dir entry removal leaves orphaned clusters but no
+        // stale references to freed clusters (which would cause corruption
+        // if those clusters are later allocated).
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        remove_dir_entries(&self.sb, parent, name)?;
+        self.sb.flush_fat_cache()?;
+
         if target_clus >= 2 && target_clus < EOC_MARKER {
             self.sb.free_chain(target_clus)?;
         }
-        let parent = self.first_clus.load(Ordering::Relaxed);
-        remove_dir_entries(&self.sb, parent, name)?;
+        self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
         Ok(())
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        let _lock = self.dir_lock.lock();
         if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
             return Err(VfsError::AlreadyExists);
         }
@@ -1010,6 +1111,7 @@ impl InodeOps for Fat32Inode {
         let mut parent = self.first_clus.load(Ordering::Relaxed);
         write_dir_entries(&self.sb, &mut parent, &new_entries)?;
         self.invalidate_dir_cache();
+        drop(_lock);
 
         let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(Fat32Inode {
@@ -1022,11 +1124,13 @@ impl InodeOps for Fat32Inode {
             entry_name: String::from(name),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
+            dir_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
@@ -1045,11 +1149,15 @@ impl InodeOps for Fat32Inode {
         let child_slots = read_dir_slots(&self.sb, target_clus)?;
         if child_slots.len() > 2 { return Err(VfsError::NotEmpty); }
 
+        // Remove directory entry first, then free clusters
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        remove_dir_entries(&self.sb, parent, name)?;
+        self.sb.flush_fat_cache()?;
+
         if target_clus >= 2 && target_clus < EOC_MARKER {
             self.sb.free_chain(target_clus)?;
         }
-        let parent = self.first_clus.load(Ordering::Relaxed);
-        remove_dir_entries(&self.sb, parent, name)?;
+        self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
         Ok(())
     }
@@ -1080,6 +1188,7 @@ impl InodeOps for Fat32Inode {
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
         let mut target = None;
@@ -1095,8 +1204,16 @@ impl InodeOps for Fat32Inode {
         let attr = target.sfn_entry[0x0B];
         let is_dir = (attr & ATTR_DIRECTORY) != 0;
 
-        if slots.iter().any(|s| decode_entry_name(s) == new_name) {
-            self.unlink(new_name)?;
+        // Inline removal of existing new_name (cannot call self.unlink while holding dir_lock)
+        if let Some(existing) = slots.iter().find(|s| decode_entry_name(s) == new_name) {
+            let existing_clus = first_clus_from_entry(&existing.sfn_entry);
+            remove_dir_entries(&self.sb, self.first_clus.load(Ordering::Relaxed), new_name)?;
+            self.sb.flush_fat_cache()?;
+            if existing_clus >= 2 && existing_clus < EOC_MARKER {
+                self.sb.free_chain(existing_clus)?;
+            }
+            self.sb.flush_fat_cache()?;
+            self.invalidate_dir_cache();
         }
 
         let sfn = sfn_from_name(new_name).ok_or(VfsError::InvalidInput)?;
@@ -1119,7 +1236,8 @@ impl InodeOps for Fat32Inode {
         remove_dir_entries(&self.sb, parent, old_name)?;
         self.invalidate_dir_cache();
 
-        if is_dir && fc >= 2 && fc < EOC_MARKER {
+        if is_dir && fc >= 2 && fc < EOC_MARKER && fc != self.sb.bpb.root_clus {
+            self.sb.flush_fat_cache()?;
             let clus_bytes = self.sb.bpb.byts_per_clus as usize;
             let mut buf = alloc::vec![0u8; clus_bytes];
             read_cluster(&self.sb, fc, &mut buf)?;
@@ -1133,7 +1251,7 @@ impl InodeOps for Fat32Inode {
 
     fn truncate(&self, len: u64) -> Result<(), VfsError> {
         if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
-        if len > u32::MAX as u64 { return Err(VfsError::InvalidInput); }
+        if len > u32::MAX as u64 { return Err(VfsError::FileTooLarge); }
 
         let new_size = len as u32;
         let clus_size = self.sb.bpb.byts_per_clus;
@@ -1142,19 +1260,36 @@ impl InodeOps for Fat32Inode {
         let have = self.sb.chain_len(current_first)?;
 
         if new_size == 0 && current_first != 0 {
-            self.sb.free_chain(current_first)?;
-            self.first_clus.store(0, Ordering::Relaxed);
-            self.size.store(0, Ordering::Relaxed);
+            // Remove dir entry reference first, then free clusters
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            Some(0), Some(0))?;
+            self.sb.flush_fat_cache()?;
+            self.sb.free_chain(current_first)?;
+            self.sb.flush_fat_cache()?;
+            self.first_clus.store(0, Ordering::Relaxed);
+            self.size.store(0, Ordering::Relaxed);
         } else if needed < have && current_first != 0 {
             self.sb.truncate_chain(current_first, needed)?;
+            self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            None, Some(new_size))?;
         } else if needed > have {
-            if current_first == 0 { return Err(VfsError::NoSpace); }
+            if current_first == 0 {
+                let new_clus = self.sb.alloc_cluster()?;
+                zero_cluster(&self.sb, new_clus)?;
+                if needed > 1 {
+                    self.sb.extend_chain(new_clus, needed - 1)?;
+                }
+                self.sb.flush_fat_cache()?;
+                self.first_clus.store(new_clus, Ordering::Relaxed);
+                self.size.store(new_size, Ordering::Relaxed);
+                update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
+                                               Some(new_clus), Some(new_size))?;
+                return Ok(());
+            }
             self.sb.extend_chain(current_first, needed - have)?;
+            self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            None, Some(new_size))?;
@@ -1183,15 +1318,26 @@ impl FileSystem for Fat32FileSystem {
              -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>
     {
         let dev = device.ok_or(VfsError::InvalidDevice)?;
-        let bpb = parse_bpb(&*dev)?;
+        let cached = CachedDevice::new(dev.clone());
+        let bpb = parse_bpb(&*cached)?;
+
+        // Check if the volume was cleanly unmounted
+        {
+            let mut sector = [0u8; SECTOR_SIZE];
+            read_sectors(&*cached, 0, 1, &mut sector)?;
+            if sector[0x41] & 1 != 0 {
+                log::warn!("FAT32: volume was not cleanly unmounted (dirty bit set)");
+            }
+        }
 
         let sb = Arc::new(Fat32SuperBlock {
-            device: dev,
+            device: cached,
             bpb: bpb.clone(),
             fat_cache: Mutex::new(FatCache::new()),
             next_ino: AtomicU64::new(2),
             next_alloc_hint: Mutex::new(2),
             free_clus_count: AtomicU32::new(0),
+            volume_dirty: AtomicBool::new(false),
         });
 
         // Scan free clusters on mount for accurate statfs + FSInfo
@@ -1209,6 +1355,7 @@ impl FileSystem for Fat32FileSystem {
             entry_name: String::new(),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
+            dir_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(crate::filesystems::vfs::inode::Inode::new(root_ops.clone()));

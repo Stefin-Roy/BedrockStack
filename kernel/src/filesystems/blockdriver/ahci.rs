@@ -1,6 +1,7 @@
 //! AHCI (Advanced Host Controller Interface) SATA driver.
 //!
-//! Polling-mode driver for the Q35 ICH9 AHCI controller.
+//! Polling-mode driver for the Q35 ICH9 AHCI controller with interrupt
+//! support via the pre-registered device interrupt vectors (33-48).
 //!
 //! Features:
 //!   - NCQ (Native Command Queuing) via FPDMA QUEUED (0x60/0x61)
@@ -14,9 +15,13 @@
 //!   - u32 FIS writes for lower overhead
 //!   - Proper BAR type detection (32/64-bit MMIO)
 //!   - Proper MMIO region sizing from CAP.NP
+//!   - Interrupt-driven completion with polling fallback
+//!   - Multi-port and multi-controller support
 
 use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::AtomicU32;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::mm::phys_alloc::BitmapAllocator;
@@ -212,7 +217,13 @@ fn ms_to_ticks(ms: u32) -> u32 {
 
 // ── Port state ──────────────────────────────────────────────────
 
-static PORT: Mutex<Option<Arc<AhciPort>>> = Mutex::new(None);
+static PORT_LIST: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
+
+struct PortPtr(*const AhciPort);
+unsafe impl Send for PortPtr {}
+unsafe impl Sync for PortPtr {}
+
+static IRQ_PORTS: Mutex<Vec<PortPtr>> = Mutex::new(Vec::new());
 
 struct AhciPort {
     hba: Hba,
@@ -228,9 +239,29 @@ struct AhciPort {
     model: [u8; 40],
     slots: [Slot; AHCI_MAX_SLOTS],
     slot_alloc: core::sync::atomic::AtomicU32,
+    irq_completed: AtomicU32,
+    irq_vector: u8,
 }
 
 unsafe impl Sync for AhciPort {}
+
+// ── Global AHCI interrupt handler ──────────────────────────────
+//
+// Called from the IDT device interrupt dispatch (irq_33..irq_48).
+// Reads PxIS from all active ports, clears the status, and records
+// completion in the per-port `irq_completed` mask.
+
+fn handle_ahci_irq() {
+    let ports = IRQ_PORTS.lock();
+    for pptr in ports.iter() {
+        let port = unsafe { &*pptr.0 };
+        let is = port.hba.pr32(port.port, port_off::IS);
+        if is != 0 {
+            port.hba.pw32(port.port, port_off::IS, is);
+            port.irq_completed.fetch_or(is, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
 
 // ── Low-level helpers ───────────────────────────────────────────
 
@@ -240,10 +271,27 @@ impl AhciPort {
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
         let deadline = ms_to_ticks(5000);
         let start = curr_count();
+        // Clear any stale IRQ completions before waiting.
+        self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Acquire);
         loop {
+            // Fast path: check IRQ completion first.
+            let completed = self.irq_completed.load(core::sync::atomic::Ordering::Acquire);
+            if completed & tag_mask == tag_mask {
+                // Clear completed bits.
+                self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
+                let tfd = self.hba.pr32(self.port, port_off::TFD);
+                if tfd & TFD_ERR != 0 {
+                    let serr = self.hba.pr32(self.port, port_off::SERR);
+                    self.dump_err(tag_mask, tfd as u8, serr);
+                    return Err("AHCI cmd error");
+                }
+                return Ok(());
+            }
+            // Polling fallback (also catches commands on non-IRQ paths).
             let ci = self.hba.pr32(self.port, port_off::CI);
             let sact = self.hba.pr32(self.port, port_off::SACT);
             if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
+                self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 if tfd & TFD_ERR != 0 {
                     let serr = self.hba.pr32(self.port, port_off::SERR);
@@ -525,6 +573,7 @@ impl BlockDevice for AhciPort {
                     let bytes = (req.count as usize) * 512;
                     let (buf_vaddr, buf_size) = match &req.buffer {
                         IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
+                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
                         IoBuffer::Phys(pa, sz) => (*pa, *sz),
                     };
                     if buf_size < bytes {
@@ -564,6 +613,7 @@ impl BlockDevice for AhciPort {
                     let bytes = (req.count as usize) * 512;
                     let (buf_vaddr, buf_size) = match &req.buffer {
                         IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
+                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
                         IoBuffer::Phys(pa, sz) => (*pa, *sz),
                     };
                     if buf_size >= bytes {
@@ -600,29 +650,12 @@ const VMM_VADDR: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000 - 0x20000000;
 /// AHCI VMM floor — 512 MB of virtual space for AHCI MMIO.
 const VMM_VADDR_FLOOR: u64 = VMM_VADDR - 0x2000_0000;
 
-pub fn init(root: u64, alloc: *mut BitmapAllocator) {
+fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> usize {
     use crate::drivers::serial::SerialPort;
-    SerialPort::puts("[ahci] init\n");
-
-    *VMM_STATE.lock() = Some(VmmState { root, alloc, next_vaddr: VMM_VADDR });
-
-    let dev = {
-        let mut d = None;
-        for dv in crate::pci::devices() {
-            if dv.class == 0x01 && dv.subclass == 0x06 && dv.prog_if == 0x01 { d = Some(*dv); break; }
-        }
-        d
-    };
-
-    let dev = match dev {
-        Some(d) => d,
-        None => { SerialPort::puts("[ahci] no AHCI controller\n"); return; }
-    };
-
     let (base, ok) = bar5_addr(dev.bars);
     if !ok {
         SerialPort::puts("[ahci] invalid BAR5\n");
-        return;
+        return 0;
     }
 
     let mmio = Hba { vaddr: map_mmio(base, 0x1000) };
@@ -636,7 +669,13 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
     let mmio = Hba { vaddr: map_mmio(base, mmio_sz) };
 
     let ver = mmio.r32(ghc::VS);
-    SerialPort::puts("[ahci] v");
+    SerialPort::puts("[ahci] controller ");
+    SerialPort::put_u64(dev.bus as u64);
+    SerialPort::puts(":");
+    SerialPort::put_u64(dev.device as u64);
+    SerialPort::puts(":");
+    SerialPort::put_u64(dev.function as u64);
+    SerialPort::puts(" v");
     SerialPort::put_u64(((ver >> 16) & 0xFF) as u64);
     SerialPort::puts(".");
     SerialPort::put_u64(((ver >> 8) & 0xFF) as u64);
@@ -657,11 +696,11 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
         core::hint::spin_loop();
     }
     if mmio.r32(ghc::GHC) & GHC_HR != 0 {
-        SerialPort::puts("[ahci] HBA reset timeout\n"); return;
+        SerialPort::puts("[ahci] HBA reset timeout\n"); return 0;
     }
     mmio.w32(ghc::GHC, mmio.r32(ghc::GHC) | GHC_AE);
 
-    // Probe
+    let mut n_initialized = 0usize;
     for p in 0u8..n_ports.min(32) as u8 {
         if pi & (1 << p) == 0 { continue; }
 
@@ -678,13 +717,21 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
         if (ssts >> 8) & 0x0F != 1 { continue; }
         if mmio.pr32(p, port_off::SIG) != 0x0000_0101 { continue; }
 
-        match init_one(p, &mmio, alloc, max_prdt_raw.min(MAX_PRDT), n_slots_raw) {
+        match init_one(p, &mmio, alloc, max_prdt_raw.min(MAX_PRDT), n_slots_raw, dev.interrupt_line) {
             Ok(port) => {
-                *PORT.lock() = Some(Arc::new(port));
+                let port_arc = Arc::new(port);
+                // Add to IRQ handler list (raw pointer).
+                let ptr = Arc::as_ptr(&port_arc);
+                IRQ_PORTS.lock().push(PortPtr(ptr));
+                PORT_LIST.lock().push(port_arc as Arc<dyn BlockDevice>);
+                n_initialized += 1;
                 SerialPort::puts("[ahci] port ");
                 SerialPort::put_u64(p as u64);
-                SerialPort::puts(" ready\n");
-                return;
+                SerialPort::puts(" ready (");
+                SerialPort::put_u64(n_initialized as u64);
+                SerialPort::puts("/");
+                SerialPort::put_u64(n_ports as u64);
+                SerialPort::puts(")\n");
             }
             Err(e) => {
                 SerialPort::puts("[ahci] port ");
@@ -694,6 +741,30 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
                 SerialPort::puts("\n");
             }
         }
+    }
+    n_initialized
+}
+
+pub fn init(root: u64, alloc: *mut BitmapAllocator) {
+    use crate::drivers::serial::SerialPort;
+    SerialPort::puts("[ahci] init\n");
+
+    *VMM_STATE.lock() = Some(VmmState { root, alloc, next_vaddr: VMM_VADDR });
+
+    let mut total = 0usize;
+    for dev in crate::pci::devices() {
+        if dev.class == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01 {
+            let initialized = init_controller(dev, alloc);
+            total += initialized;
+        }
+    }
+
+    if total == 0 {
+        SerialPort::puts("[ahci] no AHCI devices ready\n");
+    } else {
+        SerialPort::puts("[ahci] init complete: ");
+        SerialPort::put_u64(total as u64);
+        SerialPort::puts(" port(s) ready\n");
     }
 }
 
@@ -709,7 +780,7 @@ fn bar5_addr(bars: [u32; 6]) -> (u64, bool) {
     }
 }
 
-fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
+fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_slots_raw: u32, interrupt_line: u8) -> Result<AhciPort, &'static str> {
     let alloc = unsafe { &mut *alloc };
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
@@ -760,6 +831,21 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     hba.pw32(p, port_off::SERR, !0);
     hba.pw32(p, port_off::IE, 0);
 
+    // Attempt IRQ setup: register handler, enable IOAPIC, enable port interrupts.
+    let mut irq_vector = 0u8;
+    if interrupt_line != 0 {
+        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
+            // Enable IOAPIC for this GSI (interrupt_line may be the GSI).
+            // In APIC mode on Q35, interrupt_line typically matches the GSI.
+            let _ = crate::platform::x86_64_pc::ioapic::enable_irq(
+                interrupt_line as u32,
+                crate::acpi::Polarity::ActiveHigh,
+                crate::acpi::TriggerMode::Edge,
+            );
+            irq_vector = vector;
+        }
+    }
+
     hba.pw32(p, port_off::CMD, CMD_SUD | CMD_POD);
     for _ in 0..100 { core::hint::spin_loop(); }
 
@@ -782,13 +868,25 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
         sector_count: 0, lba48: false, model: [0u8; 40],
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
+        irq_completed: AtomicU32::new(0),
+        irq_vector,
     };
 
     port.identify()?;
+
+    // Enable port interrupts if IRQ setup succeeded.
+    if irq_vector != 0 {
+        hba.pw32(p, port_off::IE, 0x0000_0089); // D2H + SDB + PC
+    }
+
     Ok(port)
 }
 
 pub fn device() -> Option<Arc<dyn BlockDevice>> {
-    let g = PORT.lock();
-    g.as_ref().map(|p| p.clone() as Arc<dyn BlockDevice>)
+    let g = PORT_LIST.lock();
+    g.first().cloned()
+}
+
+pub fn devices() -> Vec<Arc<dyn BlockDevice>> {
+    PORT_LIST.lock().clone()
 }

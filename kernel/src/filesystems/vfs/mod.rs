@@ -210,6 +210,9 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
             }
         }
     }
+    // Flush FS data (FAT cache, FSInfo, dirty bit) before unmount
+    sync_drive(drive)?;
+
     // Check no open FDs reference this drive
     let mount = DRIVE_MAP.lookup(drive)?;
     for fd in FD_TABLE.iter_active() {
@@ -663,6 +666,11 @@ pub fn sync_all() -> Result<(), VfsError> {
         mount.sb.ops.sync_fs()?;
     }
     Ok(())
+}
+
+fn sync_drive(drive: char) -> Result<(), VfsError> {
+    let mount = DRIVE_MAP.lookup(drive)?;
+    mount.sb.ops.sync_fs()
 }
 
 pub fn statfs(path: &str) -> Result<StatFs, VfsError> {
