@@ -215,6 +215,25 @@ fn ms_to_ticks(ms: u32) -> u32 {
     (ms as u64 * i as u64 / p as u64) as u32
 }
 
+fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
+    if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+    if init_count() != 0 {
+        let deadline = ms_to_ticks(100);
+        let start = curr_count();
+        loop {
+            if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+            if elapsed_ticks(start) >= deadline { return false; }
+            core::hint::spin_loop();
+        }
+    } else {
+        for _ in 0..10_000_000 {
+            if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+            core::hint::spin_loop();
+        }
+        false
+    }
+}
+
 // ── Port state ──────────────────────────────────────────────────
 
 static PORT_LIST: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
@@ -652,7 +671,7 @@ const VMM_VADDR_FLOOR: u64 = VMM_VADDR - 0x2000_0000;
 
 fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> usize {
     use crate::drivers::serial::SerialPort;
-    let (base, ok) = bar5_addr(dev.bars);
+    let (base, ok) = bar5_addr(dev);
     if !ok {
         SerialPort::puts("[ahci] invalid BAR5\n");
         return 0;
@@ -705,15 +724,8 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
         if pi & (1 << p) == 0 { continue; }
 
         // Wait for device detection after HBA reset (port may not be ready yet)
-        let mut ssts = mmio.pr32(p, port_off::SSTS);
-        if ssts & SSTS_DET_MASK != SSTS_DET_ESTAB {
-            for _ in 0..100_000 {
-                ssts = mmio.pr32(p, port_off::SSTS);
-                if ssts & SSTS_DET_MASK == SSTS_DET_ESTAB { break; }
-                core::hint::spin_loop();
-            }
-        }
-        if ssts & SSTS_DET_MASK != SSTS_DET_ESTAB { continue; }
+        if !wait_ssts_det(&mmio, p) { continue; }
+        let ssts = mmio.pr32(p, port_off::SSTS);
         if (ssts >> 8) & 0x0F != 1 { continue; }
         if mmio.pr32(p, port_off::SIG) != 0x0000_0101 { continue; }
 
@@ -768,12 +780,18 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
     }
 }
 
-fn bar5_addr(bars: [u32; 6]) -> (u64, bool) {
+fn bar5_addr(dev: &crate::pci::PciDevice) -> (u64, bool) {
+    let bars = dev.bars;
     if bars[5] & 1 != 0 { return (0, false); }
     match bars[5] & 0x06 {
         0 => ((bars[5] & 0xFFFF_FFF0) as u64, true),
         4 => {
-            let base = ((bars[5] as u64) & 0xFFFF_FFF0) | ((bars[4] as u64) << 32);
+            // Upper 32 bits of a 64-bit BAR5 live at PCI config offset 0x28,
+            // which is beyond the 6-BAR array read during enumeration.
+            let upper = crate::pci::ecam::read_u32(
+                dev.segment, dev.bus, dev.device, dev.function, 0x28
+            );
+            let base = ((bars[5] as u64) & 0xFFFF_FFF0) | ((upper as u64) << 32);
             (base, true)
         }
         _ => (0, false),
@@ -852,13 +870,7 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_FRE);
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_ST);
 
-    for _ in 0..100_000 {
-        if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { break; }
-        core::hint::spin_loop();
-    }
-    if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK != SSTS_DET_ESTAB {
-        return Err("no device");
-    }
+    if !wait_ssts_det(hba, p) { return Err("no device"); }
 
     let mut port = AhciPort {
         hba: *hba, port: p,
