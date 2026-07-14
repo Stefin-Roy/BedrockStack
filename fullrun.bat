@@ -17,6 +17,9 @@ REM Parse architecture argument
 set ARCH=%1
 if "%ARCH%"=="" set ARCH=x86_64
 
+REM Set to 1 to gate the CPU slow mode feature (Intel-only, x86_64 only).
+set CPU_SLOW=1
+
 if /i "%ARCH%"=="x86_64" goto :arch_x86_64
 if /i "%ARCH%"=="riscv64" goto :arch_riscv64
 echo [fullrun] ERROR: Unknown architecture "%ARCH%". Use x86_64 or riscv64.
@@ -58,7 +61,9 @@ if not exist "%OVMF_PATH%" (
 echo [1/4] Building kernel (x86_64-unknown-none, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build --target x86_64-unknown-none -p kernel 2>&1
+set CARGO_FEATURES=
+if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features cpu_slow
+cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"
@@ -71,7 +76,9 @@ echo.
 echo [2/4] Building boot (x86_64-unknown-uefi, debug)...
 echo --- boot build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build --target x86_64-unknown-uefi -p boot 2>&1
+set CARGO_FEATURES=
+if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features cpu_slow
+cargo build --target x86_64-unknown-uefi -p boot %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: boot build failed with exit code %errorlevel%
     echo boot build FAILED: exit %errorlevel% >> "%LOG_FILE%"

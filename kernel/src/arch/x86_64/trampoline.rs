@@ -239,6 +239,12 @@ pub extern "C" fn ap_entry64() -> ! {
     SerialPort::put_u64(cpu_id as u64);
     SerialPort::puts(" online\n");
 
+    #[cfg(feature = "cpu_slow")]
+    {
+        SerialPort::puts("[AP] Enabling CPU slow mode...\n");
+        unsafe { crate::arch::x86_64::limiter::enable_cpu_slow_mode() };
+    }
+
     // Per-CPU GDT + TSS (double-fault IST stack).  This reloads CS/DS/ES/SS
     // from the real kernel GDT and loads the task register.
     crate::arch::x86_64::gdt::init();

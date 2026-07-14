@@ -13,6 +13,8 @@ use uefi::fs::FileSystem;
 
 mod allocator;
 mod elf;
+#[cfg(feature = "cpu_slow")]
+mod limiter;
 
 use common::serial::x86_64::SerialPort;
 use common::types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
@@ -170,6 +172,12 @@ fn main() -> Status {
     // 8. We are now bare metal. Jump to kernel.
     // NOTE: Serial I/O still works after exit_boot_services (bare metal port I/O).
     SerialPort::puts("[boot] Boot services exited. Jumping to kernel...\n");
+
+    #[cfg(feature = "cpu_slow")]
+    {
+        SerialPort::puts("[boot] Enabling CPU slow mode...\n");
+        unsafe { limiter::enable_cpu_slow_mode() };
+    }
 
     unsafe {
         jump_to_kernel(entry, stack_top, regions_ptr, regions_len, fb_ptr, stack_guard, rsdp_addr);

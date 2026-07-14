@@ -3,6 +3,9 @@ name = "kernel"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+cpu_slow = []
+
 [dependencies]
 spin = "0.9"
 log = "0.4"

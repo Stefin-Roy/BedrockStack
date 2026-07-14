@@ -25,6 +25,12 @@ pub extern "sysv64" fn _start(
     SerialPort::init();
     SerialPort::puts("[kernel] _start entered\n");
 
+    #[cfg(feature = "cpu_slow")]
+    {
+        SerialPort::puts("[kernel] Enabling CPU slow mode...\n");
+        unsafe { kernel::arch::x86_64::limiter::enable_cpu_slow_mode() };
+    }
+
     // Validate pointers from bootloader before dereferencing
     assert!(!memory_map_ptr.is_null(), "memory_map_ptr is null");
     assert!(!framebuffer_ptr.is_null(), "framebuffer_ptr is null");

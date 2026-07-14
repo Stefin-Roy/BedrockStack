@@ -1,5 +1,7 @@
 pub mod gdt;
 pub mod idt;
+#[cfg(feature = "cpu_slow")]
+pub mod limiter;
 pub mod paging;
 pub mod serial;
 pub mod trampoline;
