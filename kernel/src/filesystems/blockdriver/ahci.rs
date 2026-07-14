@@ -74,6 +74,13 @@ const SSTS_DET_ESTAB: u32 = 3;
 
 const TFD_ERR: u32 = 1 << 8;
 
+// The LAPIC timer normally provides the wall-clock deadline for AHCI polling.
+// Do not rely on it exclusively, though: a stopped/misconfigured timer used to
+// leave the BSP spinning forever during controller discovery.  This is a
+// deliberately generous last-resort bound; normal QEMU hardware completes
+// these operations long before it is reached.
+const POLL_FALLBACK_LIMIT: u32 = 1_000_000;
+
 #[derive(Clone, Copy)]
 struct Hba { vaddr: u64 }
 
@@ -215,14 +222,30 @@ fn ms_to_ticks(ms: u32) -> u32 {
     (ms as u64 * i as u64 / p as u64) as u32
 }
 
+/// True when either the LAPIC deadline has passed or its counter is not
+/// progressing.  The latter guard makes every MMIO polling loop finite even
+/// when timer setup failed.
+fn poll_timed_out(start: u32, deadline: u32, previous: &mut u32, stagnant: &mut u32) -> bool {
+    let current = curr_count();
+    if current == *previous {
+        *stagnant = stagnant.saturating_add(1);
+    } else {
+        *previous = current;
+        *stagnant = 0;
+    }
+    elapsed_ticks(start) >= deadline || *stagnant >= POLL_FALLBACK_LIMIT
+}
+
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
     if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
     if init_count() != 0 {
         let deadline = ms_to_ticks(100);
         let start = curr_count();
+        let mut previous = start;
+        let mut stagnant = 0;
         loop {
             if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-            if elapsed_ticks(start) >= deadline { return false; }
+            if poll_timed_out(start, deadline, &mut previous, &mut stagnant) { return false; }
             core::hint::spin_loop();
         }
     } else {
@@ -290,6 +313,8 @@ impl AhciPort {
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
         let deadline = ms_to_ticks(5000);
         let start = curr_count();
+        let mut previous = start;
+        let mut stagnant = 0;
         // Clear any stale IRQ completions before waiting.
         self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Acquire);
         loop {
@@ -319,7 +344,7 @@ impl AhciPort {
                 }
                 return Ok(());
             }
-            if elapsed_ticks(start) >= deadline {
+            if poll_timed_out(start, deadline, &mut previous, &mut stagnant) {
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 let serr = self.hba.pr32(self.port, port_off::SERR);
                 self.dump_err(tag_mask, tfd as u8, serr);
@@ -483,15 +508,21 @@ impl AhciPort {
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
         self.hba.pw32(self.port, port_off::SCTL, (sctl & !0x0F) | 1);
         let start = curr_count();
-        while ticks_to_ms(elapsed_ticks(start)) < 2 { core::hint::spin_loop(); }
+        let mut previous = start;
+        let mut stagnant = 0;
+        while !poll_timed_out(start, ms_to_ticks(2), &mut previous, &mut stagnant) {
+            core::hint::spin_loop();
+        }
         self.hba.pw32(self.port, port_off::SCTL, sctl & !0x0F);
 
         let start = curr_count();
+        let mut previous = start;
+        let mut stagnant = 0;
         loop {
             if self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB {
                 break;
             }
-            if ticks_to_ms(elapsed_ticks(start)) >= 100 {
+            if poll_timed_out(start, ms_to_ticks(100), &mut previous, &mut stagnant) {
                 SerialPort::puts("[ahci] port reset timeout\n");
                 return Err("port reset timeout");
             }
@@ -708,7 +739,9 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
     SerialPort::put_u64(n_slots_raw as u64);
     SerialPort::puts("\n");
 
-    // HBA reset
+    // HBA reset. Keep this phase visible: an HBA that never acknowledges a
+    // reset cannot be safely probed.
+    SerialPort::puts("[ahci] resetting HBA\n");
     mmio.w32(ghc::GHC, GHC_HR);
     for _ in 0..1000 {
         if mmio.r32(ghc::GHC) & GHC_HR == 0 { break; }
@@ -718,13 +751,19 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
         SerialPort::puts("[ahci] HBA reset timeout\n"); return 0;
     }
     mmio.w32(ghc::GHC, mmio.r32(ghc::GHC) | GHC_AE);
+    SerialPort::puts("[ahci] HBA reset complete\n");
 
     let mut n_initialized = 0usize;
     for p in 0u8..n_ports.min(32) as u8 {
         if pi & (1 << p) == 0 { continue; }
 
         // Wait for device detection after HBA reset (port may not be ready yet)
-        if !wait_ssts_det(&mmio, p) { continue; }
+        if !wait_ssts_det(&mmio, p) {
+            SerialPort::puts("[ahci] port ");
+            SerialPort::put_u64(p as u64);
+            SerialPort::puts(" no device\n");
+            continue;
+        }
         let ssts = mmio.pr32(p, port_off::SSTS);
         if (ssts >> 8) & 0x0F != 1 { continue; }
         if mmio.pr32(p, port_off::SIG) != 0x0000_0101 { continue; }
