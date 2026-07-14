@@ -204,10 +204,14 @@ fn translate(vaddr: u64) -> Option<u64> {
 fn init_count() -> u32 { apic::timer_init_count() }
 fn curr_count() -> u32 { apic::timer_current_count() }
 
-fn elapsed_ticks(start: u32) -> u32 {
+fn elapsed_ticks(start: u32, wraps: u32) -> u32 {
     let i = init_count();
     let c = curr_count();
-    if c <= start { start - c } else { start + (i - c) }
+    if wraps == 0 {
+        start.wrapping_sub(c)
+    } else {
+        start.wrapping_add(wraps.wrapping_mul(i + 1)).wrapping_sub(c)
+    }
 }
 
 fn ticks_to_ms(t: u32) -> u32 {
@@ -225,15 +229,22 @@ fn ms_to_ticks(ms: u32) -> u32 {
 /// True when either the LAPIC deadline has passed or its counter is not
 /// progressing.  The latter guard makes every MMIO polling loop finite even
 /// when timer setup failed.
-fn poll_timed_out(start: u32, deadline: u32, previous: &mut u32, stagnant: &mut u32) -> bool {
+///
+/// `wraps` counts how many times the periodic down-counter has wrapped past
+/// zero, which is needed because the APIC timer runs in periodic mode and the
+/// counter alone can only represent ~1 ms of elapsed time.
+fn poll_timed_out(start: u32, deadline: u32, wraps: &mut u32, previous: &mut u32, stagnant: &mut u32) -> bool {
     let current = curr_count();
     if current == *previous {
         *stagnant = stagnant.saturating_add(1);
     } else {
+        if current > *previous {
+            *wraps = wraps.wrapping_add(1);
+        }
         *previous = current;
         *stagnant = 0;
     }
-    elapsed_ticks(start) >= deadline || *stagnant >= POLL_FALLBACK_LIMIT
+    elapsed_ticks(start, *wraps) >= deadline || *stagnant >= POLL_FALLBACK_LIMIT
 }
 
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
@@ -241,11 +252,12 @@ fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
     if init_count() != 0 {
         let deadline = ms_to_ticks(100);
         let start = curr_count();
+        let mut wraps = 0;
         let mut previous = start;
         let mut stagnant = 0;
         loop {
             if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-            if poll_timed_out(start, deadline, &mut previous, &mut stagnant) { return false; }
+            if poll_timed_out(start, deadline, &mut wraps, &mut previous, &mut stagnant) { return false; }
             core::hint::spin_loop();
         }
     } else {
@@ -313,6 +325,7 @@ impl AhciPort {
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
         let deadline = ms_to_ticks(5000);
         let start = curr_count();
+        let mut wraps = 0;
         let mut previous = start;
         let mut stagnant = 0;
         // Clear any stale IRQ completions before waiting.
@@ -344,7 +357,7 @@ impl AhciPort {
                 }
                 return Ok(());
             }
-            if poll_timed_out(start, deadline, &mut previous, &mut stagnant) {
+            if poll_timed_out(start, deadline, &mut wraps, &mut previous, &mut stagnant) {
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 let serr = self.hba.pr32(self.port, port_off::SERR);
                 self.dump_err(tag_mask, tfd as u8, serr);
@@ -508,21 +521,23 @@ impl AhciPort {
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
         self.hba.pw32(self.port, port_off::SCTL, (sctl & !0x0F) | 1);
         let start = curr_count();
+        let mut wraps = 0;
         let mut previous = start;
         let mut stagnant = 0;
-        while !poll_timed_out(start, ms_to_ticks(2), &mut previous, &mut stagnant) {
+        while !poll_timed_out(start, ms_to_ticks(2), &mut wraps, &mut previous, &mut stagnant) {
             core::hint::spin_loop();
         }
         self.hba.pw32(self.port, port_off::SCTL, sctl & !0x0F);
 
         let start = curr_count();
+        let mut wraps = 0;
         let mut previous = start;
         let mut stagnant = 0;
         loop {
             if self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB {
                 break;
             }
-            if poll_timed_out(start, ms_to_ticks(100), &mut previous, &mut stagnant) {
+            if poll_timed_out(start, ms_to_ticks(100), &mut wraps, &mut previous, &mut stagnant) {
                 SerialPort::puts("[ahci] port reset timeout\n");
                 return Err("port reset timeout");
             }
