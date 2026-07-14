@@ -664,7 +664,16 @@ pub fn init(root: u64, alloc: *mut BitmapAllocator) {
     // Probe
     for p in 0u8..n_ports.min(32) as u8 {
         if pi & (1 << p) == 0 { continue; }
-        let ssts = mmio.pr32(p, port_off::SSTS);
+
+        // Wait for device detection after HBA reset (port may not be ready yet)
+        let mut ssts = mmio.pr32(p, port_off::SSTS);
+        if ssts & SSTS_DET_MASK != SSTS_DET_ESTAB {
+            for _ in 0..100_000 {
+                ssts = mmio.pr32(p, port_off::SSTS);
+                if ssts & SSTS_DET_MASK == SSTS_DET_ESTAB { break; }
+                core::hint::spin_loop();
+            }
+        }
         if ssts & SSTS_DET_MASK != SSTS_DET_ESTAB { continue; }
         if (ssts >> 8) & 0x0F != 1 { continue; }
         if mmio.pr32(p, port_off::SIG) != 0x0000_0101 { continue; }

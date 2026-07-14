@@ -124,7 +124,7 @@ fn test_open_create() -> Result<(), &'static str> {
 }
 
 fn test_write_read() -> Result<(), &'static str> {
-    let fd = try_open("A>test_wr.txt", OpenFlags::CREATE | OpenFlags::WRITE)?;
+    let fd = try_open("A>test_wr.txt", OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::READ)?;
     try_write(fd, b"HelloWorld")?;
     try_seek(fd, SeekFrom::Start(0))?;
     let mut buf = [0u8; 10];
@@ -137,7 +137,7 @@ fn test_write_read() -> Result<(), &'static str> {
 }
 
 fn test_seek() -> Result<(), &'static str> {
-    let fd = try_open("A>test_seek.txt", OpenFlags::CREATE | OpenFlags::WRITE)?;
+    let fd = try_open("A>test_seek.txt", OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::READ)?;
     try_write(fd, b"0123456789")?;
     try_seek(fd, SeekFrom::Start(3))?;
     let mut buf = [0u8; 4];
@@ -263,7 +263,7 @@ fn test_truncate() -> Result<(), &'static str> {
 }
 
 fn test_append() -> Result<(), &'static str> {
-    let fd = try_open("A>test_append.txt", OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::APPEND)?;
+    let fd = try_open("A>test_append.txt", OpenFlags::CREATE | OpenFlags::WRITE | OpenFlags::APPEND | OpenFlags::READ)?;
     try_write(fd, b"Hello")?;
     try_write(fd, b"World")?;
     try_seek(fd, SeekFrom::Start(0))?;
