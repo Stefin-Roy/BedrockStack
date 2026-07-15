@@ -230,6 +230,11 @@ impl Kernel {
         use display::Display;
         self.framebuffer.clear();
 
+        // The physical allocator was moved from the stack of `new()` into
+        // `self.allocator`, leaving the raw pointer stashed by `heap::init`
+        // dangling.  Re-point it at the final (stable) address.
+        heap::set_phys_allocator(&mut self.allocator);
+
         // Initialise PCI subsystem (ECAM mapping + bus enumeration).
         if let Some(ref acpi) = self.acpi {
             crate::pci::init(

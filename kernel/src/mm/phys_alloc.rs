@@ -150,6 +150,15 @@ impl BitmapAllocator {
                 return Some((i as u64) * 4096);
             }
         }
+        // Wrap-around: scan from 0 to next_free in case earlier frames
+        // were freed or next_free was initialised past usable frames.
+        for i in 0..self.next_free {
+            if self.is_free(i) {
+                self.set_used(i);
+                self.next_free = i + 1;
+                return Some((i as u64) * 4096);
+            }
+        }
         None
     }
 
@@ -158,21 +167,25 @@ impl BitmapAllocator {
     /// Returns the physical address of the first frame, or `None` if
     /// insufficient contiguous frames are available.
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
-        let mut run_start = self.next_free;
-        let mut run_len = 0;
-        for i in self.next_free..self.total_frames {
-            if self.is_free(i) {
-                if run_len == 0 { run_start = i; }
-                run_len += 1;
-                if run_len >= count {
-                    for j in run_start..run_start + count {
-                        self.set_used(j);
+        // Scan from next_free to end-of-bitmap, then wrap around from 0.
+        for offset in [self.next_free, 0] {
+            let end = if offset == 0 { self.next_free } else { self.total_frames };
+            let mut run_start = offset;
+            let mut run_len = 0;
+            for i in offset..end {
+                if self.is_free(i) {
+                    if run_len == 0 { run_start = i; }
+                    run_len += 1;
+                    if run_len >= count {
+                        for j in run_start..run_start + count {
+                            self.set_used(j);
+                        }
+                        self.next_free = run_start + count;
+                        return Some((run_start as u64) * 4096);
                     }
-                    self.next_free = run_start + count;
-                    return Some((run_start as u64) * 4096);
+                } else {
+                    run_len = 0;
                 }
-            } else {
-                run_len = 0;
             }
         }
         None

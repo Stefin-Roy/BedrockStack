@@ -166,7 +166,23 @@ static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static HEAP: Mutex<HeapInner> = Mutex::new(HeapInner::empty());
 
 /// Raw pointer to the physical allocator, stashed so `alloc()` can grow the heap.
+///
+/// # Safety
+/// The caller must ensure the pointed-to `BitmapAllocator` outlives the
+/// kernel heap (i.e. lives for the entire remaining boot sequence).  This
+/// pointer is set once by `init()`, but may be *updated* after a move with
+/// `set_phys_allocator()`.
 static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
+
+/// Update the physical allocator pointer after a move.
+///
+/// The heap stashes a raw pointer to the physical allocator during `init()`,
+/// but the allocator struct may be moved (e.g. into `Kernel`).  Call this
+/// once the final location is known so heap growth and DMA allocations
+/// continue to work.
+pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
+    unsafe { PHYS_ALLOCATOR = phys as *mut BitmapAllocator; }
+}
 
 unsafe fn phys_allocator() -> &'static mut BitmapAllocator {
     let ptr = unsafe { PHYS_ALLOCATOR };
