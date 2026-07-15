@@ -92,22 +92,6 @@ impl Kernel {
             )
         };
 
-        #[cfg(feature = "display_log")]
-        {
-            use framebuffer::Console;
-            let console = unsafe {
-                Console::new(
-                    display.ptr(),
-                    display.width(),
-                    display.height(),
-                    display.stride(),
-                    display.pixel_format(),
-                    display.bpp(),
-                )
-            };
-            crate::drivers::serial::set_console(console);
-        }
-
         SerialPort::puts("[kernel] Kernel::new: find_bitmap_region\n");
         let bitmap_region = find_bitmap_region(memory_map);
 
@@ -140,6 +124,23 @@ impl Kernel {
 
         SerialPort::puts("[kernel] Kernel::new: heap::init\n");
         unsafe { heap::init(&mut allocator) };
+
+        #[cfg(feature = "display_log")]
+        {
+            use framebuffer::Console;
+            let console = unsafe {
+                Console::new(
+                    display.ptr(),
+                    display.width(),
+                    display.height(),
+                    display.stride(),
+                    display.pixel_format(),
+                    display.bpp(),
+                )
+            };
+            crate::drivers::serial::set_console(console);
+        }
+
         SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {

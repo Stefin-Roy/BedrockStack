@@ -215,15 +215,10 @@ pub unsafe fn init(phys: &mut BitmapAllocator) {
 fn allocate_pages(heap: &mut HeapInner, count: usize) {
     let phys = unsafe { phys_allocator() };
 
-    for _ in 0..count {
-        if let Some(addr) = phys.alloc() {
-            unsafe {
-                heap.add_region(addr as usize, 4096);
-            }
-        } else {
-            SerialPort::puts("[heap] WARN: out of physical frames\n");
-            break;
-        }
+    if let Some(addr) = phys.alloc_contiguous(count) {
+        unsafe { heap.add_region(addr as usize, count * 4096); }
+    } else {
+        SerialPort::puts("[heap] WARN: no contiguous frames for heap growth\n");
     }
 }
 
