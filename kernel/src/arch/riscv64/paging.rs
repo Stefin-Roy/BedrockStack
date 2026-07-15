@@ -19,8 +19,9 @@ pub fn setup(
     framebuffer_addr: u64,
     framebuffer_height: usize,
     framebuffer_stride: usize,
+    framebuffer_bpp: u8,
 ) -> Vmm {
-    let fb_size = (framebuffer_stride * framebuffer_height * 4) as u64;
+    let fb_size = (framebuffer_stride * framebuffer_height * framebuffer_bpp as usize) as u64;
     let fb_start = framebuffer_addr;
     let fb_end = framebuffer_addr.saturating_add(fb_size);
 

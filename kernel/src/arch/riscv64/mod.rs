@@ -67,8 +67,9 @@ impl Arch for Riscv64 {
         fb_addr: u64,
         fb_height: usize,
         fb_stride: usize,
+        fb_bpp: u8,
     ) -> Vmm {
-        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride)
+        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride, fb_bpp)
     }
 
     fn discover_cpus(acpi: Option<&AcpiSubsystem>) -> alloc::vec::Vec<(u32, bool)> {

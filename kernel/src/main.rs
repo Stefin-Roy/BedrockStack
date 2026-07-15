@@ -145,6 +145,7 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     static FB_INFO: FramebufferInfo = FramebufferInfo {
         address: 0, width: 0, height: 0, stride: 0,
         pixel_format: PixelFormat::Bgr,
+        bpp: 4,
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");

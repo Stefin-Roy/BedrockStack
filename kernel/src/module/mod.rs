@@ -2,7 +2,7 @@ pub mod fat32_test;
 pub mod registry;
 pub mod vfs_test;
 
-use crate::display::framebuffer::Framebuffer;
+use framebuffer::Framebuffer;
 
 /// Module trait for loadable kernel modules.
 ///

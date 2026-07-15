@@ -32,9 +32,10 @@ pub struct FramebufferInfo {
     pub address: u64,
     pub width: usize,
     pub height: usize,
-    /// Pixels per scanline (NOT bytes). Bytes per row = `stride * 4`.
+    /// Pixels per scanline (NOT bytes). Bytes per row = `stride * bpp`.
     pub stride: usize,
     pub pixel_format: PixelFormat,
+    pub bpp: u8,
 }
 
 #[repr(C)]

@@ -3,8 +3,8 @@
 use super::Module;
 use super::fat32_test::Fat32Test;
 use super::vfs_test::VfsTest;
-use crate::display::framebuffer::Framebuffer;
-use crate::display::Display as _;
+use framebuffer::Framebuffer;
+use framebuffer::Display as _;
 
 /// Hello World module.
 struct HelloModule;

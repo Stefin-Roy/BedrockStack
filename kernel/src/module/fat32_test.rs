@@ -3,7 +3,7 @@ use alloc::vec::Vec;
 use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-use crate::display::framebuffer::Framebuffer;
+use framebuffer::Framebuffer;
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::vfs;
 use crate::filesystems::vfs::error::VfsError;

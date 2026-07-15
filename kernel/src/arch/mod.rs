@@ -45,6 +45,7 @@ pub trait Arch {
         fb_addr: u64,
         fb_height: usize,
         fb_stride: usize,
+        fb_bpp: u8,
     ) -> Vmm;
 
     /// Discover CPU topology from firmware tables (MADT / DTB).

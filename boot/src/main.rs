@@ -254,6 +254,7 @@ fn get_framebuffer_info() -> FramebufferInfo {
         height,
         stride,
         pixel_format,
+        bpp: 4,
     }
 }
 

@@ -10,7 +10,7 @@ type Inner = common::serial::x86_64::SerialPort;
 type Inner = common::serial::riscv64::SerialPort;
 
 #[cfg(feature = "display_log")]
-use crate::display::console::Console;
+use framebuffer::Console;
 
 #[cfg(feature = "display_log")]
 struct ConsoleCell(UnsafeCell<Option<Console>>);

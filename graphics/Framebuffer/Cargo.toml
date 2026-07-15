@@ -1,0 +1,11 @@
+[package]
+name = "framebuffer"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+scrollback = []
+
+[dependencies]
+common = { path = "../../common" }

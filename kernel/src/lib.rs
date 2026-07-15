@@ -5,7 +5,6 @@ extern crate alloc;
 pub mod acpi;
 pub mod arch;
 pub mod boot;
-pub mod display;
 pub mod drivers;
 pub mod filesystems;
 #[cfg(target_arch = "riscv64")]
@@ -22,7 +21,7 @@ pub mod smp;
 use acpi::AcpiSubsystem;
 use arch::{Arch, CurrentArch};
 use boot::{FramebufferInfo, MemoryRegion};
-use display::framebuffer::Framebuffer;
+use framebuffer::Framebuffer;
 
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
@@ -89,12 +88,13 @@ impl Kernel {
                 framebuffer.height,
                 framebuffer.stride,
                 framebuffer.pixel_format,
+                framebuffer.bpp,
             )
         };
 
         #[cfg(feature = "display_log")]
         {
-            use crate::display::console::Console;
+            use framebuffer::Console;
             let console = unsafe {
                 Console::new(
                     display.ptr(),
@@ -102,6 +102,7 @@ impl Kernel {
                     display.height(),
                     display.stride(),
                     display.pixel_format(),
+                    display.bpp(),
                 )
             };
             crate::drivers::serial::set_console(console);
@@ -211,9 +212,10 @@ impl Kernel {
             &mut self.allocator,
             &self.layout,
             self.stack_guard,
-            self.framebuffer.ptr() as u64,
+            self.framebuffer.phys_addr(),
             self.framebuffer.height(),
             self.framebuffer.stride(),
+            self.framebuffer.bpp(),
         );
         let root = vmm.root();
         unsafe {
@@ -245,7 +247,7 @@ impl Kernel {
     }
 
     pub fn run(&mut self) -> ! {
-        use display::Display;
+        use framebuffer::Display;
         self.framebuffer.clear();
 
         // The physical allocator was moved from the stack of `new()` into
