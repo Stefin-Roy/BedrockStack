@@ -24,14 +24,14 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
 use crate::platform::x86_64_pc::apic;
+use super::dma;
+use super::dma::DmaAllocator;
+use super::driver::StorageDriver;
 use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
 
 const AHCI_MAX_SLOTS: usize = 32;
 const MAX_PRDT: usize = 64;
-const TRANS_CACHE_SIZE: usize = 64;
 
 #[allow(dead_code)]
 mod ghc {
@@ -122,83 +122,6 @@ struct Slot {
     ct_vaddr: u64,
 }
 
-// ── Translation cache ──────────────────────────────────────────
-//
-// Avoids repeated 4-level page walks when the same physical page
-// is referenced across multiple PRDT entries or commands.
-
-struct TransCacheInner {
-    entries: [(u64, u64); TRANS_CACHE_SIZE],
-    next: usize,
-}
-
-struct TransCache {
-    data: core::cell::UnsafeCell<TransCacheInner>,
-}
-
-unsafe impl Sync for TransCache {}
-
-impl TransCache {
-    const fn new() -> Self {
-        TransCache {
-            data: core::cell::UnsafeCell::new(TransCacheInner {
-                entries: [(0, 0); TRANS_CACHE_SIZE],
-                next: 0,
-            }),
-        }
-    }
-
-    fn lookup_or_translate(&self, vaddr: u64) -> Option<u64> {
-        let inner = unsafe { &mut *self.data.get() };
-        let vaddr_page = vaddr & !0xFFF;
-        for &(v, p) in &inner.entries {
-            if v == vaddr_page {
-                return Some(p);
-            }
-        }
-        let pa = translate(vaddr_page)?;
-        let idx = inner.next % TRANS_CACHE_SIZE;
-        inner.entries[idx] = (vaddr_page, pa);
-        inner.next = inner.next.wrapping_add(1);
-        Some(pa)
-    }
-}
-
-static TRANS_CACHE: TransCache = TransCache::new();
-
-// ── VMM for MMIO mapping & address translation ──────────────────
-
-static VMM_STATE: Mutex<Option<VmmState>> = Mutex::new(None);
-
-struct VmmState {
-    root: u64,
-    alloc: *mut BitmapAllocator,
-    next_vaddr: u64,
-}
-
-unsafe impl Send for VmmState {}
-unsafe impl Sync for VmmState {}
-
-fn map_mmio(paddr: u64, size: u64) -> u64 {
-    let mut g = VMM_STATE.lock();
-    let s = g.as_mut().expect("VMM not init");
-    let va = s.next_vaddr.checked_sub(size).expect("AHCI VMM: address space exhausted (overflow)");
-    if va < VMM_VADDR_FLOOR {
-        panic!("AHCI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", va);
-    }
-    s.next_vaddr = va;
-    Vmm::from_root(s.root)
-        .map(unsafe { &mut *s.alloc }, va, paddr, size,
-             PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE);
-    va
-}
-
-fn translate(vaddr: u64) -> Option<u64> {
-    let g = VMM_STATE.lock();
-    let s = g.as_ref()?;
-    Vmm::from_root(s.root).translate(vaddr)
-}
-
 // ── APIC timer helpers ──────────────────────────────────────────
 
 fn init_count() -> u32 { apic::timer_init_count() }
@@ -271,8 +194,6 @@ fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
 
 // ── Port state ──────────────────────────────────────────────────
 
-static PORT_LIST: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
-
 struct PortPtr(*const AhciPort);
 unsafe impl Send for PortPtr {}
 unsafe impl Sync for PortPtr {}
@@ -280,6 +201,7 @@ unsafe impl Sync for PortPtr {}
 static IRQ_PORTS: Mutex<Vec<PortPtr>> = Mutex::new(Vec::new());
 
 struct AhciPort {
+    root: u64,
     hba: Hba,
     port: u8,
     _cl_paddr: u64,
@@ -380,23 +302,27 @@ impl AhciPort {
         SerialPort::puts("\n");
     }
 
-    /// Write a Register H2D FIS for FPDMA QUEUED (NCQ) using u32 stores.
+    /// Write a Register H2D FIS for FPDMA QUEUED (NCQ).
     ///
-    /// Layout (little-endian u32):
-    ///   dword0: type=0x27 | 0x80<<8 | cmd<<16
-    ///   dword1: LBA[23:0] | device(0x40)<<24
-    ///   dword2: LBA[31:24] | LBA[39:32]<<8 | count<<16
-    ///   dword3: tag<<11
-    ///   dword4: 0 (reserved)
-    fn write_ncq_fis(&self, fis: *mut u32, lba: u64, count: u32, cmd: u8, tag: u8) {
+    /// Per SATA 3.2 section 13.6.4.1 the NCQ frame re-maps several standard
+    /// Register H2D FIS bytes (offsets from FIS base):
+    ///   byte  3: sector_count_low  (feature 7:0)
+    ///   byte  7: FUA (bit 7)      (device, bit 6 reserved)
+    ///   byte 11: sector_count_high (feature 15:8)
+    ///   byte 12: NCQ tag[4:0]<<3  (count 7:0)
+    ///   byte 13: priority         (count 15:8)
+    ///   bytes 16-19: auxiliary (0 for normal NCQ)
+    ///   bytes 4-6, 8-10: LBA (standard 48-bit)
+    fn write_ncq_fis(&self, fis: *mut u32, lba: u64, count: u16, tag: u8, cmd: u8) {
         unsafe {
-            fis.add(0).write_volatile(0x8027u32 | (cmd as u32) << 16);
+            fis.add(0).write_volatile(0x8027u32 | (cmd as u32) << 16 | (count as u32) << 24);
             fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (0x40 << 24));
             fis.add(2).write_volatile(
                 ((lba >> 24) as u32 & 0xFF)
                 | (((lba >> 32) as u32 & 0xFF) << 8)
-                | (count << 16));
-            fis.add(3).write_volatile((tag as u32) << 11);
+                | (((lba >> 40) as u32 & 0xFF) << 16)
+                | ((count as u32 >> 8) << 24));
+            fis.add(3).write_volatile(((tag as u32) << 3) | (0 << 24));
             fis.add(4).write_volatile(0);
         }
     }
@@ -408,7 +334,7 @@ impl AhciPort {
         let mut n = 0usize;
         while rem > 0 && n < self.max_prdt {
             let va = (buf_vaddr as isize + off) as u64;
-            let pa = TRANS_CACHE.lookup_or_translate(va).ok_or("PRDT translate fail")?;
+            let pa = dma::translate(self.root, va).ok_or("PRDT translate fail")?;
             let skip = (va & 0xFFF) as usize;
             let chunk = rem.min((4096 - skip) as isize) as usize;
             unsafe {
@@ -431,7 +357,8 @@ impl AhciPort {
     fn alloc_slots(&self, count: usize) -> Result<u32, &'static str> {
         loop {
             let current = self.slot_alloc.load(core::sync::atomic::Ordering::Relaxed);
-            let free = !current & ((1u32 << self.n_slots) - 1);
+            let mask = if self.n_slots >= 32 { !0u32 } else { (1u32 << self.n_slots) - 1 };
+            let free = !current & mask;
             if (free.count_ones() as usize) < count {
                 return Err("not enough NCQ slots");
             }
@@ -468,7 +395,7 @@ impl AhciPort {
 
         // Write NCQ FIS
         let cmd = if is_write { 0x61u8 } else { 0x60u8 };
-        self.write_ncq_fis(ct_va as *mut u32, lba, count, cmd, tag);
+        self.write_ncq_fis(ct_va as *mut u32, lba, count as u16, tag, cmd);
 
         // Build PRDT
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
@@ -498,8 +425,8 @@ impl AhciPort {
     /// Submit a batch of NCQ commands identified by tag_mask.
     /// Writes PxSACT then PxCI, waits for completion.
     fn submit_batch(&self, tag_mask: u32) -> Result<(), &'static str> {
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         self.hba.pw32(self.port, port_off::SACT, tag_mask);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
         self.hba.pw32(self.port, port_off::CI, tag_mask);
         self.wait_slots(tag_mask)
     }
@@ -560,8 +487,8 @@ impl AhciPort {
         // Zero FIS + PRDT area
         unsafe { core::ptr::write_bytes(ct_va as *mut u8, 0, 0x80 + self.max_prdt * 16); }
 
-        // IDENTIFY DEVICE command (non-NCQ, but write_ncq_fis works with tag=0, count=0)
-        self.write_ncq_fis(ct_va as *mut u32, 0, 0, 0xEC, 0);
+        // IDENTIFY DEVICE command (non-NCQ, uses same Register H2D FIS format)
+        self.write_ncq_fis(ct_va as *mut u32, 0, 0u16, 0, 0xEC);
 
         // PRDT -> scratch buffer
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
@@ -711,19 +638,15 @@ impl BlockDevice for AhciPort {
 
 // ── Initialisation ──────────────────────────────────────────────
 
-const VMM_VADDR: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000 - 0x20000000;
-/// AHCI VMM floor — 512 MB of virtual space for AHCI MMIO.
-const VMM_VADDR_FLOOR: u64 = VMM_VADDR - 0x2000_0000;
-
-fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> usize {
+fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
     let (base, ok) = bar5_addr(dev);
     if !ok {
         SerialPort::puts("[ahci] invalid BAR5\n");
-        return 0;
+        return Ok(Vec::new());
     }
 
-    let mmio = Hba { vaddr: map_mmio(base, 0x1000) };
+    let mmio = Hba { vaddr: dma.map_mmio(base, 0x1000)? };
     let cap = mmio.r32(ghc::CAP);
     let n_ports = ((cap >> 17) & 0x1F) + 1;
     let pi = mmio.r32(ghc::PI);
@@ -731,7 +654,7 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
     let max_prdt_raw = (4096 - 0x80) / 16;
 
     let mmio_sz = (((0x100 + (n_ports as u64) * 0x80 + 0x80) + 0xFFF) & !0xFFF).max(0x1000);
-    let mmio = Hba { vaddr: map_mmio(base, mmio_sz) };
+    let mmio = Hba { vaddr: dma.map_mmio(base, mmio_sz)? };
 
     let ver = mmio.r32(ghc::VS);
     SerialPort::puts("[ahci] controller ");
@@ -763,38 +686,25 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
         core::hint::spin_loop();
     }
     if mmio.r32(ghc::GHC) & GHC_HR != 0 {
-        SerialPort::puts("[ahci] HBA reset timeout\n"); return 0;
+        SerialPort::puts("[ahci] HBA reset timeout\n"); return Ok(Vec::new());
     }
     mmio.w32(ghc::GHC, mmio.r32(ghc::GHC) | GHC_AE);
     SerialPort::puts("[ahci] HBA reset complete\n");
 
-    let mut n_initialized = 0usize;
+    let mut ports: Vec<Arc<dyn BlockDevice>> = Vec::new();
     for p in 0u8..n_ports.min(32) as u8 {
         if pi & (1 << p) == 0 { continue; }
 
-        // Wait for device detection after HBA reset (port may not be ready yet)
-        if !wait_ssts_det(&mmio, p) {
-            SerialPort::puts("[ahci] port ");
-            SerialPort::put_u64(p as u64);
-            SerialPort::puts(" no device\n");
-            continue;
-        }
-        let ssts = mmio.pr32(p, port_off::SSTS);
-        if (ssts >> 8) & 0x0F != 1 { continue; }
-        if mmio.pr32(p, port_off::SIG) != 0x0000_0101 { continue; }
-
-        match init_one(p, &mmio, alloc, max_prdt_raw.min(MAX_PRDT), n_slots_raw, dev.interrupt_line) {
+        match init_one(p, &mmio, dma, max_prdt_raw.min(MAX_PRDT), n_slots_raw, dev.interrupt_line) {
             Ok(port) => {
                 let port_arc = Arc::new(port);
-                // Add to IRQ handler list (raw pointer).
                 let ptr = Arc::as_ptr(&port_arc);
                 IRQ_PORTS.lock().push(PortPtr(ptr));
-                PORT_LIST.lock().push(port_arc as Arc<dyn BlockDevice>);
-                n_initialized += 1;
+                ports.push(port_arc as Arc<dyn BlockDevice>);
                 SerialPort::puts("[ahci] port ");
                 SerialPort::put_u64(p as u64);
                 SerialPort::puts(" ready (");
-                SerialPort::put_u64(n_initialized as u64);
+                SerialPort::put_u64(ports.len() as u64);
                 SerialPort::puts("/");
                 SerialPort::put_u64(n_ports as u64);
                 SerialPort::puts(")\n");
@@ -808,30 +718,7 @@ fn init_controller(dev: &crate::pci::PciDevice, alloc: *mut BitmapAllocator) -> 
             }
         }
     }
-    n_initialized
-}
-
-pub fn init(root: u64, alloc: *mut BitmapAllocator) {
-    use crate::drivers::serial::SerialPort;
-    SerialPort::puts("[ahci] init\n");
-
-    *VMM_STATE.lock() = Some(VmmState { root, alloc, next_vaddr: VMM_VADDR });
-
-    let mut total = 0usize;
-    for dev in crate::pci::devices() {
-        if dev.class == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01 {
-            let initialized = init_controller(dev, alloc);
-            total += initialized;
-        }
-    }
-
-    if total == 0 {
-        SerialPort::puts("[ahci] no AHCI devices ready\n");
-    } else {
-        SerialPort::puts("[ahci] init complete: ");
-        SerialPort::put_u64(total as u64);
-        SerialPort::puts(" port(s) ready\n");
-    }
+    Ok(ports)
 }
 
 fn bar5_addr(dev: &crate::pci::PciDevice) -> (u64, bool) {
@@ -852,8 +739,7 @@ fn bar5_addr(dev: &crate::pci::PciDevice) -> (u64, bool) {
     }
 }
 
-fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_slots_raw: u32, interrupt_line: u8) -> Result<AhciPort, &'static str> {
-    let alloc = unsafe { &mut *alloc };
+fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_raw: u32, interrupt_line: u8) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
@@ -865,24 +751,21 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     }
 
     // Allocate Command List (1 page = 32 CmdHeaders × 32 B = 1024 B)
-    let cl_paddr = alloc.alloc().ok_or("OOM CL")?;
-    unsafe { core::ptr::write_bytes(cl_paddr as *mut u8, 0, 4096); }
+    let cl_buf = dma.alloc_page().ok_or("OOM CL")?;
 
     // Allocate scratch buffer
-    let sc_paddr = alloc.alloc().ok_or("OOM scratch")?;
-    unsafe { core::ptr::write_bytes(sc_paddr as *mut u8, 0, 4096); }
+    let sc_buf = dma.alloc_page().ok_or("OOM scratch")?;
 
     // Allocate per-slot Command Table pages
     let mut slots = [Slot { ct_paddr: 0, ct_vaddr: 0 }; AHCI_MAX_SLOTS];
     for s in 0..n_slots as usize {
-        let ct_paddr = alloc.alloc().ok_or("OOM CT")?;
-        unsafe { core::ptr::write_bytes(ct_paddr as *mut u8, 0, 4096); }
-        slots[s] = Slot { ct_paddr, ct_vaddr: ct_paddr };
+        let ct_buf = dma.alloc_page().ok_or("OOM CT")?;
+        slots[s] = Slot { ct_paddr: ct_buf.phys, ct_vaddr: ct_buf.virt };
     }
 
     // Pre-initialise CmdHeaders for all slots
     for s in 0..n_slots as usize {
-        let hdr = (cl_paddr + (s as u64) * 32) as *mut CmdHeader;
+        let hdr = (cl_buf.virt + (s as u64) * 32) as *mut CmdHeader;
         let ctba = slots[s].ct_paddr;
         unsafe {
             (*hdr).cfl_w_prdtl = 5u32;  // CFL=5, W=0, PRDTL=0
@@ -894,10 +777,10 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     }
 
     // Program HBA port registers
-    hba.pw32(p, port_off::CLB, cl_paddr as u32);
-    hba.pw32(p, port_off::CLBU, (cl_paddr >> 32) as u32);
-    hba.pw32(p, port_off::FB, sc_paddr as u32);
-    hba.pw32(p, port_off::FBU, (sc_paddr >> 32) as u32);
+    hba.pw32(p, port_off::CLB, cl_buf.phys as u32);
+    hba.pw32(p, port_off::CLBU, (cl_buf.phys >> 32) as u32);
+    hba.pw32(p, port_off::FB, sc_buf.phys as u32);
+    hba.pw32(p, port_off::FBU, (sc_buf.phys >> 32) as u32);
 
     hba.pw32(p, port_off::IS, !0);
     hba.pw32(p, port_off::SERR, !0);
@@ -907,8 +790,6 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     let mut irq_vector = 0u8;
     if interrupt_line != 0 {
         if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
-            // Enable IOAPIC for this GSI (interrupt_line may be the GSI).
-            // In APIC mode on Q35, interrupt_line typically matches the GSI.
             let _ = crate::platform::x86_64_pc::ioapic::enable_irq(
                 interrupt_line as u32,
                 crate::acpi::Polarity::ActiveHigh,
@@ -918,7 +799,7 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
         }
     }
 
-    hba.pw32(p, port_off::CMD, CMD_SUD | CMD_POD);
+    hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD);
     for _ in 0..100 { core::hint::spin_loop(); }
 
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_FRE);
@@ -927,9 +808,10 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
     if !wait_ssts_det(hba, p) { return Err("no device"); }
 
     let mut port = AhciPort {
+        root: dma.root(),
         hba: *hba, port: p,
-        _cl_paddr: cl_paddr, cl_vaddr: cl_paddr,
-        scratch_paddr: sc_paddr, scratch_vaddr: sc_paddr,
+        _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
+        scratch_paddr: sc_buf.phys, scratch_vaddr: sc_buf.virt,
         max_prdt, n_slots,
         sector_count: 0, lba48: false, model: [0u8; 40],
         slots,
@@ -940,19 +822,29 @@ fn init_one(p: u8, hba: &Hba, alloc: *mut BitmapAllocator, max_prdt: usize, n_sl
 
     port.identify()?;
 
-    // Enable port interrupts if IRQ setup succeeded.
     if irq_vector != 0 {
-        hba.pw32(p, port_off::IE, 0x0000_0089); // D2H + SDB + PC
+        hba.pw32(p, port_off::IE, 0x0000_0089);
     }
 
     Ok(port)
 }
 
-pub fn device() -> Option<Arc<dyn BlockDevice>> {
-    let g = PORT_LIST.lock();
-    g.first().cloned()
-}
+pub struct AhciDriver;
 
-pub fn devices() -> Vec<Arc<dyn BlockDevice>> {
-    PORT_LIST.lock().clone()
+impl StorageDriver for AhciDriver {
+    fn name(&self) -> &str {
+        "ahci"
+    }
+
+    fn probe(&self, dev: &crate::pci::PciDevice) -> bool {
+        dev.class == 0x01 && dev.subclass == 0x06 && dev.prog_if == 0x01
+    }
+
+    fn init_controller(
+        &self,
+        dev: &crate::pci::PciDevice,
+        dma: &mut DmaAllocator,
+    ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+        init_controller(dev, dma)
+    }
 }

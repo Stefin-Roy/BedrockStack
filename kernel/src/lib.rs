@@ -240,7 +240,8 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
-        crate::filesystems::blockdriver::ahci::init(
+        let block_devices = crate::filesystems::blockdriver::driver::init_all(
+            crate::pci::devices(),
             self.page_table_root,
             &mut self.allocator as *mut _,
         );
@@ -248,10 +249,10 @@ impl Kernel {
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");
 
-        // Mount the ESP (first partition on AHCI device) as B> (fat32)
+        // Mount the ESP (first partition on first block device) as B> (fat32)
         #[cfg(target_arch = "x86_64")]
-        if let Some(ahci_dev) = crate::filesystems::blockdriver::ahci::device() {
-            match crate::filesystems::partition::mount_first_partition(ahci_dev, "fat32", 'B') {
+        if let Some(dev) = block_devices.first() {
+            match crate::filesystems::partition::mount_first_partition(dev.clone(), "fat32", 'B') {
                 Ok(()) => log::info!("Mounted ESP as B> (fat32)"),
                 Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
             }
