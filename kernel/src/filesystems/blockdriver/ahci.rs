@@ -72,7 +72,7 @@ const CMD_POD: u32 = 1 << 2;
 const SSTS_DET_MASK: u32 = 0x0F;
 const SSTS_DET_ESTAB: u32 = 3;
 
-const TFD_ERR: u32 = 1 << 8;
+const TFD_ERR: u32 = 1 << 0;
 
 // The LAPIC timer normally provides the wall-clock deadline for AHCI polling.
 // Do not rely on it exclusively, though: a stopped/misconfigured timer used to
@@ -234,7 +234,7 @@ fn handle_ahci_irq() {
         let is = port.hba.pr32(port.port, port_off::IS);
         if is != 0 {
             port.hba.pw32(port.port, port_off::IS, is);
-            port.irq_completed.fetch_or(is, core::sync::atomic::Ordering::Release);
+            port.irq_completed.store(1, core::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -250,31 +250,33 @@ impl AhciPort {
         let mut wraps = 0;
         let mut previous = start;
         let mut stagnant = 0;
-        // Clear any stale IRQ completions before waiting.
-        self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Acquire);
+        // Clear any stale IRQ flag before waiting.
+        self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
         loop {
-            // Fast path: check IRQ completion first.
-            let completed = self.irq_completed.load(core::sync::atomic::Ordering::Acquire);
-            if completed & tag_mask == tag_mask {
-                // Clear completed bits.
-                self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
-                let tfd = self.hba.pr32(self.port, port_off::TFD);
-                if tfd & TFD_ERR != 0 {
-                    let serr = self.hba.pr32(self.port, port_off::SERR);
-                    self.dump_err(tag_mask, tfd as u8, serr);
-                    return Err("AHCI cmd error");
+            // Fast path: IRQ fired — re-check hardware completion status.
+            if self.irq_completed.load(core::sync::atomic::Ordering::Acquire) != 0 {
+                self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
+                let ci = self.hba.pr32(self.port, port_off::CI);
+                let sact = self.hba.pr32(self.port, port_off::SACT);
+                if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
+                    let tfd = self.hba.pr32(self.port, port_off::TFD);
+                    if tfd & TFD_ERR != 0 {
+                        let serr = self.hba.pr32(self.port, port_off::SERR);
+                        self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
+                        return Err("AHCI cmd error");
+                    }
+                    return Ok(());
                 }
-                return Ok(());
+                continue;
             }
             // Polling fallback (also catches commands on non-IRQ paths).
             let ci = self.hba.pr32(self.port, port_off::CI);
             let sact = self.hba.pr32(self.port, port_off::SACT);
             if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
-                self.irq_completed.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 if tfd & TFD_ERR != 0 {
                     let serr = self.hba.pr32(self.port, port_off::SERR);
-                    self.dump_err(tag_mask, tfd as u8, serr);
+                    self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
                     return Err("AHCI cmd error");
                 }
                 return Ok(());
@@ -282,7 +284,7 @@ impl AhciPort {
             if poll_timed_out(start, deadline, &mut wraps, &mut previous, &mut stagnant) {
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 let serr = self.hba.pr32(self.port, port_off::SERR);
-                self.dump_err(tag_mask, tfd as u8, serr);
+                self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
                 return Err("AHCI timeout");
             }
             core::hint::spin_loop();
@@ -437,6 +439,7 @@ impl AhciPort {
         use crate::drivers::serial::SerialPort;
         SerialPort::puts("[ahci] port reset\n");
 
+        // Stop port DMA
         let cmd = self.hba.pr32(self.port, port_off::CMD);
         self.hba.pw32(self.port, port_off::CMD, cmd & !(CMD_ST | CMD_FRE));
         for _ in 0..1000 {
@@ -445,6 +448,14 @@ impl AhciPort {
             core::hint::spin_loop();
         }
 
+        // Save port registers that may be reset by COMRESET on some hardware.
+        let saved_clb  = self.hba.pr32(self.port, port_off::CLB);
+        let saved_clbu = self.hba.pr32(self.port, port_off::CLBU);
+        let saved_fb   = self.hba.pr32(self.port, port_off::FB);
+        let saved_fbu  = self.hba.pr32(self.port, port_off::FBU);
+        let saved_ie   = self.hba.pr32(self.port, port_off::IE);
+
+        // Issue COMRESET via SCTL.DET = 1
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
         self.hba.pw32(self.port, port_off::SCTL, (sctl & !0x0F) | 1);
         let start = curr_count();
@@ -456,6 +467,7 @@ impl AhciPort {
         }
         self.hba.pw32(self.port, port_off::SCTL, sctl & !0x0F);
 
+        // Wait up to 100ms for device to re-establish
         let start = curr_count();
         let mut wraps = 0;
         let mut previous = start;
@@ -471,9 +483,20 @@ impl AhciPort {
             core::hint::spin_loop();
         }
 
+        // Restore port registers that may have been cleared by COMRESET.
+        self.hba.pw32(self.port, port_off::CLB, saved_clb);
+        self.hba.pw32(self.port, port_off::CLBU, saved_clbu);
+        self.hba.pw32(self.port, port_off::FB, saved_fb);
+        self.hba.pw32(self.port, port_off::FBU, saved_fbu);
+
         self.hba.pw32(self.port, port_off::SERR, !0);
         self.hba.pw32(self.port, port_off::IS, !0);
         self.hba.pw32(self.port, port_off::CMD, CMD_FRE | CMD_ST);
+
+        // Re-enable interrupts if they were previously enabled.
+        if saved_ie != 0 {
+            self.hba.pw32(self.port, port_off::IE, saved_ie);
+        }
 
         SerialPort::puts("[ahci] port reset OK\n");
         Ok(())
@@ -525,6 +548,11 @@ impl AhciPort {
                 let w60 = data.add(60).read_volatile() as u64;
                 let w61 = data.add(61).read_volatile() as u64;
                 self.sector_count = w60 | (w61 << 16);
+            }
+
+            if self.sector_count == 0 {
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[ahci] WARN: IDENTIFY sector_count=0\n");
             }
 
             for i in 0..20 {
