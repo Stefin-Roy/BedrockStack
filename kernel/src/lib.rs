@@ -138,6 +138,9 @@ impl Kernel {
     }
 
     pub fn init(&mut self) {
+        // The physical allocator was moved during `Kernel::new()`; re-point
+        // the stashed heap/DMA pointer before any code path can need it.
+        heap::set_phys_allocator(&mut self.allocator);
         unsafe { crate::smp::early_init_bsp(); }
         CurrentArch::init();
         self.switch_to_higher_half();
