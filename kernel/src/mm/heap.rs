@@ -10,7 +10,7 @@ const BLOCK_ALIGN: usize = core::mem::align_of::<BlockHeader>();
 const BACKPTR_SIZE: usize = size_of::<*mut BlockHeader>();
 const MIN_ALLOC: usize = 8;
 const MIN_BLOCK_SIZE: usize = HEADER_SIZE + BACKPTR_SIZE + MIN_ALLOC;
-const HEAP_INIT_PAGES: usize = 64;
+const HEAP_INIT_PAGES: usize = 256;
 const HEAP_GROW_PAGES: usize = 16;
 
 #[repr(C)]

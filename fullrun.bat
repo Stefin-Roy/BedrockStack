@@ -61,8 +61,8 @@ if not exist "%OVMF_PATH%" (
 echo [1/4] Building kernel (x86_64-unknown-none, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set CARGO_FEATURES=
-if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features cpu_slow
+set CARGO_FEATURES=--features display_log
+if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log cpu_slow"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
@@ -152,7 +152,7 @@ echo.
 echo [1/2] Building kernel (riscv64gc-unknown-none-elf, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build --target riscv64gc-unknown-none-elf -p kernel 2>&1
+cargo build --target riscv64gc-unknown-none-elf -p kernel --features display_log 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"

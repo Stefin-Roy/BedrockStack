@@ -1,11 +1,24 @@
 //! Locked serial wrapper with per-CPU re-entrancy guard and `[CPU(N)]` prefix.
 
+#[cfg(feature = "display_log")]
+use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 #[cfg(target_arch = "x86_64")]
 type Inner = common::serial::x86_64::SerialPort;
 #[cfg(target_arch = "riscv64")]
 type Inner = common::serial::riscv64::SerialPort;
+
+#[cfg(feature = "display_log")]
+use crate::display::console::Console;
+
+#[cfg(feature = "display_log")]
+struct ConsoleCell(UnsafeCell<Option<Console>>);
+#[cfg(feature = "display_log")]
+unsafe impl Sync for ConsoleCell {}
+
+#[cfg(feature = "display_log")]
+static CONSOLE: ConsoleCell = ConsoleCell(UnsafeCell::new(None));
 
 static GLOBAL_LOCK: AtomicBool = AtomicBool::new(false);
 static LAST_WAS_NL: AtomicBool = AtomicBool::new(true);
@@ -31,6 +44,10 @@ impl SerialPort {
         let cpu = acquire_locks();
         Inner::putc(c);
         track_newline(c);
+        #[cfg(feature = "display_log")]
+        if let Some(con) = unsafe { &mut *CONSOLE.0.get() } {
+            con.putc(c);
+        }
         release_locks(cpu);
     }
 
@@ -59,6 +76,11 @@ impl SerialPort {
             }
         }
 
+        #[cfg(feature = "display_log")]
+        if let Some(con) = unsafe { &mut *CONSOLE.0.get() } {
+            con.puts(s);
+        }
+
         release_locks(cpu);
     }
 
@@ -82,6 +104,11 @@ impl core::fmt::Write for SerialPort {
         Self::puts(s);
         Ok(())
     }
+}
+
+#[cfg(feature = "display_log")]
+pub fn set_console(console: Console) {
+    unsafe { *CONSOLE.0.get() = Some(console); }
 }
 
 fn write_prefix(cpu_id: u32) {

@@ -92,6 +92,21 @@ impl Kernel {
             )
         };
 
+        #[cfg(feature = "display_log")]
+        {
+            use crate::display::console::Console;
+            let console = unsafe {
+                Console::new(
+                    display.ptr(),
+                    display.width(),
+                    display.height(),
+                    display.stride(),
+                    display.pixel_format(),
+                )
+            };
+            crate::drivers::serial::set_console(console);
+        }
+
         SerialPort::puts("[kernel] Kernel::new: find_bitmap_region\n");
         let bitmap_region = find_bitmap_region(memory_map);
 
