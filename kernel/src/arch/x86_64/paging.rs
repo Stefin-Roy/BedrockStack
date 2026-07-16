@@ -35,8 +35,8 @@ pub fn setup(
     let fb_end = framebuffer_addr.saturating_add(fb_size);
 
     let min_end = 4u64 * 1024 * 1024 * 1024;
-    let max_addr = fb_end.max(min_end).max(allocator.alloc_end());
-    let max_addr = (max_addr + PAGE_2M - 1) & !(PAGE_2M - 1);
+    // End of physical RAM covered by the allocator (2 MiB aligned).
+    let ram_end = (min_end.max(allocator.alloc_end()) + PAGE_2M - 1) & !(PAGE_2M - 1);
 
     // ── Enable NXE + WP ────────────────────────────────────────────
     unsafe {
@@ -47,9 +47,9 @@ pub fn setup(
     let mut vmm = Vmm::new(allocator);
     let guard_page = stack_guard & !(PAGE_4K - 1);
 
-    // ── Identity-map all RAM ───────────────────────────────────────
+    // ── Identity-map all RAM up to ram_end ─────────────────────────
     let mut chunk = 0u64;
-    while chunk < max_addr {
+    while chunk < ram_end {
         let chunk_end = chunk + PAGE_2M;
 
         let overlaps_kernel = chunk < layout.kernel_end && chunk_end > layout.kernel_start;
@@ -79,6 +79,22 @@ pub fn setup(
         }
 
         chunk = chunk_end;
+    }
+
+    // ── Identity-map framebuffer extension beyond RAM ──────────────
+    if fb_end > ram_end {
+        let fb_map_start = (fb_start & !(PAGE_2M - 1)).max(ram_end);
+        let fb_map_end = (fb_end + PAGE_2M - 1) & !(PAGE_2M - 1);
+        chunk = fb_map_start;
+        while chunk < fb_map_end {
+            vmm.map_2m(
+                allocator,
+                chunk,
+                chunk,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
+            );
+            chunk += PAGE_2M;
+        }
     }
 
     // ── Higher-half kernel alias ───────────────────────────────────

@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use uefi::prelude::*;
 use uefi::boot::AllocateType;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
-use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as UefiPixelFormat};
+use uefi::proto::console::gop::{GraphicsOutput, PixelBitmask, PixelFormat as UefiPixelFormat};
 use uefi::proto::console::text::Output;
 use uefi::fs::FileSystem;
 
@@ -135,15 +135,14 @@ fn main() -> Status {
         if desc.page_count == 0 {
             continue;
         }
-        // SAFETY/ROBUSTNESS: On x86_64 only conventional memory BELOW 4 GiB is
-        // treated as usable RAM. OVMF/QEMU commonly report gigantic "conventional"
+        // SAFETY/ROBUSTNESS: OVMF/QEMU commonly report gigantic "conventional"
         // regions in the high address space (e.g. 12 GiB @ 0xfd00000000) that are
         // NOT backed by real RAM. Mapping or allocating from them makes the kernel
-        // fabricate page tables for nonexistent memory. Real RAM for this target
-        // lives below 4 GiB; legitimate >4 GiB RAM (real hardware) would need a
-        // proper above-4G memory map and is out of scope here.
+        // fabricate page tables for nonexistent memory. On real hardware these
+        // >4 GiB regions are genuine RAM — we only filter them under hypervisors
+        // (detected via CPUID hypervisor bit).
         #[cfg(target_arch = "x86_64")]
-        if desc.ty == MemoryType::CONVENTIONAL && desc.phys_start >= 0x1_0000_0000 {
+        if is_hypervisor() && desc.ty == MemoryType::CONVENTIONAL && desc.phys_start >= 0x1_0000_0000 {
             continue;
         }
         // Cannot grow the buffer after exit_boot_services. If we ever exceed the
@@ -184,6 +183,14 @@ fn main() -> Status {
     }
 }
 
+/// Detect whether the CPU is running under a hypervisor (KVM, Hyper-V, etc.)
+/// via the CPUID hypervisor present bit (ECX bit 31 of leaf 1).
+#[cfg(target_arch = "x86_64")]
+fn is_hypervisor() -> bool {
+    let result = core::arch::x86_64::__cpuid(1);
+    (result.ecx >> 31) & 1 != 0
+}
+
 /// Classify a UEFI memory type into our kernel-facing region kind.
 ///
 /// Only `CONVENTIONAL` memory is reported as `Usable`. Everything else —
@@ -221,6 +228,63 @@ fn find_rsdp() -> u64 {
     })
 }
 
+/// Parse UEFI `PixelBitmask` into our `PixelFormat` and bytes-per-pixel.
+///
+/// The bitmask tells us which bits in a 32-bit pixel correspond to each
+/// channel.  For byte-aligned masks (the common case 24/32 bpp) we derive
+/// the byte order and bpp directly.  Non-byte-aligned masks (e.g. 16-bit
+/// 5:6:5) are logged and mapped to BGR 32bpp as a reasonable fallback.
+fn parse_bitmask(bm: &PixelBitmask) -> (PixelFormat, u8) {
+    // Check whether every mask is byte-aligned (all set bits fit in one byte).
+    let mask_aligned = |mask: u32| -> bool {
+        if mask == 0 {
+            return true;
+        }
+        let tz = mask.trailing_zeros();
+        let width = 32 - mask.leading_zeros() - tz;
+        tz % 8 == 0 && width <= 8
+    };
+
+    if !mask_aligned(bm.red)
+        || !mask_aligned(bm.green)
+        || !mask_aligned(bm.blue)
+    {
+        SerialPort::puts("[boot] WARNING: non-byte-aligned pixel bitmask (red=0x");
+        SerialPort::put_hex(bm.red as u64);
+        SerialPort::puts(" green=0x");
+        SerialPort::put_hex(bm.green as u64);
+        SerialPort::puts(" blue=0x");
+        SerialPort::put_hex(bm.blue as u64);
+        SerialPort::puts(" reserved=0x");
+        SerialPort::put_hex(bm.reserved as u64);
+        SerialPort::puts(") — using BGR 32bpp fallback\n");
+        return (PixelFormat::Bgr, 4);
+    }
+
+    // Byte offset of each channel in the pixel DWORD (0 = LSB, 3 = MSB).
+    let r_byte = (bm.red.trailing_zeros() / 8) as u8;
+    let _g_byte = (bm.green.trailing_zeros() / 8) as u8;
+    let b_byte = (bm.blue.trailing_zeros() / 8) as u8;
+
+    // If Blue occupies a lower byte than Red, the native order is BGR.
+    let format = if b_byte < r_byte {
+        PixelFormat::Bgr
+    } else {
+        PixelFormat::Rgb
+    };
+
+    // Compute bpp from the highest bit used across all channels.
+    let combined = bm.red | bm.green | bm.blue | bm.reserved;
+    let bpp: u8 = if combined == 0 {
+        4
+    } else {
+        let max_bit = 32 - combined.leading_zeros(); // u32
+        ((max_bit + 7) / 8).clamp(2, 4) as u8
+    };
+
+    (format, bpp)
+}
+
 /// Get framebuffer information from UEFI GOP.
 fn get_framebuffer_info() -> FramebufferInfo {
     let handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().unwrap();
@@ -230,12 +294,19 @@ fn get_framebuffer_info() -> FramebufferInfo {
     let (width, height) = mode.resolution();
     let stride = mode.stride();
 
-    let pixel_format = match mode.pixel_format() {
-        UefiPixelFormat::Rgb => PixelFormat::Rgb,
-        UefiPixelFormat::Bgr => PixelFormat::Bgr,
-        // Bitmask has a real linear framebuffer; assume 32bpp BGR ordering (the
-        // common x86 case) until a proper bitmask parser exists.
-        UefiPixelFormat::Bitmask => PixelFormat::Bgr,
+    let (pixel_format, bpp) = match mode.pixel_format() {
+        UefiPixelFormat::Rgb => (PixelFormat::Rgb, 4u8),
+        UefiPixelFormat::Bgr => (PixelFormat::Bgr, 4u8),
+        // Bitmask has a real linear framebuffer but the channel layout is
+        // encoded in the mode's pixel bitmasks — parse them.
+        UefiPixelFormat::Bitmask => {
+            if let Some(ref bm) = mode.pixel_bitmask() {
+                parse_bitmask(bm)
+            } else {
+                SerialPort::puts("[boot] WARNING: GOP Bitmask without pixel_bitmask() — using BGR 32bpp\n");
+                (PixelFormat::Bgr, 4)
+            }
+        }
         // BltOnly provides NO linear framebuffer address at all — writing pixels
         // to `frame_buffer()` would be undefined. Refuse to boot rather than
         // hand the kernel an invalid pointer.
@@ -254,7 +325,7 @@ fn get_framebuffer_info() -> FramebufferInfo {
         height,
         stride,
         pixel_format,
-        bpp: 4,
+        bpp,
     }
 }
 
