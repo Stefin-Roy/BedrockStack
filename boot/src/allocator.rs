@@ -23,7 +23,14 @@ unsafe impl GlobalAlloc for OsDataAllocator {
 
         // Fast path: UEFI pools are always at least 8-byte aligned.
         if align <= POOL_ALIGN {
-            return match unsafe { boot::allocate_pool(OS_DATA, layout.size()) } {
+            if let Ok(ptr) = boot::allocate_pool(OS_DATA, layout.size()) {
+                return ptr.as_ptr();
+            }
+            // Fallback: some firmware rejects OEM types — try LOADER_DATA.
+            // These allocations survive exit_boot_services because it is
+            // called with OS_DATA; on real hardware where OS_DATA fails
+            // this best-effort fallback at least lets the boot proceed.
+            return match boot::allocate_pool(MemoryType::LOADER_DATA, layout.size()) {
                 Ok(ptr) => ptr.as_ptr(),
                 Err(_) => core::ptr::null_mut(),
             };
@@ -38,9 +45,14 @@ unsafe impl GlobalAlloc for OsDataAllocator {
             None => return core::ptr::null_mut(),
         };
 
-        let base = match unsafe { boot::allocate_pool(OS_DATA, total) } {
+        let base = match boot::allocate_pool(OS_DATA, total) {
             Ok(ptr) => ptr.as_ptr() as usize,
-            Err(_) => return core::ptr::null_mut(),
+            Err(_) => {
+                match boot::allocate_pool(MemoryType::LOADER_DATA, total) {
+                    Ok(ptr) => ptr.as_ptr() as usize,
+                    Err(_) => return core::ptr::null_mut(),
+                }
+            }
         };
 
         let aligned = (base + size_of::<usize>() + align - 1) & !(align - 1);

@@ -11,7 +11,7 @@ if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Build bootloader with cpu_slow (release)
 echo [2/3] Building bootloader (release, features: cpu_slow)...
-cargo build --target x86_64-unknown-uefi -p boot --features cpu_slow --release
+cargo build --target x86_64-unknown-uefi -p boot --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Copy to USB folder

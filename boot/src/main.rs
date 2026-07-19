@@ -6,6 +6,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use uefi::prelude::*;
 use uefi::boot::AllocateType;
+use uefi::CStr16;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::proto::console::gop::{GraphicsOutput, PixelBitmask, PixelFormat as UefiPixelFormat};
 use uefi::proto::console::text::Output;
@@ -29,26 +30,54 @@ const STACK_SIZE: usize = 64 * 1024;
 /// UEFI page size.
 const PAGE_SIZE: usize = 4096;
 
+/// Write a message to both the serial port and the UEFI text console.
+fn log_msg(output: &mut Output, msg: &str) {
+    SerialPort::puts(msg);
+
+    // Echo to UEFI console (ASCII bytes → UCS-2)
+    let bytes = msg.as_bytes();
+    let mut buf = [0u16; 200];
+    let mut len = 0usize;
+    for &b in bytes {
+        if len >= buf.len() - 1 {
+            break;
+        }
+        if b == b'\n' {
+            if len < buf.len() - 1 {
+                buf[len] = b'\r' as u16;
+                len += 1;
+            }
+        }
+        buf[len] = b as u16;
+        len += 1;
+    }
+    buf[len] = 0;
+    if let Ok(cs) = CStr16::from_u16_with_nul(&buf[..=len]) {
+        let _ = output.output_string(cs);
+    }
+}
+
 #[entry]
 fn main() -> Status {
-    uefi::helpers::init().unwrap();
+    uefi::helpers::init().expect("FATAL: uefi::helpers::init() failed");
 
     // Init COM1 serial first — all log output goes here
     SerialPort::init();
-    SerialPort::puts("[boot] BedrockOS booting...\n");
 
-    // 1. Print boot message
-    let handle_out = uefi::boot::get_handle_for_protocol::<Output>().unwrap();
-    let mut output = uefi::boot::open_protocol_exclusive::<Output>(handle_out).unwrap();
-    // Clear the UEFI text console before writing anything so boot output starts
-    // on a clean screen (also resets the cursor and scroll state).
+    // 1. Open UEFI console output
+    let handle_out = uefi::boot::get_handle_for_protocol::<Output>()
+        .expect("FATAL: Output protocol not available");
+    let mut output = uefi::boot::open_protocol_exclusive::<Output>(handle_out)
+        .expect("FATAL: Output protocol open failed");
+
+    // Clear the UEFI text console so boot output starts on a clean screen.
     let _ = output.clear();
-    let _ = output.output_string(uefi::cstr16!("BedrockOS booting..."));
-    SerialPort::puts("[boot] UEFI console OK\n");
+    log_msg(&mut output, "[boot] BedrockOS booting...\n");
 
     // 2. Get framebuffer info from GOP
-    SerialPort::puts("[boot] Querying GOP framebuffer...\n");
+    log_msg(&mut output, "[boot] Querying GOP framebuffer...\n");
     let fb_info = get_framebuffer_info();
+    // Full framebuffer details go to serial only (too long for console).
     SerialPort::puts("[boot] Framebuffer: addr=0x");
     SerialPort::put_hex(fb_info.address);
     SerialPort::puts(" w=");
@@ -58,31 +87,30 @@ fn main() -> Status {
     SerialPort::puts(" stride=");
     SerialPort::put_u64(fb_info.stride as u64);
     SerialPort::puts("\n");
-    let _ = output.output_string(uefi::cstr16!("Framebuffer OK"));
+    log_msg(&mut output, "[boot] Framebuffer OK\n");
 
     // 3. Load kernel ELF from disk (allocates a large OS_DATA buffer).
-    SerialPort::puts("[boot] Reading kernel from disk: \\EFI\\BEDROCK\\KERNEL\n");
-    let _ = output.output_string(uefi::cstr16!("Reading kernel from disk..."));
+    log_msg(&mut output, "[boot] Reading kernel from disk: \\EFI\\BEDROCK\\KERNEL\n");
 
     let kernel_data = load_file_from_disk(cstr16!(r"\EFI\BEDROCK\KERNEL").into());
     SerialPort::puts("[boot] Kernel file read: ");
     SerialPort::put_u64(kernel_data.len() as u64);
     SerialPort::puts(" bytes\n");
-    let _ = output.output_string(uefi::cstr16!("Kernel read from disk"));
+    log_msg(&mut output, "[boot] Kernel read from disk\n");
 
-    SerialPort::puts("[boot] Parsing ELF and loading segments...\n");
-    let entry = unsafe { elf::load_elf(&kernel_data).expect("Failed to load kernel ELF") };
+    log_msg(&mut output, "[boot] Parsing ELF and loading segments...\n");
+    let entry = unsafe { elf::load_elf(&kernel_data).expect("FATAL: kernel ELF corrupt or invalid") };
     SerialPort::puts("[boot] Kernel entry: 0x");
     SerialPort::put_hex(entry);
     SerialPort::puts("\n");
-    let _ = output.output_string(uefi::cstr16!("Kernel loaded"));
+    log_msg(&mut output, "[boot] Kernel loaded\n");
 
     // 4. Allocate transfer buffers using the OS_DATA allocator BEFORE reading
     //    the final memory map. The memory map is only built AFTER
     //    exit_boot_services so that these allocations (and the kernel image)
     //    are reflected correctly and the kernel never hands out frames that
     //    hold its own stack / hand-off data.
-    SerialPort::puts("[boot] Allocating transfer buffers (OS_DATA)...\n");
+    log_msg(&mut output, "[boot] Allocating transfer buffers (OS_DATA)...\n");
 
     // Estimate capacity for the region list from the current map, with generous
     // slack for entries added/split by our own allocations before
@@ -107,7 +135,7 @@ fn main() -> Status {
         allocator::OS_DATA,
         stack_pages,
     )
-    .expect("Failed to allocate kernel stack")
+    .expect("FATAL: kernel stack allocation failed (insufficient memory)")
     .as_ptr() as usize;
     let stack_guard = stack_base as u64; // lowest page is the guard
     let stack_region_top = stack_base + stack_pages * PAGE_SIZE;
@@ -118,19 +146,23 @@ fn main() -> Status {
     let stack_top = (((stack_region_top) & !0xF) - 8) as *const u8;
 
     // 5. Find ACPI RSDP in the UEFI configuration table (before exit_boot_services).
-    let rsdp_addr = find_rsdp();
+    let rsdp_addr = find_rsdp(&mut output);
 
-    // 6. Exiting boot services...
-    let _ = output.output_string(uefi::cstr16!("Exiting boot services..."));
-    SerialPort::puts("[boot] Calling exit_boot_services...\n");
+    // 6. Print final message before exiting boot services.
+    log_msg(&mut output, "[boot] Jumping to kernel...\n");
 
-    // 5. Exit boot services — after this, only runtime services remain.
+    // 7. Exit boot services — after this, only runtime services remain.
     //    The returned map is the authoritative post-exit memory map.
+    //    uefi-rs handles the memory-map-key dance internally; if the
+    //    firmware refuses the transition the library will panic with a
+    //    clear message rather than leaving us in an inconsistent state.
     let mmap = unsafe { uefi::boot::exit_boot_services(Some(allocator::OS_DATA)) };
 
-    // 7. Build the region list from the FINAL map into the pre-allocated buffer.
+    // 8. Build the region list from the FINAL map into the pre-allocated buffer.
     //    No allocation happens here (we stay within reserved capacity), which is
     //    required since boot services (and thus the allocator) are gone.
+    //    NOTE: UEFI console is gone after exit_boot_services —
+    //          all further output is serial-only.
     for desc in mmap.entries() {
         if desc.page_count == 0 {
             continue;
@@ -168,7 +200,7 @@ fn main() -> Status {
     core::mem::forget(regions_buf);
     core::mem::forget(fb_buf);
 
-    // 8. We are now bare metal. Jump to kernel.
+    // 9. We are now bare metal. Jump to kernel.
     // NOTE: Serial I/O still works after exit_boot_services (bare metal port I/O).
     SerialPort::puts("[boot] Boot services exited. Jumping to kernel...\n");
 
@@ -212,7 +244,7 @@ fn classify_memory(ty: MemoryType) -> MemoryRegionKind {
 
 /// Find the physical address of the ACPI 2.0 RSDP from the UEFI config table.
 /// Returns 0 if not found.
-fn find_rsdp() -> u64 {
+fn find_rsdp(output: &mut Output) -> u64 {
     uefi::system::with_config_table(|entries| {
         for entry in entries {
             if entry.guid == ConfigTableEntry::ACPI2_GUID {
@@ -220,10 +252,11 @@ fn find_rsdp() -> u64 {
                 SerialPort::puts("[boot] ACPI RSDP at 0x");
                 SerialPort::put_hex(addr);
                 SerialPort::puts("\n");
+                log_msg(output, "[boot] ACPI RSDP OK\n");
                 return addr;
             }
         }
-        SerialPort::puts("[boot] WARNING: ACPI RSDP not found in UEFI config table\n");
+        log_msg(output, "[boot] WARNING: ACPI RSDP not found\n");
         0
     })
 }
@@ -286,9 +319,25 @@ fn parse_bitmask(bm: &PixelBitmask) -> (PixelFormat, u8) {
 }
 
 /// Get framebuffer information from UEFI GOP.
+/// Never panics — if GOP is unavailable or has no linear framebuffer,
+/// returns a zeroed `FramebufferInfo` so the kernel can fall back to
+/// text mode or serial-only operation.
 fn get_framebuffer_info() -> FramebufferInfo {
-    let handle = uefi::boot::get_handle_for_protocol::<GraphicsOutput>().unwrap();
-    let mut gop = uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle).unwrap();
+    let handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
+        Ok(h) => h,
+        Err(_) => {
+            SerialPort::puts("[boot] GOP not available — continuing without framebuffer\n");
+            return FramebufferInfo::zeroed();
+        }
+    };
+
+    let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
+        Ok(g) => g,
+        Err(_) => {
+            SerialPort::puts("[boot] GOP open failed — continuing without framebuffer\n");
+            return FramebufferInfo::zeroed();
+        }
+    };
 
     let mode = gop.current_mode_info();
     let (width, height) = mode.resolution();
@@ -307,12 +356,11 @@ fn get_framebuffer_info() -> FramebufferInfo {
                 (PixelFormat::Bgr, 4)
             }
         }
-        // BltOnly provides NO linear framebuffer address at all — writing pixels
-        // to `frame_buffer()` would be undefined. Refuse to boot rather than
-        // hand the kernel an invalid pointer.
+        // BltOnly provides NO linear framebuffer address — let the kernel
+        // run without a framebuffer rather than crashing at boot time.
         UefiPixelFormat::BltOnly => {
-            SerialPort::puts("[boot] FATAL: GOP is BltOnly (no linear framebuffer)\n");
-            panic!("GOP BltOnly mode unsupported: no linear framebuffer");
+            SerialPort::puts("[boot] GOP is BltOnly (no linear framebuffer) — continuing without framebuffer\n");
+            return FramebufferInfo::zeroed();
         }
     };
 
@@ -330,10 +378,23 @@ fn get_framebuffer_info() -> FramebufferInfo {
 }
 
 /// Load a file from the boot partition's FAT32 filesystem.
+/// Halts with a clear message on failure instead of panicking.
 fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
-    let ss = uefi::boot::get_image_file_system(uefi::boot::image_handle()).unwrap();
+    let ss = match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
+        Ok(s) => s,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: ESP file system protocol unavailable\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
     let mut fs = FileSystem::new(ss);
-    fs.read(path).expect("Failed to read kernel file from disk")
+    match fs.read(path) {
+        Ok(data) => data,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: kernel not found at \\EFI\\BEDROCK\\KERNEL\n");
+            loop { core::hint::spin_loop() }
+        }
+    }
 }
 
 /// Jump to kernel entry point.

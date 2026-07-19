@@ -61,7 +61,7 @@ if not exist "%OVMF_PATH%" (
 echo [1/4] Building kernel (x86_64-unknown-none, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set CARGO_FEATURES=--features display_log cpu_slow
+set CARGO_FEATURES=--features display_log
 if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log cpu_slow"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (

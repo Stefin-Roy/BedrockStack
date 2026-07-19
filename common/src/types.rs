@@ -38,6 +38,19 @@ pub struct FramebufferInfo {
     pub bpp: u8,
 }
 
+impl FramebufferInfo {
+    pub const fn zeroed() -> Self {
+        Self {
+            address: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            pixel_format: PixelFormat::Rgb,
+            bpp: 0,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PixelFormat {
