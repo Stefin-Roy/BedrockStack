@@ -256,7 +256,7 @@ echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 set CARGO_FEATURES=--features "display_log kernelmb2"
-if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log cpu_slow kernelmb2"
+if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log kernelmb2"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
@@ -273,7 +273,7 @@ echo %date% %time% >> "%LOG_FILE%"
 
 REM Write grub.cfg
 (
-echo set timeout=2
+echo set timeout=1
 echo set default=0
 echo insmod efi_gop
 echo insmod video
@@ -355,7 +355,7 @@ if not exist "%QEMU_PATH%" (
     -device nvme,serial=1234,drive=nvme_disk ^
     -vga std ^
     -serial stdio ^
-    -m 256M ^
+    -m 7120M ^
     -smp 4
 echo QEMU exited with code %errorlevel% >> "%LOG_FILE%"
 echo [fullrun] QEMU exited with code %errorlevel%.

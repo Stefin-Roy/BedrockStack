@@ -43,7 +43,7 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
     -device nvme,serial=1234,drive=nvme_disk ^
-    -m 256M ^
+    -m 7120M ^
     -smp 4 ^
     -serial mon:stdio ^
     -d int,cpu_reset -D qemu_smp.log 

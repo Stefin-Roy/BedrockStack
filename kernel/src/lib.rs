@@ -302,7 +302,24 @@ impl Kernel {
 }
 
 fn find_bitmap_region(memory_map: &[MemoryRegion]) -> (u64, u64) {
+    // Prefer the largest usable region below 4 GiB, which is guaranteed
+    // to be identity-mapped by both GRUB's initial 1 GiB map and UEFI's
+    // page tables.  The bitmap (~300 KiB for 32 GiB RAM) fits easily.
     let mut best = (0u64, 0u64);
+    for region in memory_map {
+        if region.kind == crate::boot::MemoryRegionKind::Usable
+            && region.base < 0x100000000
+            && region.size > best.1
+        {
+            best = (region.base, region.size);
+        }
+    }
+    if best.1 > 0 {
+        return best;
+    }
+
+    // Fall back to the largest usable region overall (may be above 4 GiB
+    // on systems with no low-memory RAM, e.g. certain NUMA configs).
     for region in memory_map {
         if region.kind == crate::boot::MemoryRegionKind::Usable
             && region.size > best.1

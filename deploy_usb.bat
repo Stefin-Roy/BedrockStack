@@ -43,7 +43,7 @@ set GRUB_EFI=%TARGET_DIR%\grub_bootx64.efi
 
 REM Write grub.cfg
 (
-echo set timeout=2
+echo set timeout=1
 echo set default=0
 echo insmod efi_gop
 echo insmod video
