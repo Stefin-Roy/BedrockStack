@@ -26,35 +26,51 @@ pub struct SdtEntry {
     pub length: u32,
 }
 
-pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
-    let rsdp_vaddr = map_region(rsdp_addr, 36);
-
-    let sig_arr: [u8; 8] = unsafe { (rsdp_vaddr as *const [u8; 8]).read() };
-    if &sig_arr != b"RSD PTR " {
+/// Parse ACPI tables from an already-mapped RSDP byte slice (embedded in
+/// a Multiboot2 tag, for example).  Extracts the RSDT / XSDT address from
+/// the RSDP data and walks the corresponding table.
+pub fn parse_tables_from_data(rsdp_data: &[u8]) -> Result<Vec<SdtEntry>, AcpiError> {
+    if rsdp_data.len() < 20 {
         return Err(AcpiError::BadSignature);
     }
 
-    let raw = unsafe { core::slice::from_raw_parts(rsdp_vaddr as *const u8, 36) };
-    if !checksum(&raw[..20]) {
+    if &rsdp_data[..8] != b"RSD PTR " {
+        return Err(AcpiError::BadSignature);
+    }
+
+    if !checksum(&rsdp_data[..20]) {
         return Err(AcpiError::BadChecksum);
     }
 
-    let revision = raw[15];
+    let revision = rsdp_data[15];
 
-    let rsdt_addr_u32 = u32::from_le_bytes([raw[16], raw[17], raw[18], raw[19]]);
+    let rsdt_addr_u32 = u32::from_le_bytes([rsdp_data[16], rsdp_data[17], rsdp_data[18], rsdp_data[19]]);
 
-    // For ACPI 2.0+:
-    let length = if revision >= 2 { u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]]) } else { 20 };
-    let xsdt_addr_u64 = if revision >= 2 {
-        u64::from_le_bytes([raw[24], raw[25], raw[26], raw[27], raw[28], raw[29], raw[30], raw[31]])
+    let length = if revision >= 2 {
+        if rsdp_data.len() < 24 {
+            return Err(AcpiError::BadSignature);
+        }
+        u32::from_le_bytes([rsdp_data[20], rsdp_data[21], rsdp_data[22], rsdp_data[23]])
+    } else {
+        20
+    };
+
+    let xsdt_addr_u64 = if revision >= 2 && rsdp_data.len() >= 32 {
+        u64::from_le_bytes([
+            rsdp_data[24], rsdp_data[25], rsdp_data[26], rsdp_data[27],
+            rsdp_data[28], rsdp_data[29], rsdp_data[30], rsdp_data[31],
+        ])
     } else {
         0
     };
 
     // Extended checksum for revision >= 2
     if revision >= 2 {
-        let ext_raw = unsafe { core::slice::from_raw_parts(rsdp_vaddr as *const u8, length as usize) };
-        if !checksum(&ext_raw[0..length as usize]) {
+        let len = length as usize;
+        if rsdp_data.len() < len {
+            return Err(AcpiError::BadSignature);
+        }
+        if !checksum(&rsdp_data[..len]) {
             return Err(AcpiError::BadChecksum);
         }
     }
@@ -66,6 +82,40 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     } else {
         Err(AcpiError::TableNotFound)
     }
+}
+
+/// Parse ACPI tables by mapping the RSDP from physical memory.
+///
+/// Maps a minimum of 36 bytes, then re-maps with the full length reported
+/// in the RSDP for ACPI 2.0+ before delegating to `parse_tables_from_data`.
+pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
+    let rsdp_vaddr = map_region(rsdp_addr, 36);
+
+    let raw = unsafe { core::slice::from_raw_parts(rsdp_vaddr as *const u8, 36) };
+    if &raw[..8] != b"RSD PTR " {
+        return Err(AcpiError::BadSignature);
+    }
+    if !checksum(&raw[..20]) {
+        return Err(AcpiError::BadChecksum);
+    }
+
+    let revision = raw[15];
+    let length = if revision >= 2 {
+        u32::from_le_bytes([raw[20], raw[21], raw[22], raw[23]])
+    } else {
+        20
+    };
+
+    // Re-map with the full RSDP length for ACPI 2.0+ (needed for the extended
+    // checksum and in case the initial 36 bytes were insufficient).
+    let rsdp_data = if length as u64 > 36 {
+        let vaddr = map_region(rsdp_addr, length as u64);
+        unsafe { core::slice::from_raw_parts(vaddr as *const u8, length as usize) }
+    } else {
+        raw
+    };
+
+    parse_tables_from_data(rsdp_data)
 }
 
 fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {

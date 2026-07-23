@@ -8,11 +8,12 @@ use kernel::arch::{Arch, CurrentArch};
 use kernel::boot::{FramebufferInfo, MemoryRegion};
 use kernel::drivers::serial::SerialPort;
 
-/// Kernel entry point.
+/// Kernel entry point (custom bootloader path).
 ///
 /// # Safety
 /// Called from boot after exit_boot_services.
 #[unsafe(no_mangle)]
+#[cfg(not(feature = "kernelmb2"))]
 #[cfg(target_arch = "x86_64")]
 pub extern "sysv64" fn _start(
     memory_map_ptr: *const MemoryRegion,
@@ -21,6 +22,11 @@ pub extern "sysv64" fn _start(
     stack_guard: u64,
     rsdp_addr: u64,
 ) -> ! {
+    // ── Kernel arrived ──
+    if let Some(fb) = unsafe { framebuffer_ptr.as_ref() } {
+        fb.draw_rect(192, 0, 64, 64, 255, 255, 0);  // M4: YELLOW — kernel _start
+    }
+
     // Reinit COM1 — boot already did this, but be safe
     SerialPort::init();
     SerialPort::puts("[kernel] _start entered\n");
@@ -42,7 +48,7 @@ pub extern "sysv64" fn _start(
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr) };
+    let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");
@@ -149,7 +155,7 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr) };
+    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     SerialPort::puts("[kernel] Init complete, running modules...\n");

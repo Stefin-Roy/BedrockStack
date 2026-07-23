@@ -49,6 +49,7 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -d int,cpu_reset -D qemu_smp.log 
 goto :done
 
+
 :arch_riscv64
 set QEMU_PATH=%QEMU_DIR%\qemu-system-riscv64.exe
 set OPENSBI=%QEMU_DIR%\share\opensbi-riscv64-generic-fw_dynamic.bin

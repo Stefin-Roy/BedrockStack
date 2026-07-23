@@ -15,9 +15,7 @@ pub struct Framebuffer {
 
 impl Framebuffer {
     pub unsafe fn new(addr: u64, width: usize, height: usize, stride: usize, pixel_format: PixelFormat, bpp: u8) -> Self {
-        if addr != 0 {
-            assert!(addr as u64 % bpp as u64 == 0, "framebuffer address must be bpp-aligned");
-        }
+        assert!(bpp > 0, "framebuffer bytes per pixel must be nonzero");
         assert!(width <= stride, "width must be <= stride (pixels per scanline)");
 
         Framebuffer {

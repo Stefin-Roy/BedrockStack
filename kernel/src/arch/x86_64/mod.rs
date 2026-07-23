@@ -5,6 +5,8 @@ pub mod limiter;
 pub mod paging;
 pub mod serial;
 pub mod trampoline;
+#[cfg(feature = "kernelmb2")]
+mod multiboot2;
 
 use crate::acpi::AcpiSubsystem;
 use crate::platform::x86_64_pc::apic;

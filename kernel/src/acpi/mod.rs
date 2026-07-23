@@ -70,9 +70,17 @@ pub struct AcpiSubsystem {
 
 impl AcpiSubsystem {
     /// Parse all ACPI tables starting from the RSDP at `rsdp_addr`.
-    pub fn new(rsdp_addr: u64) -> Result<Self, AcpiError> {
+    ///
+    /// When `rsdp_data` is `Some(...)` the RSDP data is already available in
+    /// memory (e.g. embedded in a Multiboot2 tag) and is used directly;
+    /// otherwise the RSDP is mapped from physical `rsdp_addr`.
+    pub fn new(rsdp_addr: u64, rsdp_data: Option<&'static [u8]>) -> Result<Self, AcpiError> {
         log::info!("ACPI: RSDP at 0x{:x}", rsdp_addr);
-        let entries = tables::parse_tables(rsdp_addr)?;
+        let entries = if let Some(data) = rsdp_data {
+            tables::parse_tables_from_data(data)?
+        } else {
+            tables::parse_tables(rsdp_addr)?
+        };
 
         // DEBUG: dump all parsed table entries and their signatures
         for (i, e) in entries.iter().enumerate() {

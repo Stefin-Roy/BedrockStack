@@ -49,6 +49,45 @@ impl FramebufferInfo {
             bpp: 0,
         }
     }
+
+    /// Draw a solid-colour rectangle directly to the linear framebuffer.
+    /// Safe to call with any `FramebufferInfo` — returns immediately if the
+    /// address or bpp is invalid (zeroed fallback).  Writes pixel bytes in
+    /// the correct order for `Rgb` vs `Bgr` formats.
+    pub fn draw_rect(&self, x: usize, y: usize, w: usize, h: usize, r: u8, g: u8, b: u8) {
+        if self.address == 0 || self.bpp < 3 {
+            return;
+        }
+        let bpp = self.bpp as usize;
+        let base = self.address as *mut u8;
+        let row = self.stride * bpp;
+        for dy in 0..h {
+            for dx in 0..w {
+                unsafe {
+                    let off = (y + dy) * row + (x + dx) * bpp;
+                    // GOP framebuffer memory is scanned out by the display
+                    // controller outside the CPU's normal memory model.  Use
+                    // volatile stores so early-boot diagnostic pixels cannot
+                    // be folded away or reordered by the compiler.
+                    match self.pixel_format {
+                        PixelFormat::Rgb => {
+                            base.add(off).write_volatile(r);
+                            base.add(off + 1).write_volatile(g);
+                            base.add(off + 2).write_volatile(b);
+                        }
+                        PixelFormat::Bgr => {
+                            base.add(off).write_volatile(b);
+                            base.add(off + 1).write_volatile(g);
+                            base.add(off + 2).write_volatile(r);
+                        }
+                    }
+                    if bpp >= 4 {
+                        base.add(off + 3).write_volatile(0xFF);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[repr(C)]

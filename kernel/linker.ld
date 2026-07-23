@@ -9,7 +9,9 @@ SECTIONS
 
     __text_start = .;
     .text : AT(KERNEL_OFFSET) {
-        *(.text.boot)
+        KEEP(*(.multiboot2))
+        KEEP(*(.text.boot))
+        KEEP(*(.text.boot64))
         *(.text)
         *(.text.*)
     }
@@ -36,6 +38,7 @@ SECTIONS
 
     __data_start = .;
     .data : {
+        *(.data.boot)
         *(.data)
         *(.data.*)
     }
@@ -56,15 +59,23 @@ SECTIONS
         __bss_end = .;
     }
 
+    .stack (NOLOAD) : {
+        __stack_start = .;
+        . += 0x8000;
+        __stack_end = .;
+    }
+
     . = ALIGN(4096);
     __kernel_end = .;
 
     /DISCARD/ : {
         *(.eh_frame)
+        *(.eh_frame_hdr)
         *(.comment)
         *(.note*)
         *(.gnu.hash)
         *(.dynsym)
         *(.dynstr)
+        *(.gcc_except_table)
     }
 }

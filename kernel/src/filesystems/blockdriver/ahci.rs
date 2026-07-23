@@ -212,6 +212,7 @@ struct AhciPort {
     n_slots: u8,
     sector_count: u64,
     lba48: bool,
+    ncq: bool,
     model: [u8; 40],
     slots: [Slot; AHCI_MAX_SLOTS],
     slot_alloc: core::sync::atomic::AtomicU32,
@@ -329,6 +330,29 @@ impl AhciPort {
         }
     }
 
+    /// Write a standard Register H2D FIS (non-NCQ).
+    /// For 28-bit LBA commands (0xC8/0xCA): device reg includes LBA[27:24].
+    /// For 48-bit LBA commands (0x25/0x35): LBA goes to bytes 4-6 and 8-10.
+    fn write_std_fis(&self, fis: *mut u32, lba: u64, count: u16, cmd: u8) {
+        unsafe {
+            fis.add(0).write_volatile(0x8027u32 | (cmd as u32) << 16);
+            if self.lba48 {
+                fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (0xE0 << 24));
+                fis.add(2).write_volatile(
+                    ((lba >> 24) as u32 & 0xFF)
+                    | (((lba >> 32) as u32 & 0xFF) << 8)
+                    | (((lba >> 40) as u32 & 0xFF) << 16));
+                fis.add(3).write_volatile((count as u32 & 0xFF) | ((count as u32 >> 8) << 8));
+            } else {
+                let dev = 0xE0u32 | ((lba >> 24) as u32 & 0x0F);
+                fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (dev << 24));
+                fis.add(2).write_volatile(0);
+                fis.add(3).write_volatile(count as u32 & 0xFF);
+            }
+            fis.add(4).write_volatile(0);
+        }
+    }
+
     /// Build PRDT entries with translation caching.
     fn build_prdt(&self, buf_vaddr: u64, size: usize, prdt_ptr: *mut PrdEntry) -> Result<usize, &'static str> {
         let mut rem = size as isize;
@@ -386,20 +410,25 @@ impl AhciPort {
         self.slot_alloc.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
     }
 
-    /// Prepare a single NCQ command in the given slot.
+    /// Prepare a command in the given slot.
     fn prepare_cmd(&self, tag: u8, lba: u64, count: u32, buf_vaddr: u64, size: usize, is_write: bool) -> Result<(), &'static str> {
         let ct_va = self.slots[tag as usize].ct_vaddr;
 
-        // Zero only FIS + PRDT area (not entire 4K page)
         unsafe {
             core::ptr::write_bytes(ct_va as *mut u8, 0, 0x80 + self.max_prdt * 16);
         }
 
-        // Write NCQ FIS
-        let cmd = if is_write { 0x61u8 } else { 0x60u8 };
-        self.write_ncq_fis(ct_va as *mut u32, lba, count as u16, tag, cmd);
+        if self.ncq {
+            let cmd = if is_write { 0x61u8 } else { 0x60u8 };
+            self.write_ncq_fis(ct_va as *mut u32, lba, count as u16, tag, cmd);
+        } else if self.lba48 {
+            let cmd = if is_write { 0x35u8 } else { 0x25u8 };
+            self.write_std_fis(ct_va as *mut u32, lba, count as u16, cmd);
+        } else {
+            let cmd = if is_write { 0xCAu8 } else { 0xC8u8 };
+            self.write_std_fis(ct_va as *mut u32, lba, count as u16, cmd);
+        }
 
-        // Build PRDT
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
         let prdtl = if buf_vaddr != 0 {
             self.build_prdt(buf_vaddr, size, prdt_ptr)?
@@ -413,7 +442,6 @@ impl AhciPort {
             1usize
         };
 
-        // Update CmdHeader (W bit, PRDTL, clear PRDBC)
         let hdr = (self.cl_vaddr + (tag as u64) * 32) as *mut CmdHeader;
         let w = if is_write { 1u32 << 7 } else { 0 };
         unsafe {
@@ -424,11 +452,14 @@ impl AhciPort {
         Ok(())
     }
 
-    /// Submit a batch of NCQ commands identified by tag_mask.
-    /// Writes PxSACT then PxCI, waits for completion.
+    /// Submit a batch of commands identified by tag_mask.
+    /// For NCQ: writes PxSACT then PxCI, waits for completion.
+    /// For non-NCQ: writes only PxCI, waits for completion.
     fn submit_batch(&self, tag_mask: u32) -> Result<(), &'static str> {
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-        self.hba.pw32(self.port, port_off::SACT, tag_mask);
+        if self.ncq {
+            self.hba.pw32(self.port, port_off::SACT, tag_mask);
+        }
         self.hba.pw32(self.port, port_off::CI, tag_mask);
         self.wait_slots(tag_mask)
     }
@@ -555,6 +586,10 @@ impl AhciPort {
                 SerialPort::puts("[ahci] WARN: IDENTIFY sector_count=0\n");
             }
 
+            // Check NCQ support (IDENTIFY word 76, bit 8)
+            let w76 = data.add(76).read_volatile();
+            self.ncq = (w76 & (1 << 8)) != 0;
+
             for i in 0..20 {
                 let w = data.add(27 + i).read_volatile();
                 self.model[i * 2] = (w >> 8) as u8;
@@ -573,12 +608,12 @@ impl AhciPort {
 
 impl BlockDevice for AhciPort {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
-        let n = reqs.len().min(self.n_slots as usize);
+        let n = reqs.len().min(if self.ncq { self.n_slots as usize } else { 1 });
         if n == 0 {
             return Ok(IoCompletions { completed: 0, errors: 0 });
         }
 
-        // Allocate NCQ tags
+        // Allocate tags (NCQ or non-NCQ)
         let tag_mask = self.alloc_slots(n)?;
 
         // Phase 1: prepare all command slots
@@ -841,7 +876,7 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
         _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
         scratch_paddr: sc_buf.phys, scratch_vaddr: sc_buf.virt,
         max_prdt, n_slots,
-        sector_count: 0, lba48: false, model: [0u8; 40],
+        sector_count: 0, lba48: false, ncq: false, model: [0u8; 40],
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),

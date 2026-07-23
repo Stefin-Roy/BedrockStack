@@ -61,6 +61,7 @@ pub struct Kernel {
     layout: KernelLayout,
     stack_guard: u64,
     rsdp_addr: u64,
+    rsdp_data: Option<&'static [u8]>,
     acpi: Option<AcpiSubsystem>,
     page_table_root: u64,
 }
@@ -75,6 +76,7 @@ impl Kernel {
         framebuffer: &FramebufferInfo,
         stack_guard: u64,
         rsdp_addr: u64,
+        rsdp_data: Option<&'static [u8]>,
     ) -> Self {
         use crate::drivers::serial::SerialPort;
         SerialPort::puts("[kernel] Kernel::new: acpi_log init\n");
@@ -125,22 +127,6 @@ impl Kernel {
         SerialPort::puts("[kernel] Kernel::new: heap::init\n");
         unsafe { heap::init(&mut allocator) };
 
-        #[cfg(feature = "display_log")]
-        {
-            use framebuffer::Console;
-            let console = unsafe {
-                Console::new(
-                    display.ptr(),
-                    display.width(),
-                    display.height(),
-                    display.stride(),
-                    display.pixel_format(),
-                    display.bpp(),
-                )
-            };
-            crate::drivers::serial::set_console(console);
-        }
-
         SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {
@@ -149,6 +135,7 @@ impl Kernel {
             layout,
             stack_guard,
             rsdp_addr,
+            rsdp_data,
             acpi: None,
             page_table_root: 0,
         }
@@ -159,8 +146,9 @@ impl Kernel {
         // the stashed heap/DMA pointer before any code path can need it.
         heap::set_phys_allocator(&mut self.allocator);
         unsafe { crate::smp::early_init_bsp(); }
-        CurrentArch::init();
         self.switch_to_higher_half();
+        self.enable_framebuffer_log();
+        CurrentArch::init();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
         self.init_acpi();
@@ -227,16 +215,38 @@ impl Kernel {
         log::info!("Higher-half page tables activated");
     }
 
+    /// Enable display logging only after the active page tables map the
+    /// Multiboot framebuffer.  The bootstrap tables cover only low memory.
+    #[cfg(feature = "display_log")]
+    fn enable_framebuffer_log(&self) {
+        use framebuffer::Console;
+
+        let console = unsafe {
+            Console::new(
+                self.framebuffer.ptr(),
+                self.framebuffer.width(),
+                self.framebuffer.height(),
+                self.framebuffer.stride(),
+                self.framebuffer.pixel_format(),
+                self.framebuffer.bpp(),
+            )
+        };
+        crate::drivers::serial::set_console(console);
+    }
+
+    #[cfg(not(feature = "display_log"))]
+    fn enable_framebuffer_log(&self) {}
+
     /// Parse ACPI tables from the RSDP.
     ///
     /// Runs after page tables are live so the VMM-backed `AcpiHandler` can
     /// map physical regions.
     fn init_acpi(&mut self) {
-        if self.rsdp_addr == 0 {
+        if self.rsdp_addr == 0 && self.rsdp_data.is_none() {
             log::info!("No RSDP address provided — ACPI disabled");
             return;
         }
-        match AcpiSubsystem::new(self.rsdp_addr) {
+        match AcpiSubsystem::new(self.rsdp_addr, self.rsdp_data) {
             Ok(a) => {
                 log::info!("ACPI subsystem initialised");
                 self.acpi = Some(a);

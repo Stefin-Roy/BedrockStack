@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 cpu_slow = []
 display_log = []
+kernelmb2 = []
 
 [dependencies]
 spin = "0.9"

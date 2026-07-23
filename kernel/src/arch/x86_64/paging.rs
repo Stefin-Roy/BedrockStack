@@ -1,5 +1,5 @@
 use x86_64::registers::control::{Cr0, Cr0Flags};
-use x86_64::registers::model_specific::{Efer, EferFlags};
+use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
 
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
@@ -9,6 +9,7 @@ const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
 
 const TRAMPOLINE_PHYS: u64 = 0x8000;
+const IA32_APIC_BASE_MSR: u32 = 0x1B;
 
 /// Build identity-mapped page tables together with a higher-half alias of
 /// the kernel image at `KERNEL_VMA_BASE + phys_addr`.
@@ -47,6 +48,10 @@ pub fn setup(
     let mut vmm = Vmm::new(allocator);
     let guard_page = stack_guard & !(PAGE_4K - 1);
 
+    // Read the local APIC base so it can be mapped uncacheable.
+    let apic_base_msr = Msr::new(IA32_APIC_BASE_MSR);
+    let apic_base = unsafe { apic_base_msr.read() } & !(PAGE_4K - 1);
+
     // ── Identity-map all RAM up to ram_end ─────────────────────────
     let mut chunk = 0u64;
     while chunk < ram_end {
@@ -55,8 +60,9 @@ pub fn setup(
         let overlaps_kernel = chunk < layout.kernel_end && chunk_end > layout.kernel_start;
         let contains_guard = stack_guard != 0 && guard_page >= chunk && guard_page < chunk_end;
         let is_first = chunk == 0;
+        let contains_apic = chunk <= apic_base && chunk_end > apic_base;
 
-        if overlaps_kernel || contains_guard || is_first {
+        if overlaps_kernel || contains_guard || is_first || contains_apic {
             let mut page_addr = chunk;
             while page_addr < chunk_end {
                 if page_addr == 0 || (stack_guard != 0 && page_addr == guard_page) {
@@ -66,6 +72,9 @@ pub fn setup(
                 let mut flags = leaf_flags(page_addr, layout, fb_start, fb_end);
                 if page_addr == TRAMPOLINE_PHYS {
                     flags |= PageFlags::EXECUTE;
+                }
+                if page_addr == apic_base {
+                    flags |= PageFlags::NO_CACHE;
                 }
                 vmm.map_4k(allocator, page_addr, page_addr, flags);
                 page_addr += PAGE_4K;
@@ -100,6 +109,18 @@ pub fn setup(
     // ── Higher-half kernel alias ───────────────────────────────────
     // Every 4 KiB page of the kernel image is also mapped at
     // KERNEL_VMA_BASE + phys_addr with identical permissions.
+    // Enforce the CR3 handoff invariant: all linked kernel pages (including
+    // .data, .bss, and the bootstrap stack) remain identity-mapped.
+    let kernel_map_start = layout.kernel_start & !(PAGE_4K - 1);
+    let kernel_map_end = (layout.kernel_end + PAGE_4K - 1) & !(PAGE_4K - 1);
+    let mut addr = kernel_map_start;
+    while addr < kernel_map_end {
+        if vmm.translate(addr).is_none() {
+            vmm.map_4k(allocator, addr, addr, leaf_flags(addr, layout, fb_start, fb_end));
+        }
+        addr += PAGE_4K;
+    }
+
     let mut addr = layout.kernel_start;
     while addr < layout.kernel_end {
         let flags = leaf_flags(addr, layout, fb_start, fb_end);

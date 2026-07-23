@@ -9,6 +9,7 @@ rustflags = [
     "-C", "link-arg=-Tkernel/linker.ld",
     "-C", "link-arg=-no-pie",
     "-C", "link-arg=-static",
+    "-C", "linker=rust-lld",
 ]
 
 [target.riscv64gc-unknown-none-elf]
