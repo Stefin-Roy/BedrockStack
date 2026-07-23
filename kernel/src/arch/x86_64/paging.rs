@@ -35,10 +35,6 @@ pub fn setup(
     let fb_start = framebuffer_addr;
     let fb_end = framebuffer_addr.saturating_add(fb_size);
 
-    let min_end = 4u64 * 1024 * 1024 * 1024;
-    // End of physical RAM covered by the allocator (2 MiB aligned).
-    let ram_end = (min_end.max(allocator.alloc_end()) + PAGE_2M - 1) & !(PAGE_2M - 1);
-
     // ── Enable NXE + WP ────────────────────────────────────────────
     unsafe {
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
@@ -48,9 +44,15 @@ pub fn setup(
     let mut vmm = Vmm::new(allocator);
     let guard_page = stack_guard & !(PAGE_4K - 1);
 
-    // Read the local APIC base so it can be mapped uncacheable.
+    // Read the local APIC base so it can be mapped uncacheable and so
+    // we know the minimum extent of the identity-map range.
     let apic_base_msr = Msr::new(IA32_APIC_BASE_MSR);
     let apic_base = unsafe { apic_base_msr.read() } & !(PAGE_4K - 1);
+
+    // Identity-map at least up to the end of physical RAM and the local
+    // APIC MMIO region.  The framebuffer (which may be far above RAM on
+    // 64-bit systems) is handled separately below.
+    let ram_end = (allocator.alloc_end().max(apic_base + PAGE_4K) + PAGE_2M - 1) & !(PAGE_2M - 1);
 
     // ── Identity-map all RAM up to ram_end ─────────────────────────
     let mut chunk = 0u64;

@@ -157,17 +157,16 @@ impl Console {
             }
         }
 
+        let copy_bytes = row_bytes * (self.height - 16);
         unsafe {
-            core::ptr::copy(
-                self.fb_ptr.add(char_row_bytes),
-                self.fb_ptr,
-                row_bytes * (self.height - 16),
-            );
-            core::ptr::write_bytes(
-                self.fb_ptr.add(row_bytes * (self.height - 16)),
-                0,
-                char_row_bytes,
-            );
+            for i in 0..copy_bytes {
+                self.fb_ptr.add(i).write_volatile(
+                    self.fb_ptr.add(char_row_bytes + i).read_volatile(),
+                );
+            }
+            for i in 0..char_row_bytes {
+                self.fb_ptr.add(copy_bytes + i).write_volatile(0);
+            }
         }
     }
 
@@ -238,7 +237,9 @@ impl Console {
         let bpp = self.bpp as usize;
         let total = self.stride * self.height * bpp;
         unsafe {
-            core::ptr::write_bytes(self.fb_ptr, 0, total);
+            for i in 0..total {
+                self.fb_ptr.add(i).write_volatile(0);
+            }
         }
 
         if self.view_offset < 0 {

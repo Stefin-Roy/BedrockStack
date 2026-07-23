@@ -25,8 +25,11 @@ pub fn setup(
     let fb_start = framebuffer_addr;
     let fb_end = framebuffer_addr.saturating_add(fb_size);
 
-    let min_end = 4u64 * 1024 * 1024 * 1024;
-    let max_addr = fb_end.max(min_end).max(allocator.alloc_end());
+    // Identity-map at least up to the end of physical RAM and the end of
+    // the framebuffer.  RISC-V virt platform MMIO (UART at 0x10000000,
+    // PLIC at 0x0C000000, HTIF at 0x40008000) sits below typical RAM
+    // (which starts at 0x80000000), so it is covered automatically.
+    let max_addr = fb_end.max(allocator.alloc_end());
     let max_addr = (max_addr + PAGE_2M - 1) & !(PAGE_2M - 1);
 
     let mut vmm = Vmm::new(allocator);

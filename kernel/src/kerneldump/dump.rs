@@ -20,9 +20,6 @@ const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER:     u64 = 1 << 2;
 const PTE_NO_EXEC:  u64 = 1 << 63;
 
-/// Maximum physical address we trust for identity-mapped access.
-const MAX_PHYS: u64 = 4 * 1024 * 1024 * 1024;
-
 // ── Re-entrancy guard ───────────────────────────────────────────────
 
 static DUMP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
@@ -63,7 +60,6 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     }
 
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
-    if pml4_phys >= MAX_PHYS { return None; }
 
     unsafe {
         let pml4_virt = KERNEL_VMA_BASE + pml4_phys;
@@ -72,38 +68,32 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
         if pml4_entry & PTE_PRESENT == 0 { return None; }
 
         let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
-        if pdp_phys >= MAX_PHYS { return None; }
         let pdp_virt = KERNEL_VMA_BASE + pdp_phys;
         let pdp_idx = ((addr >> 30) & 0x1FF) as usize;
         let pdp_entry = read_volatile_u64((pdp_virt + (pdp_idx as u64) * 8) as *const u64)?;
         if pdp_entry & PTE_PRESENT == 0 { return None; }
         if pdp_entry & (1 << 7) != 0 {
             let phys = (pdp_entry & 0x000F_FFC0_0000_0000) | (addr & 0x3FFF_FFFF);
-            if phys >= MAX_PHYS { return None; }
             return Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64));
         }
 
         let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
-        if pd_phys >= MAX_PHYS { return None; }
         let pd_virt = KERNEL_VMA_BASE + pd_phys;
         let pd_idx = ((addr >> 21) & 0x1FF) as usize;
         let pd_entry = read_volatile_u64((pd_virt + (pd_idx as u64) * 8) as *const u64)?;
         if pd_entry & PTE_PRESENT == 0 { return None; }
         if pd_entry & (1 << 7) != 0 {
             let phys = (pd_entry & 0x000F_FFFF_FE00_0000) | (addr & 0x1F_FFFF);
-            if phys >= MAX_PHYS { return None; }
             return Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64));
         }
 
         let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
-        if pt_phys >= MAX_PHYS { return None; }
         let pt_virt = KERNEL_VMA_BASE + pt_phys;
         let pt_idx = ((addr >> 12) & 0x1FF) as usize;
         let pte = read_volatile_u64((pt_virt + (pt_idx as u64) * 8) as *const u64)?;
         if pte & PTE_PRESENT == 0 { return None; }
 
         let phys = (pte & 0x000F_FFFF_FFFF_F000) | (addr & 0xFFF);
-        if phys >= MAX_PHYS { return None; }
         Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64))
     }
 }
@@ -439,7 +429,6 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let _ = writeln!(w, "--- Page Table Walk for {:#018x} ---", vaddr);
 
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
-    if pml4_phys >= MAX_PHYS { let _ = writeln!(w, "  (PML4 phys out of range)"); return; }
     let pml4_virt = KERNEL_VMA_BASE + pml4_phys;
 
     let idx4 = ((vaddr >> 39) & 0x1FF) as usize;
@@ -451,7 +440,6 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     if e4 & PTE_PRESENT == 0 { return; }
 
     let pdp_phys = e4 & 0x000F_FFFF_FFFF_F000;
-    if pdp_phys >= MAX_PHYS { let _ = writeln!(w, "  (PDP phys out of range)"); return; }
     let pdp_virt = KERNEL_VMA_BASE + pdp_phys;
     let idx3 = ((vaddr >> 30) & 0x1FF) as usize;
     let e3 = match unsafe { read_volatile_u64((pdp_virt + (idx3 as u64) * 8) as *const u64) } {
@@ -467,7 +455,6 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     }
 
     let pd_phys = e3 & 0x000F_FFFF_FFFF_F000;
-    if pd_phys >= MAX_PHYS { let _ = writeln!(w, "  (PD phys out of range)"); return; }
     let pd_virt = KERNEL_VMA_BASE + pd_phys;
     let idx2 = ((vaddr >> 21) & 0x1FF) as usize;
     let e2 = match unsafe { read_volatile_u64((pd_virt + (idx2 as u64) * 8) as *const u64) } {
@@ -483,7 +470,6 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     }
 
     let pt_phys = e2 & 0x000F_FFFF_FFFF_F000;
-    if pt_phys >= MAX_PHYS { let _ = writeln!(w, "  (PT phys out of range)"); return; }
     let pt_virt = KERNEL_VMA_BASE + pt_phys;
     let idx1 = ((vaddr >> 12) & 0x1FF) as usize;
     let e1 = match unsafe { read_volatile_u64((pt_virt + (idx1 as u64) * 8) as *const u64) } {

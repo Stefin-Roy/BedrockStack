@@ -94,7 +94,10 @@ impl Display for Framebuffer {
         let offset = y * self.stride * bpp + x * bpp;
         let bytes = color.to_pixel_bytes(self.pixel_format);
         unsafe {
-            self.ptr.add(offset).copy_from_nonoverlapping(bytes.as_ptr(), bpp);
+            let p = self.ptr.add(offset);
+            for i in 0..bpp {
+                p.add(i).write_volatile(bytes[i]);
+            }
         }
         true
     }
@@ -104,6 +107,7 @@ impl Display for Framebuffer {
         if self.ptr.is_null() || w == 0 || h == 0 {
             return;
         }
+        let bytes = color.to_pixel_bytes(self.pixel_format);
         for row in 0..h {
             let py = y + row;
             if py >= self.height {
@@ -115,9 +119,11 @@ impl Display for Framebuffer {
                     break;
                 }
                 let offset = py * self.stride * bpp + px * bpp;
-                let bytes = color.to_pixel_bytes(self.pixel_format);
                 unsafe {
-                    self.ptr.add(offset).copy_from_nonoverlapping(bytes.as_ptr(), bpp);
+                    let p = self.ptr.add(offset);
+                    for i in 0..bpp {
+                        p.add(i).write_volatile(bytes[i]);
+                    }
                 }
             }
         }
@@ -137,8 +143,12 @@ impl Display for Framebuffer {
         let src = unsafe { self.ptr.add(src_offset) };
         let copy_bytes = (self.height - rows) * row_bytes;
         unsafe {
-            core::ptr::copy(src, dst, copy_bytes);
-            core::ptr::write_bytes(self.ptr.add(copy_bytes), 0, rows * row_bytes);
+            for i in 0..copy_bytes {
+                dst.add(i).write_volatile(src.add(i).read_volatile());
+            }
+            for i in 0..rows * row_bytes {
+                self.ptr.add(copy_bytes + i).write_volatile(0);
+            }
         }
     }
 
@@ -148,7 +158,9 @@ impl Display for Framebuffer {
         }
         let total = self.stride * self.height * (self.bpp as usize);
         unsafe {
-            core::ptr::write_bytes(self.ptr, 0, total);
+            for i in 0..total {
+                self.ptr.add(i).write_volatile(0);
+            }
         }
     }
 
@@ -199,7 +211,10 @@ pub(crate) unsafe fn draw_glyph_raw(
             };
             let bytes = color.to_pixel_bytes(pixel_format);
             unsafe {
-                fb_ptr.add(offset).copy_from_nonoverlapping(bytes.as_ptr(), bpp);
+                let p = fb_ptr.add(offset);
+                for i in 0..bpp {
+                    p.add(i).write_volatile(bytes[i]);
+                }
             }
         }
     }

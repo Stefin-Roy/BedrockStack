@@ -5,7 +5,10 @@
 use core::arch::global_asm;
 use core::panic::PanicInfo;
 use kernel::arch::{Arch, CurrentArch};
-use kernel::boot::{FramebufferInfo, MemoryRegion};
+#[cfg(any(target_arch = "riscv64", not(feature = "kernelmb2")))]
+use kernel::boot::FramebufferInfo;
+#[cfg(not(feature = "kernelmb2"))]
+use kernel::boot::MemoryRegion;
 use kernel::drivers::serial::SerialPort;
 
 /// Kernel entry point (custom bootloader path).
