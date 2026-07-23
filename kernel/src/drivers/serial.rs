@@ -46,7 +46,7 @@ impl SerialPort {
         track_newline(c);
         #[cfg(feature = "display_log")]
         if let Some(con) = unsafe { &mut *CONSOLE.0.get() } {
-            con.putc(c);
+            con.putc_and_flush(c);
         }
         release_locks(cpu);
     }
@@ -88,6 +88,12 @@ impl SerialPort {
     pub fn put_hex(val: u64) {
         let cpu = acquire_locks();
         Inner::put_hex(val);
+        #[cfg(feature = "display_log")]
+        if let Some(con) = unsafe { &mut *CONSOLE.0.get() } {
+            let mut buf = [0u8; 18];
+            let s = format_hex(val, &mut buf);
+            con.puts(s);
+        }
         release_locks(cpu);
     }
 
@@ -95,6 +101,12 @@ impl SerialPort {
     pub fn put_u64(val: u64) {
         let cpu = acquire_locks();
         Inner::put_u64(val);
+        #[cfg(feature = "display_log")]
+        if let Some(con) = unsafe { &mut *CONSOLE.0.get() } {
+            let mut buf = [0u8; 20];
+            let s = format_dec(val, &mut buf);
+            con.puts(s);
+        }
         release_locks(cpu);
     }
 }
@@ -126,6 +138,37 @@ fn write_prefix(cpu_id: u32) {
 
 fn track_newline(c: u8) {
     LAST_WAS_NL.store(c == b'\n', Ordering::Relaxed);
+}
+
+#[cfg(feature = "display_log")]
+fn format_hex(mut val: u64, buf: &mut [u8; 18]) -> &str {
+    if val == 0 {
+        buf[0] = b'0';
+        return unsafe { core::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let mut i = 16;
+    while val > 0 {
+        i -= 1;
+        let digit = (val & 0xF) as u8;
+        buf[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+        val >>= 4;
+    }
+    unsafe { core::str::from_utf8_unchecked(&buf[i..]) }
+}
+
+#[cfg(feature = "display_log")]
+fn format_dec(mut val: u64, buf: &mut [u8; 20]) -> &str {
+    if val == 0 {
+        buf[0] = b'0';
+        return unsafe { core::str::from_utf8_unchecked(&buf[..1]) };
+    }
+    let mut i = 20;
+    while val > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    unsafe { core::str::from_utf8_unchecked(&buf[i..]) }
 }
 
 fn acquire_locks() -> Option<()> {

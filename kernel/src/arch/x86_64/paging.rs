@@ -2,7 +2,7 @@ use x86_64::registers::control::{Cr0, Cr0Flags};
 use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
 
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
+use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE, init_pat_wc};
 use crate::KernelLayout;
 
 const PAGE_4K: u64 = 4096;
@@ -34,6 +34,9 @@ pub fn setup(
     let fb_size = (framebuffer_stride * framebuffer_height * framebuffer_bpp as usize) as u64;
     let fb_start = framebuffer_addr;
     let fb_end = framebuffer_addr.saturating_add(fb_size);
+
+    // ── Program PAT so entry 1 = Write-Combining ───────────────────
+    init_pat_wc();
 
     // ── Enable NXE + WP ────────────────────────────────────────────
     unsafe {
@@ -84,7 +87,7 @@ pub fn setup(
         } else {
             let mut flags = PageFlags::READ | PageFlags::WRITE;
             if chunk < fb_end && chunk_end > fb_start {
-                flags |= PageFlags::NO_CACHE;
+                flags |= PageFlags::WRITE_COMBINING;
             }
             vmm.map_2m(allocator, chunk, chunk, flags);
         }
@@ -102,7 +105,7 @@ pub fn setup(
                 allocator,
                 chunk,
                 chunk,
-                PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINING,
             );
             chunk += PAGE_2M;
         }
@@ -145,7 +148,7 @@ fn leaf_flags(addr: u64, layout: &KernelLayout, fb_start: u64, fb_end: u64) -> P
         PageFlags::READ | PageFlags::WRITE
     };
     if addr >= fb_start && addr < fb_end {
-        flags |= PageFlags::NO_CACHE;
+        flags |= PageFlags::WRITE_COMBINING;
     }
     flags
 }

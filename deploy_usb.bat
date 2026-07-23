@@ -34,7 +34,7 @@ goto :done
 :deploy_grub
 echo === GRUB+Multiboot2 USB deployment ===
 echo [1/2] Building kernel (release, kernelmb2)...
-cargo build --target x86_64-unknown-none -p kernel --features "display_log kernelmb2" --release
+cargo build --target x86_64-unknown-none -p kernel --features "display_log kernelmb2 cpu_slow" --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/2] Creating GRUB standalone image and copying to USB folder...

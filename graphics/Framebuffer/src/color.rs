@@ -39,4 +39,8 @@ impl Color {
             PixelFormat::Rgb => [self.r, self.g, self.b, self.a],
         }
     }
+
+    pub fn to_pixel_u32(self, format: PixelFormat) -> u32 {
+        u32::from_le_bytes(self.to_pixel_bytes(format))
+    }
 }

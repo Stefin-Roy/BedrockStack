@@ -1,7 +1,5 @@
-use common::types::PixelFormat;
-
 use crate::color::Color;
-use crate::framebuffer::draw_glyph_raw;
+use crate::display::Display;
 
 #[cfg(feature = "scrollback")]
 use alloc::vec::Vec;
@@ -12,12 +10,7 @@ use alloc::vec;
 const SCROLLBACK_LINES: usize = 1024;
 
 pub struct Console {
-    fb_ptr: *mut u8,
-    stride: usize,
-    bpp: u8,
-    height: usize,
-    width: usize,
-    pixel_format: PixelFormat,
+    display: *mut dyn Display,
     cursor_col: usize,
     cursor_row: usize,
     max_cols: usize,
@@ -35,25 +28,15 @@ pub struct Console {
 }
 
 impl Console {
-    pub unsafe fn new(
-        fb_ptr: *mut u8,
-        width: usize,
-        height: usize,
-        stride: usize,
-        pixel_format: PixelFormat,
-        bpp: u8,
-    ) -> Self {
-        let max_cols = if width > 0 { width / 8 } else { 0 };
-        let max_rows = if height > 0 { height / 16 } else { 0 };
+    pub unsafe fn new(display: &mut dyn Display) -> Self {
+        let w = display.width();
+        let h = display.height();
+        let max_cols = if w > 0 { w / 8 } else { 0 };
+        let max_rows = if h > 0 { h / 16 } else { 0 };
         #[cfg(feature = "scrollback")]
         let screen_chars = vec![b' '; max_cols * max_rows];
         Console {
-            fb_ptr,
-            stride,
-            bpp,
-            height,
-            width,
-            pixel_format,
+            display: unsafe { core::mem::transmute::<&mut dyn Display, *mut dyn Display>(display) },
             cursor_col: 0,
             cursor_row: 0,
             max_cols,
@@ -76,11 +59,15 @@ impl Console {
         self.bg_color = bg;
     }
 
+    fn display_mut(&mut self) -> &mut dyn Display {
+        unsafe { &mut *self.display }
+    }
+
     fn draw_char(&mut self, ch: u8) {
         let x = self.cursor_col * 8;
         let y = self.cursor_row * 16;
 
-        if self.fb_ptr.is_null() || ch >= 128 || x >= self.width || y >= self.height {
+        if ch >= 128 || x >= self.display_mut().width() || y >= self.display_mut().height() {
             return;
         }
 
@@ -95,21 +82,7 @@ impl Console {
             }
         }
 
-        unsafe {
-            draw_glyph_raw(
-                self.fb_ptr,
-                self.stride,
-                self.bpp,
-                self.width,
-                self.height,
-                self.pixel_format,
-                x,
-                y,
-                ch,
-                self.fg_color,
-                self.bg_color,
-            );
-        }
+        self.display_mut().draw_char(x, y, ch);
     }
 
     #[cfg(feature = "scrollback")]
@@ -142,10 +115,7 @@ impl Console {
     }
 
     fn scroll(&mut self) {
-        let bpp = self.bpp as usize;
-        let row_bytes = self.stride * bpp;
-        let char_row_bytes = 16 * row_bytes;
-        if self.height <= 16 {
+        if self.display_mut().height() <= 16 {
             return;
         }
 
@@ -157,17 +127,7 @@ impl Console {
             }
         }
 
-        let copy_bytes = row_bytes * (self.height - 16);
-        unsafe {
-            for i in 0..copy_bytes {
-                self.fb_ptr.add(i).write_volatile(
-                    self.fb_ptr.add(char_row_bytes + i).read_volatile(),
-                );
-            }
-            for i in 0..char_row_bytes {
-                self.fb_ptr.add(copy_bytes + i).write_volatile(0);
-            }
-        }
+        self.display_mut().scroll_up(16);
     }
 
     fn newline(&mut self) {
@@ -201,10 +161,20 @@ impl Console {
         }
     }
 
+    pub fn putc_and_flush(&mut self, c: u8) {
+        self.putc(c);
+        self.display_mut().flush();
+    }
+
     pub fn puts(&mut self, s: &str) {
         for &b in s.as_bytes() {
             self.putc(b);
         }
+        self.display_mut().flush();
+    }
+
+    pub fn flush(&mut self) {
+        self.display_mut().flush();
     }
 
     #[cfg(feature = "scrollback")]
@@ -234,69 +204,44 @@ impl Console {
 
     #[cfg(feature = "scrollback")]
     fn redraw_from_scrollback(&mut self) {
-        let bpp = self.bpp as usize;
-        let total = self.stride * self.height * bpp;
-        unsafe {
-            for i in 0..total {
-                self.fb_ptr.add(i).write_volatile(0);
-            }
-        }
+        let view_offset = self.view_offset;
+        let max_rows = self.max_rows;
+        let max_cols = self.max_cols;
+        let scrollback_lines = self.scrollback_lines;
+        let display_ptr = self.display;
 
-        if self.view_offset < 0 {
-            for row in 0..self.max_rows {
-                for col in 0..self.max_cols {
-                    let idx = row * self.max_cols + col;
+        if view_offset < 0 {
+            let display = unsafe { &mut *display_ptr };
+            display.clear();
+            for row in 0..max_rows {
+                for col in 0..max_cols {
+                    let idx = row * max_cols + col;
                     let ch = self.screen_chars[idx];
                     if ch != b' ' {
                         let x = col * 8;
                         let y = row * 16;
-                        unsafe {
-                            draw_glyph_raw(
-                                self.fb_ptr,
-                                self.stride,
-                                self.bpp as u8,
-                                self.width,
-                                self.height,
-                                self.pixel_format,
-                                x,
-                                y,
-                                ch,
-                                self.fg_color,
-                                self.bg_color,
-                            );
-                        }
+                        display.draw_char(x, y, ch);
                     }
                 }
             }
+            display.flush();
             return;
         }
 
-        let start_line = self.view_offset as usize;
-        let end_line = (start_line + self.max_rows).min(self.scrollback_lines);
-
+        let start_line = view_offset as usize;
+        let end_line = (start_line + max_rows).min(scrollback_lines);
+        let display = unsafe { &mut *display_ptr };
+        display.clear();
         for sb_line in start_line..end_line {
             let row = sb_line - start_line;
-            let base = sb_line * self.max_cols;
-            for col in 0..self.max_cols {
+            let base = sb_line * max_cols;
+            for col in 0..max_cols {
                 let ch = self.scrollback[base + col];
                 let x = col * 8;
                 let y = row * 16;
-                unsafe {
-                    draw_glyph_raw(
-                        self.fb_ptr,
-                        self.stride,
-                        self.bpp as u8,
-                        self.width,
-                        self.height,
-                        self.pixel_format,
-                        x,
-                        y,
-                        ch,
-                        self.fg_color,
-                        self.bg_color,
-                    );
-                }
+                display.draw_char(x, y, ch);
             }
         }
+        display.flush();
     }
 }

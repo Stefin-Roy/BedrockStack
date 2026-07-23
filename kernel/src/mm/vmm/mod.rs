@@ -10,6 +10,8 @@ use crate::mm::phys_alloc::BitmapAllocator;
 // Re-export arch-specific activation helpers so callers can switch tables.
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::activate;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
 
@@ -32,6 +34,7 @@ impl PageFlags {
     pub const EXECUTE: Self = Self(1 << 2);
     pub const NO_CACHE: Self = Self(1 << 3);
     pub const USER:    Self = Self(1 << 4); // future user-space
+    pub const WRITE_COMBINING: Self = Self(1 << 5); // WC (via PAT on x86_64)
 
     pub fn contains(self, other: Self) -> bool {
         (self.0 & other.0) == other.0

@@ -47,10 +47,26 @@ fn page_flags_to_x86(flags: PageFlags) -> PageTableFlags {
     if flags.contains(PageFlags::NO_CACHE) {
         f |= PageTableFlags::NO_CACHE;
     }
+    if flags.contains(PageFlags::WRITE_COMBINING) {
+        // PAT index 1 (001): PWT=1, PCD=0, PAT=0
+        // Requires PAT MSR entry 1 = 01h (WC).
+        f |= PageTableFlags::WRITE_THROUGH;
+    }
     if flags.contains(PageFlags::USER) {
         f |= PageTableFlags::USER_ACCESSIBLE;
     }
     f
+}
+
+/// Program IA32_PAT MSR so that PAT entry 1 = WC (01h).
+pub fn init_pat_wc() {
+    use x86_64::registers::model_specific::Msr;
+    const IA32_PAT: u32 = 0x277;
+    let mut msr = Msr::new(IA32_PAT);
+    let val = unsafe { msr.read() };
+    // Entry 1 is bits 15:8. Change byte 1 to 01h (WC).
+    let new_val = (val & !(0xFF << 8)) | (0x01u64 << 8);
+    unsafe { msr.write(new_val); }
 }
 
 #[inline]

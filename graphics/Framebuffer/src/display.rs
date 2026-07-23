@@ -6,6 +6,7 @@ pub trait Display {
     fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Color);
     fn scroll_up(&mut self, rows: usize);
     fn clear(&mut self);
+    fn flush(&mut self) {}
     fn width(&self) -> usize;
     fn height(&self) -> usize;
 }

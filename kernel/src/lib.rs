@@ -82,18 +82,6 @@ impl Kernel {
         SerialPort::puts("[kernel] Kernel::new: acpi_log init\n");
         crate::acpi_log::init();
 
-        SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
-        let display = unsafe {
-            Framebuffer::new(
-                framebuffer.address,
-                framebuffer.width,
-                framebuffer.height,
-                framebuffer.stride,
-                framebuffer.pixel_format,
-                framebuffer.bpp,
-            )
-        };
-
         SerialPort::puts("[kernel] Kernel::new: find_bitmap_region\n");
         let bitmap_region = find_bitmap_region(memory_map);
 
@@ -123,6 +111,25 @@ impl Kernel {
 
         SerialPort::puts("[kernel] Kernel::new: reserve_region\n");
         allocator.reserve_region(layout.kernel_start, layout.kernel_end);
+
+        SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
+        let fb_size = framebuffer.stride * framebuffer.height * framebuffer.bpp as usize;
+        let fb_pages = (fb_size + 4095) / 4096;
+        let shadow_phys = allocator
+            .alloc_contiguous(fb_pages)
+            .expect("OOM for framebuffer shadow buffer");
+        unsafe { core::ptr::write_bytes(shadow_phys as *mut u8, 0, fb_size) };
+        let display = unsafe {
+            Framebuffer::new(
+                framebuffer.address,
+                framebuffer.width,
+                framebuffer.height,
+                framebuffer.stride,
+                framebuffer.pixel_format,
+                framebuffer.bpp,
+                shadow_phys,
+            )
+        };
 
         SerialPort::puts("[kernel] Kernel::new: heap::init\n");
         unsafe { heap::init(&mut allocator) };
@@ -218,24 +225,18 @@ impl Kernel {
     /// Enable display logging only after the active page tables map the
     /// Multiboot framebuffer.  The bootstrap tables cover only low memory.
     #[cfg(feature = "display_log")]
-    fn enable_framebuffer_log(&self) {
+    fn enable_framebuffer_log(&mut self) {
         use framebuffer::Console;
 
         let console = unsafe {
-            Console::new(
-                self.framebuffer.ptr(),
-                self.framebuffer.width(),
-                self.framebuffer.height(),
-                self.framebuffer.stride(),
-                self.framebuffer.pixel_format(),
-                self.framebuffer.bpp(),
-            )
+            let display: &mut dyn framebuffer::Display = &mut self.framebuffer;
+            Console::new(display)
         };
         crate::drivers::serial::set_console(console);
     }
 
     #[cfg(not(feature = "display_log"))]
-    fn enable_framebuffer_log(&self) {}
+    fn enable_framebuffer_log(&mut self) {}
 
     /// Parse ACPI tables from the RSDP.
     ///
@@ -260,6 +261,7 @@ impl Kernel {
     pub fn run(&mut self) -> ! {
         use framebuffer::Display;
         self.framebuffer.clear();
+        self.framebuffer.flush();
 
         // The physical allocator was moved from the stack of `new()` into
         // `self.allocator`, leaving the raw pointer stashed by `heap::init`
