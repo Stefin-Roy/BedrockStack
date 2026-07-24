@@ -1,7 +1,32 @@
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::arch::Arch;
 use crate::arch::CurrentArch;
+
+/// Cache-line-aligned per-AP ready flag, avoiding false sharing between CPUs.
+#[repr(align(64))]
+pub struct ApReady {
+    pub ready: AtomicBool,
+}
+
+pub static AP_READY: [ApReady; MAX_CPUS] = [
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+    ApReady { ready: AtomicBool::new(false) },
+];
 
 /// Per-CPU data structure.
 ///
@@ -104,7 +129,7 @@ pub unsafe fn early_init_bsp() {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn set_gs_base(addr: u64) {
+pub fn set_gs_base(addr: u64) {
     use x86_64::registers::model_specific::Msr;
     const IA32_GS_BASE: u32 = 0xC0000101;
     unsafe { Msr::new(IA32_GS_BASE).write(addr); }
@@ -118,6 +143,17 @@ fn set_tp(pc: *const PerCpu) {
 /// Fill in the hardware ID (APIC ID / hart ID) for the BSP.
 pub fn set_bsp_hardware_id(id: u32) {
     unsafe { PER_CPU_SLOTS[0].apic_id = id; }
+}
+
+/// Find the PerCpu slot and cpu_id matching a hardware (APIC/hart) ID.
+pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)> {
+    for i in 0..MAX_CPUS {
+        let pc = unsafe { &mut PER_CPU_SLOTS[i] };
+        if pc.apic_id == hw_id {
+            return Some((pc, i as u32));
+        }
+    }
+    None
 }
 
 /// Context needed to wake an AP.

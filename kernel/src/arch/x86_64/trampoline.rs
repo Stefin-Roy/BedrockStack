@@ -3,7 +3,8 @@
 use crate::arch::Arch;
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::smp::{ApContext, PerCpu, per_cpu_by_id, current_per_cpu};
+use crate::platform::x86_64_pc::apic;
+use crate::smp::{ApContext, current_per_cpu};
 
 pub const TRAMPOLINE_ADDR: u64 = 0x8000;
 const DATA_OFFSET: u64 = 0x700;
@@ -96,25 +97,28 @@ core::arch::global_asm!(
     "mov  rax, [0x8700]",
     "mov  cr3, rax",
 
-    // Set GS base to per-CPU pointer (the `ap_entry64` function reads
-    // `current_per_cpu()` via `mov %gs:0, %rax`).
+    // Atomically claim a boot index from the shared counter at 0x8E00.
+    "lock inc qword ptr [0x8E00]",
+    "mov  rbx, [0x8E00]",
+    "dec  rbx",
+
+    // Index into per-AP records at 0x8D00 + index * 64.
+    "shl  rbx, 6",
+    "add  rbx, 0x8D00",
+
+    // Load stack_top from record offset 8 and set RSP.
+    "mov  rsp, [rbx + 8]",
+    "and  rsp, -16",
+    "sub  rsp, 8",
+
+    // Set GS.base from per_cpu_ptr at record offset 0.
     "mov  ecx, 0xC0000101",
-    "mov  rax, [0x8718]",
+    "mov  rax, [rbx]",
     "mov  rdx, rax",
     "shr  rdx, 32",
     "wrmsr",
 
-    // Set stack pointer *after* GS base so that a stack probe that faults
-    // can still walk the per-CPU data.
-    "mov  rsp, [0x8708]",
-
-    // Align stack: x86-64 SysV ABI requires RSP % 16 == 8 at function
-    // entry.  `jmp` does not push a return address, so adjust from
-    // 16-aligned (typical for a page-aligned stack_top) to 8-below.
-    "and  rsp, -16",
-    "sub  rsp, 8",
-
-    // Jump into Rust — `ap_entry64` will signal `started` atomically.
+    // Jump into Rust — ap_entry64 uses current_per_cpu() directly.
     "mov  rax, [0x8710]",
     "jmp  rax",
 
@@ -163,65 +167,86 @@ pub unsafe fn start_aps(
     let entry = ap_entry64 as *const () as usize as u64;
     let data = (TRAMPOLINE_ADDR + DATA_OFFSET) as *mut TrampolineData;
 
-    let mut started_ok = 0usize;
+    // Write per-AP boot records at 0x8D00 (within the reserved trampoline page).
+    // Each record is 64 bytes (cache-line sized) to avoid false sharing when
+    // multiple APs read concurrently.
+    for (i, ap) in aps.iter().enumerate() {
+        let pc = crate::smp::per_cpu_by_id(ap.cpu_id);
+        let record_addr = (0x8D00 + (i as u64) * 64) as *mut u64;
+        unsafe {
+            *record_addr = pc as *const crate::smp::PerCpu as u64;
+            *record_addr.add(1) = ap.stack_top;
+        }
+    }
+    // Reset atomic boot counter at 0x8E00.
+    unsafe { *(0x8E00 as *mut u64) = 0; }
 
+    // Write shared trampoline data once (cr3, entry, lm_entry are the same for all APs).
+    unsafe {
+        data.write(TrampolineData {
+            cr3: page_table_root,
+            stack_top: 0,          // unused — AP self-configures
+            entry,
+            per_cpu_ptr: 0,        // unused — AP self-identifies
+            started_flag_addr: 0,  // unused
+            lm_entry: lm_phys,
+        });
+    }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+
+    // Phase 1: INIT all APs in parallel
+    SerialPort::puts("[trampoline] Phase 1: INIT all APs\n");
     for ap in aps {
-        SerialPort::puts("[trampoline] waking AP cpu_id=");
+        SerialPort::puts("  >>> send_init_ipi cpu_id=");
         SerialPort::put_u64(ap.cpu_id as u64);
         SerialPort::puts(" hardware_id=");
         SerialPort::put_u64(ap.hardware_id as u64);
         SerialPort::puts("\n");
-
-        let pc: &mut PerCpu = per_cpu_by_id(ap.cpu_id);
-        assert!(!pc.self_ptr.is_null(), "AP {}: PerCpu self_ptr is null", ap.cpu_id);
-        assert!(ap.stack_top > 0x1000, "AP {}: stack_top too low ({:#x})", ap.cpu_id, ap.stack_top);
-        assert!(ap.stack_top & 0xF == 0, "AP {}: stack_top not aligned ({:#x})", ap.cpu_id, ap.stack_top);
-        let started_addr = &pc.started as *const core::sync::atomic::AtomicU64 as u64;
-
-            unsafe {
-                data.write(TrampolineData {
-                    cr3: page_table_root,
-                    stack_top: ap.stack_top,
-                    entry,
-                    per_cpu_ptr: pc as *const PerCpu as u64,
-                    started_flag_addr: started_addr, // kept for layout stability
-                    lm_entry: lm_phys,
-                });
-            }
-
-        // Ensure all TrampolineData and PerCpu writes are visible before AP wakes.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-
-        SerialPort::puts("[trampoline] >>> send_init_ipi\n");
         crate::platform::x86_64_pc::apic::send_init_ipi(ap.hardware_id);
-        SerialPort::puts("[trampoline] >>> init_ipi done\n");
-        delay_ms(10);
+    }
+    apic_delay_ms(10);
 
-        SerialPort::puts("[trampoline] >>> send_init_deassert\n");
+    // Phase 2: Deassert + SIPI each AP
+    SerialPort::puts("[trampoline] Phase 2: SIPI all APs\n");
+    for ap in aps {
         crate::platform::x86_64_pc::apic::send_init_deassert(ap.hardware_id);
-        SerialPort::puts("[trampoline] >>> deassert done\n");
-        delay_us(200);
-
-        SerialPort::puts("[trampoline] >>> send_sipi\n");
+        apic_delay_us(200);
         crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id, TRAMPOLINE_PAGE);
-        SerialPort::puts("[trampoline] >>> sipi 1 done\n");
-        delay_us(200);
+        apic_delay_us(200);
         crate::platform::x86_64_pc::apic::send_sipi_ipi(ap.hardware_id, TRAMPOLINE_PAGE);
-        SerialPort::puts("[trampoline] >>> sipi 2 done\n");
+    }
 
-        SerialPort::puts("[trampoline] >>> polling started\n");
-        for _ in 0..200_000_000 {
-            if pc.started.load(core::sync::atomic::Ordering::Acquire) != 0 {
-                break;
-            }
-            core::hint::spin_loop();
+    // Phase 3: Parallel poll with 30ms timeout
+    SerialPort::puts("[trampoline] Phase 3: polling\n");
+    let mut timeout = apic::ApicTimeout::new(30);
+    let mut started_ok = 0usize;
+    while started_ok < aps.len() {
+        if timeout.expired() {
+            SerialPort::puts("[trampoline] poll timeout\n");
+            break;
         }
+        started_ok = 0;
+        for ap in aps {
+            if crate::smp::AP_READY[ap.cpu_id as usize].ready
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                started_ok += 1;
+            }
+        }
+        core::hint::spin_loop();
+    }
 
-        if pc.started.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            started_ok += 1;
-            SerialPort::puts("[trampoline] AP started OK\n");
+    for ap in aps {
+        if crate::smp::AP_READY[ap.cpu_id as usize].ready
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            SerialPort::puts("[trampoline] AP ");
+            SerialPort::put_u64(ap.cpu_id as u64);
+            SerialPort::puts(" started OK\n");
         } else {
-            SerialPort::puts("[trampoline] WARNING: AP startup TIMEOUT\n");
+            SerialPort::puts("[trampoline] WARNING: AP ");
+            SerialPort::put_u64(ap.cpu_id as u64);
+            SerialPort::puts(" startup TIMEOUT\n");
         }
     }
 
@@ -230,10 +255,11 @@ pub unsafe fn start_aps(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ap_entry64() -> ! {
-    // Signal to the BSP that this AP is past the trampoline hand-off.
     let pc = current_per_cpu();
     let cpu_id = pc.cpu_id;
-    pc.started.store(1, core::sync::atomic::Ordering::Release);
+
+    // Signal ready — own cache line, no lock needed.
+    crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
 
     SerialPort::puts("[AP] cpu ");
     SerialPort::put_u64(cpu_id as u64);
@@ -263,14 +289,18 @@ pub extern "C" fn ap_entry64() -> ! {
     }
 }
 
-fn delay_ms(ms: u64) {
-    for _ in 0..ms * 1_000_000 {
+fn apic_delay_ms(ms: u64) {
+    let mut t = apic::ApicTimeout::new(ms);
+    while !t.expired() {
         core::hint::spin_loop();
     }
 }
 
-fn delay_us(us: u64) {
-    for _ in 0..us * 1_000 {
-        core::hint::spin_loop();
-    }
+/// Busy-wait for at least `us` microseconds.
+///
+/// The APIC timer has 1ms granularity, so sub-millisecond waits round up
+/// to the next 1ms boundary. This is fine — the MP spec only requires a
+/// *minimum* delay of 200µs between INIT and SIPI.
+fn apic_delay_us(_us: u64) {
+    apic_delay_ms(1);
 }

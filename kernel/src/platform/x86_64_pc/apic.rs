@@ -117,6 +117,48 @@ pub fn timer_init_count() -> u32 {
     BSP_TIMER_COUNT.load(Ordering::Relaxed)
 }
 
+/// Tracks APIC timer state for implementing a poll-with-timeout.
+///
+/// The APIC timer runs at TIMER_HZ (1000 Hz) — each period is 1ms.
+/// `ApicTimeout` tracks how many times the counter has wrapped (fired)
+/// and computes elapsed milliseconds since construction.
+pub struct ApicTimeout {
+    start_count: u32,
+    init_count: u32,
+    deadline_ms: u64,
+    wraps: u64,
+    last_count: u32,
+}
+
+impl ApicTimeout {
+    /// Create a timeout that will expire after `ms` milliseconds.
+    ///
+    /// Must be called after `apic::init()` has started the BSP's LAPIC timer.
+    pub fn new(ms: u64) -> Self {
+        Self {
+            start_count: timer_current_count(),
+            init_count: timer_init_count(),
+            deadline_ms: ms,
+            wraps: 0,
+            last_count: timer_current_count(),
+        }
+    }
+
+    /// Returns `true` if the deadline has passed.
+    pub fn expired(&mut self) -> bool {
+        let cur = timer_current_count();
+        if cur > self.last_count {
+            self.wraps += 1;
+        }
+        self.last_count = cur;
+
+        let init = self.init_count as u64;
+        let elapsed_ticks = (self.start_count as u64 + self.wraps * init).saturating_sub(cur as u64);
+        let elapsed_ms = elapsed_ticks * (TIMER_PERIOD_MS as u64) / init;
+        elapsed_ms >= self.deadline_ms
+    }
+}
+
 pub fn read_apic_id() -> u8 {
     (lapic_read(LAPIC_ID) >> 24) as u8
 }

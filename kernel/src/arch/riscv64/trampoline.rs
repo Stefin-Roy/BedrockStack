@@ -7,7 +7,7 @@
 use crate::arch::Arch;
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::smp::{ApContext, PerCpu, per_cpu_by_id, current_per_cpu};
+use crate::smp::{ApContext, per_cpu_by_id, current_per_cpu};
 
 pub const TRAMPOLINE_ADDR: u64 = 0x8000;
 const DATA_OFFSET: u64 = 0x700; // trampoline data at 0x8700
@@ -64,12 +64,13 @@ pub unsafe fn start_aps(
 
     let entry = ap_entry_riscv as usize as u64;
     let data = (TRAMPOLINE_ADDR + DATA_OFFSET) as *mut TrampolineData;
-
-    // Build the satp value from the page table root.
     let satp = (8u64 << 60) | (page_table_root >> 12);
 
-    let mut started_ok = 0usize;
+    // Write shared trampoline data once (satp, entry are same for all APs).
+    unsafe { data.write(TrampolineData { satp, entry }); }
+    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
+    // Phase 1: Start all harts via SBI HSM
     for ap in aps {
         SerialPort::puts("[trampoline] waking AP cpu_id=");
         SerialPort::put_u64(ap.cpu_id as u64);
@@ -77,31 +78,35 @@ pub unsafe fn start_aps(
         SerialPort::put_u64(ap.hardware_id as u64);
         SerialPort::puts("\n");
 
-        let pc: &mut PerCpu = per_cpu_by_id(ap.cpu_id);
-        let pc_ptr = pc as *const PerCpu as u64;
-
-        unsafe {
-            data.write(TrampolineData { satp, entry });
-        }
-
-        // Ensure all TrampolineData and PerCpu writes are visible before AP wakes.
-        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        let pc = per_cpu_by_id(ap.cpu_id);
+        let pc_ptr = pc as *const crate::smp::PerCpu as u64;
 
         if !crate::arch::riscv64::sbi::hart_start(ap.hardware_id as u64, TRAMPOLINE_ADDR, pc_ptr) {
             SerialPort::puts("[trampoline] WARNING: hart_start failed\n");
-            continue;
         }
+    }
 
-        for _ in 0..200_000_000 {
-            if pc.started.load(core::sync::atomic::Ordering::Acquire) != 0 {
-                break;
+    // Phase 2: Parallel poll
+    let mut started_ok = 0usize;
+    while started_ok < aps.len() {
+        started_ok = 0;
+        for ap in aps {
+            if crate::smp::AP_READY[ap.cpu_id as usize].ready
+                .load(core::sync::atomic::Ordering::Acquire)
+            {
+                started_ok += 1;
             }
-            core::hint::spin_loop();
         }
+        core::hint::spin_loop();
+    }
 
-        if pc.started.load(core::sync::atomic::Ordering::Acquire) != 0 {
-            started_ok += 1;
-            SerialPort::puts("[trampoline] AP started OK\n");
+    for ap in aps {
+        if crate::smp::AP_READY[ap.cpu_id as usize].ready
+            .load(core::sync::atomic::Ordering::Acquire)
+        {
+            SerialPort::puts("[trampoline] AP ");
+            SerialPort::put_u64(ap.cpu_id as u64);
+            SerialPort::puts(" started OK\n");
         } else {
             SerialPort::puts("[trampoline] WARNING: AP startup TIMEOUT\n");
         }
@@ -133,8 +138,8 @@ pub extern "C" fn ap_entry_riscv() -> ! {
     SerialPort::put_u64(cpu_id as u64);
     SerialPort::puts(" online\n");
 
-    // Mark started.
-    pc.started.store(1, core::sync::atomic::Ordering::Release);
+    // Mark started — own cache line, no lock.
+    crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
 
     // Per-CPU arch init (trap vectors, PLIC, SIE).
     crate::arch::CurrentArch::init_ap(cpu_id);

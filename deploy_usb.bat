@@ -39,36 +39,71 @@ if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/2] Creating GRUB standalone image and copying to USB folder...
 set GRUB_CFG=%TARGET_DIR%\grub.cfg
+set GRUB_CFG_CACHED=%GRUB_CFG%.cached
 set GRUB_EFI=%TARGET_DIR%\grub_bootx64.efi
 
-REM Write grub.cfg
-(
-echo set timeout=1
-echo set default=0
-echo insmod efi_gop
-echo insmod video
-echo insmod all_video
-echo set gfxmode=1024x768x32
-echo set gfxpayload=keep
-echo.
-echo menuentry "BedrockOS" {
-echo     insmod part_gpt
-echo     insmod fat
-echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
-echo     multiboot2 /EFI/BEDROCK/KERNEL
-echo     boot
-echo }
-) > "%GRUB_CFG%"
-
-REM Convert TARGET_DIR to WSL path
+REM Convert TARGET_DIR to WSL path (compute once outside the if block)
 set "WSL_TARGET=%TARGET_DIR:\=/%"
 set DRIVE_LETTER=%WSL_TARGET:~0,1%
 for %%a in (a b c d e f g h i j k l m n o p q r s t u v w x y z) do if /i "%%a"=="%DRIVE_LETTER%" set DRIVE_LETTER=%%a
 set "WSL_TARGET=/mnt/%DRIVE_LETTER%%WSL_TARGET:~2%"
 
-REM Run grub-mkstandalone via WSL
-wsl bash -c "set -euo pipefail; if ! command -v grub-mkstandalone >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq grub-efi-amd64-bin; fi; grub-mkstandalone -O x86_64-efi -o '%WSL_TARGET%/grub_bootx64.efi' --modules='part_gpt fat multiboot2' 'boot/grub/grub.cfg=%WSL_TARGET%/grub.cfg'"
-if %errorlevel% neq 0 exit /b %errorlevel%
+REM Check GRUB cache — only regenerate if the config changed
+set GRUB_SKIP=0
+if exist "%GRUB_EFI%" if exist "%GRUB_CFG_CACHED%" (
+    > "%TARGET_DIR%\_grub_cmp.cfg" (
+    echo set timeout=1
+    echo set default=0
+    echo insmod efi_gop
+    echo insmod video
+    echo insmod all_video
+    echo set gfxmode=1024x768x32
+    echo set gfxpayload=keep
+    echo.
+    echo menuentry "BedrockOS" {
+    echo     insmod part_gpt
+    echo     insmod fat
+    echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
+    echo     multiboot2 /EFI/BEDROCK/KERNEL
+    echo     boot
+    echo }
+    )
+    fc "%TARGET_DIR%\_grub_cmp.cfg" "%GRUB_CFG_CACHED%" >nul 2>&1
+    if !errorlevel! equ 0 set GRUB_SKIP=1
+    del "%TARGET_DIR%\_grub_cmp.cfg"
+)
+
+if %GRUB_SKIP% equ 1 (
+    echo [deploy] GRUB config unchanged, reusing cached %GRUB_EFI%
+) else (
+    echo [deploy] GRUB config changed or missing, regenerating...
+
+    REM Write grub.cfg
+    (
+    echo set timeout=1
+    echo set default=0
+    echo insmod efi_gop
+    echo insmod video
+    echo insmod all_video
+    echo set gfxmode=1024x768x32
+    echo set gfxpayload=keep
+    echo.
+    echo menuentry "BedrockOS" {
+    echo     insmod part_gpt
+    echo     insmod fat
+    echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
+    echo     multiboot2 /EFI/BEDROCK/KERNEL
+    echo     boot
+    echo }
+    ) > "%GRUB_CFG%"
+
+    REM Update cache
+    copy /Y "%GRUB_CFG%" "%GRUB_CFG_CACHED%" >nul
+
+    REM Run grub-mkstandalone via WSL
+    wsl bash -c "set -euo pipefail; if ! command -v grub-mkstandalone >/dev/null 2>&1; then sudo apt-get update -qq && sudo apt-get install -y -qq grub-efi-amd64-bin; fi; grub-mkstandalone -O x86_64-efi -o '%WSL_TARGET%/grub_bootx64.efi' --modules='part_gpt fat multiboot2' 'boot/grub/grub.cfg=%WSL_TARGET%/grub.cfg'"
+    if !errorlevel! neq 0 exit /b !errorlevel!
+)
 
 REM Copy to USB folder
 rmdir /S /Q "%USB_DIR%" 2>nul
