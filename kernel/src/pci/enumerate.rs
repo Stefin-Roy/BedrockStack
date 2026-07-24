@@ -54,6 +54,7 @@ fn read_function(segment: u16, bus: u8, device: u8, function: u8, devices: &mut 
         bars[i] = ecam::read_u32(segment, bus, device, function, 0x10 + (i as u16) * 4);
     }
 
+    let caps_ptr = ecam::read_u8(segment, bus, device, function, 0x34);
     let interrupt_line = ecam::read_u8(segment, bus, device, function, 0x3C);
     let interrupt_pin = ecam::read_u8(segment, bus, device, function, 0x3D);
 
@@ -69,6 +70,7 @@ fn read_function(segment: u16, bus: u8, device: u8, function: u8, devices: &mut 
         subclass,
         prog_if,
         bars,
+        caps_ptr,
         interrupt_line,
         interrupt_pin,
     };

@@ -3,3 +3,4 @@
 Cargo.lock
 qemu_smp.log
 /USB
+AGENTS.md

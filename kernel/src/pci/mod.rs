@@ -1,8 +1,11 @@
-pub mod ecam;
-pub mod enumerate;
-
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::acpi::PciConfigRegions;
+
+pub mod caps;
+pub mod ecam;
+pub mod enumerate;
+pub mod msi;
+pub mod msix;
 
 /// A discovered PCI(e) device / function.
 #[derive(Debug, Clone, Copy)]
@@ -18,6 +21,7 @@ pub struct PciDevice {
     pub subclass: u8,
     pub prog_if: u8,
     pub bars: [u32; 6],
+    pub caps_ptr: u8,
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
 }

@@ -85,8 +85,15 @@ impl DmaAllocator {
     pub fn alloc_page(&mut self) -> Option<DmaBuffer> {
         let alloc = unsafe { &mut *self.alloc };
         let phys = alloc.alloc()?;
-        unsafe { core::ptr::write_bytes(phys as *mut u8, 0, 4096); }
-        Some(DmaBuffer { phys, virt: phys, size: 4096 })
+        let va = self.next_vaddr.checked_sub(4096)?;
+        if va < self.vaddr_floor {
+            return None;
+        }
+        self.next_vaddr = va;
+        Vmm::from_root(self.root).map(alloc, va, phys, 4096,
+            PageFlags::READ | PageFlags::WRITE);
+        unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096); }
+        Some(DmaBuffer { phys, virt: va, size: 4096 })
     }
 }
 
