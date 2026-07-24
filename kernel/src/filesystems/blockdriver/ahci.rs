@@ -73,13 +73,17 @@ const SSTS_DET_MASK: u32 = 0x0F;
 const SSTS_DET_ESTAB: u32 = 3;
 
 const TFD_ERR: u32 = 1 << 0;
+const PRDT_IOC: u32 = 1 << 31;
 
 // The LAPIC timer normally provides the wall-clock deadline for AHCI polling.
 // Do not rely on it exclusively, though: a stopped/misconfigured timer used to
 // leave the BSP spinning forever during controller discovery.  This is a
 // deliberately generous last-resort bound; normal QEMU hardware completes
 // these operations long before it is reached.
-const POLL_FALLBACK_LIMIT: u32 = 1_000_000;
+// QEMU may defer an AHCI completion until it regains a scheduling slice.  A
+// tight guest polling loop can consume a million iterations before that
+// happens, so this guard must be far larger than normal command latency.
+const POLL_FALLBACK_LIMIT: u32 = 100_000_000;
 
 #[derive(Clone, Copy)]
 struct Hba { vaddr: u64 }
@@ -206,6 +210,8 @@ struct AhciPort {
     port: u8,
     _cl_paddr: u64,
     cl_vaddr: u64,
+    _rfis_paddr: u64,
+    _rfis_vaddr: u64,
     scratch_paddr: u64,
     scratch_vaddr: u64,
     max_prdt: usize,
@@ -246,14 +252,23 @@ impl AhciPort {
     /// Wait for one or more command slots to complete.
     /// Polls both PxCI and PxSACT until all mask bits are cleared.
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
-        let deadline = ms_to_ticks(5000);
-        let start = curr_count();
-        let mut wraps = 0;
-        let mut previous = start;
-        let mut stagnant = 0;
+        use crate::platform::x86_64_pc::apic::ApicTimeout;
+
+        // APIC-based timeout (5 s) — only valid after the LAPIC timer has
+        // been calibrated during apic::init().
+        let apic_ok = apic::timer_init_count() != 0;
+        let mut timeout = if apic_ok { Some(ApicTimeout::new(5000)) } else { None };
+        // Safety iteration limit for emulators (e.g. QEMU TCG) where the
+        // APIC timer counter may not advance during a tight MMIO polling
+        // loop, preventing ApicTimeout from ever expiring.
+        let mut iterations: u64 = 0;
+        const MAX_ITERATIONS: u64 = 500_000_000;
+
         // Clear any stale IRQ flag before waiting.
         self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
         loop {
+            iterations += 1;
+
             // Fast path: IRQ fired — re-check hardware completion status.
             if self.irq_completed.load(core::sync::atomic::Ordering::Acquire) != 0 {
                 self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
@@ -282,7 +297,19 @@ impl AhciPort {
                 }
                 return Ok(());
             }
-            if poll_timed_out(start, deadline, &mut wraps, &mut previous, &mut stagnant) {
+
+            // Timeout check: APIC wall-clock timer, or iteration counter
+            // fallback for emulators (TCG) where the APIC CCR is stuck.
+            let expired = timeout.as_mut().map_or(false, |t| t.expired());
+            if expired || iterations >= MAX_ITERATIONS {
+                // One last check — the command may have completed between the
+                // last CI read and the timeout decision.
+                if self.hba.pr32(self.port, port_off::CI) & tag_mask == 0
+                    && self.hba.pr32(self.port, port_off::SACT) & tag_mask == 0
+                {
+                    let tfd = self.hba.pr32(self.port, port_off::TFD);
+                    if tfd & TFD_ERR == 0 { return Ok(()); }
+                }
                 let tfd = self.hba.pr32(self.port, port_off::TFD);
                 let serr = self.hba.pr32(self.port, port_off::SERR);
                 self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
@@ -292,7 +319,7 @@ impl AhciPort {
         }
     }
 
-    fn dump_err(&self, _tag_mask: u32, err: u8, serr: u32) {
+    fn dump_err(&self, tag_mask: u32, err: u8, serr: u32) {
         use crate::drivers::serial::SerialPort;
         SerialPort::puts("[ahci] ERR err=0x");
         SerialPort::put_hex(err as u64);
@@ -302,6 +329,16 @@ impl AhciPort {
         if err & 0x80 != 0 { SerialPort::puts(" WP"); }
         SerialPort::puts(" serr=0x");
         SerialPort::put_hex(serr as u64);
+        SerialPort::puts(" tfd=0x");
+        SerialPort::put_hex(self.hba.pr32(self.port, port_off::TFD) as u64);
+        SerialPort::puts(" ci=0x");
+        SerialPort::put_hex(self.hba.pr32(self.port, port_off::CI) as u64);
+        SerialPort::puts(" sact=0x");
+        SerialPort::put_hex(self.hba.pr32(self.port, port_off::SACT) as u64);
+        SerialPort::puts(" is=0x");
+        SerialPort::put_hex(self.hba.pr32(self.port, port_off::IS) as u64);
+        SerialPort::puts(" tag=0x");
+        SerialPort::put_hex(tag_mask as u64);
         SerialPort::puts("\n");
     }
 
@@ -337,6 +374,9 @@ impl AhciPort {
         unsafe {
             fis.add(0).write_volatile(0x8027u32 | (cmd as u32) << 16);
             if self.lba48 {
+                // Keep the ATA task-file obsolete bits set as required by
+                // the controller's non-NCQ DMA-EXT path (0xE0 = LBA + the
+                // legacy high bits).  QEMU rejects 0x40 here with AMNF.
                 fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (0xE0 << 24));
                 fis.add(2).write_volatile(
                     ((lba >> 24) as u32 & 0xFF)
@@ -442,6 +482,11 @@ impl AhciPort {
             1usize
         };
 
+        // Request completion only after the final PRDT entry.  In particular
+        // NCQ completion is reported by an SDB FIS, and without IOC QEMU's
+        // AHCI path can leave the command outstanding until the timeout.
+        unsafe { (*prdt_ptr.add(prdtl - 1)).dbc |= PRDT_IOC; }
+
         let hdr = (self.cl_vaddr + (tag as u64) * 32) as *mut CmdHeader;
         let w = if is_write { 1u32 << 7 } else { 0 };
         unsafe {
@@ -456,6 +501,13 @@ impl AhciPort {
     /// For NCQ: writes PxSACT then PxCI, waits for completion.
     /// For non-NCQ: writes only PxCI, waits for completion.
     fn submit_batch(&self, tag_mask: u32) -> Result<(), &'static str> {
+        // A command bit is set by software and cleared by the HBA.  Do not
+        // overwrite an outstanding bit: doing so would turn a retry into a
+        // permanent wait for the original command.
+        if self.hba.pr32(self.port, port_off::CI) & tag_mask != 0
+            || self.hba.pr32(self.port, port_off::SACT) & tag_mask != 0 {
+            return Err("AHCI slot still active");
+        }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         if self.ncq {
             self.hba.pw32(self.port, port_off::SACT, tag_mask);
@@ -522,7 +574,7 @@ impl AhciPort {
 
         self.hba.pw32(self.port, port_off::SERR, !0);
         self.hba.pw32(self.port, port_off::IS, !0);
-        self.hba.pw32(self.port, port_off::CMD, CMD_FRE | CMD_ST);
+        self.hba.pw32(self.port, port_off::CMD, CMD_SUD | CMD_POD | CMD_FRE | CMD_ST);
 
         // Re-enable interrupts if they were previously enabled.
         if saved_ie != 0 {
@@ -541,8 +593,8 @@ impl AhciPort {
         // Zero FIS + PRDT area
         unsafe { core::ptr::write_bytes(ct_va as *mut u8, 0, 0x80 + self.max_prdt * 16); }
 
-        // IDENTIFY DEVICE command (non-NCQ, uses same Register H2D FIS format)
-        self.write_ncq_fis(ct_va as *mut u32, 0, 0u16, 0, 0xEC);
+        // IDENTIFY DEVICE command (non-NCQ, uses standard Register H2D FIS)
+        self.write_std_fis(ct_va as *mut u32, 0, 0u16, 0xEC);
 
         // PRDT -> scratch buffer
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
@@ -550,7 +602,7 @@ impl AhciPort {
             (*prdt_ptr).dba = self.scratch_paddr as u32;
             (*prdt_ptr).dbau = (self.scratch_paddr >> 32) as u32;
             (*prdt_ptr)._rsvd = 0;
-            (*prdt_ptr).dbc = 511;
+            (*prdt_ptr).dbc = 511 | PRDT_IOC;
         }
 
         // CmdHeader slot 0
@@ -586,9 +638,10 @@ impl AhciPort {
                 SerialPort::puts("[ahci] WARN: IDENTIFY sector_count=0\n");
             }
 
-            // Check NCQ support (IDENTIFY word 76, bit 8)
-            let w76 = data.add(76).read_volatile();
-            self.ncq = (w76 & (1 << 8)) != 0;
+            // Keep the data path serialized until NCQ error recovery is
+            // implemented per-tag.  DMA EXT is sufficient for the ESP and
+            // avoids carrying a failed queued command across a port reset.
+            self.ncq = false;
 
             for i in 0..20 {
                 let w = data.add(27 + i).read_volatile();
@@ -660,7 +713,8 @@ impl BlockDevice for AhciPort {
                     self.free_slots(tag_mask);
                     return Err("AHCI port reset failed");
                 }
-                // Re-prepare
+                // Re-prepare; exclude any tag whose re-preparation fails.
+                let mut retry_ok = ok_mask;
                 for i in 0..n {
                     let tag = tag_of[i];
                     if err_mask & (1 << tag) != 0 { continue; }
@@ -672,10 +726,20 @@ impl BlockDevice for AhciPort {
                         IoBuffer::Phys(pa, sz) => (*pa, *sz),
                     };
                     if buf_size >= bytes {
-                        let _ = self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write);
+                        if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
+                            err_mask |= 1 << tag;
+                            retry_ok &= !(1 << tag);
+                        }
+                    } else {
+                        err_mask |= 1 << tag;
+                        retry_ok &= !(1 << tag);
                     }
                 }
-                match self.submit_batch(ok_mask) {
+                if retry_ok == 0 {
+                    self.free_slots(tag_mask);
+                    return Ok(IoCompletions { completed: 0, errors: tag_mask });
+                }
+                match self.submit_batch(retry_ok) {
                     Ok(()) => {
                         self.free_slots(tag_mask);
                         Ok(IoCompletions { completed: ok_mask, errors: err_mask })
@@ -799,7 +863,12 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
     // Allocate Command List (1 page = 32 CmdHeaders × 32 B = 1024 B)
     let cl_buf = dma.alloc_page().ok_or("OOM CL")?;
 
-    // Allocate scratch buffer
+    // Keep the received-FIS area distinct from data buffers.  The HBA writes
+    // D2H/SDB FISes to PxFB while commands are in flight, so sharing it with
+    // IDENTIFY data (or any PRDT target) corrupts both DMA streams.
+    let rfis_buf = dma.alloc_page().ok_or("OOM received FIS")?;
+
+    // Allocate scratch buffer for IDENTIFY data only.
     let sc_buf = dma.alloc_page().ok_or("OOM scratch")?;
 
     // Allocate per-slot Command Table pages
@@ -825,25 +894,12 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
     // Program HBA port registers
     hba.pw32(p, port_off::CLB, cl_buf.phys as u32);
     hba.pw32(p, port_off::CLBU, (cl_buf.phys >> 32) as u32);
-    hba.pw32(p, port_off::FB, sc_buf.phys as u32);
-    hba.pw32(p, port_off::FBU, (sc_buf.phys >> 32) as u32);
+    hba.pw32(p, port_off::FB, rfis_buf.phys as u32);
+    hba.pw32(p, port_off::FBU, (rfis_buf.phys >> 32) as u32);
 
     hba.pw32(p, port_off::IS, !0);
     hba.pw32(p, port_off::SERR, !0);
     hba.pw32(p, port_off::IE, 0);
-
-    // Attempt IRQ setup: register handler, enable IOAPIC, enable port interrupts.
-    let mut irq_vector = 0u8;
-    if interrupt_line != 0 {
-        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
-            let _ = crate::platform::x86_64_pc::ioapic::enable_irq(
-                interrupt_line as u32,
-                crate::acpi::Polarity::ActiveHigh,
-                crate::acpi::TriggerMode::Edge,
-            );
-            irq_vector = vector;
-        }
-    }
 
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD);
     for _ in 0..100 { core::hint::spin_loop(); }
@@ -857,18 +913,38 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
         root: dma.root(),
         hba: *hba, port: p,
         _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
+        _rfis_paddr: rfis_buf.phys, _rfis_vaddr: rfis_buf.virt,
         scratch_paddr: sc_buf.phys, scratch_vaddr: sc_buf.virt,
         max_prdt, n_slots,
         sector_count: 0, lba48: false, ncq: false, model: [0u8; 40],
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),
-        irq_vector,
+        irq_vector: 0,
     };
 
     port.identify()?;
 
-    if irq_vector != 0 {
+    // Clear stale PxIS from IDENTIFY before enabling interrupts so that a
+    // level-triggered IRQ does not fire before the port is reachable through
+    // IRQ_PORTS (which gets populated after init_one returns).
+    hba.pw32(p, port_off::IS, !0);
+    hba.pw32(p, port_off::SERR, !0);
+
+    // AHCI uses PCI INTx here.  It is a shared, active-low, level-triggered
+    // line; set it up only after a device was found so empty ports cannot
+    // consume vectors or repeatedly reprogram the same GSI.
+    if interrupt_line != 0 {
+        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
+            let _ = crate::platform::x86_64_pc::ioapic::enable_irq(
+                interrupt_line as u32,
+                crate::acpi::Polarity::ActiveLow,
+                crate::acpi::TriggerMode::Level,
+            );
+            port.irq_vector = vector;
+        }
+    }
+    if port.irq_vector != 0 {
         hba.pw32(p, port_off::IE, 0x0000_0089);
     }
 

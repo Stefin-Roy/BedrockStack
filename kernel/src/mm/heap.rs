@@ -233,7 +233,11 @@ unsafe impl GlobalAlloc for HeapAllocator {
         let mut heap = HEAP.lock();
         let ptr = heap.alloc_inner(layout);
         if ptr.is_null() {
-            allocate_pages(&mut heap, HEAP_GROW_PAGES);
+            // Grow by at least the number of pages required for this
+            // allocation so that a single large resize (e.g. a hashmap
+            // backing array at ~260 KiB) does not loop indefinitely.
+            let pages_needed = (layout.size() + 4095) / 4096;
+            allocate_pages(&mut heap, pages_needed.max(HEAP_GROW_PAGES));
             heap.alloc_inner(layout)
         } else {
             ptr
