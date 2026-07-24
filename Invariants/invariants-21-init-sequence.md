@@ -11,37 +11,40 @@
 The following dependencies MUST be respected:
 
 ```
-                        bootloader (UEFI)
-                              │
-                    ┌─────────┼─────────┐
-                    │         │         │
-                    ▼         ▼         ▼
-             ELF loaded   RSDP from   Memory map
-             to phys mem  config tbl  from EBS
-                    │         │         │
-                    └─────────┼─────────┘
-                              │
-                              ▼
+  ┌─ UEFI boot path ─────────────────┐    ┌─ GRUB/Multiboot2 path ────┐
+  │  bootloader (UEFI)               │    │  GRUB loads kernel ELF    │
+  │  ├── ELF loaded to phys mem      │    │  ├── 32-bit asm entry     │
+  │  ├── RSDP from config table      │    │  ├── Identity-map 1 GiB   │
+  │  └── Memory map from EBS         │    │  ├── Enter long mode      │
+  └────────────────┬─────────────────┘    │  └── rust_entry_mb2()     │
+                   │                      └───────────┬───────────────┘
+                   └────────────┬──────────────────────┘
+                                ▼
                     Kernel::new()
                     ├── BitmapAllocator::new()
-                    ├── Framebuffer::new()
+                    ├── Framebuffer::new() (detects bpp from GOP/GRUB tag)
                     ├── heap::init()
                     │
                     ▼
                     Kernel::init()
+                    ├── heap::set_phys_allocator()
                     ├── smp::early_init_bsp()
-                    ├── Arch::init()
+                    ├── switch_to_higher_half()
+                    │   └── Arch::setup_virt_mem()
+                    │       (builds identity + higher-half page tables)
+                    ├── Vmm::activate()
+                    │   (switches CR3 / SATP)
+                    ├── enable_framebuffer_log()
+                    │   (Console init moved here — after page tables
+                    │    cover framebuffer physical address)
+                    ├── CurrentArch::init()
                     │   ├── GDT::init()
                     │   ├── IDT::init()
                     │   └── APIC::init()
                     │       └── PIT calibration
-                    ├── Arch::setup_virt_mem()
-                    │   (builds identity + higher-half page tables)
-                    ├── Vmm::activate()
-                    │   (switches CR3 / SATP)
                     ├── ACPI::init_vmm()
                     ├── AcpiSubsystem::new()
-                    │   (parses RSDP, XSDT, MADT, MCFG, FADT)
+                    │   (parses RSDP data or mapped RSDP)
                     ├── IOAPIC::init() [x86_64 only]
                     ├── smp::init()
                     │   ├── Arch::discover_cpus()
@@ -78,6 +81,13 @@ The IDT must be valid before the CPU can take any interrupt or exception.
 Page-table intermediate frames are allocated from `BitmapAllocator`.
 - Location: `kernel/src/lib.rs:` `Kernel::new` → `Kernel::init`
 
+**INIT-003b — Physical allocator must be re-pointed at start of `init()`:**
+`heap::set_phys_allocator(&mut self.allocator)` is called at the top of
+`init()` (before any heap activity) so that the heap can grow through
+the correct `PHYS_ALLOCATOR` pointer. This prevents stale-pointer
+corruption during `log::info!`, string formatting, or Vec allocations.
+- Location: `kernel/src/lib.rs:` `init()` → `set_phys_allocator()`
+
 **INIT-004 — Physical allocator must exist before heap init:**
 Heap pages are allocated from `BitmapAllocator`.
 - Location: `kernel/src/lib.rs:` `Kernel::new` calls `heap::init(&mut allocator)`
@@ -102,9 +112,12 @@ I/O APIC base addresses and GSI mappings come from the MADT table.
 APs may generate interrupts that the I/O APIC must route.
 - Location: `kernel/src/lib.rs:` `init_ioapic()` → `smp::init()`
 
-**INIT-010 — Page tables must be set up before framebuffer use:**
-Framebuffer memory must be identity-mapped.
-- Location: `kernel/src/lib.rs:` `setup_virt_mem()` before `run()`
+**INIT-010 — Page tables must be set up before framebuffer console init:**
+Framebuffer memory must be identity-mapped before `enable_framebuffer_log()`
+creates a `Console` that draws to the framebuffer. Console init was moved
+from `Kernel::new()` to `Kernel::init()` after `switch_to_higher_half()` to
+ensure page tables cover the framebuffer physical address.
+- Location: `kernel/src/lib.rs:` `switch_to_higher_half()` then `enable_framebuffer_log()`
 
 **INIT-011 — Interrupts must be enabled after SMP init:**
 AP startup uses IPIs (x86_64) or SBI ecalls (RISC-V). Interrupts are

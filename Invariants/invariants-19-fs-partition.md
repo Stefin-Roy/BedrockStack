@@ -43,6 +43,18 @@ offset by the partition's `start_lba`. The `sector_count()` returns
 the partition's sector count, not the whole disk's.
 - Location: `kernel/src/filesystems/partition/mod.rs:50-91`
 
+**PART-007 — FAT32 BPB validated with proper discriminant and per-field bounds:**
+`parse_bpb()` checks:
+- `RootEntCnt == 0` (FAT32 has no fixed root directory)
+- `FATSz16 == 0` (FAT32 uses the 32-bit size at offset 0x24)
+- `FATSz32 != 0`
+- `bytes_per_sec == SECTOR_SIZE` (512)
+- `sec_per_clus` is power of two, non-zero, and ≤ 128
+- `rsvd_sec_cnt > 0`, `num_fats > 0`, `root_clus >= 2`
+- `total_sectors > first_data_sec` and `total_sectors <= device.sector_count()`
+Returns `VfsError::InvalidInput` on any violation.
+- Location: `kernel/src/filesystems/fstypes/fat32.rs`
+
 ---
 
 ## Safety Invariants

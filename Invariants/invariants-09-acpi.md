@@ -8,10 +8,12 @@
 
 ## State Invariants
 
-**ACPI-001 — RSDP is parsed during `Kernel::init()`, after VMM activation:**
-The VMM-backed `AcpiHandler` requires live page tables with a reserved
-virtual address range (`ACPI_VADDR_BASE`, 256 MB below `KERNEL_VMA_BASE`).
-- Location: `kernel/src/lib.rs:213-227`, `kernel/src/acpi/mod.rs:21,36-38`
+**ACPI-001 — RSDP is parsed during `Kernel::init()`, after VMM activation (or from embedded data):**
+The VMM-backed `AcpiHandler` requires live page tables for the physical-
+address path. When `rsdp_data` is provided (e.g. from Multiboot2 tag),
+the RSDP bytes are already in memory and `parse_tables_from_data()` is used
+directly, requiring no VMM mapping for the RSDP itself.
+- Location: `kernel/src/lib.rs:213-227`, `kernel/src/acpi/mod.rs`, `kernel/src/acpi/tables.rs`
 
 **ACPI-002 — `AcpiSubsystem` stored as `Option`; ACPI is optional:**
 If RSDP discovery or table parsing fails, the kernel continues without
@@ -56,6 +58,14 @@ A flat `Vec<(local_apic_id, enabled)>` is extracted from the MADT,
 bypassing the `ProcessorInfo` struct for direct use by SMP init.
 - Location: `kernel/src/acpi/mod.rs:138-145`
 
+**ACPI-010 — `parse_tables_from_data()` parses RSDP from embedded byte slice:**
+When `rsdp_data: Option<&'static [u8]>` is `Some`, the function operates on
+the already-mapped byte slice directly. This supports Multiboot2 tags 14 and
+15 which embed the RSDP data inline. The function validates the RSDP signature,
+checksum, revision, and extracts RSDT/XSDT addresses without needing a VMM
+mapping call.
+- Location: `kernel/src/acpi/tables.rs`
+
 ---
 
 ## Safety Invariants
@@ -79,9 +89,12 @@ space in RISC-V).
 
 ## API Contracts
 
-**ACPI-API-001 — `AcpiSubsystem::new(rsdp_addr)`:**
-Parses all ACPI tables from the RSDP. Returns `Err(AcpiError)` on
-bad signature, bad checksum, or missing required tables.
+**ACPI-API-001 — `AcpiSubsystem::new(rsdp_addr, rsdp_data)`:**
+Parses all ACPI tables from the RSDP. `rsdp_data: Option<&'static [u8]>`
+can carry embedded RSDP bytes (Multiboot2 path). When `Some`, uses
+`parse_tables_from_data()` instead of mapping from physical `rsdp_addr`.
+Returns `Err(AcpiError)` on bad signature, bad checksum, or missing
+required tables.
 
 **ACPI-API-002 — `AcpiSubsystem::reset()`:**
 Attempts reset via:

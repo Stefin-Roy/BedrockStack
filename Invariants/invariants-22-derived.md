@@ -101,5 +101,8 @@ x86_64: `rdi=regions, rsi=regions_len, rdx=fb, rcx=stack_guard, r8=rsdp_addr`.
 
 **DERV-018 — The physical memory map identity coverage must include
 all frames the heap might allocate (VMM-006 + ALLOC-006):**
-`max_addr = max(4 GiB, fb_end, allocator.alloc_end())` guarantees that
-any frame `BitmapAllocator::alloc()` can return is mapped.
+x86_64 (`ram_end = alloc_end().max(apic_base + PAGE_4K)`) and RISC-V
+(`max_addr = fb_end.max(alloc_end())`) guarantee that any frame
+`BitmapAllocator::alloc()` can return is identity-mapped. No hardcoded
+4 GiB minimum. Framebuffer pages above `ram_end` are mapped as a
+separate identity extension with appropriate cache attributes.

@@ -35,11 +35,13 @@ from `BitmapAllocator` for intermediate tables. These frames are never freed
 (mappings are permanent).
 - Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/mm/vmm/riscv64.rs`
 
-**VMM-006 — Identity map covers `[0, max_addr)`:**
-`max_addr = max(4 GiB, fb_end, allocator.alloc_end())`, rounded up to 2 MiB.
-This ensures all managed RAM, kernel image, framebuffer, and hardware-mapped
-regions within range are accessible.
-- Location: `kernel/src/arch/x86_64/paging.rs:36-38`
+**VMM-006 — Identity map covers `[0, ram_end)`, framebuffer extension beyond:**
+`ram_end = alloc_end().max(apic_base + PAGE_4K)` (x86_64) or
+`ram_end = alloc_end().max(fb_end)` (RISC-V), rounded up to 2 MiB.
+No hardcoded 4 GiB minimum. If the framebuffer sits above `ram_end`, it is
+identity-mapped as a separate extension with `WRITE_COMBINING` (x86_64) or
+`NO_CACHE` (RISC-V).
+- Location: `kernel/src/arch/x86_64/paging.rs:36-38`, `kernel/src/arch/riscv64/paging.rs`
 
 ---
 
@@ -80,9 +82,12 @@ Walks the page table without TLB lookups. Returns the physical address or
 `None` if not mapped.
 
 **VMM-API-006 — `PageFlags` encoding:**
-`READ=1, WRITE=2, EXECUTE=4, NO_CACHE=8, USER=16`. Translated to native
-PTE bits inside each arch module.
-- Location: `kernel/src/mm/vmm/mod.rs:30-34`
+`READ=1, WRITE=2, EXECUTE=4, NO_CACHE=8, USER=16, WRITE_COMBINING=32`.
+Translated to native PTE bits inside each arch module.
+On x86_64, `WRITE_COMBINING` sets `PWT=1, PCD=0, PAT=0` (PAT index 1),
+requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
+`init_pat_wc()` before any such mapping is created.
+- Location: `kernel/src/mm/vmm/mod.rs:30-34`, `kernel/src/mm/vmm/x86_64.rs`
 
 ---
 
@@ -96,3 +101,6 @@ PTE bits inside each arch module.
   `PCI_VMM`) that share the same root frame and use a bump-allocated
   virtual address range below `KERNEL_VMA_BASE`.
 - RISC-V uses Sv39 paging (hand-rolled, no `x86_64`-crate dependency).
+- On x86_64, `WRITE_COMBINING` requires PAT programming (`init_pat_wc()`)
+  before any page with that flag is mapped. This is done at the start of
+  `paging::setup()`, before any identity-map entries are created.

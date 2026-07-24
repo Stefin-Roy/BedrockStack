@@ -25,8 +25,11 @@ page. PRDT (Physical Region Descriptor Table) entries point directly
 to caller buffer physical pages (zero-copy DMA).
 - Location: `kernel/src/filesystems/blockdriver/ahci.rs:26-27`
 
-**AHCI-004 — NCQ supported via FPDMA QUEUED commands (0x60/0x61):**
-Native Command Queuing for up to 32 concurrent commands per port.
+**AHCI-004 — Supports both NCQ and non-NCQ command paths:**
+NCQ uses FPDMA QUEUED commands (0x60/0x61) via `write_ncq_fis()`.
+Non-NCQ uses standard Register H2D FIS via `write_std_fis()` with
+28-bit LBA (0xC8/0xCA) or 48-bit LBA (0x25/0x35) commands.
+Per-port `ncq` flag selects the path.
 - Location: `kernel/src/filesystems/blockdriver/ahci.rs:6-7`
 
 **AHCI-005 — Translation cache avoids repeated 4-level page walks:**
@@ -49,7 +52,23 @@ before retrying.
 `true` if `errors == 0 && completed > 0`.
 - Location: `kernel/src/filesystems/blockdriver/traits.rs:13-22`
 
----
+**AHCI-009 — Per-port NCQ flag probed from IDENTIFY data:**
+`ncq: bool` on `AhciPort` is set from IDENTIFY word 76, bit 8.
+When `ncq == false`, all I/O uses standard non-NCQ FIS.
+- Location: `kernel/src/filesystems/blockdriver/ahci.rs`
+
+**AHCI-010 — `write_std_fis()` for non-NCQ Register H2D FIS:**
+Writes a standard Register H2D FIS (type 0x27) for non-NCQ commands.
+For 28-bit LBA: device register includes LBA[27:24]; commands 0xC8 (read)
+and 0xCA (write). For 48-bit LBA: LBA spans bytes 4-6 and 8-10; commands
+0x25 (read) and 0x35 (write).
+- Location: `kernel/src/filesystems/blockdriver/ahci.rs`
+
+**AHCI-011 — Non-NCQ batch size limited to 1; PxSACT only for NCQ:**
+When `ncq == false`, `submit()` limits the batch to a single request
+(`reqs.len().min(1)`). `PxSACT` is only written for NCQ commands;
+non-NCQ uses `PxCI` alone.
+- Location: `kernel/src/filesystems/blockdriver/ahci.rs`
 
 ## Safety Invariants
 

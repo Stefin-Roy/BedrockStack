@@ -1,6 +1,6 @@
 # Display / Framebuffer — Invariants
 
-**Version:** 0.4.0
+**Version:** 0.5.0
 **Source:** `graphics/Framebuffer/src/{display,framebuffer,console}.rs`
 **Status:** Stable
 
@@ -8,9 +8,11 @@
 
 ## State Invariants
 
-**DISP-001 — Framebuffer pointer is `bpp`-aligned:**
-`Framebuffer::new()` asserts `addr % bpp == 0` for non-zero addresses.
-Zero address (no display) is allowed.
+**DISP-001 — Framebuffer pointer has only `bpp > 0` assertion:**
+`Framebuffer::new()` asserts `bpp > 0` for non-zero addresses.
+Zero address (no display) is allowed. The `addr % bpp == 0` assertion was
+removed because GRUB framebuffer tags may report `bpp_bits == 0` and the
+alignment check could spuriously fail on some firmware.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:18-20`
 
 **DISP-002 — `width <= stride` (pixels per scanline):**
@@ -57,22 +59,64 @@ the framebuffer is shifted. `scroll_back()`/`scroll_forward()`/`reset_scroll()`
 redraw from the scrollback buffer.
 - Location: `graphics/Framebuffer/src/console.rs` (feature-gated)
 
+**DISP-011 — Shadow buffer for cached drawing:**
+`Framebuffer` allocates a cacheable RAM shadow buffer (`shadow: *mut u8`)
+from the kernel page allocator as contiguous physical pages. All drawing
+primitives (`put_pixel`, `fill_rect`, `clear`, `draw_glyph_raw`) write to
+the shadow buffer via regular cached stores (packed `u32` values), never
+directly to the real scanout framebuffer.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
+
+**DISP-012 — Dirty rectangle tracking:**
+Each drawing primitive expands a dirty bounding box (`dirty_x1`, `dirty_y1`,
+`dirty_x2`, `dirty_y2`) via `mark_dirty()`. The dirty region coalesces
+multiple small writes (e.g. a line of text glyphs) into a single
+rectangular copy on the next `flush()`.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
+
+**DISP-013 — Deferred flushing to real framebuffer:**
+Drawing primitives never flush automatically. `flush()` copies only the
+dirty scanlines from shadow to real fb via `core::ptr::copy_nonoverlapping`
+(bulk memcpy). `flush_full()` copies the entire buffer. `scroll_up()` and
+`clear()` mark the full screen dirty and call `flush()` inline.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
+
+**DISP-014 — Console delegates to `Display` trait:**
+`Console` stores a `*mut dyn Display` (lifetime-erased via `core::mem::transmute`)
+instead of duplicating `fb_ptr`, `stride`, `bpp`, `width`, `height`, and
+`pixel_format`. All drawing (`draw_char`, `scroll_up`, `clear`, `flush`)
+delegates through the `Display` trait interface.
+- Location: `graphics/Framebuffer/src/console.rs`
+
+**DISP-015 — Console flushes once per string output:**
+`Console::puts()` writes the entire string then calls `Display::flush()` once.
+`Console::putc_and_flush()` provides single-character immediate visibility.
+- Location: `graphics/Framebuffer/src/console.rs`
+
+**DISP-016 — `Framebuffer::new()` requires shadow address:**
+`shadow_addr: u64` parameter provides the physical address of the shadow
+buffer. `shadow_ptr()` and `shadow_slice()`/`shadow_slice_mut()` expose the
+shadow for direct access.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
+
 ---
 
 ## Safety Invariants
 
 **DISP-S001 — `Framebuffer::new()` safety:**
-`addr` must be valid for `stride * height * bpp` bytes of writable memory.
+Both `addr` (real framebuffer) and `shadow_addr` (shadow buffer) must be
+valid for `stride * height * bpp` bytes of writable memory each.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:17-19`
 
-**DISP-S002 — `draw_char()` / `draw_glyph_raw()` safety:**
-The computed offset `py * stride * bpp + px * bpp` is validated by the
-bounds checks. The write is unsafe because it dereferences the raw pointer.
+**DISP-S002 — `draw_glyph_raw()` safety:**
+Writes packed `u32` values to `buf` (the shadow buffer, not the real fb).
+The computed offset is validated by bounds checks. The write is unsafe
+because it dereferences the raw pointer.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:192-201`
 
 **DISP-S003 — `clear()` safety:**
-Zeroes `stride * height * bpp` bytes starting at `ptr`. Null pointer
-is a safe no-op.
+Zeroes `stride * height * bpp` bytes in the shadow buffer via
+`core::ptr::write_bytes` (fast memset). Null pointer is a safe no-op.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:143-151`
 
 **DISP-S004 — `Framebuffer` is `!Sync`:**
@@ -80,23 +124,25 @@ Access is single-threaded (only BSP writes to the display). No `Sync`
 impl is provided, preventing data races.
 - Location: `graphics/Framebuffer/src/framebuffer.rs` (implicit)
 
-**DISP-S005 — `Console` uses shared `draw_glyph_raw`:**
-Console delegates pixel manipulation to `draw_glyph_raw` instead of
-duplicating the rendering loop. The same safety invariants apply.
-- Location: `graphics/Framebuffer/src/console.rs:53-70`
+**DISP-S005 — `Console` delegates through `Display` trait:**
+Console stores `*mut dyn Display` (lifetime-erased via `transmute`) and
+calls trait methods for all drawing. The caller must ensure the `Display`
+outlives the `Console`.
+- Location: `graphics/Framebuffer/src/console.rs`
 
-**DISP-S006 — `phys_addr()` returns raw address:**
-Returns the framebuffer physical address for page-table mapping.
-The caller must ensure the address is still valid when used.
+**DISP-S006 — `phys_addr()` / `shadow_phys_addr()` return raw addresses:**
+Return the framebuffer and shadow buffer physical addresses for page-table
+mapping. The caller must ensure the addresses are still valid when used.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:39-41`
 
 ---
 
 ## API Contracts
 
-**DISP-API-001 — `Framebuffer::new(addr, width, height, stride, pixel_format, bpp)`:**
-Returns a `Framebuffer` ready for drawing. Panics if `addr != 0` and not
-`bpp`-aligned, or if `width > stride`.
+**DISP-API-001 — `Framebuffer::new(addr, width, height, stride, pixel_format, bpp, shadow_addr)`:**
+Returns a `Framebuffer` ready for drawing. Panics if `bpp == 0` or
+`width > stride`. The `shadow_addr` must point to a writable buffer of
+`stride * height * bpp` bytes.
 
 **DISP-API-002 — `Display` trait:**
 Provides:
@@ -105,13 +151,20 @@ Provides:
 - `fill_rect(x, y, w, h, color)`
 - `scroll_up(rows)`
 - `clear()`
+- `flush()` (default no-op)
 - `width() → usize`
 - `height() → usize`
 
-**DISP-API-003 — `Console`:**
-Wraps a raw framebuffer pointer for cursor-based text output. Uses
-`draw_glyph_raw` for character rendering and `core::ptr::copy` for scroll.
-Default colors are white-on-black; `set_colors(fg, bg)` overrides them.
+**DISP-API-003 — `Framebuffer::flush()` / `flush_full()`:**
+`flush()` copies only the dirty rectangle scanlines from shadow buffer to
+real framebuffer via `core::ptr::copy_nonoverlapping`. `flush_full()`
+copies the entire buffer. Both reset the dirty flag.
+
+**DISP-API-004 — `Console`:**
+Wraps a `&mut dyn Display` pointer for cursor-based text output. All
+drawing delegates to the trait interface. Default colors are white-on-black;
+`set_colors(fg, bg)` overrides them. `puts()` flushes once after writing
+the entire string. `putc_and_flush()` for single-character visibility.
 
 With feature `scrollback` enabled, the last `SCROLLBACK_LINES` (1024) of
 scrolled-off content are available via `scroll_back()`, `scroll_forward()`,
@@ -133,3 +186,15 @@ and `reset_scroll()`.
 - Scrollback stores raw character bytes in a flat `Vec<u8>`. Each line
   contributes `max_cols` bytes. The buffer is capped at `SCROLLBACK_LINES`
   lines (oldest lines are dropped when full).
+- Drawing primitives pack pixel data as `u32` via `Color::to_pixel_u32()`
+  and write to the shadow buffer with regular non-volatile stores. Only
+  `flush()` uses `copy_nonoverlapping` to transfer the dirty region to the
+  real scanout buffer. This is safe because the shadow buffer is in
+  cacheable RAM, not device MMIO.
+- The shadow buffer is allocated from the kernel page allocator as
+  contiguous physical pages. Its physical address is passed to
+  `Framebuffer::new()` as `shadow_addr`.
+- On x86_64, the real framebuffer pages are mapped with `WRITE_COMBINING`
+  (PAT entry 1 = 01h) instead of `NO_CACHE`, enabling the CPU to coalesce
+  flush stores into burst writes over the PCIe bus. APIC and other MMIO
+  regions remain `NO_CACHE`.

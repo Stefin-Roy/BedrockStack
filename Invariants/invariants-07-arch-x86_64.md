@@ -13,10 +13,12 @@ Temporary UEFI page tables are replaced by our own PML4, avoiding
 firmware huge-page mappings that would silently block our flags.
 - Location: `kernel/src/arch/x86_64/paging.rs`
 
-**PAGING-002 — Identity mapping covers `[0, max_addr)`:**
-`max_addr = max(4 GiB, fb_end, allocator.alloc_end())` rounded to 2 MiB.
-Bulk RAM uses 2 MiB huge pages; kernel image, NULL page's 2 MiB chunk,
-and guard page's chunk use 4 KiB pages.
+**PAGING-002 — Identity mapping covers `[0, ram_end)`, framebuffer extension beyond:**
+`ram_end = allocator.alloc_end().max(apic_base + PAGE_4K)` rounded to 2 MiB.
+No hardcoded 4 GiB minimum. Bulk RAM uses 2 MiB huge pages; kernel image,
+NULL page's 2 MiB chunk, and guard page's chunk use 4 KiB pages.
+If the framebuffer sits above `ram_end`, a separate identity-map extension
+covers `[fb_map_start, fb_map_end)` with `WRITE_COMBINING` caching.
 - Location: `kernel/src/arch/x86_64/paging.rs:36-81`
 
 **PAGING-003 — W^X policy:**
@@ -39,6 +41,25 @@ faults to the double-fault handler (via IST).
 **PAGING-006 — Trampoline code at `0x8000` is executable:**
 The page at physical address `0x8000` is mapped with EXECUTE permission.
 - Location: `kernel/src/arch/x86_64/paging.rs:66-68`
+
+**PAGING-007 — PAT entry 1 programmed as Write-Combining (01h):**
+`init_pat_wc()` writes `IA32_PAT` MSR (0x277) so that PAT entry 1
+(bits 15:8) is `01h` (WC). Called at the top of `paging::setup()`,
+before any identity-map entries are created.
+- Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/arch/x86_64/paging.rs`
+
+**PAGING-008 — Framebuffer identity map uses WRITE_COMBINING (not NO_CACHE):**
+Identity-map pages that overlap the bootloader framebuffer region are
+mapped with `PageFlags::WRITE_COMBINING` instead of `PageFlags::NO_CACHE`.
+This enables the CPU to coalesce flush stores into burst writes over the bus.
+APIC and other MMIO regions remain mapped as `NO_CACHE`.
+- Location: `kernel/src/arch/x86_64/paging.rs`
+
+**PAGING-009 — Local APIC MMIO is identity-mapped as NO_CACHE:**
+The `IA32_APIC_BASE` MSR is read during `paging::setup()` and the local
+APIC 4 KiB page is mapped as `NO_CACHE` in the identity page tables.
+This ensures the APIC registers are accessible before `Arch::init()`.
+- Location: `kernel/src/arch/x86_64/paging.rs`
 
 ---
 

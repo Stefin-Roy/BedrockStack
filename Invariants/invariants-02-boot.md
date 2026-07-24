@@ -27,9 +27,10 @@ truncating. Only `CONVENTIONAL` memory is `Usable`; all other types are
 Pre-allocated as `alloc::vec![fb_info]`, leaked via `core::mem::forget`.
 - Location: `boot/src/main.rs:94,168`
 
-**BOOT-004 — All transfer buffers use OS_DATA memory type (0x80000001):**
+**BOOT-004 — All transfer buffers use OS_DATA memory type (0x80000001), with LOADER_DATA fallback:**
 Custom `#[global_allocator]` backed by `uefi::boot::allocate_pool(OS_DATA, ...)`.
-All `Vec` allocations persist after `exit_boot_services`.
+If `OS_DATA` is rejected (some real firmware rejects OEM types), falls back to
+`LOADER_DATA`. All `Vec` allocations persist after `exit_boot_services`.
 - Location: `boot/src/allocator.rs`, `boot/src/main.rs:21-22`
 
 **BOOT-005 — Kernel stack is 64 KB + 1 guard page per BSP:**
@@ -47,9 +48,10 @@ Rust from calling `dealloc` after UEFI teardown.
 Config table entries are invalid after `exit_boot_services`.
 - Location: `boot/src/main.rs:119,200-214`
 
-**BOOT-008 — `GOP BltOnly` is fatal at boot:**
-If the framebuffer has no linear address, the bootloader panics rather than
-handing the kernel an invalid pointer.
+**BOOT-008 — `GOP BltOnly` returns zeroed `FramebufferInfo` (not fatal):**
+If the framebuffer has no linear address, the bootloader logs a warning and
+returns `FramebufferInfo::zeroed()` so the kernel can fall back to serial-only
+operation. Never panics.
 - Location: `boot/src/main.rs:234-238`
 
 **BOOT-009 — ELF loading rejects PIE executables (`ET_DYN`):**
@@ -57,7 +59,34 @@ Only `ET_EXEC` (type 2) is accepted. Accepting `ET_DYN` would silently jump
 to a wrong entry point.
 - Location: `boot/src/elf.rs:105-107`
 
----
+**BOOT-010 — Multiboot2/GRUB entry via `kernelmb2` feature:**
+A second boot path exists via Multiboot2 (GRUB). An assembly trampoline in
+`multiboot2_header.s` enters from 32-bit protected mode, identity-maps 1 GiB
+via 2 MiB pages, enters long mode, then calls `rust_entry_mb2()`.
+The Rust entry parses the Multiboot2 information structure (memory map,
+framebuffer tag, ACPI RSDP tags) and constructs a `Kernel` instance.
+Gated behind `#[cfg(feature = "kernelmb2")]`.
+- Location: `kernel/src/arch/x86_64/multiboot2_header.s`, `kernel/src/arch/x86_64/multiboot2.rs`
+
+**BOOT-011 — RSDP can be passed as embedded data from Multiboot2 tags:**
+In addition to `rsdp_addr` (physical address from UEFI config table), the
+RSDP can be passed as `rsdp_data: Option<&'static [u8]>` containing the
+embedded RSDP bytes from Multiboot2 ACPI tags (types 14 and 15). This avoids
+needing to map from a physical address before VMM activation.
+- Location: `kernel/src/arch/x86_64/multiboot2.rs`, `kernel/src/lib.rs`, `common/src/types.rs`
+
+**BOOT-012 — CLI + CLD executed before kernel entry:**
+The bootloader executes `CLI` (disable interrupts) before `MOV RSP` to
+prevent firmware IDT from handling an interrupt on the kernel's unprotected
+stack. `CLD` guarantees the SysV ABI direction-flag invariant before any
+`cld`-dependent string operation in the kernel.
+- Location: `boot/src/main.rs`
+
+**BOOT-013 — `FramebufferInfo::zeroed()` provides safe default:**
+When GOP is unavailable (missing handle, open failure, or BltOnly), a
+zeroed `FramebufferInfo` (address=0, bpp=0) is returned. The kernel's
+display subsystem treats a null framebuffer pointer as a safe no-op.
+- Location: `common/src/types.rs`
 
 ## Safety Invariants
 
@@ -75,7 +104,9 @@ to valid, non-dangling data. This function does not return.
 **BOOT-S003 — Kernel entry ABI (x86_64):**
 sysv64 calling convention: `rdi=regions_ptr, rsi=regions_len, rdx=fb_ptr,
 rcx=stack_guard, r8=rsdp_addr`. `rsdp_addr` is 0 if RSDP not found.
-- Location: `boot/src/main.rs:281-292`
+For the Multiboot2 path, the `Kernel::new()` call additionally receives
+`rsdp_data: Option<&'static [u8]>` in lieu of `rsdp_addr`.
+- Location: `boot/src/main.rs:281-292`, `kernel/src/arch/x86_64/multiboot2.rs`
 
 ---
 
@@ -98,7 +129,10 @@ impossible).
 
 - `OS_DATA` memory type (`0x80000001`) is a custom UEFI type that persists
   after `exit_boot_services(Some(OS_DATA))`.
-- On x86_64, x86_64 conventional memory ABOVE 4 GiB is filtered out because
-  OVMF/QEMU may report it without real RAM backing.
+- On x86_64, conventional memory ABOVE 4 GiB is only filtered under
+  hypervisors (detected via CPUID hypervisor bit). Real hardware trusts the
+  UEFI memory map and keeps its full RAM.
 - The kernel ELF is stored on the ESP as `\EFI\BEDROCK\KERNEL` and loaded
   from disk at runtime (not embedded at build time).
+- When booting via GRUB/Multiboot2, the kernel is loaded by GRUB directly
+  from the ESP as a multiboot2 ELF module (no separate bootloader executable).

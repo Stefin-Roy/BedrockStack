@@ -14,9 +14,12 @@ from recursively invoking the dump. If already dumping, the handler
 halts immediately.
 - Location: `kernel/src/kerneldump/mod.rs`
 
-**DUMP-002 — Dump output includes all critical register state:**
+**DUMP-002 — Dump output includes all critical register state with no MAX_PHYS cap:**
 On x86_64: all GPRs, CR0/CR2/CR3/CR4, RFLAGS, RSP, stack trace,
 page fault info (CR2, error code), and disassembly around RIP.
+Page-table walkers (`probe_read_quad`, `dump_page_walk`) no longer cap at
+`MAX_PHYS = 4 GiB` — all physical addresses are probed without truncation.
+This ensures diagnostics work for framebuffers and PCIe MMIO above 4 GiB.
 - Location: `kernel/src/kerneldump/dump.rs`
 
 **DUMP-003 — Disassembler covers x86_64 common instructions:**

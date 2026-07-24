@@ -22,6 +22,13 @@ with NX. Framebuffer area strips EXECUTE.
 Same 4 KiB hole-punching as x86_64 in the identity map loop.
 - Location: `kernel/src/arch/riscv64/paging.rs:43-51`
 
+**RISCV-007 — Identity map covers `[0, max_addr)` without hardcoded 4 GiB ceiling:**
+`max_addr = fb_end.max(allocator.alloc_end())`, rounded to 2 MiB.
+The hardcoded 4 GiB minimum was removed. MMIO regions (UART at 0x10000000,
+PLIC at 0x0C000000, HTIF at 0x40008000) sit below typical RAM (0x80000000)
+and are covered automatically.
+- Location: `kernel/src/arch/riscv64/paging.rs`
+
 **RISCV-004 — Trap handler saves/restores all 32 GPRs + `sepc` + `sstatus`:**
 `__trap_entry` allocates a `TrapFrame` (256 bytes) on the stack,
 calls `__trap_handler`, then restores and `sret`.
