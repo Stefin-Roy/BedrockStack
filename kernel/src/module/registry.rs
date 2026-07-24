@@ -2,6 +2,8 @@
 
 use super::Module;
 use super::fat32_test::Fat32Test;
+#[cfg(target_arch = "x86_64")]
+use super::msix_test::MsixTest;
 use super::vfs_test::VfsTest;
 use framebuffer::Framebuffer;
 use framebuffer::Display as _;
@@ -27,6 +29,15 @@ impl Module for HelloModule {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+static MODULES: &[&dyn Module] = &[
+    &HelloModule,
+    &Fat32Test,
+    &MsixTest,
+    &VfsTest,
+];
+
+#[cfg(not(target_arch = "x86_64"))]
 static MODULES: &[&dyn Module] = &[
     &HelloModule,
     &Fat32Test,

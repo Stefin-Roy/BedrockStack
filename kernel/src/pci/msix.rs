@@ -5,6 +5,10 @@ use super::caps::{self, PciCapability};
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
 
+/// MSI-X Message Control register bits (capability offset +2).
+const MC_MSIX_ENABLE: u16 = 1 << 14;
+const MC_FUNCTION_MASK: u16 = 1 << 15;
+
 /// MSI-X table entry (16 bytes, in device BAR space).
 #[repr(C)]
 struct MsixTableEntry {
@@ -67,8 +71,8 @@ pub fn enable(
 
     let mc = caps::read_u16(dev, cap, 2);
 
-    // Disable + function mask while programming.
-    caps::write_u16(dev, cap, 2, mc | 3);
+    // Disable MSI-X + set Function Mask while programming the table.
+    caps::write_u16(dev, cap, 2, (mc & !MC_MSIX_ENABLE) | MC_FUNCTION_MASK);
 
     let addr: u64 = 0xFEE00000 | ((dest_apic_id as u64) << 12);
     let data: u32 = vector as u32;
@@ -90,15 +94,15 @@ pub fn enable(
     SerialPort::put_u64(count as u64);
     SerialPort::puts("\n");
 
-    // Enable MSI-X, clear function mask.
-    let mc_on = (mc | 1) & !2;
+    // Enable MSI-X, clear Function Mask.
+    let mc_on = (mc & !MC_FUNCTION_MASK) | MC_MSIX_ENABLE;
     caps::write_u16(dev, cap, 2, mc_on);
 }
 
 /// Disable MSI-X for a device.
 pub fn disable(dev: &PciDevice, cap: &PciCapability) {
     let mc = caps::read_u16(dev, cap, 2);
-    caps::write_u16(dev, cap, 2, mc & !1);
+    caps::write_u16(dev, cap, 2, mc & !MC_MSIX_ENABLE);
 }
 
 /// Read the Pending Bit Array for a given entry index.

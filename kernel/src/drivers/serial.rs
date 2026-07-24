@@ -128,9 +128,7 @@ fn write_prefix(cpu_id: u32) {
     Inner::putc(b'C');
     Inner::putc(b'P');
     Inner::putc(b'U');
-    Inner::putc(b'(');
     Inner::put_u64(cpu_id as u64);
-    Inner::putc(b')');
     Inner::putc(b']');
     Inner::putc(b' ');
     // These primitives don't affect LAST_WAS_NL — only the caller's content does.

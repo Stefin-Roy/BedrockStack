@@ -1,4 +1,6 @@
 pub mod fat32_test;
+#[cfg(target_arch = "x86_64")]
+pub mod msix_test;
 pub mod registry;
 pub mod vfs_test;
 

@@ -136,8 +136,10 @@ if not exist "%QEMU_PATH%" (
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
     -device nvme,serial=1234,drive=nvme_disk ^
+    -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
+    -device virtio-net,netdev=net0 ^
     -serial stdio ^
-    -m 256M ^
+    -m 7120M ^
     -smp 4
 echo QEMU exited with code %errorlevel% >> "%LOG_FILE%"
 echo [fullrun] QEMU exited with code %errorlevel%.
@@ -353,6 +355,8 @@ if not exist "%QEMU_PATH%" (
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
     -device nvme,serial=1234,drive=nvme_disk ^
+    -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
+    -device virtio-net,netdev=net0 ^
     -vga std ^
     -serial stdio ^
     -m 7120M ^

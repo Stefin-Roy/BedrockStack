@@ -43,6 +43,8 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=nvme_disk ^
     -device nvme,serial=1234,drive=nvme_disk ^
+    -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
+    -device virtio-net,netdev=net0 ^
     -m 7120M ^
     -smp 4 ^
     -serial mon:stdio ^
