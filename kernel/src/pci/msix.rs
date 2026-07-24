@@ -1,5 +1,6 @@
 use core::ptr::{read_volatile, write_volatile};
 
+use super::bar::Bar;
 use super::caps::{self, PciCapability};
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
@@ -24,7 +25,6 @@ pub struct MsixInfo {
 /// Parse the MSI-X capability to extract table and PBA location.
 pub fn table_info(dev: &PciDevice, cap: &PciCapability) -> MsixInfo {
     let mc = caps::read_u16(dev, cap, 2);
-    // Table Size: N-1 encoded in bits 10:7.
     let table_size = ((mc >> 7) & 0xF) + 1;
 
     let tbl = caps::read_u32(dev, cap, 4);
@@ -38,24 +38,33 @@ pub fn table_info(dev: &PciDevice, cap: &PciCapability) -> MsixInfo {
     MsixInfo { table_size, bir, table_offset, pba_bir, pba_offset }
 }
 
-/// Program MSI-X table entries at `table_va` (the virtual address of the
-/// MSI-X table within the mapped BAR). Each entry gets the same vector
-/// (single-vector mode).
+/// Enable MSI-X for a device.
 ///
-/// The caller must have already mapped the BAR containing the MSI-X table
-/// into the virtual address space (using `DmaAllocator::map_mmio()` or
-/// equivalent).
+/// `bar_va` is the virtual address of the mapped BAR that contains the
+/// MSI-X table (the BAR index is read from the MSI-X capability). The
+/// table offset within that BAR is computed internally.
 ///
-/// `table_entries` is the number of entries to program (<= `info.table_size`).
+/// The BAR is validated via `pci::bar::bar()` — it must be a memory BAR
+/// or the function returns early without enabling MSI-X.
 pub fn enable(
     dev: &PciDevice,
     cap: &PciCapability,
-    info: &MsixInfo,
-    table_va: u64,
+    bar_va: u64,
     table_entries: u16,
     vector: u8,
     dest_apic_id: u8,
 ) {
+    let info = table_info(dev, cap);
+
+    // Validate the table's BAR is memory-mapped.
+    match super::bar::bar(dev, info.bir) {
+        Bar::Memory { .. } => {}
+        _ => {
+            SerialPort::puts("[msix] table BAR is not memory-mapped, cannot enable\n");
+            return;
+        }
+    }
+
     let mc = caps::read_u16(dev, cap, 2);
 
     // Disable + function mask while programming.
@@ -63,14 +72,14 @@ pub fn enable(
 
     let addr: u64 = 0xFEE00000 | ((dest_apic_id as u64) << 12);
     let data: u32 = vector as u32;
+    let count = table_entries.min(info.table_size);
+    let table_va = bar_va + info.table_offset;
 
     let table = table_va as *mut MsixTableEntry;
-    let count = table_entries.min(info.table_size);
     for i in 0..count {
         unsafe {
             write_volatile(&mut (*table.add(i as usize)).msg_addr, addr);
             write_volatile(&mut (*table.add(i as usize)).msg_data, data);
-            // Clear mask bit to enable this entry.
             write_volatile(&mut (*table.add(i as usize)).vector_ctrl, 0);
         }
     }

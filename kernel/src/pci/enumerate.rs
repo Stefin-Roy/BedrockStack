@@ -50,8 +50,12 @@ fn read_function(segment: u16, bus: u8, device: u8, function: u8, devices: &mut 
     let class = ecam::read_u8(segment, bus, device, function, 0x0B);
 
     let mut bars = [0u32; 6];
+    let mut bars_consumed: u8 = 0;
     for i in 0..6 {
         bars[i] = ecam::read_u32(segment, bus, device, function, 0x10 + (i as u16) * 4);
+        if i < 5 && bars[i] & 1 == 0 && (bars[i] & 0x06) == 4 {
+            bars_consumed |= 1 << (i + 1);
+        }
     }
 
     let caps_ptr = ecam::read_u8(segment, bus, device, function, 0x34);
@@ -70,6 +74,7 @@ fn read_function(segment: u16, bus: u8, device: u8, function: u8, devices: &mut 
         subclass,
         prog_if,
         bars,
+        bars_consumed,
         caps_ptr,
         interrupt_line,
         interrupt_pin,

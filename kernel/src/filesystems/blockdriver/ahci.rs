@@ -703,11 +703,13 @@ impl BlockDevice for AhciPort {
 
 fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
-    let (base, ok) = bar5_addr(dev);
-    if !ok {
-        SerialPort::puts("[ahci] invalid BAR5\n");
-        return Ok(Vec::new());
-    }
+    let base = match crate::pci::bar::bar(dev, 5) {
+        crate::pci::bar::Bar::Memory { addr, .. } => addr,
+        _ => {
+            SerialPort::puts("[ahci] BAR5 is not memory-mapped\n");
+            return Ok(Vec::new());
+        }
+    };
 
     let mmio = Hba { vaddr: dma.map_mmio(base, 0x1000)? };
     let cap = mmio.r32(ghc::CAP);
@@ -783,25 +785,6 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Resul
     }
     Ok(ports)
 }
-
-fn bar5_addr(dev: &crate::pci::PciDevice) -> (u64, bool) {
-    let bars = dev.bars;
-    if bars[5] & 1 != 0 { return (0, false); }
-    match bars[5] & 0x06 {
-        0 => ((bars[5] & 0xFFFF_FFF0) as u64, true),
-        4 => {
-            // Upper 32 bits of a 64-bit BAR5 live at PCI config offset 0x28,
-            // which is beyond the 6-BAR array read during enumeration.
-            let upper = crate::pci::ecam::read_u32(
-                dev.segment, dev.bus, dev.device, dev.function, 0x28
-            );
-            let base = ((bars[5] as u64) & 0xFFFF_FFF0) | ((upper as u64) << 32);
-            (base, true)
-        }
-        _ => (0, false),
-    }
-}
-
 fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_raw: u32, interrupt_line: u8) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 

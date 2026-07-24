@@ -1,11 +1,12 @@
-use crate::mm::phys_alloc::BitmapAllocator;
-use crate::acpi::PciConfigRegions;
-
+pub mod bar;
 pub mod caps;
 pub mod ecam;
 pub mod enumerate;
 pub mod msi;
 pub mod msix;
+
+use crate::mm::phys_alloc::BitmapAllocator;
+use crate::acpi::PciConfigRegions;
 
 /// A discovered PCI(e) device / function.
 #[derive(Debug, Clone, Copy)]
@@ -21,6 +22,9 @@ pub struct PciDevice {
     pub subclass: u8,
     pub prog_if: u8,
     pub bars: [u32; 6],
+    /// Bitmask of BAR slots consumed by a preceding 64-bit BAR (bit i set =
+    /// slot i is the upper half of a 64-bit BAR at i-1).
+    pub bars_consumed: u8,
     pub caps_ptr: u8,
     pub interrupt_line: u8,
     pub interrupt_pin: u8,
