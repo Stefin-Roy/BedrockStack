@@ -38,18 +38,6 @@ pub fn is_dump_in_progress() -> bool {
     }
 }
 
-// ── Per-CPU dedicated dump stacks (2 KiB each — stack-frugal!) ────
-
-const DUMP_STACK_SIZE: usize = 2048;
-
-#[unsafe(link_section = ".bss")]
-static mut DUMP_STACKS: [[u8; DUMP_STACK_SIZE]; MAX_CPUS] = [
-    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
-    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
-    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
-    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
-];
-
 // ── Page-fault recovery during dump ────────────────────────────────
 // These are checked by the PF handler in idt.rs when DUMP_IN_PROGRESS.
 
@@ -99,10 +87,11 @@ impl Write for DumpWriter {
 unsafe fn pf_read_volatile(ptr: *const u64) -> Option<u64> {
     if ptr.is_null() { return None; }
 
-    let result: u64;
+    // Initialize result so the recovery path has a defined value
+    // (the asm output is not written on the PF recovery path).
+    let mut result: u64 = 0;
 
     unsafe {
-        // Compute raw pointers to statics (safe cast, no dereference of the result)
         let rip_slot = &PF_RECOVERY_RIP as *const AtomicU64 as *const u64 as *mut u64;
         let happ_slot = &PF_RECOVERY_HAPPENED as *const AtomicBool as *const u8 as *mut u8;
 
@@ -118,10 +107,11 @@ unsafe fn pf_read_volatile(ptr: *const u64) -> Option<u64> {
             "jmp 30f",
             // Recovery point: PF handler will set RIP here
             "20:",
+            "mov qword ptr [{rip_slot}], 0",
             "mov byte ptr [{happ_slot}], 1",
             // Continue
             "30:",
-            result = out(reg) result,
+            result = inlateout(reg) result,
             ptr = in(reg) ptr,
             rip_slot = in(reg) rip_slot,
             happ_slot = in(reg) happ_slot,
@@ -215,10 +205,10 @@ fn dump_code_bytes(w: &mut impl Write, rip: u64, cr3: u64) {
         let addr = start_addr.wrapping_add(i as u64 * 8);
         if let Some(val) = probe_read_quad(cr3, addr) {
             buf[valid..][..8].copy_from_slice(&val.to_le_bytes());
-            valid += 8;
         } else {
-            valid += 8;
+            buf[valid..][..8].fill(0xCC);
         }
+        valid += 8;
     }
 
     if valid == 0 {
@@ -588,14 +578,14 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
         }
     }
 
-    // ── Switch to per-CPU dedicated dump stack ────────────────────
-    unsafe {
-        let base = core::ptr::addr_of!(DUMP_STACKS) as *const u8;
-        let cpu_stack = base.add(cpu * DUMP_STACK_SIZE);
-        let dump_rsp = cpu_stack as u64 + DUMP_STACK_SIZE as u64;
-        asm!("mov rsp, {}", in(reg) dump_rsp, options(nomem, nostack));
-    }
+    // ── Extract frame values ──────────────────────────────────────
+    let fault_rip  = frame.instruction_pointer.as_u64();
+    let fault_rsp  = frame.stack_pointer.as_u64();
+    let fault_cs   = frame.code_segment.0 as u64;
+    let fault_rfl  = frame.cpu_flags.bits();
+    let fault_ss   = frame.stack_segment.0 as u64;
 
+    // ── Read control registers ────────────────────────────────────
     let cr0: u64;
     let cr2: u64;
     let cr3: u64;
@@ -636,16 +626,16 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
 
     // ── Interrupt frame ───────────────────────────────────────────
     let _ = writeln!(w, "--- Interrupt Frame ---");
-    let _ = writeln!(w, "RIP  = {:#018x}", frame.instruction_pointer.as_u64());
-    let _ = writeln!(w, "CS   = {:#018x}", frame.code_segment.0 as u64);
-    let _ = writeln!(w, "RFLAGS = {:#018x}", frame.cpu_flags.bits());
-    write_rflags(&mut w, frame.cpu_flags.bits());
-    let cpl = frame.code_segment.0 as u64 & 3;
+    let _ = writeln!(w, "RIP  = {:#018x}", fault_rip);
+    let _ = writeln!(w, "CS   = {:#018x}", fault_cs);
+    let _ = writeln!(w, "RFLAGS = {:#018x}", fault_rfl);
+    write_rflags(&mut w, fault_rfl);
+    let cpl = fault_cs & 3;
     if cpl == 3 {
-        let _ = writeln!(w, "SS   = {:#018x}  (saved by CPU on CPL change)", frame.stack_segment.0 as u64);
-        let _ = writeln!(w, "RSP  = {:#018x}  (original user RSP)", frame.stack_pointer.as_u64());
+        let _ = writeln!(w, "SS   = {:#018x}  (saved by CPU on CPL change)", fault_ss);
+        let _ = writeln!(w, "RSP  = {:#018x}  (original user RSP)", fault_rsp);
     } else {
-        let _ = writeln!(w, "RSP  = {:#018x}", frame.stack_pointer.as_u64());
+        let _ = writeln!(w, "RSP  = {:#018x}", fault_rsp);
     }
     let _ = writeln!(w);
 
@@ -671,7 +661,7 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     let _ = writeln!(w);
 
     // ── RFLAGS summary ────────────────────────────────────────────
-    let if_flag = (frame.cpu_flags.bits() >> 9) & 1;
+    let if_flag = (fault_rfl >> 9) & 1;
     let _ = writeln!(w, "Interrupts: {}", if if_flag != 0 { "enabled (IF=1)" } else { "disabled (IF=0)" });
     let _ = writeln!(w);
 
@@ -682,13 +672,11 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     }
 
     // ── Stack dump ────────────────────────────────────────────────
-    let rsp = frame.stack_pointer.as_u64();
-    dump_fault_stack(&mut w, rsp, cr3);
+    dump_fault_stack(&mut w, fault_rsp, cr3);
     let _ = writeln!(w);
 
     // ── Code disassembly ──────────────────────────────────────────
-    let rip = frame.instruction_pointer.as_u64();
-    dump_code_bytes(&mut w, rip, cr3);
+    dump_code_bytes(&mut w, fault_rip, cr3);
     let _ = writeln!(w);
 
     // ── Footer ────────────────────────────────────────────────────

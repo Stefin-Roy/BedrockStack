@@ -99,7 +99,7 @@ fn try_getcwd() -> Result<String, &'static str> {
 fn rd(path: &str) -> Result<(), &'static str> {
     let entries = try_readdir(path)?;
     for e in &entries {
-        if e.name == "." || e.name == ".." { continue; }
+        if e.name.is_empty() || e.name == "." || e.name == ".." { continue; }
         let child = if path.ends_with('/') {
             alloc::format!("{}{}", path, e.name)
         } else {
@@ -147,7 +147,17 @@ fn test_create_unlink() -> Result<(), &'static str> {
         Err(VfsError::NotFound) => {}
         _ => return Err("stat should return NotFound after unlink"),
     }
-    SerialPort::puts("[DBG]   -> rd cleanup\n");
+    SerialPort::puts("[DBG]   -> rd cleanup enter\n");
+    SerialPort::puts("[DBG]   -> trying readdir\n");
+    let entries = vfs::readdir("B>fat32_test/cu").map_err(|_| "readdir failed")?;
+    SerialPort::puts("[DBG]   -> readdir ok entries=");
+    SerialPort::put_u64(entries.len() as u64);
+    SerialPort::puts("\n");
+    for e in &entries {
+        SerialPort::puts("[DBG]   -> entry: ");
+        SerialPort::puts(&e.name);
+        SerialPort::puts("\n");
+    }
     rd("B>fat32_test/cu")?;
     SerialPort::puts("[DBG]   -> try_rmdir\n");
     try_rmdir("B>fat32_test/cu")

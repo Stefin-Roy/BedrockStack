@@ -38,11 +38,9 @@ static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] = [const { Ma
 ///
 /// Reads the currently loaded GDTR — must be called after `init()`.
 pub fn get_gdt_ptr() -> (u64, u16) {
-    unsafe {
-        use x86_64::instructions::tables::sgdt;
-        let desc = sgdt();
-        (desc.base.as_u64(), desc.limit)
-    }
+    use x86_64::instructions::tables::sgdt;
+    let desc = sgdt();
+    (desc.base.as_u64(), desc.limit)
 }
 
 /// Initialize and load the GDT and TSS for the *current* CPU.

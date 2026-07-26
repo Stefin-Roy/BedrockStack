@@ -15,6 +15,15 @@ use crate::filesystems::vfs::superblock::{SuperBlock, SuperOps, StatFs};
 use crate::filesystems::vfs::types::{DirEntry, FileType, Stat};
 use super::FileSystem;
 
+// ── Debug tracing ──────────────────────────────────────────────────────────
+
+macro_rules! fat_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "fat_trace")]
+        $($arg)*
+    };
+}
+
 // ── FAT32 constants ──────────────────────────────────────────────────────────
 
 const SECTOR_SIZE: usize = 512;
@@ -122,7 +131,8 @@ fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
 
 impl Bpb {
     fn cluster_to_lba(&self, cluster: u32) -> u64 {
-        self.first_data_sec + ((cluster - 2) as u64) * (self.sec_per_clus as u64)
+        let offset = (cluster.saturating_sub(2)) as u64;
+        self.first_data_sec + offset * (self.sec_per_clus as u64)
     }
 
     fn active_fat_idx(&self) -> u8 {
@@ -137,6 +147,10 @@ impl Bpb {
 
     fn fat_entry_position(&self, cluster: u32) -> (u32, u32) {
         let byte_off = cluster as u32 * 4;
+        if self.bytes_per_sec == 0 {
+            crate::drivers::serial::dump_puts("[BPB] CORRUPT: bytes_per_sec=0 in fat_entry_position!\n");
+            return (0, 0);
+        }
         let sector_idx = byte_off / self.bytes_per_sec as u32;
         let offset = byte_off % self.bytes_per_sec as u32;
         (sector_idx, offset)
@@ -272,7 +286,7 @@ impl Fat32SuperBlock {
     }
 
     fn alloc_cluster(&self) -> Result<u32, VfsError> {
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] alloc_cluster\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] alloc_cluster\n"));
         let mut hint = self.next_alloc_hint.lock();
         let n = self.bpb.total_clus;
         for i in 0..n {
@@ -472,11 +486,11 @@ impl SuperOps for Fat32SuperBlock {
 // ── Sector/cluster I/O helpers ──────────────────────────────────────────────
 
 fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), VfsError> {
-    {
+    fat_trace!({
         use core::fmt::Write;
         let mut port = crate::drivers::serial::SerialPort::new();
         write!(port, "[DBG:io] read lba=0x{:x} count={}\n", lba, count).ok();
-    }
+    });
     let req = IoRequest { lba, count, buffer: IoBuffer::Buf(buf), is_write: false };
     let c = device.submit(&[req]).map_err(|_| {
         crate::drivers::serial::SerialPort::puts("[fat32] read_sectors submit err lba=");
@@ -498,11 +512,11 @@ fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) 
 }
 
 fn write_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), VfsError> {
-    {
+    fat_trace!({
         use core::fmt::Write;
         let mut port = crate::drivers::serial::SerialPort::new();
         write!(port, "[DBG:io] write lba=0x{:x} count={}\n", lba, count).ok();
-    }
+    });
     let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
     let c = device.submit(&[req]).map_err(|_| {
         crate::drivers::serial::SerialPort::puts("[fat32] write_sectors submit err lba=");
@@ -525,6 +539,13 @@ fn write_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> 
 
 fn read_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &mut [u8]) -> Result<(), VfsError> {
     let lba = sb.bpb.cluster_to_lba(cluster);
+    fat_trace!({
+        crate::drivers::serial::dump_puts("[DBG:fat32] read_cluster clus=0x");
+        crate::drivers::serial::dump_put_hex(cluster as u64);
+        crate::drivers::serial::dump_puts(" lba=0x");
+        crate::drivers::serial::dump_put_hex(lba);
+        crate::drivers::serial::dump_puts("\n");
+    });
     read_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }
 
@@ -725,6 +746,17 @@ struct DirEntrySlot {
 }
 
 fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlot>, VfsError> {
+    if sb.bpb.byts_per_clus == 0 || sb.bpb.bytes_per_sec == 0 || sb.bpb.sec_per_clus == 0 {
+        crate::drivers::serial::dump_puts("[FAT32] CORRUPT BPB in read_dir_slots!\n");
+        crate::drivers::serial::dump_puts("  byts_per_clus=");
+        crate::drivers::serial::dump_put_hex(sb.bpb.byts_per_clus as u64);
+        crate::drivers::serial::dump_puts(" bytes_per_sec=");
+        crate::drivers::serial::dump_put_hex(sb.bpb.bytes_per_sec as u64);
+        crate::drivers::serial::dump_puts(" sec_per_clus=");
+        crate::drivers::serial::dump_put_hex(sb.bpb.sec_per_clus as u64);
+        crate::drivers::serial::dump_puts("\n");
+        return Err(VfsError::IOError);
+    }
     let mut slots: Vec<DirEntrySlot> = Vec::new();
     let clus_bytes = sb.bpb.byts_per_clus as usize;
     let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
@@ -732,13 +764,20 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
     let mut cluster = dir_clus;
     let mut vfat_chain: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
     let mut _iters = 0u32;
+    let mut end_of_dir = false;
 
+    fat_trace!({
+        crate::drivers::serial::dump_puts("[DBG:fat32] read_dir_slots cluster=0x");
+        crate::drivers::serial::dump_put_hex(cluster as u64);
+        crate::drivers::serial::dump_puts("\n");
+    });
     loop {
         read_cluster(sb, cluster, &mut buf)?;
+        fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] read_dir_slots read cluster ok\n"));
         for i in 0..entries_per_clus {
             let off = i * DIR_ENTRY_SIZE;
             let entry: &[u8; DIR_ENTRY_SIZE] = &buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
-            if entry[0] == DIR_END { break; }
+            if entry[0] == DIR_END { vfat_chain.clear(); end_of_dir = true; break; }
             if entry[0] == DIR_DELETED { vfat_chain.clear(); continue; }
             let attr = entry[0x0B];
             if attr == ATTR_LONG_NAME { vfat_chain.push(*entry); continue; }
@@ -750,6 +789,7 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
             }
             slots.push(DirEntrySlot { vfat_entries: core::mem::take(&mut vfat_chain), sfn_entry: *entry });
         }
+        if end_of_dir { break; }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER { break; }
         cluster = next;
@@ -777,12 +817,13 @@ fn decode_entry_name(slot: &DirEntrySlot) -> String {
 fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &u32,
                      entries: &[[u8; DIR_ENTRY_SIZE]]) -> Result<(), VfsError>
 {
-    use core::fmt::Write;
-    let mut port = crate::drivers::serial::SerialPort::new();
-    write!(port, "[DBG:fat32] wde enter clus={} entries={}\n", *dir_clus, entries.len()).ok();
-
+    fat_trace!({
+        use core::fmt::Write;
+        let mut port = crate::drivers::serial::SerialPort::new();
+        write!(port, "[DBG:fat32] wde enter clus={} entries={}\n", *dir_clus, entries.len()).ok();
+    });
     if entries.is_empty() { return Ok(()); }
-    if *dir_clus < 2 { crate::drivers::serial::SerialPort::puts("[DBG:fat32] wde bad clus\n"); return Err(VfsError::InvalidInput); }
+    if *dir_clus < 2 { fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] wde bad clus\n")); return Err(VfsError::InvalidInput); }
     let total = entries.len();
     let clus_bytes = sb.bpb.byts_per_clus as usize;
     let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
@@ -1030,7 +1071,19 @@ impl Fat32Inode {
                 }
             }
         }
-        let slots = read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?;
+        fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] get_dir_slots re-read from disk\n"));
+        let first = self.first_clus.load(Ordering::Relaxed);
+        fat_trace!({
+            crate::drivers::serial::dump_puts("[DBG:fat32] get_dir_slots first_clus=0x");
+            crate::drivers::serial::dump_put_hex(first as u64);
+            crate::drivers::serial::dump_puts("\n");
+        });
+        let slots = read_dir_slots(&self.sb, first)?;
+        fat_trace!({
+            crate::drivers::serial::dump_puts("[DBG:fat32] get_dir_slots got ");
+            crate::drivers::serial::dump_put_hex(slots.len() as u64);
+            crate::drivers::serial::dump_puts(" slots\n");
+        });
         *self.dir_cache.lock() = Some((generation, slots.clone()));
         Ok(slots)
     }
@@ -1204,12 +1257,12 @@ impl InodeOps for Fat32Inode {
     }
 
     fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create enter\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create enter\n"));
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create get_dir_slots\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create get_dir_slots\n"));
         let slots = self.get_dir_slots()?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create got slots\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create got slots\n"));
         if slots.iter().any(|s| decode_entry_name(s).eq_ignore_ascii_case(name)) {
             return Err(VfsError::AlreadyExists);
         }
@@ -1235,9 +1288,9 @@ impl InodeOps for Fat32Inode {
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create write_dir_entries\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create write_dir_entries\n"));
         write_dir_entries(&self.sb, &parent, &new_entries)?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create done\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create done\n"));
         self.invalidate_dir_cache();
         drop(_lock);
 
@@ -1259,13 +1312,13 @@ impl InodeOps for Fat32Inode {
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink enter\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink enter\n"));
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
         if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
         let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink got slots\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink got slots\n"));
         let mut target_clus = 0u32;
         let mut found = false;
         for slot in &slots {
@@ -1284,28 +1337,28 @@ impl InodeOps for Fat32Inode {
         // Fat32Inode::Drop so that open file handles remain valid until the
         // last reference is released (Unix semantics).
         let parent = self.first_clus.load(Ordering::Relaxed);
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink remove_dir_entries\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink remove_dir_entries\n"));
         remove_dir_entries(&self.sb, parent, name)?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink flush\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink flush\n"));
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink done\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink done\n"));
         Ok(())
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir enter\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir enter\n"));
         let slots = self.get_dir_slots()?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir got slots\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir got slots\n"));
         if slots.iter().any(|s| decode_entry_name(s).eq_ignore_ascii_case(name)) {
             return Err(VfsError::AlreadyExists);
         }
 
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir alloc_cluster\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir alloc_cluster\n"));
         let new_clus = self.sb.alloc_cluster()?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir zero_cluster\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir zero_cluster\n"));
         zero_cluster(&self.sb, new_clus)?;
 
         let empty_set = HashSet::new();
@@ -1328,9 +1381,9 @@ impl InodeOps for Fat32Inode {
         let mut clus_buf = alloc::vec![0u8; clus_bytes];
         clus_buf[..DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
         clus_buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot_entry);
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_cluster\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_cluster\n"));
         write_cluster(&self.sb, new_clus, &clus_buf)?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir wrote dot/dotdot\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir wrote dot/dotdot\n"));
 
         let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots.iter()
             .map(|s| {
@@ -1353,9 +1406,9 @@ impl InodeOps for Fat32Inode {
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_dir_entries\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_dir_entries\n"));
         write_dir_entries(&self.sb, &parent, &new_entries)?;
-        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir done\n");
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir done\n"));
         self.invalidate_dir_cache();
         drop(_lock);
 
@@ -1409,11 +1462,13 @@ impl InodeOps for Fat32Inode {
 
     fn readdir(&self) -> Result<Vec<DirEntry>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] readdir enter\n"));
         let slots = self.get_dir_slots()?;
+        fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] readdir got slots\n"));
         let mut entries = Vec::with_capacity(slots.len());
         for slot in &slots {
             let name = decode_entry_name(slot);
-            if name == "." || name == ".." { continue; }
+            if name.is_empty() || name == "." || name == ".." { continue; }
             let fc = first_clus_from_entry(&slot.sfn_entry);
             let attr = slot.sfn_entry[0x0B];
             let ft = if attr & ATTR_DIRECTORY != 0 { FileType::Directory } else { FileType::Regular };

@@ -499,31 +499,51 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
 
         // -- MOV AL/EAX/RAX, moffs --
         0xA0 => {
-            if pos + 8 <= bytes.len() {
-                let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-                pos += 8;
+            let moff_sz = if addrsz32 { 4 } else { 8 };
+            if pos + moff_sz <= bytes.len() {
+                let v = if addrsz32 {
+                    u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as u64
+                } else {
+                    u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap())
+                };
+                pos += moff_sz;
                 let _ = write!(w, "mov al,[{:#x}]", v);
             }
         }
         0xA1 => {
-            if pos + 8 <= bytes.len() {
-                let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-                pos += 8;
+            let moff_sz = if addrsz32 { 4 } else { 8 };
+            if pos + moff_sz <= bytes.len() {
+                let v = if addrsz32 {
+                    u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as u64
+                } else {
+                    u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap())
+                };
+                pos += moff_sz;
                 if wide { let _ = write!(w, "mov rax,[{:#x}]", v); }
                 else { let _ = write!(w, "mov eax,[{:#x}]", v); }
             }
         }
         0xA2 => {
-            if pos + 8 <= bytes.len() {
-                let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-                pos += 8;
+            let moff_sz = if addrsz32 { 4 } else { 8 };
+            if pos + moff_sz <= bytes.len() {
+                let v = if addrsz32 {
+                    u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as u64
+                } else {
+                    u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap())
+                };
+                pos += moff_sz;
                 let _ = write!(w, "mov [{:#x}],al", v);
             }
         }
         0xA3 => {
-            if pos + 8 <= bytes.len() {
-                let v = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap());
-                pos += 8;
+            let moff_sz = if addrsz32 { 4 } else { 8 };
+            if pos + moff_sz <= bytes.len() {
+                let v = if addrsz32 {
+                    u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as u64
+                } else {
+                    u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap())
+                };
+                pos += moff_sz;
                 if wide { let _ = write!(w, "mov [{:#x}],rax", v); }
                 else { let _ = write!(w, "mov [{:#x}],eax", v); }
             }
@@ -852,8 +872,8 @@ pub fn disasm_one(addr: u64, bytes: &[u8], w: &mut impl Write) -> Option<usize> 
                             (1, _) => { let _ = write!(w, "vmmcall"); pos += 1; }
                             (2, _) => { let _ = write!(w, "vmload"); pos += 1; }
                             (3, _) => { let _ = write!(w, "vmsave"); pos += 1; }
-                            (4, 1) => { let _ = write!(w, "smsw"); if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; } }
-                            (6, 1) => { let _ = write!(w, "lmsw"); if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; } }
+                            (4, _) => { let _ = write!(w, "smsw"); if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; } }
+                            (6, _) => { let _ = write!(w, "lmsw"); if let Some(c) = write_ea(w, rest, addrsz32, ext_b, ext_x, byte_sz, wide, has_rex, opsz16) { pos += c; } }
                             (7, 0) => { let _ = write!(w, "swapgs"); pos += 1; }
                             (7, 1) => { let _ = write!(w, "rdtscp"); pos += 1; }
                             _ => { let _ = write!(w, "sysop {:#x},{:#x}", reg, modrm & 7); pos += 1; }

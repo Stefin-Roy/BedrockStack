@@ -140,6 +140,15 @@ impl ApicTimeout {
         self.last_count = cur;
 
         let init = self.init_count as u64;
+        if init == 0 {
+            crate::drivers::serial::dump_puts("[APIC] BUG: ApicTimeout::expired() — init_count is 0!\n");
+            crate::drivers::serial::dump_puts("[APIC] start_count=");
+            crate::drivers::serial::dump_put_hex(self.start_count as u64);
+            crate::drivers::serial::dump_puts(" deadline_ms=");
+            crate::drivers::serial::dump_put_hex(self.deadline_ms);
+            crate::drivers::serial::dump_puts("\n");
+            loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
+        }
         let elapsed_ticks = (self.start_count as u64 + self.wraps * init).saturating_sub(cur as u64);
         let elapsed_ms = elapsed_ticks * (TIMER_PERIOD_MS as u64) / init;
         elapsed_ms >= self.deadline_ms

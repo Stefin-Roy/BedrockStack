@@ -6,6 +6,7 @@ edition = "2024"
 [features]
 cpu_slow = []
 display_log = []
+fat_trace = []
 kernelmb2 = []
 
 [dependencies]

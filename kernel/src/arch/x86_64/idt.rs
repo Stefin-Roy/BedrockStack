@@ -34,6 +34,12 @@ pub fn verify_integrity() {
     }
 }
 
+/// Check integrity and return true/false without halting (for diagnostics).
+pub fn check_integrity() -> bool {
+    let g = IDT_GUARD.load(core::sync::atomic::Ordering::Relaxed);
+    g == IDT_GUARD_MAGIC
+}
+
 // ── Device interrupt dispatch (vectors 33-48) ─────────────────────
 //
 // Drivers can register a handler for one of the 16 available device
@@ -110,21 +116,22 @@ pub fn init() {
     let idt = IDT.call_once(|| {
         let mut idt = InterruptDescriptorTable::new();
 
-        idt.divide_error.set_handler_fn(divide_error_handler);
-        idt.breakpoint.set_handler_fn(breakpoint_handler);
-        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler);
-        idt.invalid_tss.set_handler_fn(invalid_tss_handler);
+        idt.divide_error.set_handler_fn(divide_error_handler).disable_interrupts(true);
+        idt.breakpoint.set_handler_fn(breakpoint_handler).disable_interrupts(true);
+        idt.invalid_opcode.set_handler_fn(invalid_opcode_handler).disable_interrupts(true);
+        idt.invalid_tss.set_handler_fn(invalid_tss_handler).disable_interrupts(true);
         idt.segment_not_present
-            .set_handler_fn(segment_not_present_handler);
+            .set_handler_fn(segment_not_present_handler).disable_interrupts(true);
         idt.stack_segment_fault
-            .set_handler_fn(stack_segment_fault_handler);
-        idt.general_protection_fault.set_handler_fn(gpf_handler);
-        idt.page_fault.set_handler_fn(page_fault_handler);
+            .set_handler_fn(stack_segment_fault_handler).disable_interrupts(true);
+        idt.general_protection_fault.set_handler_fn(gpf_handler).disable_interrupts(true);
+        idt.page_fault.set_handler_fn(page_fault_handler).disable_interrupts(true);
 
         unsafe {
             idt.double_fault
                 .set_handler_fn(double_fault_handler)
-                .set_stack_index(crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX);
+                .set_stack_index(crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX)
+                .disable_interrupts(true);
         }
 
         // Register APIC timer interrupt at vector 32 (interrupt gate, clears IF).
@@ -163,6 +170,14 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    let rsp: u64;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
+    crate::drivers::serial::dump_puts("[#DE] RSP = 0x");
+    crate::drivers::serial::dump_put_hex(rsp);
+    crate::drivers::serial::dump_puts("\n");
+    crate::drivers::serial::dump_puts("[#DE] frame RIP = 0x");
+    crate::drivers::serial::dump_put_hex(frame.instruction_pointer.as_u64());
+    crate::drivers::serial::dump_puts("\n");
     crate::kerneldump::dump_full_fault(&frame, 0, 0);
 }
 
@@ -212,9 +227,9 @@ extern "x86-interrupt" fn page_fault_handler(
             dump::PF_FAULT_ADDR.store(cr2, Ordering::Relaxed);
             dump::PF_ERROR_CODE.store(error_code.bits(), Ordering::Relaxed);
             unsafe {
-                let mut inner = frame.as_mut().read();
-                inner.instruction_pointer = VirtAddr::new(target);
-                frame.as_mut().write(inner);
+                frame
+                    .as_mut()
+                    .update(|val| val.instruction_pointer = VirtAddr::new(target));
             }
             return;
         }

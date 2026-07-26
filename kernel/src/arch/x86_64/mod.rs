@@ -34,7 +34,7 @@ impl Arch for X86_64 {
 
     fn init_ap(_cpu_id: u32) {
         crate::arch::x86_64::gdt::init();
-        crate::arch::x86_64::idt::init();
+        crate::arch::x86_64::idt::init_ap();
         crate::platform::x86_64_pc::apic::init_ap();
     }
 
