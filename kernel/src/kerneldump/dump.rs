@@ -6,12 +6,12 @@
 
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use x86_64::structures::idt::InterruptStackFrame;
 
-use crate::drivers::serial::SerialPort;
-use crate::mm::vmm::KERNEL_VMA_BASE;
+use crate::drivers::serial::{dump_put_hex, dump_puts};
+use crate::smp::{current_cpu_id, MAX_CPUS};
 
 // ── x86-64 PTE flag constants ───────────────────────────────────────
 
@@ -20,9 +20,43 @@ const PTE_WRITABLE: u64 = 1 << 1;
 const PTE_USER:     u64 = 1 << 2;
 const PTE_NO_EXEC:  u64 = 1 << 63;
 
-// ── Re-entrancy guard ───────────────────────────────────────────────
+// ── Per-CPU re-entrancy guard ──────────────────────────────────────
 
-static DUMP_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static DUMP_IN_PROGRESS: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+];
+
+pub fn is_dump_in_progress() -> bool {
+    let cpu = current_cpu_id() as usize;
+    if cpu < MAX_CPUS {
+        DUMP_IN_PROGRESS[cpu].load(Ordering::Relaxed)
+    } else {
+        false
+    }
+}
+
+// ── Per-CPU dedicated dump stacks (2 KiB each — stack-frugal!) ────
+
+const DUMP_STACK_SIZE: usize = 2048;
+
+#[unsafe(link_section = ".bss")]
+static mut DUMP_STACKS: [[u8; DUMP_STACK_SIZE]; MAX_CPUS] = [
+    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
+    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
+    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
+    [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE], [0u8; DUMP_STACK_SIZE],
+];
+
+// ── Page-fault recovery during dump ────────────────────────────────
+// These are checked by the PF handler in idt.rs when DUMP_IN_PROGRESS.
+
+pub static PF_RECOVERY_RIP: AtomicU64 = AtomicU64::new(0);
+pub static PF_RECOVERY_HAPPENED: AtomicBool = AtomicBool::new(false);
+pub static PF_FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
+pub static PF_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
 
 // ── Exception name ──────────────────────────────────────────────────
 
@@ -44,16 +78,69 @@ impl Write for NullWrite {
     fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }
 }
 
-// ── Safe memory probes ──────────────────────────────────────────────
+// ── Lock-free raw serial writer (bypasses spinlock during dump) ────
 
-unsafe fn read_volatile_u64(ptr: *const u64) -> Option<u64> {
-    if ptr.is_null() { return None; }
-    // SAFETY: caller guarantees ptr is valid for read.
-    Some(unsafe { core::ptr::read_volatile(ptr) })
+struct DumpWriter;
+
+impl Write for DumpWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        dump_puts(s);
+        Ok(())
+    }
 }
 
+// ── PF-safe volatile memory reader ──────────────────────────────────
+// Uses inline asm to set a recovery target before the read.  If a page
+// fault fires, the handler (in idt.rs) modifies the interrupt frame's
+// RIP to jump to the recovery label, which sets the happened flag and
+// continues.  The caller then sees `PF_RECOVERY_HAPPENED` and returns
+// `None` instead of faulting again.
+
+unsafe fn pf_read_volatile(ptr: *const u64) -> Option<u64> {
+    if ptr.is_null() { return None; }
+
+    let result: u64;
+
+    unsafe {
+        // Compute raw pointers to statics (safe cast, no dereference of the result)
+        let rip_slot = &PF_RECOVERY_RIP as *const AtomicU64 as *const u64 as *mut u64;
+        let happ_slot = &PF_RECOVERY_HAPPENED as *const AtomicBool as *const u8 as *mut u8;
+
+        asm!(
+            // Set recovery target → label 20
+            "lea rax, [20f + rip]",
+            "mov [{rip_slot}], rax",
+            "mov byte ptr [{happ_slot}], 0",
+            // The actual read (may PF)
+            "mov {result}, [{ptr}]",
+            // No PF — clear recovery target and skip recovery
+            "mov qword ptr [{rip_slot}], 0",
+            "jmp 30f",
+            // Recovery point: PF handler will set RIP here
+            "20:",
+            "mov byte ptr [{happ_slot}], 1",
+            // Continue
+            "30:",
+            result = out(reg) result,
+            ptr = in(reg) ptr,
+            rip_slot = in(reg) rip_slot,
+            happ_slot = in(reg) happ_slot,
+            out("rax") _,
+            options(nostack),
+        );
+    }
+
+    if PF_RECOVERY_HAPPENED.load(Ordering::Relaxed) {
+        PF_RECOVERY_HAPPENED.store(false, Ordering::Relaxed);
+        None
+    } else {
+        Some(result)
+    }
+}
+
+// ── Safe memory probes (identity-map: phys == virt for all RAM) ────
+
 fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
-    // Canonical check.
     let ext = (addr as i64) >> 47;
     if ext != 0 && ext != -1 {
         return None;
@@ -62,39 +149,33 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
     unsafe {
-        let pml4_virt = KERNEL_VMA_BASE + pml4_phys;
-        let pml4_idx = ((addr >> 39) & 0x1FF) as usize;
-        let pml4_entry = read_volatile_u64((pml4_virt + (pml4_idx as u64) * 8) as *const u64)?;
+        let pml4_entry = pf_read_volatile((pml4_phys + (addr >> 39 & 0x1FF) * 8) as *const u64)?;
         if pml4_entry & PTE_PRESENT == 0 { return None; }
 
         let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
-        let pdp_virt = KERNEL_VMA_BASE + pdp_phys;
-        let pdp_idx = ((addr >> 30) & 0x1FF) as usize;
-        let pdp_entry = read_volatile_u64((pdp_virt + (pdp_idx as u64) * 8) as *const u64)?;
+        let pdp_entry =
+            pf_read_volatile((pdp_phys + (addr >> 30 & 0x1FF) * 8) as *const u64)?;
         if pdp_entry & PTE_PRESENT == 0 { return None; }
         if pdp_entry & (1 << 7) != 0 {
-            let phys = (pdp_entry & 0x000F_FFC0_0000_0000) | (addr & 0x3FFF_FFFF);
-            return Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64));
+            let page = pdp_entry & 0x000F_FFC0_0000_0000;
+            return pf_read_volatile((page | (addr & 0x3FFF_FFFF)) as *const u64);
         }
 
         let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
-        let pd_virt = KERNEL_VMA_BASE + pd_phys;
-        let pd_idx = ((addr >> 21) & 0x1FF) as usize;
-        let pd_entry = read_volatile_u64((pd_virt + (pd_idx as u64) * 8) as *const u64)?;
+        let pd_entry =
+            pf_read_volatile((pd_phys + (addr >> 21 & 0x1FF) * 8) as *const u64)?;
         if pd_entry & PTE_PRESENT == 0 { return None; }
         if pd_entry & (1 << 7) != 0 {
-            let phys = (pd_entry & 0x000F_FFFF_FE00_0000) | (addr & 0x1F_FFFF);
-            return Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64));
+            let page = pd_entry & 0x000F_FFFF_FE00_0000;
+            return pf_read_volatile((page | (addr & 0x1F_FFFF)) as *const u64);
         }
 
         let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
-        let pt_virt = KERNEL_VMA_BASE + pt_phys;
-        let pt_idx = ((addr >> 12) & 0x1FF) as usize;
-        let pte = read_volatile_u64((pt_virt + (pt_idx as u64) * 8) as *const u64)?;
+        let pte = pf_read_volatile((pt_phys + (addr >> 12 & 0x1FF) * 8) as *const u64)?;
         if pte & PTE_PRESENT == 0 { return None; }
 
-        let phys = (pte & 0x000F_FFFF_FFFF_F000) | (addr & 0xFFF);
-        Some(core::ptr::read_volatile((KERNEL_VMA_BASE + phys) as *const u64))
+        let page = pte & 0x000F_FFFF_FFFF_F000;
+        pf_read_volatile((page | (addr & 0xFFF)) as *const u64)
     }
 }
 
@@ -145,51 +226,61 @@ fn dump_code_bytes(w: &mut impl Write, rip: u64, cr3: u64) {
         return;
     }
 
-    // Pre-scan: identify instruction boundaries
-    let mut insn_offsets = [0usize; 64];
-    let mut num_insns = 0;
-    let mut rip_insn_idx = None;
+    // Single-pass: find which instruction contains RIP and record
+    // its index and the exact offset.  No 512-byte insn_offsets array.
+    let mut offset = 0usize;
+    let mut num_insns = 0usize;
+    let mut rip_idx = 0usize;
+    let mut found_rip = false;
 
-    let mut offset = 0;
     while offset < valid && num_insns < 64 {
         let addr = start_addr.wrapping_add(offset as u64);
         let len = super::disasm::disasm_one(addr, &buf[offset..], &mut NullWrite).unwrap_or(0);
         let len = if len == 0 { 1 } else { len };
 
-        insn_offsets[num_insns] = offset;
-        if rip >= addr && rip < addr.wrapping_add(len as u64) {
-            rip_insn_idx = Some(num_insns);
+        if !found_rip && rip >= addr && rip < addr.wrapping_add(len as u64) {
+            rip_idx = num_insns;
+            found_rip = true;
         }
 
         offset += len;
         num_insns += 1;
     }
 
-    let rip_idx = rip_insn_idx.unwrap_or(0);
+    if !found_rip {
+        rip_idx = 0;
+    }
+
     let start_idx = rip_idx.saturating_sub(4);
     let end_idx = (rip_idx + 5).min(num_insns);
 
-    for i in start_idx..end_idx {
-        let offset = insn_offsets[i];
+    // Second pass: re-decode within the window, emitting output
+    offset = 0;
+    num_insns = 0;
+    while offset < valid && num_insns < end_idx {
         let addr = start_addr.wrapping_add(offset as u64);
-
-        let _ = write!(w, "  {:#018x}:", addr);
-
         let len = super::disasm::disasm_one(addr, &buf[offset..], &mut NullWrite).unwrap_or(0);
         let len = if len == 0 { 1 } else { len };
 
-        for j in 0..len {
-            let _ = write!(w, " {:02x}", buf[offset + j]);
-        }
-        let pad_len = (25usize).saturating_sub(len * 3);
-        for _ in 0..pad_len { let _ = write!(w, " "); }
+        if num_insns >= start_idx {
+            let _ = write!(w, "  {:#018x}:", addr);
 
-        super::disasm::disasm_one(addr, &buf[offset..], w);
+            for j in 0..len {
+                let _ = write!(w, " {:02x}", buf[offset + j]);
+            }
+            let pad_len = (25usize).saturating_sub(len * 3);
+            for _ in 0..pad_len { let _ = write!(w, " "); }
 
-        if i == rip_idx {
-            let _ = write!(w, "  <-- RIP");
+            super::disasm::disasm_one(addr, &buf[offset..], w);
+
+            if num_insns == rip_idx {
+                let _ = write!(w, "  <-- RIP");
+            }
+            let _ = writeln!(w);
         }
-        let _ = writeln!(w);
+
+        offset += len;
+        num_insns += 1;
     }
 }
 
@@ -429,10 +520,9 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let _ = writeln!(w, "--- Page Table Walk for {:#018x} ---", vaddr);
 
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
-    let pml4_virt = KERNEL_VMA_BASE + pml4_phys;
 
     let idx4 = ((vaddr >> 39) & 0x1FF) as usize;
-    let e4 = match unsafe { read_volatile_u64((pml4_virt + (idx4 as u64) * 8) as *const u64) } {
+    let e4 = match unsafe { pf_read_volatile((pml4_phys + (idx4 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PML4 unreadable)"); return; }
     };
@@ -440,9 +530,8 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     if e4 & PTE_PRESENT == 0 { return; }
 
     let pdp_phys = e4 & 0x000F_FFFF_FFFF_F000;
-    let pdp_virt = KERNEL_VMA_BASE + pdp_phys;
     let idx3 = ((vaddr >> 30) & 0x1FF) as usize;
-    let e3 = match unsafe { read_volatile_u64((pdp_virt + (idx3 as u64) * 8) as *const u64) } {
+    let e3 = match unsafe { pf_read_volatile((pdp_phys + (idx3 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PDP unreadable)"); return; }
     };
@@ -455,9 +544,8 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     }
 
     let pd_phys = e3 & 0x000F_FFFF_FFFF_F000;
-    let pd_virt = KERNEL_VMA_BASE + pd_phys;
     let idx2 = ((vaddr >> 21) & 0x1FF) as usize;
-    let e2 = match unsafe { read_volatile_u64((pd_virt + (idx2 as u64) * 8) as *const u64) } {
+    let e2 = match unsafe { pf_read_volatile((pd_phys + (idx2 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PD unreadable)"); return; }
     };
@@ -470,9 +558,8 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     }
 
     let pt_phys = e2 & 0x000F_FFFF_FFFF_F000;
-    let pt_virt = KERNEL_VMA_BASE + pt_phys;
     let idx1 = ((vaddr >> 12) & 0x1FF) as usize;
-    let e1 = match unsafe { read_volatile_u64((pt_virt + (idx1 as u64) * 8) as *const u64) } {
+    let e1 = match unsafe { pf_read_volatile((pt_phys + (idx1 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PT unreadable)"); return; }
     };
@@ -489,10 +576,24 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 // ── Main fault-dump orchestrator ───────────────────────────────────
 
 pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8) -> ! {
-    if DUMP_IN_PROGRESS.swap(true, Ordering::SeqCst) {
+    let cpu = current_cpu_id() as usize;
+
+    // ── Per-CPU re-entrancy guard ────────────────────────────────
+    if cpu >= MAX_CPUS || DUMP_IN_PROGRESS[cpu].swap(true, Ordering::SeqCst) {
+        dump_puts("\n[DUMP] Nested fault (#");
+        dump_put_hex(vector as u64);
+        dump_puts(") while dumping — halting\n");
         loop {
             unsafe { asm!("cli", "hlt", options(nomem, nostack)); }
         }
+    }
+
+    // ── Switch to per-CPU dedicated dump stack ────────────────────
+    unsafe {
+        let base = core::ptr::addr_of!(DUMP_STACKS) as *const u8;
+        let cpu_stack = base.add(cpu * DUMP_STACK_SIZE);
+        let dump_rsp = cpu_stack as u64 + DUMP_STACK_SIZE as u64;
+        asm!("mov rsp, {}", in(reg) dump_rsp, options(nomem, nostack));
     }
 
     let cr0: u64;
@@ -506,7 +607,7 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
     }
 
-    let mut w = SerialPort;
+    let mut w = DumpWriter;
 
     // ── Header ─────────────────────────────────────────────────────
     let _ = writeln!(w);
@@ -520,8 +621,6 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     }
 
     // ── Error code and fault address ──────────────────────────────
-    let _fault_addr = if vector == 14 { cr2 } else { frame.instruction_pointer.as_u64() };
-
     if vector == 14 || (error_code != 0 && matches!(vector, 10..=14)) {
         dump_error_code(&mut w, vector, error_code);
         let _ = writeln!(w);
@@ -594,8 +693,6 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
 
     // ── Footer ────────────────────────────────────────────────────
     let _ = writeln!(w, "================================================");
-
-    DUMP_IN_PROGRESS.store(false, Ordering::Release);
 
     loop {
         unsafe { asm!("cli", "hlt", options(nomem, nostack)); }

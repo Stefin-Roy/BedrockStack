@@ -51,6 +51,14 @@ SECTIONS
 
     . = ALIGN(4096);
 
+    __idt_start = .;
+    .idt : {
+        *(.idt)
+    }
+    __idt_end = .;
+
+    . = ALIGN(4096);
+
     .bss : {
         __bss_start = .;
         *(.bss)

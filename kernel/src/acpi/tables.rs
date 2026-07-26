@@ -67,7 +67,7 @@ pub fn parse_tables_from_data(rsdp_data: &[u8]) -> Result<Vec<SdtEntry>, AcpiErr
     // Extended checksum for revision >= 2
     if revision >= 2 {
         let len = length as usize;
-        if rsdp_data.len() < len {
+        if len < 20 || rsdp_data.len() < len {
             return Err(AcpiError::BadSignature);
         }
         if !checksum(&rsdp_data[..len]) {
@@ -106,6 +106,12 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
         20
     };
 
+    // Sanity-check the RSDP length before remapping: must be at least 20
+    // and no more than 64 KiB (typical RSDP is 36-48 bytes).
+    if length < 20 || length > 0x10000 {
+        return Err(AcpiError::InvalidData);
+    }
+
     // Re-map with the full RSDP length for ACPI 2.0+ (needed for the extended
     // checksum and in case the initial 36 bytes were insufficient).
     let rsdp_data = if length as u64 > 36 {
@@ -119,11 +125,17 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
 }
 
 fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
+    if xsdt_addr == 0 {
+        return Err(AcpiError::TableNotFound);
+    }
     let vaddr = map_region(xsdt_addr, 8);
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
     };
+    if hdr_len < 36 || hdr_len > 0x0100_0000 {
+        return Err(AcpiError::InvalidData);
+    }
     let vaddr = map_region(xsdt_addr, hdr_len as u64);
 
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
@@ -134,7 +146,6 @@ fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if raw[0..4] != [b'X', b'S', b'D', b'T'] {
         return Err(AcpiError::BadSignature);
     }
-
     let entry_count = (hdr_len as usize - 36) / 8;
     let entries_addr = vaddr + 36;
 
@@ -160,11 +171,17 @@ fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
 }
 
 fn walk_rsdt(rsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
+    if rsdt_addr == 0 {
+        return Err(AcpiError::TableNotFound);
+    }
     let vaddr = map_region(rsdt_addr, 8);
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
     };
+    if hdr_len < 36 || hdr_len > 0x0100_0000 {
+        return Err(AcpiError::InvalidData);
+    }
     let vaddr = map_region(rsdt_addr, hdr_len as u64);
 
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
@@ -175,7 +192,6 @@ fn walk_rsdt(rsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if raw[0..4] != [b'R', b'S', b'D', b'T'] {
         return Err(AcpiError::BadSignature);
     }
-
     let entry_count = (hdr_len as usize - 36) / 4;
     let entries_addr = vaddr + 36;
 
@@ -191,11 +207,19 @@ fn walk_rsdt(rsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
 }
 
 fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
+    if phys_addr == 0 {
+        return Ok(None);
+    }
     let vaddr = map_region(phys_addr, 8);
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
     };
+
+    if hdr_len < 36 || hdr_len > 0x0100_0000 {
+        log::warn!("ACPI table at 0x{:x}: invalid header length {}", phys_addr, hdr_len);
+        return Ok(None);
+    }
 
     let vaddr = map_region(phys_addr, hdr_len as u64);
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };

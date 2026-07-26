@@ -111,12 +111,16 @@ impl HeapInner {
             let size = unsafe { (*curr).size };
             let next = unsafe { (*curr).next };
             let block_addr = curr as usize;
-            let block_end = block_addr + size;
-            let payload_addr = (block_addr + HEADER_SIZE + BACKPTR_SIZE + align - 1) & !(align - 1);
-            let payload_end = payload_addr + needed;
-            // Every free block begins with a `BlockHeader`, so the split
-            // point must preserve that alignment even when `needed` is small.
-            let alloc_end = (payload_end + BLOCK_ALIGN - 1) & !(BLOCK_ALIGN - 1);
+            let Some(block_end) = block_addr.checked_add(size) else { continue };
+            let Some(payload_addr) = block_addr
+                .checked_add(HEADER_SIZE + BACKPTR_SIZE + align - 1)
+                .map(|v| v & !(align - 1))
+            else { continue };
+            let Some(payload_end) = payload_addr.checked_add(needed) else { continue };
+            let Some(alloc_end) = payload_end
+                .checked_add(BLOCK_ALIGN - 1)
+                .map(|v| v & !(BLOCK_ALIGN - 1))
+            else { continue };
 
             if alloc_end <= block_end {
                 let remaining = block_end - alloc_end;

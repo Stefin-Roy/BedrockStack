@@ -1,21 +1,21 @@
+use alloc::boxed::Box;
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use crate::pci::ecam;
 use crate::pci::PciDevice;
 
-static DEVICES: Mutex<Option<Vec<PciDevice>>> = Mutex::new(None);
+/// Leaked slice of PCI devices — set once by `enumerate()` and never freed.
+static mut DEVICES: Option<&'static [PciDevice]> = None;
 
 pub fn all() -> &'static [PciDevice] {
-    let guard = DEVICES.lock();
-    let vec = guard.as_ref().expect("PCI not enumerated yet");
-    unsafe { core::mem::transmute::<&[PciDevice], &[PciDevice]>(vec.as_slice()) }
+    unsafe { DEVICES.expect("PCI not enumerated yet") }
 }
 
 pub fn enumerate(segment: u16) {
     let mut devices = Vec::new();
     scan_bus(segment, 0, &mut devices);
-    *DEVICES.lock() = Some(devices);
+    let leaked: &'static [PciDevice] = Box::leak(devices.into_boxed_slice());
+    unsafe { DEVICES = Some(leaked); }
 }
 
 fn scan_bus(segment: u16, bus: u8, devices: &mut Vec<PciDevice>) {

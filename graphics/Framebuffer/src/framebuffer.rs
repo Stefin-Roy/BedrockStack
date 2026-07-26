@@ -105,11 +105,32 @@ impl Framebuffer {
     }
 
     pub fn total_bytes(&self) -> usize {
-        self.stride * self.height * (self.bpp as usize)
+        self.stride
+            .checked_mul(self.height)
+            .and_then(|v| v.checked_mul(self.bpp as usize))
+            .expect("framebuffer total_bytes overflow")
     }
 
     fn bpp_usize(&self) -> usize {
         self.bpp as usize
+    }
+
+    fn checked_offset(&self, x: usize, y: usize) -> Option<usize> {
+        let bpp = self.bpp_usize();
+        let row = y.checked_mul(self.stride)?.checked_mul(bpp)?;
+        let col = x.checked_mul(bpp)?;
+        let off = row.checked_add(col)?;
+        if off < self.total_bytes() { Some(off) } else { None }
+    }
+
+    fn checked_row_offset(&self, y: usize) -> Option<usize> {
+        let bpp = self.bpp_usize();
+        let off = y.checked_mul(self.stride)?.checked_mul(bpp)?;
+        if off < self.total_bytes() { Some(off) } else { None }
+    }
+
+    fn row_bytes(&self) -> usize {
+        self.stride * self.bpp_usize()
     }
 
     fn mark_dirty(&mut self, x: usize, y: usize, w: usize, h: usize) {
@@ -136,15 +157,15 @@ impl Framebuffer {
         if !self.dirty {
             return;
         }
-        let bpp = self.bpp_usize();
-        let stride = self.stride;
         let x1 = self.dirty_x1;
         let y1 = self.dirty_y1;
         let x2 = self.dirty_x2;
         let y2 = self.dirty_y2;
+        let bpp = self.bpp_usize();
         for y in y1..y2 {
-            let off = y * stride * bpp + x1 * bpp;
+            let Some(off) = self.checked_offset(x1, y) else { continue };
             let count = (x2 - x1) * bpp;
+            if off + count > self.total_bytes() { continue; }
             unsafe {
                 core::ptr::copy_nonoverlapping(self.shadow.add(off), self.fb_ptr.add(off), count);
             }
@@ -185,12 +206,11 @@ impl Display for Framebuffer {
     }
 
     fn put_pixel(&mut self, x: usize, y: usize, color: Color) -> bool {
-        let bpp = self.bpp_usize();
         if self.shadow.is_null() || x >= self.width || y >= self.height {
             return false;
         }
+        let Some(offset) = self.checked_offset(x, y) else { return false; };
         let pixel = color.to_pixel_u32(self.pixel_format);
-        let offset = y * self.stride * bpp + x * bpp;
         unsafe {
             *(self.shadow.add(offset) as *mut u32) = pixel;
         }
@@ -199,7 +219,6 @@ impl Display for Framebuffer {
     }
 
     fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: Color) {
-        let bpp = self.bpp_usize();
         if self.shadow.is_null() || w == 0 || h == 0 {
             return;
         }
@@ -209,7 +228,8 @@ impl Display for Framebuffer {
             if py >= self.height {
                 break;
             }
-            let base = unsafe { self.shadow.add(py * self.stride * bpp + x * bpp) as *mut u32 };
+            let Some(off) = self.checked_offset(x, py) else { continue };
+            let base = unsafe { self.shadow.add(off) as *mut u32 };
             let mut col = 0;
             while col < w {
                 let px = x + col;
@@ -224,22 +244,26 @@ impl Display for Framebuffer {
     }
 
     fn scroll_up(&mut self, rows: usize) {
-        let bpp = self.bpp_usize();
         if self.shadow.is_null() || rows == 0 || rows >= self.height {
             if rows >= self.height && !self.shadow.is_null() {
                 self.clear();
             }
             return;
         }
-        let row_bytes = self.stride * bpp;
-        let copy_bytes = (self.height - rows) * row_bytes;
+        let row_bytes = self.row_bytes();
+        let Some(src_off) = self.checked_row_offset(rows) else { return };
+        let copy_rows = self.height - rows;
+        let Some(copy_bytes) = copy_rows.checked_mul(row_bytes) else { return };
+        if src_off + copy_bytes > self.total_bytes() { return; }
+        let zero_bytes = rows * row_bytes;
+        if copy_bytes + zero_bytes > self.total_bytes() { return; }
         unsafe {
             core::ptr::copy(
-                self.shadow.add(rows * row_bytes),
+                self.shadow.add(src_off),
                 self.shadow,
                 copy_bytes,
             );
-            core::ptr::write_bytes(self.shadow.add(copy_bytes), 0, rows * row_bytes);
+            core::ptr::write_bytes(self.shadow.add(copy_bytes), 0, zero_bytes);
         }
         self.mark_dirty(0, 0, self.width, self.height);
         self.flush();

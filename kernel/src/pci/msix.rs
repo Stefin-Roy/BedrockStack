@@ -105,6 +105,75 @@ pub fn disable(dev: &PciDevice, cap: &PciCapability) {
     caps::write_u16(dev, cap, 2, mc & !MC_MSIX_ENABLE);
 }
 
+/// Mask bit in the MSI-X table entry Vector Control field.
+const VECTOR_CTRL_MASK: u32 = 1 << 0;
+
+/// Program a single MSI-X table entry with the given vector and target APIC.
+///
+/// The entry is masked before writing and unmasked after, so no spurious
+/// interrupt fires during programming.  Use this when different entries
+/// need different vectors (e.g. NVMe per-queue MSI-X).
+pub fn program_entry(
+    dev: &PciDevice,
+    cap: &PciCapability,
+    bar_va: u64,
+    entry_index: u16,
+    vector: u8,
+    dest_apic_id: u8,
+) {
+    let info = table_info(dev, cap);
+    if entry_index >= info.table_size {
+        SerialPort::puts("[msix] program_entry: index out of range\n");
+        return;
+    }
+
+    let table_va = bar_va + info.table_offset;
+    unsafe {
+        let entry = (table_va as *mut MsixTableEntry).add(entry_index as usize);
+        write_volatile(&mut (*entry).vector_ctrl, VECTOR_CTRL_MASK);
+        let addr: u64 = 0xFEE00000 | ((dest_apic_id as u64) << 12);
+        let data: u32 = vector as u32;
+        write_volatile(&mut (*entry).msg_addr, addr);
+        write_volatile(&mut (*entry).msg_data, data);
+        write_volatile(&mut (*entry).vector_ctrl, 0);
+    }
+
+    SerialPort::puts("[msix] entry=");
+    SerialPort::put_u64(entry_index as u64);
+    SerialPort::puts(" vector=");
+    SerialPort::put_u64(vector as u64);
+    SerialPort::puts("\n");
+}
+
+/// Mask a single MSI-X table entry so the device will not generate
+/// an interrupt on that vector.
+pub fn mask_entry(dev: &PciDevice, cap: &PciCapability, bar_va: u64, entry_index: u16) {
+    let info = table_info(dev, cap);
+    if entry_index >= info.table_size {
+        return;
+    }
+    let table_va = bar_va + info.table_offset;
+    unsafe {
+        let entry = (table_va as *mut MsixTableEntry).add(entry_index as usize);
+        let vc = read_volatile(&(*entry).vector_ctrl);
+        write_volatile(&mut (*entry).vector_ctrl, vc | VECTOR_CTRL_MASK);
+    }
+}
+
+/// Unmask a single MSI-X table entry, re-enabling interrupt delivery.
+pub fn unmask_entry(dev: &PciDevice, cap: &PciCapability, bar_va: u64, entry_index: u16) {
+    let info = table_info(dev, cap);
+    if entry_index >= info.table_size {
+        return;
+    }
+    let table_va = bar_va + info.table_offset;
+    unsafe {
+        let entry = (table_va as *mut MsixTableEntry).add(entry_index as usize);
+        let vc = read_volatile(&(*entry).vector_ctrl);
+        write_volatile(&mut (*entry).vector_ctrl, vc & !VECTOR_CTRL_MASK);
+    }
+}
+
 /// Read the Pending Bit Array for a given entry index.
 /// Returns true if there is a pending interrupt for entry `index`.
 ///

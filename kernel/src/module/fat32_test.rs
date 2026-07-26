@@ -125,9 +125,14 @@ fn cleanup_workdir() {
 // ---------------------------------------------------------------------------
 
 fn test_create_unlink() -> Result<(), &'static str> {
+    SerialPort::puts("[DBG] test_create_unlink enter\n");
+    SerialPort::puts("[DBG]   -> try_mkdir\n");
     try_mkdir("B>fat32_test/cu")?;
+    SerialPort::puts("[DBG]   -> try_open\n");
     let fd = try_open("B>fat32_test/cu/file.txt", OpenFlags::CREATE | OpenFlags::WRITE)?;
+    SerialPort::puts("[DBG]   -> try_close\n");
     try_close(fd)?;
+    SerialPort::puts("[DBG]   -> try_stat\n");
     let st = try_stat("B>fat32_test/cu/file.txt")?;
     if st.file_type != FileType::Regular {
         return Err("stat returned non-regular after create");
@@ -135,12 +140,16 @@ fn test_create_unlink() -> Result<(), &'static str> {
     if st.size != 0 {
         return Err("new file size should be 0");
     }
+    SerialPort::puts("[DBG]   -> try_unlink\n");
     try_unlink("B>fat32_test/cu/file.txt")?;
+    SerialPort::puts("[DBG]   -> stat after unlink\n");
     match vfs::stat("B>fat32_test/cu/file.txt") {
         Err(VfsError::NotFound) => {}
         _ => return Err("stat should return NotFound after unlink"),
     }
+    SerialPort::puts("[DBG]   -> rd cleanup\n");
     rd("B>fat32_test/cu")?;
+    SerialPort::puts("[DBG]   -> try_rmdir\n");
     try_rmdir("B>fat32_test/cu")
 }
 
@@ -525,15 +534,20 @@ impl Module for Fat32Test {
         SerialPort::puts("[FAT32TEST] === FAT32 Test Suite ===\n");
 
         // Clean up any leftovers from a previous crashed run
+        SerialPort::puts("[DBG] cleanup_workdir\n");
         cleanup_workdir();
 
         // Create the workdir
+        SerialPort::puts("[DBG] try_mkdir B>fat32_test\n");
         if try_mkdir("B>fat32_test").is_err() {
             SerialPort::puts("[FAT32TEST] WARNING: could not create B>fat32_test\n");
             // Non-fatal — individual tests may fail but don't block VfsTest
         }
+        SerialPort::puts("[DBG] workdir ready\n");
 
+        SerialPort::puts("[DBG] about to run create_unlink\n");
         t!("create_unlink",    test_create_unlink());
+        SerialPort::puts("[DBG] create_unlink returned\n");
         t!("write_read",       test_write_read());
         t!("seek",             test_seek());
         t!("append",           test_append());

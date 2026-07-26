@@ -346,10 +346,19 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
             if !create {
                 return Err(VfsError::NotFound);
             }
-            let child_ops = {
+            let child_ops = match {
                 let lock = parent.inode.lock();
                 let p = lock.as_ref().ok_or(VfsError::NotFound)?;
-                p.ops.create(&leaf_name)?
+                p.ops.create(&leaf_name)
+            } {
+                Ok(ops) => ops,
+                Err(VfsError::AlreadyExists) if !flags.contains(OpenFlags::EXCL) => {
+                    // Raced with another create — use the existing file
+                    let lock = parent.inode.lock();
+                    let p = lock.as_ref().ok_or(VfsError::NotFound)?;
+                    p.ops.lookup(&leaf_name)?
+                }
+                Err(e) => return Err(e),
             };
             let inode = Arc::new(Inode::new(child_ops));
             let child_dentry = Dentry::new(&leaf_name, Some(inode.clone()));
@@ -424,11 +433,10 @@ pub fn write(fd: u32, buf: &[u8]) -> Result<usize, VfsError> {
 pub fn seek(fd: u32, whence: SeekFrom) -> Result<u64, VfsError> {
     let file = FD_TABLE.get(fd)?;
     let mut pos = file.pos.lock();
-    let size = file.inode.size.load(Ordering::Relaxed);
     let new_pos = match whence {
         SeekFrom::Start(o) => o as i64,
         SeekFrom::Current(o) => (*pos as i64).checked_add(o).ok_or(VfsError::InvalidInput)?,
-        SeekFrom::End(o) => (size as i64).checked_add(o).ok_or(VfsError::InvalidInput)?,
+        SeekFrom::End(o) => (file.inode.ops.size() as i64).checked_add(o).ok_or(VfsError::InvalidInput)?,
     };
     if new_pos < 0 {
         return Err(VfsError::InvalidInput);
@@ -464,8 +472,17 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
 
 pub fn rmdir(path: &str) -> Result<(), VfsError> {
     let (parent, name) = resolve_parent(path)?;
+    if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
     let parent_ino = parent.inode.lock()
         .as_ref().map(|i| i.ino).ok_or(VfsError::NotFound)?;
+
+    // Signal the child inode that it will be unlinked, before dropping the
+    // dentry reference (which may drop the inode if no handles are open).
+    if let Some(child) = parent.children.lock().get(&name) {
+        if let Some(ref inode) = *child.inode.lock() {
+            inode.ops.on_unlink();
+        }
+    }
 
     if let Some(child) = parent.children.lock().remove(&name) {
         child.inode.lock().take();
@@ -534,6 +551,13 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
             if child_ops.file_type() == FileType::Directory {
                 return Err(VfsError::IsADirectory);
             }
+        }
+    }
+
+    // Signal the child inode before dropping the dentry reference.
+    if let Some(child) = parent.children.lock().get(&name) {
+        if let Some(ref inode) = *child.inode.lock() {
+            inode.ops.on_unlink();
         }
     }
 

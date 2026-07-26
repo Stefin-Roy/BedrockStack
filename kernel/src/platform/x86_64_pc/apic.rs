@@ -4,7 +4,6 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 const CPUID_APIC_BIT: u32 = 1 << 9;
-const CPUID_X2APIC_BIT: u32 = 1 << 21;
 const IA32_APIC_BASE_MSR: u32 = 0x1B;
 const IA32_X2APIC_ID_MSR: u32 = 0x802;
 const IA32_X2APIC_ICR_MSR: u32 = 0x830;
@@ -28,18 +27,6 @@ static X2APIC_MODE: AtomicBool = AtomicBool::new(false);
 fn cpu_has_apic() -> bool {
     let result = core::arch::x86_64::__cpuid(1);
     result.edx & CPUID_APIC_BIT != 0
-}
-
-fn cpu_has_x2apic() -> bool {
-    let result = core::arch::x86_64::__cpuid(1);
-    result.ecx & CPUID_X2APIC_BIT != 0
-}
-
-fn is_x2apic_enabled() -> bool {
-    unsafe {
-        let base = rdmsr(IA32_APIC_BASE_MSR);
-        base & (1 << 10) != 0
-    }
 }
 
 /// Send an IPI via the appropriate path for the current APIC mode.
@@ -329,19 +316,11 @@ pub fn init_ap() {
     let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
     LAPIC_BASE.store(base_addr, Ordering::Relaxed);
 
-    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
-
-    if base & (1 << 11) == 0 {
-        wrmsr(IA32_APIC_BASE_MSR, base | (1 << 11));
-    }
-
-    // x2APIC enable is per-logical-processor; the BSP enabled it for itself,
-    // but each AP must enable it on its own local APIC.
-    if cpu_has_x2apic() && !is_x2apic_enabled() {
-        let cur = rdmsr(IA32_APIC_BASE_MSR);
-        wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
-    }
-    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
+    // Don't write IA32_APIC_BASE MSR on APs — it may cause #GP on many CPUs
+    // (Intel SDM: "Writes from a logical processor other than the BSP ... may
+    // cause a general-protection exception").  The BSP already set up APIC
+    // enable and forced xAPIC mode globally.
+    X2APIC_MODE.store(false, Ordering::Relaxed);
 
     let svr = lapic_read(LAPIC_SVR);
     lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);
@@ -377,17 +356,14 @@ pub fn init() {
         SerialPort::puts("[apic] enabled via MSR\n");
     }
 
-    // Enable x2APIC mode when the CPU supports it. This makes ICR accesses and
-    // APIC ID reads use MSRs, which is required for APIC IDs wider than 8 bits.
-    if cpu_has_x2apic() && !is_x2apic_enabled() {
-        let cur = rdmsr(IA32_APIC_BASE_MSR);
-        wrmsr(IA32_APIC_BASE_MSR, cur | (1 << 10));
-        SerialPort::puts("[apic] x2APIC mode enabled\n");
-    }
-    X2APIC_MODE.store(is_x2apic_enabled(), Ordering::Relaxed);
-    SerialPort::puts("[apic] x2APIC mode: ");
-    SerialPort::put_u64(if X2APIC_MODE.load(Ordering::Relaxed) { 1 } else { 0 });
-    SerialPort::puts("\n");
+    // Force xAPIC mode — disable x2APIC.
+    // QEMU TCG sets CPUID x2APIC bit and MSR 0x1B bit 10, but the x2APIC MSR
+    // range causes #GP anyway.  On real hardware xAPIC MMIO is always available
+    // as a fallback and the performance difference is negligible for this kernel.
+    let cur = rdmsr(IA32_APIC_BASE_MSR);
+    wrmsr(IA32_APIC_BASE_MSR, cur & !(1 << 10));
+    X2APIC_MODE.store(false, Ordering::Relaxed);
+    SerialPort::puts("[apic] x2APIC mode: 0 (forced to xAPIC)\n");
 
     let svr = lapic_read(LAPIC_SVR);
     lapic_write(LAPIC_SVR, (svr & 0xFFFFFF00) | 0x100 | 0xFF);

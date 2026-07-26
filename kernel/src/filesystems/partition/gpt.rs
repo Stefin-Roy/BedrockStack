@@ -38,7 +38,7 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
     let mut buf = [0u8; 512];
     read_sector(&*device, 1, &mut buf)?;
 
-    let hdr = unsafe { &*(buf.as_ptr() as *const GptHeader) };
+    let hdr = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
 
     if &hdr.signature != b"EFI PART" {
         return Err("GPT signature not found");
@@ -76,7 +76,7 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
         if offset + 128 > entries_buf.len() {
             break;
         }
-        let entry = unsafe { &*(entries_buf.as_ptr().add(offset) as *const GptEntry) };
+        let entry = unsafe { core::ptr::read_unaligned(entries_buf.as_ptr().add(offset) as *const GptEntry) };
 
         if entry.partition_type_guid == [0u8; 16] {
             continue;
@@ -86,7 +86,7 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
         let end_lba = u64::from_le(entry.ending_lba);
         let size_sectors = end_lba - start_lba + 1;
 
-        let name_units = unsafe { core::ptr::read_unaligned(core::ptr::addr_of!(entry.name)) };
+        let name_units = entry.name;
         let name_str = decode_utf16_le(&name_units);
 
         partitions.push(PartitionInfo {

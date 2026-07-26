@@ -143,6 +143,32 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())
 }
 
+/// Remove the WRITABLE flag from a single 4 KiB page, making it read-only
+/// in both the identity and higher-half mappings.
+///
+/// The page must already be mapped with 4 KiB granularity via 4-level paging
+/// (the kernel identity map uses 4 KiB pages for kernel-image pages).
+/// Panics if the page is not present.
+pub fn make_read_only_both(root: u64, vaddr: u64) {
+    let set_ro = |addr: u64| {
+        let mut mapper = mapper_at(root);
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
+        // Reconstruct flags matching what leaf_flags() would have set for
+        // .data/.bss (READ | WRITE | NO_EXECUTE) minus WRITABLE.
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::ACCESSED
+            | PageTableFlags::NO_EXECUTE;
+        unsafe {
+            mapper
+                .update_flags(page, flags)
+                .expect("make_read_only: update_flags failed")
+                .flush();
+        }
+    };
+    set_ro(vaddr);
+    set_ro(crate::mm::vmm::KERNEL_VMA_BASE + vaddr);
+}
+
 /// Switch to the given root table (physical address of the PML4).
 ///
 /// # Safety

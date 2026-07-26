@@ -118,6 +118,32 @@ impl core::fmt::Write for SerialPort {
     }
 }
 
+// ── Lock-free raw dump output ──────────────────────────────────────
+// These bypass the serial spinlock entirely.  Safe ONLY during a fault
+// dump (single CPU, interrupts disabled, no concurrent access).
+
+/// Write one byte to serial without acquiring any locks.
+pub fn dump_putc(c: u8) {
+    Inner::putc(c);
+}
+
+/// Write a string to serial without acquiring any locks.
+pub fn dump_puts(s: &str) {
+    for &b in s.as_bytes() {
+        Inner::putc(b);
+    }
+}
+
+/// Write a u64 as hex to serial without acquiring any locks.
+pub fn dump_put_hex(val: u64) {
+    Inner::put_hex(val);
+}
+
+/// Write a u64 in decimal to serial without acquiring any locks.
+pub fn dump_put_u64(val: u64) {
+    Inner::put_u64(val);
+}
+
 #[cfg(feature = "display_log")]
 pub fn set_console(console: Console) {
     unsafe { *CONSOLE.0.get() = Some(console); }

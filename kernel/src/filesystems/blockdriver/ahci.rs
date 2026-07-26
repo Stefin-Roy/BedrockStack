@@ -188,7 +188,7 @@ fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
             core::hint::spin_loop();
         }
     } else {
-        for _ in 0..10_000_000 {
+        for _ in 0..POLL_FALLBACK_LIMIT {
             if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
             core::hint::spin_loop();
         }
@@ -223,7 +223,6 @@ struct AhciPort {
     slots: [Slot; AHCI_MAX_SLOTS],
     slot_alloc: core::sync::atomic::AtomicU32,
     irq_completed: AtomicU32,
-    irq_vector: u8,
 }
 
 unsafe impl Sync for AhciPort {}
@@ -235,6 +234,7 @@ unsafe impl Sync for AhciPort {}
 // completion in the per-port `irq_completed` mask.
 
 fn handle_ahci_irq() {
+    crate::arch::x86_64::idt::verify_integrity();
     let ports = IRQ_PORTS.lock();
     for pptr in ports.iter() {
         let port = unsafe { &*pptr.0 };
@@ -406,10 +406,10 @@ impl AhciPort {
             unsafe {
                 let e = prdt_ptr.add(n);
                 let dba = pa | (skip as u64);
-                (*e).dba = dba as u32;
-                (*e).dbau = (dba >> 32) as u32;
-                (*e)._rsvd = 0;
-                (*e).dbc = (chunk - 1) as u32;
+                core::ptr::addr_of_mut!((*e).dba).write_volatile(dba as u32);
+                core::ptr::addr_of_mut!((*e).dbau).write_volatile((dba >> 32) as u32);
+                core::ptr::addr_of_mut!((*e)._rsvd).write_volatile(0);
+                core::ptr::addr_of_mut!((*e).dbc).write_volatile((chunk - 1) as u32);
             }
             n += 1;
             rem -= chunk as isize;
@@ -471,13 +471,24 @@ impl AhciPort {
 
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
         let prdtl = if buf_vaddr != 0 {
-            self.build_prdt(buf_vaddr, size, prdt_ptr)?
+            match self.build_prdt(buf_vaddr, size, prdt_ptr) {
+                Ok(n) => n,
+                Err(e) => {
+                    use crate::drivers::serial::SerialPort;
+                    SerialPort::puts("[ahci] prepare_cmd: ");
+                    SerialPort::puts(e);
+                    SerialPort::puts(" vaddr=0x");
+                    SerialPort::put_hex(buf_vaddr);
+                    SerialPort::puts("\n");
+                    return Err(e);
+                }
+            }
         } else {
             unsafe {
-                (*prdt_ptr).dba = self.scratch_paddr as u32;
-                (*prdt_ptr).dbau = (self.scratch_paddr >> 32) as u32;
-                (*prdt_ptr)._rsvd = 0;
-                (*prdt_ptr).dbc = (size - 1) as u32;
+                core::ptr::addr_of_mut!((*prdt_ptr).dba).write_volatile(self.scratch_paddr as u32);
+                core::ptr::addr_of_mut!((*prdt_ptr).dbau).write_volatile((self.scratch_paddr >> 32) as u32);
+                core::ptr::addr_of_mut!((*prdt_ptr)._rsvd).write_volatile(0);
+                core::ptr::addr_of_mut!((*prdt_ptr).dbc).write_volatile((size - 1) as u32);
             }
             1usize
         };
@@ -485,13 +496,34 @@ impl AhciPort {
         // Request completion only after the final PRDT entry.  In particular
         // NCQ completion is reported by an SDB FIS, and without IOC QEMU's
         // AHCI path can leave the command outstanding until the timeout.
-        unsafe { (*prdt_ptr.add(prdtl - 1)).dbc |= PRDT_IOC; }
+        unsafe {
+            let dbc = core::ptr::addr_of_mut!((*prdt_ptr.add(prdtl - 1)).dbc);
+            dbc.write_volatile(dbc.read_volatile() | PRDT_IOC);
+        }
 
         let hdr = (self.cl_vaddr + (tag as u64) * 32) as *mut CmdHeader;
-        let w = if is_write { 1u32 << 7 } else { 0 };
+        let w = if is_write { 1u32 << 6 } else { 0 };
         unsafe {
-            (*hdr).cfl_w_prdtl = 5u32 | w | (prdtl as u32) << 16;
-            (*hdr).prdbc = 0;
+            core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl).write_volatile(5u32 | w | (prdtl as u32) << 16);
+            core::ptr::addr_of_mut!((*hdr).prdbc).write_volatile(0);
+        }
+
+        // DEBUG: flush Command Table (FIS + PRDT) and Command List (CmdHeader)
+        // so the HBA reads coherent data from RAM.
+        let ct_end = ct_va + 0x80 + (prdtl as u64) * 16;
+        unsafe {
+            let mut cl = ct_va & !63u64;
+            while cl < ct_end {
+                core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags));
+                cl += 64;
+            }
+            let hdr_vaddr = self.cl_vaddr + (tag as u64) * 32;
+            let hdr_end = hdr_vaddr + 32;
+            let mut cl2 = hdr_vaddr & !63u64;
+            while cl2 < hdr_end {
+                core::arch::asm!("clflush [{}]", in(reg) cl2 as *const u8, options(nostack, preserves_flags));
+                cl2 += 64;
+            }
         }
 
         Ok(())
@@ -574,7 +606,9 @@ impl AhciPort {
 
         self.hba.pw32(self.port, port_off::SERR, !0);
         self.hba.pw32(self.port, port_off::IS, !0);
-        self.hba.pw32(self.port, port_off::CMD, CMD_SUD | CMD_POD | CMD_FRE | CMD_ST);
+        self.hba.pw32(self.port, port_off::CMD, CMD_SUD | CMD_POD | CMD_FRE);
+        for _ in 0..10 { core::hint::spin_loop(); }
+        self.hba.pw32(self.port, port_off::CMD, self.hba.pr32(self.port, port_off::CMD) | CMD_ST);
 
         // Re-enable interrupts if they were previously enabled.
         if saved_ie != 0 {
@@ -599,17 +633,17 @@ impl AhciPort {
         // PRDT -> scratch buffer
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
         unsafe {
-            (*prdt_ptr).dba = self.scratch_paddr as u32;
-            (*prdt_ptr).dbau = (self.scratch_paddr >> 32) as u32;
-            (*prdt_ptr)._rsvd = 0;
-            (*prdt_ptr).dbc = 511 | PRDT_IOC;
+            core::ptr::addr_of_mut!((*prdt_ptr).dba).write_volatile(self.scratch_paddr as u32);
+            core::ptr::addr_of_mut!((*prdt_ptr).dbau).write_volatile((self.scratch_paddr >> 32) as u32);
+            core::ptr::addr_of_mut!((*prdt_ptr)._rsvd).write_volatile(0);
+            core::ptr::addr_of_mut!((*prdt_ptr).dbc).write_volatile(511 | PRDT_IOC);
         }
 
         // CmdHeader slot 0
         let hdr = self.cl_vaddr as *mut CmdHeader;
         unsafe {
-            (*hdr).cfl_w_prdtl = 5u32 | (1u32 << 16);
-            (*hdr).prdbc = 0;
+            core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl).write_volatile(5u32 | (1u32 << 16));
+            core::ptr::addr_of_mut!((*hdr).prdbc).write_volatile(0);
         }
 
         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
@@ -638,10 +672,8 @@ impl AhciPort {
                 SerialPort::puts("[ahci] WARN: IDENTIFY sector_count=0\n");
             }
 
-            // Keep the data path serialized until NCQ error recovery is
-            // implemented per-tag.  DMA EXT is sufficient for the ESP and
-            // avoids carrying a failed queued command across a port reset.
-            self.ncq = false;
+            let w76 = data.add(76).read_volatile();
+            self.ncq = (w76 & (1 << 8)) != 0;
 
             for i in 0..20 {
                 let w = data.add(27 + i).read_volatile();
@@ -668,27 +700,31 @@ impl BlockDevice for AhciPort {
 
         // Allocate tags (NCQ or non-NCQ)
         let tag_mask = self.alloc_slots(n)?;
-
-        // Phase 1: prepare all command slots
         let mut tag_of = [0u8; AHCI_MAX_SLOTS];
         let mut idx = 0usize;
         let mut err_mask = 0u32;
+        // DEBUG: store buffer ranges for cache maintenance
+        let mut buf_ranges: [(u64, u64); AHCI_MAX_SLOTS] = [(0, 0); AHCI_MAX_SLOTS];
         for tag in 0..self.n_slots as u8 {
             if tag_mask & (1 << tag) != 0 {
-                if idx < n {
-                    tag_of[idx] = tag;
-                    let req = &reqs[idx];
-                    let bytes = (req.count as usize) * 512;
-                    let (buf_vaddr, buf_size) = match &req.buffer {
-                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::Phys(pa, sz) => (*pa, *sz),
-                    };
-                    if buf_size < bytes {
-                        err_mask |= 1 << tag;
-                    } else if let Err(_) = self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write) {
-                        err_mask |= 1 << tag;
+                        if idx < n {
+                            tag_of[idx] = tag;
+                            let req = &reqs[idx];
+                            let bytes = (req.count as usize) * 512;
+                            // SAFETY: The buffer virtual address is extracted for
+                            // DMA translation. The caller guarantees the buffer
+                            // lives until submit() returns (synchronous submit).
+                            let (buf_vaddr, buf_size) = match &req.buffer {
+                                IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
+                                IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
+                                IoBuffer::Phys(pa, sz) => (*pa, *sz),
+                            };
+                            if buf_size < bytes {
+                                err_mask |= 1 << tag;
+                            } else if let Err(_) = self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write) {
+                                err_mask |= 1 << tag;
                     }
+                    buf_ranges[idx] = (buf_vaddr, bytes as u64);
                     idx += 1;
                 }
             }
@@ -701,14 +737,48 @@ impl BlockDevice for AhciPort {
             return Ok(IoCompletions { completed: 0, errors: tag_mask });
         }
 
+        // DEBUG: Flush CPU cache for write buffers before DMA submission.
+        // Without this the HBA may read stale data from RAM.
+        if reqs[0].is_write {
+            for i in 0..n {
+                let (va, sz) = buf_ranges[i];
+                if va == 0 || sz == 0 { continue; }
+                let end = va + sz;
+                let mut cl = va & !63u64;
+                while cl < end {
+                    unsafe { core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags)); }
+                    cl += 64;
+                }
+            }
+        }
+
         let result = self.submit_batch(ok_mask);
         match result {
             Ok(()) => {
+                // DEBUG: Invalidate CPU cache for read buffers after DMA completes.
+                // Without this the CPU may read stale cache lines instead of
+                // the data the HBA wrote to RAM.
+                if !reqs[0].is_write {
+                    for i in 0..n {
+                        let (va, sz) = buf_ranges[i];
+                        if va == 0 || sz == 0 { continue; }
+                        let end = va + sz;
+                        let mut cl = va & !63u64;
+                        while cl < end {
+                            unsafe { core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags)); }
+                            cl += 64;
+                        }
+                    }
+                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+                }
                 self.free_slots(tag_mask);
                 Ok(IoCompletions { completed: ok_mask, errors: err_mask })
             }
-            Err(_e) => {
-                // Port reset + retry once
+            Err(e) => {
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[ahci] submit error: ");
+                SerialPort::puts(e);
+                SerialPort::puts("\n");
                 if self.port_reset().is_err() {
                     self.free_slots(tag_mask);
                     return Err("AHCI port reset failed");
@@ -720,6 +790,7 @@ impl BlockDevice for AhciPort {
                     if err_mask & (1 << tag) != 0 { continue; }
                     let req = &reqs[i];
                     let bytes = (req.count as usize) * 512;
+                    // SAFETY: Same as above — buffer lives until submit returns.
                     let (buf_vaddr, buf_size) = match &req.buffer {
                         IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
                         IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
@@ -821,14 +892,16 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Resul
     SerialPort::puts("[ahci] HBA reset complete\n");
 
     let mut ports: Vec<Arc<dyn BlockDevice>> = Vec::new();
+    let mut port_numbers: Vec<u8> = Vec::new();
     for p in 0u8..n_ports.min(32) as u8 {
         if pi & (1 << p) == 0 { continue; }
 
-        match init_one(p, &mmio, dma, max_prdt_raw.min(MAX_PRDT), n_slots_raw, dev.interrupt_line) {
+        match init_one(p, &mmio, dma, max_prdt_raw.min(MAX_PRDT), n_slots_raw) {
             Ok(port) => {
                 let port_arc = Arc::new(port);
                 let ptr = Arc::as_ptr(&port_arc);
                 IRQ_PORTS.lock().push(PortPtr(ptr));
+                port_numbers.push(p);
                 ports.push(port_arc as Arc<dyn BlockDevice>);
                 SerialPort::puts("[ahci] port ");
                 SerialPort::put_u64(p as u64);
@@ -847,9 +920,27 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Resul
             }
         }
     }
+
+    // Register IRQ once per controller (all ports share the same INTX# line).
+    if !port_numbers.is_empty() && dev.interrupt_line != 0 {
+        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
+            if crate::platform::x86_64_pc::ioapic::enable_irq(
+                dev.interrupt_line as u32,
+                crate::acpi::Polarity::ActiveLow,
+                crate::acpi::TriggerMode::Level,
+            ).is_some() {
+                for &p in &port_numbers {
+                    mmio.pw32(p, port_off::IE, 0x0000_0089);
+                }
+            } else {
+                crate::arch::x86_64::idt::unregister_device_handler(vector);
+            }
+        }
+    }
+
     Ok(ports)
 }
-fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_raw: u32, interrupt_line: u8) -> Result<AhciPort, &'static str> {
+fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
@@ -883,10 +974,10 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
         let hdr = (cl_buf.virt + (s as u64) * 32) as *mut CmdHeader;
         let ctba = slots[s].ct_paddr;
         unsafe {
-            (*hdr).cfl_w_prdtl = 5u32;  // CFL=5, W=0, PRDTL=0
-            (*hdr).prdbc = 0;
-            (*hdr).ctba = ctba as u32;
-            (*hdr).ctbau = (ctba >> 32) as u32;
+            core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl).write_volatile(5u32);
+            core::ptr::addr_of_mut!((*hdr).prdbc).write_volatile(0);
+            core::ptr::addr_of_mut!((*hdr).ctba).write_volatile(ctba as u32);
+            core::ptr::addr_of_mut!((*hdr).ctbau).write_volatile((ctba >> 32) as u32);
             core::ptr::write_bytes((hdr as *mut u32).add(4) as *mut u8, 0, 16);
         }
     }
@@ -920,33 +1011,12 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),
-        irq_vector: 0,
     };
 
     port.identify()?;
 
-    // Clear stale PxIS from IDENTIFY before enabling interrupts so that a
-    // level-triggered IRQ does not fire before the port is reachable through
-    // IRQ_PORTS (which gets populated after init_one returns).
     hba.pw32(p, port_off::IS, !0);
     hba.pw32(p, port_off::SERR, !0);
-
-    // AHCI uses PCI INTx here.  It is a shared, active-low, level-triggered
-    // line; set it up only after a device was found so empty ports cannot
-    // consume vectors or repeatedly reprogram the same GSI.
-    if interrupt_line != 0 {
-        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
-            let _ = crate::platform::x86_64_pc::ioapic::enable_irq(
-                interrupt_line as u32,
-                crate::acpi::Polarity::ActiveLow,
-                crate::acpi::TriggerMode::Level,
-            );
-            port.irq_vector = vector;
-        }
-    }
-    if port.irq_vector != 0 {
-        hba.pw32(p, port_off::IE, 0x0000_0089);
-    }
 
     Ok(port)
 }

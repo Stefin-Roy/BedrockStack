@@ -12,6 +12,8 @@ use crate::mm::phys_alloc::BitmapAllocator;
 pub use self::x86_64::activate;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::make_read_only_both;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
 

@@ -1,3 +1,4 @@
+use crate::filesystems::vfs::irq::IrqMutex;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
 
@@ -9,15 +10,13 @@ struct TransCacheInner {
 }
 
 struct TransCache {
-    data: core::cell::UnsafeCell<TransCacheInner>,
+    inner: IrqMutex<TransCacheInner>,
 }
-
-unsafe impl Sync for TransCache {}
 
 impl TransCache {
     const fn new() -> Self {
         TransCache {
-            data: core::cell::UnsafeCell::new(TransCacheInner {
+            inner: IrqMutex::new(TransCacheInner {
                 entries: [(0, 0); TRANS_CACHE_SIZE],
                 next: 0,
             }),
@@ -25,7 +24,7 @@ impl TransCache {
     }
 
     fn lookup_or_translate(&self, vaddr: u64, root: u64) -> Option<u64> {
-        let inner = unsafe { &mut *self.data.get() };
+        let mut inner = self.inner.lock();
         let vaddr_page = vaddr & !0xFFF;
         for &(v, p) in &inner.entries {
             if v == vaddr_page {
@@ -94,6 +93,26 @@ impl DmaAllocator {
             PageFlags::READ | PageFlags::WRITE);
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096); }
         Some(DmaBuffer { phys, virt: va, size: 4096 })
+    }
+
+    /// Allocate `count` contiguous physical pages, map them into DMA
+    /// virtual address space, zero them, and return a single DmaBuffer.
+    ///
+    /// NVMe needs this for Submission/Completion Queues and PRP lists.
+    /// XHCI can use it for Transfer Request Block rings.
+    pub fn alloc_contiguous(&mut self, count: usize) -> Option<DmaBuffer> {
+        let alloc = unsafe { &mut *self.alloc };
+        let phys = alloc.alloc_contiguous(count)?;
+        let size = (count as u64) * 4096;
+        let va = self.next_vaddr.checked_sub(size)?;
+        if va < self.vaddr_floor {
+            return None;
+        }
+        self.next_vaddr = va;
+        Vmm::from_root(self.root).map(alloc, va, phys, size,
+            PageFlags::READ | PageFlags::WRITE);
+        unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize); }
+        Some(DmaBuffer { phys, virt: va, size: size as usize })
     }
 }
 

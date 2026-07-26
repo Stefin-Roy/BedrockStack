@@ -39,6 +39,8 @@ unsafe extern "C" {
     static __rodata_end: u8;
     pub static __stack_start: u8;
     pub static __stack_end: u8;
+    pub static __idt_start: u8;
+    pub static __idt_end: u8;
 }
 
 /// Physical-address boundaries of the kernel image sections, used to apply
@@ -53,6 +55,8 @@ pub struct KernelLayout {
     pub rela_dyn_end: u64,
     pub rodata_start: u64,
     pub rodata_end: u64,
+    pub idt_start: u64,
+    pub idt_end: u64,
 }
 
 pub struct Kernel {
@@ -96,6 +100,8 @@ impl Kernel {
                 rela_dyn_end: &__rela_dyn_end as *const u8 as u64,
                 rodata_start: &__rodata_start as *const u8 as u64,
                 rodata_end: &__rodata_end as *const u8 as u64,
+                idt_start: &__idt_start as *const u8 as u64,
+                idt_end: &__idt_end as *const u8 as u64,
             }
         };
 
@@ -113,7 +119,10 @@ impl Kernel {
         allocator.reserve_region(layout.kernel_start, layout.kernel_end);
 
         SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
-        let fb_size = framebuffer.stride * framebuffer.height * framebuffer.bpp as usize;
+        let fb_size = (framebuffer.stride as u64)
+            .checked_mul(framebuffer.height as u64)
+            .and_then(|v| v.checked_mul(framebuffer.bpp as u64))
+            .expect("framebuffer size overflow") as usize;
         let fb_pages = (fb_size + 4095) / 4096;
         let shadow_phys = allocator
             .alloc_contiguous(fb_pages)
@@ -267,6 +276,15 @@ impl Kernel {
         // `self.allocator`, leaving the raw pointer stashed by `heap::init`
         // dangling.  Re-point it at the final (stable) address.
         heap::set_phys_allocator(&mut self.allocator);
+
+        // Lock down the IDT — .idt section becomes read-only.
+        // Any wild write through the IDT's page will now page-fault immediately.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::idt::protect_idt(
+            self.page_table_root,
+            self.layout.idt_start,
+            self.layout.idt_end,
+        );
 
         // Initialise PCI subsystem (ECAM mapping + bus enumeration).
         if let Some(ref acpi) = self.acpi {

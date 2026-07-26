@@ -16,6 +16,8 @@ pub struct BitmapAllocator {
     total_frames: usize,
     alloc_end: u64,
     next_free: usize,
+    kernel_start: u64,
+    kernel_end: u64,
 }
 
 impl BitmapAllocator {
@@ -47,7 +49,7 @@ impl BitmapAllocator {
     pub unsafe fn new(
         bitmap_region: (u64, u64),
         memory_map: &[MemoryRegion],
-        _kernel_start: u64,
+        kernel_start: u64,
         kernel_end: u64,
     ) -> Self {
         use crate::drivers::serial::SerialPort;
@@ -113,6 +115,8 @@ impl BitmapAllocator {
             total_frames,
             alloc_end: max_addr,
             next_free: (base / 4096) as usize,
+            kernel_start,
+            kernel_end,
         }
     }
 
@@ -147,7 +151,13 @@ impl BitmapAllocator {
             if self.is_free(i) {
                 self.set_used(i);
                 self.next_free = i + 1;
-                return Some((i as u64) * 4096);
+                let addr = (i as u64) * 4096;
+                debug_assert!(
+                    addr < self.kernel_start || addr >= self.kernel_end,
+                    "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",
+                    addr, self.kernel_start, self.kernel_end
+                );
+                return Some(addr);
             }
         }
         // Wrap-around: scan from 0 to next_free in case earlier frames
@@ -156,7 +166,13 @@ impl BitmapAllocator {
             if self.is_free(i) {
                 self.set_used(i);
                 self.next_free = i + 1;
-                return Some((i as u64) * 4096);
+                let addr = (i as u64) * 4096;
+                debug_assert!(
+                    addr < self.kernel_start || addr >= self.kernel_end,
+                    "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",
+                    addr, self.kernel_start, self.kernel_end
+                );
+                return Some(addr);
             }
         }
         None
@@ -167,6 +183,9 @@ impl BitmapAllocator {
     /// Returns the physical address of the first frame, or `None` if
     /// insufficient contiguous frames are available.
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
+        if count == 0 || count > self.total_frames {
+            return None;
+        }
         // Scan from next_free to end-of-bitmap, then wrap around from 0.
         for offset in [self.next_free, 0] {
             let end = if offset == 0 { self.next_free } else { self.total_frames };
@@ -181,7 +200,14 @@ impl BitmapAllocator {
                             self.set_used(j);
                         }
                         self.next_free = run_start + count;
-                        return Some((run_start as u64) * 4096);
+                        let addr = (run_start as u64) * 4096;
+                        let end_addr = addr + (count as u64) * 4096;
+                        debug_assert!(
+                            end_addr <= self.kernel_start || addr >= self.kernel_end,
+                            "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
+                            addr, end_addr, self.kernel_start, self.kernel_end
+                        );
+                        return Some(addr);
                     }
                 } else {
                     run_len = 0;

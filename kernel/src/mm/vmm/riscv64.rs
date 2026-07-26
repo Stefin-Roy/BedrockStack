@@ -22,6 +22,9 @@ const PTE_U: u64 = 1 << 4;
 const PTE_A: u64 = 1 << 6;
 const PTE_D: u64 = 1 << 7;
 
+/// Leaf-page permission bits — any of R, W, X set means this is a leaf.
+const PTE_LEAF: u64 = PTE_R | PTE_W | PTE_X;
+
 const SATP_MODE_SV39: u64 = 8 << 60;
 
 // ── Page table type ──────────────────────────────────────────────────
@@ -37,6 +40,9 @@ struct PageTableEntry(u64);
 impl PageTableEntry {
     fn is_valid(self) -> bool {
         self.0 & PTE_V != 0
+    }
+    fn is_leaf(self) -> bool {
+        self.0 & PTE_LEAF != 0
     }
     fn ppn(self) -> u64 {
         self.0 >> 10
@@ -122,7 +128,11 @@ pub fn map_4k(
             l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(phys), PTE_V);
             l1.entries[idx0] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
         } else {
+            assert!(!l2.entries[idx1].is_leaf(),
+                "RISC-V map_4k: address 0x{:x} already mapped as 2M megapage", vaddr);
             let l1 = pt_at_mut(l2.entries[idx1].ppn());
+            assert!(!l1.entries[idx0].is_valid(),
+                "RISC-V map_4k: double-map at 0x{:x}", vaddr);
             l1.entries[idx0] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
         }
     }
@@ -147,6 +157,8 @@ pub fn map_2m(
         l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
     } else {
         let l2 = pt_at_mut(root_pt.entries[idx2].ppn());
+        assert!(!l2.entries[idx1].is_valid(),
+            "RISC-V map_2m: double-map at 0x{:x}", vaddr);
         l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
     }
 }

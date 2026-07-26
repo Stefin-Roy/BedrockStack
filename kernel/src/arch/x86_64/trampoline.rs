@@ -63,8 +63,8 @@ core::arch::global_asm!(
     "mov  eax, [0x8700]",
     "mov  cr3, eax",
 
-    "mov  eax, cr4",
-    "or   eax, 1 << 5",
+    // Set full CR4 matching BSP: DE|PAE|MCE|PGE|OSFXSR|OSXMMEXCPT = 0x6E8
+    "mov  eax, (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9) | (1 << 10)",
     "mov  cr4, eax",
 
     "mov  ecx, 0xC0000080",
@@ -97,13 +97,23 @@ core::arch::global_asm!(
     "mov  rax, [0x8700]",
     "mov  cr3, rax",
 
-    // Atomically claim a boot index from the shared counter at 0x8E00.
-    "lock inc qword ptr [0x8E00]",
-    "mov  rbx, [0x8E00]",
-    "dec  rbx",
+    // Fix CR0: clear CD (bit 30) and NW (bit 29); set WP (bit 16), MP (bit 1),
+    // and NE (bit 5) to match BSP.  The trampoline reset leaves cache disabled
+    // (CD=1) which causes #GP from CLFLUSH and other instructions on some CPUs.
+    "mov  rbx, cr0",
+    "and  ebx, 0x9FFFFFFF",
+    "or   ebx, (1 << 1) | (1 << 5) | (1 << 16)",
+    "mov  cr0, rbx",
 
-    // Index into per-AP records at 0x8D00 + index * 64.
-    "shl  rbx, 6",
+    // Atomically claim a boot index from the shared counter at 0x8CF8.
+    // lock xadd exchanges [counter] with rbx then adds them:
+    //   tmp = [counter]; [counter] = tmp + rbx; rbx = tmp
+    // So rbx gets the old counter value = this AP's index.
+    "mov  rbx, 1",
+    "lock xadd qword ptr [0x8CF8], rbx",
+
+    // Index into per-AP records at 0x8D00 + index * 32.
+    "shl  rbx, 5",
     "add  rbx, 0x8D00",
 
     // Load stack_top from record offset 8 and set RSP.
@@ -168,18 +178,17 @@ pub unsafe fn start_aps(
     let data = (TRAMPOLINE_ADDR + DATA_OFFSET) as *mut TrampolineData;
 
     // Write per-AP boot records at 0x8D00 (within the reserved trampoline page).
-    // Each record is 64 bytes (cache-line sized) to avoid false sharing when
-    // multiple APs read concurrently.
+    // Each record is 32 bytes (2 × u64) — fits 15 APs within 480 bytes.
     for (i, ap) in aps.iter().enumerate() {
         let pc = crate::smp::per_cpu_by_id(ap.cpu_id);
-        let record_addr = (0x8D00 + (i as u64) * 64) as *mut u64;
+        let record_addr = (0x8D00 + (i as u64) * 32) as *mut u64;
         unsafe {
             *record_addr = pc as *const crate::smp::PerCpu as u64;
             *record_addr.add(1) = ap.stack_top;
         }
     }
-    // Reset atomic boot counter at 0x8E00.
-    unsafe { *(0x8E00 as *mut u64) = 0; }
+    // Reset atomic boot counter at 0x8CF8 (before the record area).
+    unsafe { *(0x8CF8 as *mut u64) = 0; }
 
     // Write shared trampoline data once (cr3, entry, lm_entry are the same for all APs).
     unsafe {

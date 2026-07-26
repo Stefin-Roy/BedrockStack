@@ -23,6 +23,11 @@ pub trait InodeOps: Send + Sync {
     fn file_type(&self) -> FileType;
     fn ino(&self) -> u64;
     fn size(&self) -> u64;
+
+    /// Called by VFS before the inode is removed from the namespace (unlink,
+    /// rmdir).  The filesystem can mark the inode for deferred cleanup — the
+    /// inode won't be dropped until the last open handle is closed.
+    fn on_unlink(&self) {}
 }
 
 pub struct InodeMeta {

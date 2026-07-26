@@ -1,8 +1,8 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use spin::Mutex;
 
+use crate::filesystems::vfs::irq::IrqMutex;
 use super::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
 
 const CACHE_SIZE: usize = 4096;
@@ -14,7 +14,7 @@ struct CachedSector {
 
 pub struct CachedDevice {
     inner: Arc<dyn BlockDevice>,
-    cache: Mutex<BlockCache>,
+    cache: IrqMutex<BlockCache>,
 }
 
 struct BlockCache {
@@ -66,20 +66,29 @@ impl BlockCache {
         Ok(&self.sectors.get(&lba).unwrap().data)
     }
 
-    fn read_into(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), ()> {
+    fn read_raw(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf_ptr: *mut u8, buf_len: usize) -> Result<(), ()> {
         if count <= 1 {
             let data = self.read(device, lba)?;
-            buf[..data.len()].copy_from_slice(data);
-            return Ok(());
+            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, data.len()); }
+            Ok(())
+        } else {
+            let total = (count as usize) * 512;
+            let mut tmp = alloc::vec![0u8; total];
+            let req = IoRequest { lba, count, buffer: IoBuffer::Buf(&mut tmp), is_write: false };
+            let c = device.submit(&[req]).map_err(|_| ())?;
+            if !c.all_ok() { return Err(()); }
+            let copy_len = total.min(buf_len);
+            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr, copy_len); }
+            Ok(())
         }
-        // For multi-sector reads, bypass the cache and go directly
-        let req = IoRequest { lba, count, buffer: IoBuffer::Buf(buf), is_write: false };
-        let c = device.submit(&[req]).map_err(|_| ())?;
-        if !c.all_ok() { return Err(()); }
-        Ok(())
     }
 
     fn write(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), ()> {
+        // Write-through to device first
+        let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
+        let c = device.submit(&[req]).map_err(|_| ())?;
+        if !c.all_ok() { return Err(()); }
+        // Only update cache after successful write
         if count <= 1 && buf.len() == 512 {
             let mut sector = [0u8; 512];
             sector.copy_from_slice(buf);
@@ -87,10 +96,6 @@ impl BlockCache {
             self.sectors.insert(lba, CachedSector { data: sector, access_gen: 0 });
             self.touch(lba);
         }
-        // Always write-through to the device
-        let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
-        let c = device.submit(&[req]).map_err(|_| ())?;
-        if !c.all_ok() { return Err(()); }
         Ok(())
     }
 }
@@ -105,16 +110,11 @@ impl CachedDevice {
     }
 
     fn read_io(&self, cache: &mut BlockCache, r: &IoRequest) -> Result<(), ()> {
-        match &r.buffer {
-            IoBuffer::Buf(buf) => {
-                // buf is &&mut [u8]; need &mut [u8]
-                let buf_len = buf.len();
-                let buf_ptr = buf.as_ptr() as *mut u8;
-                let mut_buf = unsafe { &mut *core::ptr::slice_from_raw_parts_mut(buf_ptr, buf_len) };
-                cache.read_into(&*self.inner, r.lba, r.count, mut_buf)
-            }
-            _ => Err(()),
-        }
+        let (buf_ptr, buf_len) = match &r.buffer {
+            IoBuffer::Buf(buf) => (buf.as_ptr() as *mut u8, buf.len()),
+            _ => return Err(()),
+        };
+        cache.read_raw(&*self.inner, r.lba, r.count, buf_ptr, buf_len)
     }
 }
 
@@ -122,13 +122,14 @@ impl CachedDevice {
     pub fn new(inner: Arc<dyn BlockDevice>) -> Arc<Self> {
         Arc::new(CachedDevice {
             inner,
-            cache: Mutex::new(BlockCache::new()),
+            cache: IrqMutex::new(BlockCache::new()),
         })
     }
 }
 
 impl BlockDevice for CachedDevice {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
+        crate::arch::x86_64::idt::verify_integrity();
         let mut cache = self.cache.lock();
         let mut completed = 0u32;
         let mut errors = 0u32;

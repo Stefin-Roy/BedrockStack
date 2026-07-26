@@ -24,7 +24,7 @@ pub fn parse(
 
     for i in 0..4 {
         let offset = 0x1BE + i * 16;
-        let entry = unsafe { &*(mbr_sector.as_ptr().add(offset) as *const MbrEntry) };
+        let entry = unsafe { core::ptr::read_unaligned(mbr_sector.as_ptr().add(offset) as *const MbrEntry) };
         let typ = entry.partition_type;
         if typ == 0 {
             continue;
@@ -63,7 +63,7 @@ pub fn parse(
                 break;
             }
 
-            let entry0 = unsafe { &*(ebr.as_ptr().add(0x1BE) as *const MbrEntry) };
+            let entry0 = unsafe { core::ptr::read_unaligned(ebr.as_ptr().add(0x1BE) as *const MbrEntry) };
             let typ0 = entry0.partition_type;
 
             if typ0 != 0 {
@@ -85,7 +85,7 @@ pub fn parse(
                 logical_num += 1;
             }
 
-            let entry1 = unsafe { &*(ebr.as_ptr().add(0x1CE) as *const MbrEntry) };
+            let entry1 = unsafe { core::ptr::read_unaligned(ebr.as_ptr().add(0x1CE) as *const MbrEntry) };
             let typ1 = entry1.partition_type;
             let next_rel = u32::from_le(entry1.lba_start) as u64;
 

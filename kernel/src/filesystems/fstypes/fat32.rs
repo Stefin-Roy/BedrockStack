@@ -182,7 +182,7 @@ impl FatCache {
         let target = MAX_FAT_CACHE_ENTRIES - MAX_FAT_CACHE_ENTRIES / 4;
         let mut evictable: Vec<(u64, u64)> = self.sectors.keys()
             .filter_map(|lba| {
-                if self.dirty.iter().any(|d| d == lba) { return None; }
+                if self.dirty.contains(lba) { return None; }
                 Some((*lba, self.access_gen.get(lba).copied().unwrap_or(0)))
             })
             .collect();
@@ -272,6 +272,7 @@ impl Fat32SuperBlock {
     }
 
     fn alloc_cluster(&self) -> Result<u32, VfsError> {
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] alloc_cluster\n");
         let mut hint = self.next_alloc_hint.lock();
         let n = self.bpb.total_clus;
         for i in 0..n {
@@ -287,11 +288,16 @@ impl Fat32SuperBlock {
     }
 
     fn free_chain(&self, mut cluster: u32) -> Result<(), VfsError> {
+        let mut _iters = 0u32;
         while cluster >= 2 && cluster < EOC_MARKER {
             let next = self.read_fat_entry(cluster)?;
             self.write_fat_entry(cluster, FREE_CLUSTER)?;
             self.free_clus_count.fetch_add(1, Ordering::Relaxed);
             cluster = next;
+            _iters += 1;
+            if _iters > self.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
         }
         Ok(())
     }
@@ -305,19 +311,28 @@ impl Fat32SuperBlock {
             if next >= EOC_MARKER { break; }
             c = next;
             n += 1;
+            if n > self.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
         }
         Ok(n)
     }
 
     fn extend_chain(&self, start: u32, additional: u32) -> Result<(), VfsError> {
         let mut tail = start;
+        let mut _iters = 0u32;
         loop {
             let next = self.read_fat_entry(tail)?;
             if next >= EOC_MARKER { break; }
             tail = next;
+            _iters += 1;
+            if _iters > self.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
         }
         for _ in 0..additional {
             let new = self.alloc_cluster()?;
+            zero_cluster(self, new)?;
             self.write_fat_entry(tail, new)?;
             tail = new;
         }
@@ -352,11 +367,40 @@ impl Fat32SuperBlock {
         Ok(())
     }
 
+    /// Read the entire active FAT into a contiguous buffer.
+    ///
+    /// Reads in chunks that fit within the AHCI PRDT limit (512 sectors per
+    /// call), avoiding both the old per-sector flood and single-giant-read
+    /// overflows.
+    // 64 PRDT entries × 4 KiB/page = 256 KiB max per I/O, but the heap
+    // allocator rarely gives page-aligned buffers so we lose one entry to
+    // alignment.  504 sectors × 512 B = 252 KiB → fits in 63 full pages + 1
+    // partial, well within 64 entries even at worst-case offset.
+    const PRDT_MAX_SECTORS: u32 = 504;
+    fn read_fat_bulk(&self) -> Result<Vec<u8>, VfsError> {
+        let fat_idx = self.bpb.active_fat_idx();
+        let first_lba = self.bpb.fat_sector_lba(fat_idx, 0);
+        let nsec = self.bpb.fat_sz32;
+        let mut fat = alloc::vec![0u8; nsec as usize * SECTOR_SIZE];
+        let chunk = Self::PRDT_MAX_SECTORS;
+        let mut done = 0u32;
+        while done < nsec {
+            let take = core::cmp::min(chunk, nsec - done);
+            let off = done as usize * SECTOR_SIZE;
+            read_sectors(&*self.device, first_lba + done as u64, take, &mut fat[off..])?;
+            done += take;
+        }
+        Ok(fat)
+    }
+
     fn scan_free_clusters(&self) -> Result<u32, VfsError> {
+        let fat = self.read_fat_bulk()?;
         let n = self.bpb.total_clus;
         let mut count = 0u32;
         for c in 2..2 + n {
-            if self.read_fat_entry(c)? == FREE_CLUSTER {
+            let off = (c as usize) * 4;
+            let val = u32::from_le_bytes(fat[off..off + 4].try_into().unwrap());
+            if val & 0x0FFFFFFF == FREE_CLUSTER {
                 count += 1;
             }
         }
@@ -367,7 +411,7 @@ impl Fat32SuperBlock {
         if !self.bpb.fsinfo_is_valid() { return Ok(()); }
         let sec = self.bpb.fsinfo_sec as u64;
         let mut buf = [0u8; SECTOR_SIZE];
-        let _ = read_sectors(&*self.device, sec, 1, &mut buf);
+        read_sectors(&*self.device, sec, 1, &mut buf)?;
 
         buf[0..4].copy_from_slice(&FSINFO_LEAD_SIG.to_le_bytes());
         buf[484..488].copy_from_slice(&FSINFO_STRUCT_SIG.to_le_bytes());
@@ -428,16 +472,54 @@ impl SuperOps for Fat32SuperBlock {
 // ── Sector/cluster I/O helpers ──────────────────────────────────────────────
 
 fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), VfsError> {
+    {
+        use core::fmt::Write;
+        let mut port = crate::drivers::serial::SerialPort::new();
+        write!(port, "[DBG:io] read lba=0x{:x} count={}\n", lba, count).ok();
+    }
     let req = IoRequest { lba, count, buffer: IoBuffer::Buf(buf), is_write: false };
-    let c = device.submit(&[req]).map_err(|_| VfsError::IOError)?;
-    if !c.all_ok() { return Err(VfsError::IOError); }
+    let c = device.submit(&[req]).map_err(|_| {
+        crate::drivers::serial::SerialPort::puts("[fat32] read_sectors submit err lba=");
+        crate::drivers::serial::SerialPort::put_hex(lba);
+        crate::drivers::serial::SerialPort::puts("\n");
+        VfsError::IOError
+    })?;
+    if !c.all_ok() {
+        crate::drivers::serial::SerialPort::puts("[fat32] read_sectors !all_ok lba=");
+        crate::drivers::serial::SerialPort::put_hex(lba);
+        crate::drivers::serial::SerialPort::puts(" completed=");
+        crate::drivers::serial::SerialPort::put_hex(c.completed as u64);
+        crate::drivers::serial::SerialPort::puts(" errors=");
+        crate::drivers::serial::SerialPort::put_hex(c.errors as u64);
+        crate::drivers::serial::SerialPort::puts("\n");
+        return Err(VfsError::IOError);
+    }
     Ok(())
 }
 
 fn write_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), VfsError> {
+    {
+        use core::fmt::Write;
+        let mut port = crate::drivers::serial::SerialPort::new();
+        write!(port, "[DBG:io] write lba=0x{:x} count={}\n", lba, count).ok();
+    }
     let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
-    let c = device.submit(&[req]).map_err(|_| VfsError::IOError)?;
-    if !c.all_ok() { return Err(VfsError::IOError); }
+    let c = device.submit(&[req]).map_err(|_| {
+        crate::drivers::serial::SerialPort::puts("[fat32] write_sectors submit err lba=");
+        crate::drivers::serial::SerialPort::put_hex(lba);
+        crate::drivers::serial::SerialPort::puts("\n");
+        VfsError::IOError
+    })?;
+    if !c.all_ok() {
+        crate::drivers::serial::SerialPort::puts("[fat32] write_sectors !all_ok lba=");
+        crate::drivers::serial::SerialPort::put_hex(lba);
+        crate::drivers::serial::SerialPort::puts(" completed=");
+        crate::drivers::serial::SerialPort::put_hex(c.completed as u64);
+        crate::drivers::serial::SerialPort::puts(" errors=");
+        crate::drivers::serial::SerialPort::put_hex(c.errors as u64);
+        crate::drivers::serial::SerialPort::puts("\n");
+        return Err(VfsError::IOError);
+    }
     Ok(())
 }
 
@@ -486,14 +568,8 @@ fn decode_volume_label(sfn: &[u8; MAX_SFN_LEN]) -> String {
     core::str::from_utf8(&sfn[..end]).unwrap_or("").trim_end_matches('\0').to_string()
 }
 
-fn sfn_from_name(name: &str) -> Option<[u8; MAX_SFN_LEN]> {
-    if name.is_empty() { return None; }
+fn make_sfn_bytes(stem: &str, ext: &str) -> [u8; MAX_SFN_LEN] {
     let mut sfn = [b' '; MAX_SFN_LEN];
-    let (stem, ext) = if let Some(dot) = name.rfind('.') {
-        if dot == 0 { ("", &name[1..]) } else { (&name[..dot], &name[dot + 1..]) }
-    } else {
-        (name, "")
-    };
     for (i, &b) in stem.as_bytes().iter().enumerate() {
         if i >= 8 { break; }
         sfn[i] = b.to_ascii_uppercase();
@@ -502,7 +578,46 @@ fn sfn_from_name(name: &str) -> Option<[u8; MAX_SFN_LEN]> {
         if i >= 3 { break; }
         sfn[8 + i] = b.to_ascii_uppercase();
     }
-    Some(sfn)
+    sfn
+}
+
+fn sfn_from_name(name: &str, existing_sfns: &HashSet<[u8; MAX_SFN_LEN]>) -> Option<[u8; MAX_SFN_LEN]> {
+    if name.is_empty() { return None; }
+    let (stem, ext) = if let Some(dot) = name.rfind('.') {
+        if dot == 0 { ("", &name[1..]) } else { (&name[..dot], &name[dot + 1..]) }
+    } else {
+        (name, "")
+    };
+
+    let base = make_sfn_bytes(stem, ext);
+    if !existing_sfns.contains(&base) {
+        return Some(base);
+    }
+
+    let mut counter = 1u32;
+    loop {
+        let suffix = alloc::format!("~{}", counter);
+        let suffix_bytes = suffix.as_bytes();
+        if suffix_bytes.len() > 6 { return None; }
+        let stem_avail = 8 - suffix_bytes.len();
+        let stem_trunc = &stem.as_bytes()[..stem.len().min(stem_avail)];
+        let mut sfn = [b' '; MAX_SFN_LEN];
+        for (i, &b) in stem_trunc.iter().enumerate() {
+            sfn[i] = b.to_ascii_uppercase();
+        }
+        for (j, &b) in suffix_bytes.iter().enumerate() {
+            sfn[stem_avail + j] = b;
+        }
+        for (i, &b) in ext.as_bytes().iter().enumerate() {
+            if i >= 3 { break; }
+            sfn[8 + i] = b.to_ascii_uppercase();
+        }
+        if !existing_sfns.contains(&sfn) {
+            return Some(sfn);
+        }
+        counter += 1;
+        if counter > 99999 { return None; }
+    }
 }
 
 fn vfat_checksum(sfn: &[u8; MAX_SFN_LEN]) -> u8 {
@@ -513,10 +628,18 @@ fn vfat_checksum(sfn: &[u8; MAX_SFN_LEN]) -> u8 {
     sum
 }
 
+fn needs_vfat(name: &str) -> bool {
+    if name == "." || name == ".." { return false; }
+    let dot = name.rfind('.');
+    let base_len = dot.unwrap_or(name.len());
+    let ext_len = if let Some(d) = dot { name.len() - d - 1 } else { 0 };
+    base_len > 8 || ext_len > 3 || name.bytes().any(|b| b > 127 || b == b' ')
+}
+
 fn decode_vfat_name(entries: &[[u8; DIR_ENTRY_SIZE]]) -> String {
     let mut utf16_buf: Vec<u16> = Vec::new();
-    for entry in entries.iter().rev() {
-        if entry[0] & 0x1F == 0 { continue; }
+    for entry in entries.iter() {
+        if entry[0] == DIR_DELETED || entry[0] & 0x1F == 0 { continue; }
         for j in 0..13 {
             let c = get_vfat_char(entry, j);
             if c == 0 || c == 0xFFFF { break; }
@@ -562,6 +685,9 @@ fn encode_vfat_entries(name: &str, checksum: u8) -> Vec<[u8; DIR_ENTRY_SIZE]> {
         for j in count..13 { set_vfat_char(&mut entry, j, 0xFFFF); }
         entries.push(entry);
     }
+    // VFAT requires LFN entries in directory order: FIRST entry (ord=1) farthest
+    // from SFN, LAST entry (ord=N|0x40) adjacent to SFN.
+    entries.reverse();
     entries
 }
 
@@ -605,6 +731,7 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
     let mut buf = alloc::vec![0u8; clus_bytes];
     let mut cluster = dir_clus;
     let mut vfat_chain: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
+    let mut _iters = 0u32;
 
     loop {
         read_cluster(sb, cluster, &mut buf)?;
@@ -626,6 +753,10 @@ fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlo
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER { break; }
         cluster = next;
+        _iters += 1;
+        if _iters > sb.bpb.total_clus + 2 {
+            return Err(VfsError::IOError);
+        }
     }
     Ok(slots)
 }
@@ -643,16 +774,22 @@ fn decode_entry_name(slot: &DirEntrySlot) -> String {
 
 // ── Directory writing / updating helpers ────────────────────────────────────
 
-fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &mut u32,
+fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &u32,
                      entries: &[[u8; DIR_ENTRY_SIZE]]) -> Result<(), VfsError>
 {
+    use core::fmt::Write;
+    let mut port = crate::drivers::serial::SerialPort::new();
+    write!(port, "[DBG:fat32] wde enter clus={} entries={}\n", *dir_clus, entries.len()).ok();
+
     if entries.is_empty() { return Ok(()); }
+    if *dir_clus < 2 { crate::drivers::serial::SerialPort::puts("[DBG:fat32] wde bad clus\n"); return Err(VfsError::InvalidInput); }
     let total = entries.len();
     let clus_bytes = sb.bpb.byts_per_clus as usize;
     let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
     let mut placed = 0usize;
     let mut cluster = *dir_clus;
     let mut buf = alloc::vec![0u8; clus_bytes];
+    let mut _iters = 0u32;
 
     loop {
         read_cluster(sb, cluster, &mut buf)?;
@@ -689,6 +826,10 @@ fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &mut u32,
             return Ok(());
         }
 
+        _iters += 1;
+        if _iters > sb.bpb.total_clus + 2 {
+            return Err(VfsError::IOError);
+        }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER {
             let new_clus = sb.alloc_cluster()?;
@@ -717,6 +858,7 @@ where
     let mut buf = alloc::vec![0u8; clus_bytes];
 
     let mut cluster = dir_clus;
+    let mut _iters = 0u32;
     loop {
         read_cluster(sb, cluster, &mut buf)?;
 
@@ -747,7 +889,7 @@ where
                 decode_sfn(sfn)
             };
 
-            if entry_name == name {
+            if entry_name.eq_ignore_ascii_case(name) {
                 let mut sfn_entry: [u8; DIR_ENTRY_SIZE] = buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
                 f(&mut sfn_entry);
                 buf[off..off + DIR_ENTRY_SIZE].copy_from_slice(&sfn_entry);
@@ -757,6 +899,10 @@ where
             i += 1;
         }
 
+        _iters += 1;
+        if _iters > sb.bpb.total_clus + 2 {
+            return Err(VfsError::IOError);
+        }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER { break; }
         cluster = next;
@@ -781,6 +927,7 @@ fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str) -> Result
     let mut buf = alloc::vec![0u8; clus_bytes];
 
     let mut cluster = dir_clus;
+    let mut _iters = 0u32;
     loop {
         read_cluster(sb, cluster, &mut buf)?;
         let mut i = 0;
@@ -810,7 +957,7 @@ fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str) -> Result
                 decode_sfn(sfn)
             };
 
-            if entry_name == name {
+            if entry_name.eq_ignore_ascii_case(name) {
                 for j in chain_start..=i {
                     buf[j * DIR_ENTRY_SIZE] = DIR_DELETED;
                 }
@@ -820,6 +967,10 @@ fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str) -> Result
             i += 1;
         }
 
+        _iters += 1;
+        if _iters > sb.bpb.total_clus + 2 {
+            return Err(VfsError::IOError);
+        }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER { break; }
         cluster = next;
@@ -837,9 +988,23 @@ pub struct Fat32Inode {
     ino: u64,
     parent_clus: u32,
     entry_name: String,
+    unlinked: AtomicBool,
     dir_cache: Mutex<Option<(u64, Vec<DirEntrySlot>)>>,
     dir_generation: AtomicU64,
     dir_lock: Mutex<()>,
+    write_lock: Mutex<()>,
+}
+
+impl Drop for Fat32Inode {
+    fn drop(&mut self) {
+        if !self.unlinked.load(Ordering::Relaxed) {
+            return;
+        }
+        let first = self.first_clus.load(Ordering::Relaxed);
+        if first >= 2 && first < EOC_MARKER {
+            let _ = self.sb.free_chain(first);
+        }
+    }
 }
 
 impl Fat32Inode {
@@ -884,7 +1049,7 @@ impl InodeOps for Fat32Inode {
         let mut current = if start_idx == 0 {
             first
         } else {
-            self.sb.chain_cluster_at(first, start_idx).unwrap_or(first)
+            self.sb.chain_cluster_at(first, start_idx)?
         };
 
         if current >= EOC_MARKER || current < 2 { return Ok(0); }
@@ -893,6 +1058,7 @@ impl InodeOps for Fat32Inode {
         let mut cluster_buf = alloc::vec![0u8; clus_bytes];
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
+        let mut _rd_iters = 0u32;
 
         while done < total {
             read_cluster(&self.sb, current, &mut cluster_buf)?;
@@ -904,6 +1070,10 @@ impl InodeOps for Fat32Inode {
             current = self.sb.read_fat_entry(current)?;
             if current >= EOC_MARKER { break; }
             clus_off = 0;
+            _rd_iters += 1;
+            if _rd_iters > self.sb.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
         }
         Ok(done)
     }
@@ -914,6 +1084,7 @@ impl InodeOps for Fat32Inode {
         if offset.saturating_add(buf.len() as u64) > u32::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
+        let _write_lock = self.write_lock.lock();
 
         let clus_size = self.sb.bpb.byts_per_clus as u64;
         let end_byte = offset + buf.len() as u64;
@@ -948,6 +1119,7 @@ impl InodeOps for Fat32Inode {
         let mut cluster_buf = alloc::vec![0u8; clus_bytes];
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
+        let mut _wr_iters = 0u32;
 
         while done < buf.len() {
             let need_rmw = clus_off != 0
@@ -967,6 +1139,10 @@ impl InodeOps for Fat32Inode {
             current = self.sb.read_fat_entry(current)?;
             if current >= EOC_MARKER { break; }
             clus_off = 0;
+            _wr_iters += 1;
+            if _wr_iters > self.sb.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
         }
 
         // Flush FAT changes to disk before updating directory entry.
@@ -994,9 +1170,15 @@ impl InodeOps for Fat32Inode {
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        let slots = self.get_dir_slots()?;
+        // Always re-read for ".." to avoid stale cache after rename updates
+        // the .. entry on disk.
+        let slots = if name == ".." {
+            read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?
+        } else {
+            self.get_dir_slots()?
+        };
         for slot in &slots {
-            if decode_entry_name(slot) == name {
+            if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 let fc = first_clus_from_entry(&slot.sfn_entry);
                 let actual_clus = if name == ".." && fc == 0 { self.sb.bpb.root_clus } else { fc };
                 let sz = file_size_from_entry(&slot.sfn_entry);
@@ -1010,9 +1192,11 @@ impl InodeOps for Fat32Inode {
                     ino: self.sb.next_ino.fetch_add(1, Ordering::Relaxed),
                     parent_clus: self.first_clus.load(Ordering::Relaxed),
                     entry_name: String::from(name),
+                    unlinked: AtomicBool::new(false),
                     dir_cache: Mutex::new(None),
                     dir_generation: AtomicU64::new(0),
                     dir_lock: Mutex::new(()),
+                    write_lock: Mutex::new(()),
                 }) as Arc<dyn InodeOps>);
             }
         }
@@ -1020,16 +1204,26 @@ impl InodeOps for Fat32Inode {
     }
 
     fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create enter\n");
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
-        if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create get_dir_slots\n");
+        let slots = self.get_dir_slots()?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create got slots\n");
+        if slots.iter().any(|s| decode_entry_name(s).eq_ignore_ascii_case(name)) {
             return Err(VfsError::AlreadyExists);
         }
-
-        let sfn = sfn_from_name(name).ok_or(VfsError::InvalidInput)?;
+        let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots.iter()
+            .map(|s| {
+                let mut buf = [b' '; MAX_SFN_LEN];
+                buf.copy_from_slice(&s.sfn_entry[..MAX_SFN_LEN]);
+                buf
+            })
+            .collect();
+        let sfn = sfn_from_name(name, &existing_sfns).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
-        if name.len() > 12 || name.bytes().any(|b| b > 127 || b == b' ') {
+        if needs_vfat(name) {
             new_entries.extend(encode_vfat_entries(name, csum));
         }
         let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
@@ -1040,8 +1234,10 @@ impl InodeOps for Fat32Inode {
         set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
-        let mut parent = self.first_clus.load(Ordering::Relaxed);
-        write_dir_entries(&self.sb, &mut parent, &new_entries)?;
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create write_dir_entries\n");
+        write_dir_entries(&self.sb, &parent, &new_entries)?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] create done\n");
         self.invalidate_dir_cache();
         drop(_lock);
 
@@ -1054,21 +1250,29 @@ impl InodeOps for Fat32Inode {
             ino,
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
+            unlinked: AtomicBool::new(false),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>)
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink enter\n");
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
         let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink got slots\n");
         let mut target_clus = 0u32;
         let mut found = false;
         for slot in &slots {
-            if decode_entry_name(slot) == name {
+            if decode_entry_name(slot).eq_ignore_ascii_case(name) {
+                if slot.sfn_entry[0x0B] & ATTR_DIRECTORY != 0 {
+                    return Err(VfsError::IsADirectory);
+                }
                 target_clus = first_clus_from_entry(&slot.sfn_entry);
                 found = true;
                 break;
@@ -1076,35 +1280,37 @@ impl InodeOps for Fat32Inode {
         }
         if !found { return Err(VfsError::NotFound); }
 
-        // Remove directory entry first, then free clusters.
-        // Order: dir entry → FAT flush → free chain.
-        // A crash after dir entry removal leaves orphaned clusters but no
-        // stale references to freed clusters (which would cause corruption
-        // if those clusters are later allocated).
+        // Remove the directory entry only — cluster cleanup is deferred to
+        // Fat32Inode::Drop so that open file handles remain valid until the
+        // last reference is released (Unix semantics).
         let parent = self.first_clus.load(Ordering::Relaxed);
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink remove_dir_entries\n");
         remove_dir_entries(&self.sb, parent, name)?;
-        self.sb.flush_fat_cache()?;
-
-        if target_clus >= 2 && target_clus < EOC_MARKER {
-            self.sb.free_chain(target_clus)?;
-        }
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink flush\n");
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink done\n");
         Ok(())
     }
 
     fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
-        if self.get_dir_slots()?.iter().any(|s| decode_entry_name(s) == name) {
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir enter\n");
+        let slots = self.get_dir_slots()?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir got slots\n");
+        if slots.iter().any(|s| decode_entry_name(s).eq_ignore_ascii_case(name)) {
             return Err(VfsError::AlreadyExists);
         }
 
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir alloc_cluster\n");
         let new_clus = self.sb.alloc_cluster()?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir zero_cluster\n");
         zero_cluster(&self.sb, new_clus)?;
 
-        let dot_sfn = sfn_from_name(".").unwrap();
-        let dotdot_sfn = sfn_from_name("..").unwrap();
+        let empty_set = HashSet::new();
+        let dot_sfn = sfn_from_name(".", &empty_set).unwrap();
+        let dotdot_sfn = sfn_from_name("..", &empty_set).unwrap();
 
         let mut dot_entry = [0u8; DIR_ENTRY_SIZE];
         dot_entry[..MAX_SFN_LEN].copy_from_slice(&dot_sfn);
@@ -1122,12 +1328,21 @@ impl InodeOps for Fat32Inode {
         let mut clus_buf = alloc::vec![0u8; clus_bytes];
         clus_buf[..DIR_ENTRY_SIZE].copy_from_slice(&dot_entry);
         clus_buf[DIR_ENTRY_SIZE..2 * DIR_ENTRY_SIZE].copy_from_slice(&dotdot_entry);
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_cluster\n");
         write_cluster(&self.sb, new_clus, &clus_buf)?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir wrote dot/dotdot\n");
 
-        let sfn = sfn_from_name(name).ok_or(VfsError::InvalidInput)?;
+        let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots.iter()
+            .map(|s| {
+                let mut buf = [b' '; MAX_SFN_LEN];
+                buf.copy_from_slice(&s.sfn_entry[..MAX_SFN_LEN]);
+                buf
+            })
+            .collect();
+        let sfn = sfn_from_name(name, &existing_sfns).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
-        if name.len() > 12 || name.bytes().any(|b| b > 127 || b == b' ') {
+        if needs_vfat(name) {
             new_entries.extend(encode_vfat_entries(name, csum));
         }
         let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
@@ -1137,8 +1352,10 @@ impl InodeOps for Fat32Inode {
         set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
-        let mut parent = self.first_clus.load(Ordering::Relaxed);
-        write_dir_entries(&self.sb, &mut parent, &new_entries)?;
+        let parent = self.first_clus.load(Ordering::Relaxed);
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir write_dir_entries\n");
+        write_dir_entries(&self.sb, &parent, &new_entries)?;
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir done\n");
         self.invalidate_dir_cache();
         drop(_lock);
 
@@ -1151,21 +1368,24 @@ impl InodeOps for Fat32Inode {
             ino,
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
+            unlinked: AtomicBool::new(false),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
         let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
         let mut found = false;
         for slot in &slots {
-            if decode_entry_name(slot) == name {
+            if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 let attr = slot.sfn_entry[0x0B];
                 if attr & ATTR_DIRECTORY == 0 { return Err(VfsError::NotADirectory); }
                 target_clus = first_clus_from_entry(&slot.sfn_entry);
@@ -1178,14 +1398,10 @@ impl InodeOps for Fat32Inode {
         let child_slots = read_dir_slots(&self.sb, target_clus)?;
         if child_slots.len() > 2 { return Err(VfsError::NotEmpty); }
 
-        // Remove directory entry first, then free clusters
+        // Remove the directory entry only — cluster cleanup is deferred to
+        // Fat32Inode::Drop.
         let parent = self.first_clus.load(Ordering::Relaxed);
         remove_dir_entries(&self.sb, parent, name)?;
-        self.sb.flush_fat_cache()?;
-
-        if target_clus >= 2 && target_clus < EOC_MARKER {
-            self.sb.free_chain(target_clus)?;
-        }
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
         Ok(())
@@ -1222,7 +1438,7 @@ impl InodeOps for Fat32Inode {
         let slots = self.get_dir_slots()?;
         let mut target = None;
         for slot in &slots {
-            if decode_entry_name(slot) == old_name {
+            if decode_entry_name(slot).eq_ignore_ascii_case(old_name) {
                 target = Some(slot);
                 break;
             }
@@ -1234,7 +1450,7 @@ impl InodeOps for Fat32Inode {
         let is_dir = (attr & ATTR_DIRECTORY) != 0;
 
         // Inline removal of existing new_name (cannot call self.unlink while holding dir_lock)
-        if let Some(existing) = slots.iter().find(|s| decode_entry_name(s) == new_name) {
+        if let Some(existing) = slots.iter().find(|s| decode_entry_name(s).eq_ignore_ascii_case(new_name)) {
             let existing_clus = first_clus_from_entry(&existing.sfn_entry);
             remove_dir_entries(&self.sb, self.first_clus.load(Ordering::Relaxed), new_name)?;
             self.sb.flush_fat_cache()?;
@@ -1245,10 +1461,22 @@ impl InodeOps for Fat32Inode {
             self.invalidate_dir_cache();
         }
 
-        let sfn = sfn_from_name(new_name).ok_or(VfsError::InvalidInput)?;
+        let target_sfn: [u8; MAX_SFN_LEN] = {
+            let mut buf = [b' '; MAX_SFN_LEN];
+            buf.copy_from_slice(&target.sfn_entry[..MAX_SFN_LEN]);
+            buf
+        };
+        let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots.iter()
+            .filter_map(|s| {
+                let mut buf = [b' '; MAX_SFN_LEN];
+                buf.copy_from_slice(&s.sfn_entry[..MAX_SFN_LEN]);
+                if buf == target_sfn { None } else { Some(buf) }
+            })
+            .collect();
+        let sfn = sfn_from_name(new_name, &existing_sfns).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
-        if new_name.len() > 12 || new_name.bytes().any(|b| b > 127 || b == b' ') {
+        if needs_vfat(new_name) {
             new_entries.extend(encode_vfat_entries(new_name, csum));
         }
         let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
@@ -1260,8 +1488,7 @@ impl InodeOps for Fat32Inode {
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
-        let mut p = parent;
-        write_dir_entries(&self.sb, &mut p, &new_entries)?;
+        write_dir_entries(&self.sb, &parent, &new_entries)?;
         remove_dir_entries(&self.sb, parent, old_name)?;
         self.invalidate_dir_cache();
 
@@ -1281,6 +1508,7 @@ impl InodeOps for Fat32Inode {
     fn truncate(&self, len: u64) -> Result<(), VfsError> {
         if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
         if len > u32::MAX as u64 { return Err(VfsError::FileTooLarge); }
+        let _write_lock = self.write_lock.lock();
 
         let new_size = len as u32;
         let clus_size = self.sb.bpb.byts_per_clus;
@@ -1334,6 +1562,10 @@ impl InodeOps for Fat32Inode {
     fn size(&self) -> u64 {
         if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 }
     }
+
+    fn on_unlink(&self) {
+        self.unlinked.store(true, Ordering::Relaxed);
+    }
 }
 
 // ── Fat32FileSystem (implements FileSystem) ──────────────────────────────────
@@ -1369,6 +1601,21 @@ impl FileSystem for Fat32FileSystem {
             volume_dirty: AtomicBool::new(false),
         });
 
+        // Read FSInfo next_alloc_hint to seed the allocator (best-effort)
+        if bpb.fsinfo_is_valid() {
+            let mut sector = [0u8; SECTOR_SIZE];
+            if read_sectors(&*sb.device, bpb.fsinfo_sec as u64, 1, &mut sector).is_ok() {
+                if sector[0..4] == FSINFO_LEAD_SIG.to_le_bytes()
+                    && sector[484..488] == FSINFO_STRUCT_SIG.to_le_bytes()
+                {
+                    let hint = u32::from_le_bytes([sector[492], sector[493], sector[494], sector[495]]);
+                    if hint >= 2 && hint < 2 + bpb.total_clus {
+                        *sb.next_alloc_hint.lock() = hint;
+                    }
+                }
+            }
+        }
+
         // Scan free clusters on mount for accurate statfs + FSInfo
         let free = sb.scan_free_clusters()?;
         sb.free_clus_count.store(free, Ordering::Relaxed);
@@ -1382,9 +1629,11 @@ impl FileSystem for Fat32FileSystem {
             ino: 1,
             parent_clus: root_clus,
             entry_name: String::new(),
+            unlinked: AtomicBool::new(false),
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
+            write_lock: Mutex::new(()),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(crate::filesystems::vfs::inode::Inode::new(root_ops.clone()));

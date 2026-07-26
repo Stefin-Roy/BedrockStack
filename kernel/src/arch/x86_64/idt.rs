@@ -4,10 +4,35 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
+use x86_64::VirtAddr;
 
+use crate::drivers::serial::SerialPort;
+use crate::kerneldump::dump;
 use crate::platform::x86_64_pc::apic;
 
+// Placed in .idt section (its own page-aligned area in the linker script)
+// so it can be made read-only after init to prevent silent corruption.
+#[unsafe(link_section = ".idt")]
 static IDT: Once<InterruptDescriptorTable> = Once::new();
+
+// ── IDT integrity canary ─────────────────────────────────────────
+// Placed at the end of the .idt page; if anything overwrites it the
+// IDT entries are likely corrupted too.  Verified before every IO.
+const IDT_GUARD_MAGIC: u64 = 0x1D7_1D7_1D7_1D7;
+
+#[unsafe(link_section = ".idt")]
+static IDT_GUARD: core::sync::atomic::AtomicU64 =
+    core::sync::atomic::AtomicU64::new(IDT_GUARD_MAGIC);
+
+pub fn verify_integrity() {
+    let g = IDT_GUARD.load(core::sync::atomic::Ordering::Relaxed);
+    if g != IDT_GUARD_MAGIC {
+        SerialPort::puts("\n[IDT] INTEGRITY CHECK FAILED — canary overwritten (0x");
+        SerialPort::put_hex(g);
+        SerialPort::puts(")\n");
+        loop { unsafe { core::arch::asm!("cli; hlt"); } }
+    }
+}
 
 // ── Device interrupt dispatch (vectors 33-48) ─────────────────────
 //
@@ -127,6 +152,9 @@ pub fn init() {
     });
 
     idt.load();
+
+    // Arm integrity canary — must stay alive through every IO operation.
+    IDT_GUARD.store(IDT_GUARD_MAGIC, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Timer interrupt handler (vector 32).
@@ -172,14 +200,58 @@ extern "x86-interrupt" fn double_fault_handler(
 }
 
 extern "x86-interrupt" fn page_fault_handler(
-    frame: InterruptStackFrame,
+    mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    // ── PF recovery during a kernel dump ───────────────────────────
+    if dump::is_dump_in_progress() {
+        let target = dump::PF_RECOVERY_RIP.load(Ordering::Relaxed);
+        if target != 0 {
+            let cr2: u64;
+            unsafe { core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)); }
+            dump::PF_FAULT_ADDR.store(cr2, Ordering::Relaxed);
+            dump::PF_ERROR_CODE.store(error_code.bits(), Ordering::Relaxed);
+            unsafe {
+                let mut inner = frame.as_mut().read();
+                inner.instruction_pointer = VirtAddr::new(target);
+                frame.as_mut().write(inner);
+            }
+            return;
+        }
+        crate::drivers::serial::dump_puts(
+            "\n[DUMP] Nested PF during dump (no recovery target) — halting\n",
+        );
+        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
+    }
+
     crate::kerneldump::dump_full_fault(&frame, error_code.bits(), 14);
 }
 
 extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error_code: u64) {
+    let ecx: u32;
+    unsafe { core::arch::asm!("mov {0:e}, ecx", out(reg) ecx); }
+    crate::drivers::serial::dump_puts("[GPF] ECX (MSR) = 0x");
+    crate::drivers::serial::dump_put_hex(ecx as u64);
+    crate::drivers::serial::dump_puts("   RIP = 0x");
+    crate::drivers::serial::dump_put_hex(frame.instruction_pointer.as_u64());
+    crate::drivers::serial::dump_puts("\n");
     crate::kerneldump::dump_full_fault(&frame, error_code, 13);
+}
+
+/// Make the .idt pages read-only in the page tables so any wild write
+/// to the IDT or its canary triggers an immediate page fault.
+/// Must be called after all IDT initialisation is complete.
+pub fn protect_idt(root: u64, idt_start_phys: u64, idt_end_phys: u64) {
+    let mut page = idt_start_phys & !0xFFF;
+    let end = (idt_end_phys + 0xFFF) & !0xFFF;
+    while page < end {
+        crate::mm::vmm::make_read_only_both(root, page);
+        page += 0x1000;
+    }
+    // Flush TLB after modifying page tables.
+    use core::sync::atomic::Ordering;
+    core::sync::atomic::fence(Ordering::SeqCst);
+    unsafe { core::arch::asm!("mov rax, cr3; mov cr3, rax", options(nostack, preserves_flags)); }
 }
 
 /// Reload the IDT on an Application Processor (IDTR is per-CPU).

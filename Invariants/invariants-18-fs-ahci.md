@@ -37,17 +37,17 @@ Per-port `ncq` flag selects the path.
 for DMA buffer pages.
 - Location: `kernel/src/filesystems/blockdriver/ahci.rs:28`
 
-**AHCI-006 — Timeout detection via APIC timer count:`
+**AHCI-006 — Timeout detection via APIC timer count:**
 The APIC timer count is read before a command and compared with the
 current count to detect stalled commands.
 - Location: `kernel/src/filesystems/blockdriver/ahci.rs:23`
 
-**AHCI-007 — Port reset recovery on command failure:`
+**AHCI-007 — Port reset recovery on command failure:**
 If a command fails (TFD error or SERR diagnostic), the port is reset
 before retrying.
 - Location: `kernel/src/filesystems/blockdriver/ahci.rs:11`
 
-**AHCI-008 — Async completions tracked via `IoCompletions`:`
+**AHCI-008 — Async completions tracked via `IoCompletions`:**
 `IoCompletions { completed: u32, errors: u32 }` — `all_ok()` returns
 `true` if `errors == 0 && completed > 0`.
 - Location: `kernel/src/filesystems/blockdriver/traits.rs:13-22`
@@ -114,7 +114,12 @@ pub trait BlockDevice: Send + Sync {
 
 - The AHCI driver is x86_64 only (Q35 ICH9 controller at PCI
   00:1f.2). RISC-V platforms use different storage controllers.
-- The driver operates in polling mode (no interrupts).
+- The driver supports both interrupt-driven and polling completion paths.
+  Interrupts are registered once per controller (shared PCI INTx#); each port
+  has its own PxIE and `irq_completed` flag, and `handle_ahci_irq` iterates
+  all active ports to clear PxIS and record completions. Polling fallback
+  via `wait_slots` and `POLL_FALLBACK_LIMIT` covers emulators where the
+  APIC timer may stall.
 - `IoBuffer::Phys` is used for DMA directly to/from user buffers,
   avoiding a copy through a bounce buffer.
 - AHCI is currently configured but NOT connected to the VFS mount
