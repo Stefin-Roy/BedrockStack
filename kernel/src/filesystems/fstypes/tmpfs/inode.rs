@@ -6,25 +6,29 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 use spin::Mutex;
 
-use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::{Inode, InodeOps};
-use crate::filesystems::vfs::superblock::{SuperBlock, SuperOps, StatFs};
+use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::types::{DirEntry, FileType, Stat};
-use super::FileSystem;
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(2);
 const ROOT_INO: u64 = 1;
 
-pub struct Tmpfs;
+pub(super) enum TmpfsEntry {
+    File { data: Mutex<Vec<u8>> },
+    Dir { children: Mutex<HashMap<String, Arc<TmpfsInode>>> },
+}
 
-impl FileSystem for Tmpfs {
-    fn name(&self) -> &str {
-        "tmpfs"
-    }
+pub(super) struct TmpfsInode {
+    pub ino: u64,
+    pub file_type: FileType,
+    pub entry: TmpfsEntry,
+    pub mtime: Mutex<u64>,
+    pub size: AtomicU64,
+}
 
-    fn mount(&self, _device: Option<Arc<dyn BlockDevice>>) -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError> {
-        let root_ops = Arc::new(TmpfsInode {
+impl TmpfsInode {
+    pub fn new_root() -> Self {
+        TmpfsInode {
             ino: ROOT_INO,
             file_type: FileType::Directory,
             entry: TmpfsEntry::Dir {
@@ -32,43 +36,8 @@ impl FileSystem for Tmpfs {
             },
             mtime: Mutex::new(0),
             size: AtomicU64::new(0),
-        }) as Arc<dyn InodeOps>;
-
-        let root_inode = Arc::new(Inode::new(root_ops.clone()));
-        let super_ops = Arc::new(TmpfsSuperOps);
-        let sb = Arc::new(SuperBlock::new(super_ops, root_inode.clone()));
-
-        Ok((sb, root_ops))
+        }
     }
-}
-
-struct TmpfsSuperOps;
-
-impl SuperOps for TmpfsSuperOps {
-    fn statfs(&self) -> Result<StatFs, VfsError> {
-        Ok(StatFs {
-            block_size: 4096,
-            total_blocks: 0,
-            free_blocks: 0,
-        })
-    }
-
-    fn sync_fs(&self) -> Result<(), VfsError> {
-        Ok(())
-    }
-}
-
-enum TmpfsEntry {
-    File { data: Mutex<Vec<u8>> },
-    Dir { children: Mutex<HashMap<String, Arc<TmpfsInode>>> },
-}
-
-struct TmpfsInode {
-    ino: u64,
-    file_type: FileType,
-    entry: TmpfsEntry,
-    mtime: Mutex<u64>,
-    size: AtomicU64,
 }
 
 impl InodeOps for TmpfsInode {
@@ -249,15 +218,7 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn file_type(&self) -> FileType {
-        self.file_type
-    }
-
-    fn ino(&self) -> u64 {
-        self.ino
-    }
-
-    fn size(&self) -> u64 {
-        self.size.load(Ordering::Relaxed)
-    }
+    fn file_type(&self) -> FileType { self.file_type }
+    fn ino(&self) -> u64 { self.ino }
+    fn size(&self) -> u64 { self.size.load(Ordering::Relaxed) }
 }

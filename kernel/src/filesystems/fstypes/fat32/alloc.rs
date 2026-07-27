@@ -1,0 +1,77 @@
+use core::sync::atomic::Ordering;
+
+use crate::filesystems::vfs::error::VfsError;
+
+use super::io::read_sectors;
+use super::bpb::SECTOR_SIZE;
+use super::fat::{EOC_MARKER, FREE_CLUSTER, FSINFO_LEAD_SIG, FSINFO_STRUCT_SIG, FSINFO_TRAIL_SIG};
+
+macro_rules! fat_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "fat_trace")]
+        $($arg)*
+    };
+}
+
+use super::mount::Fat32SuperBlock;
+
+impl Fat32SuperBlock {
+    pub fn alloc_cluster(&self) -> Result<u32, VfsError> {
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] alloc_cluster\n"));
+        let mut hint = self.next_alloc_hint.lock();
+        let n = self.bpb.total_clus;
+        for i in 0..n {
+            let clus = 2 + ((*hint - 2 + i) % n);
+            if self.read_fat_entry(clus)? == FREE_CLUSTER {
+                self.write_fat_entry(clus, EOC_MARKER)?;
+                *hint = clus + 1;
+                self.free_clus_count.fetch_sub(1, Ordering::Relaxed);
+                return Ok(clus);
+            }
+        }
+        Err(VfsError::NoSpace)
+    }
+
+    pub fn free_chain(&self, mut cluster: u32) -> Result<(), VfsError> {
+        let mut _iters = 0u32;
+        while cluster >= 2 && cluster < EOC_MARKER {
+            let next = self.read_fat_entry(cluster)?;
+            self.write_fat_entry(cluster, FREE_CLUSTER)?;
+            self.free_clus_count.fetch_add(1, Ordering::Relaxed);
+            cluster = next;
+            _iters += 1;
+            if _iters > self.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn scan_free_clusters(&self) -> Result<u32, VfsError> {
+        let fat = self.read_fat_bulk()?;
+        let n = self.bpb.total_clus;
+        let mut count = 0u32;
+        for c in 2..2 + n {
+            let off = (c as usize) * 4;
+            let val = u32::from_le_bytes(fat[off..off + 4].try_into().unwrap());
+            if val & 0x0FFFFFFF == FREE_CLUSTER {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
+    pub fn write_fsinfo(&self) -> Result<(), VfsError> {
+        if !self.bpb.fsinfo_is_valid() { return Ok(()); }
+        let sec = self.bpb.fsinfo_sec as u64;
+        let mut buf = [0u8; SECTOR_SIZE];
+        read_sectors(&*self.device, sec, 1, &mut buf)?;
+
+        buf[0..4].copy_from_slice(&FSINFO_LEAD_SIG.to_le_bytes());
+        buf[484..488].copy_from_slice(&FSINFO_STRUCT_SIG.to_le_bytes());
+        buf[488..492].copy_from_slice(&self.free_clus_count.load(Ordering::Relaxed).to_le_bytes());
+        buf[492..496].copy_from_slice(&(*self.next_alloc_hint.lock()).to_le_bytes());
+        buf[508..512].copy_from_slice(&FSINFO_TRAIL_SIG.to_le_bytes());
+        super::io::write_sectors(&*self.device, sec, 1, &buf)
+    }
+}
