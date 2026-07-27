@@ -16,6 +16,8 @@ pub mod mm;
 pub mod module;
 pub mod pci;
 pub mod platform;
+#[cfg(target_arch = "x86_64")]
+pub mod usb;
 pub mod smp;
 
 use acpi::AcpiSubsystem;
@@ -297,6 +299,13 @@ impl Kernel {
 
         #[cfg(target_arch = "x86_64")]
         let block_devices = crate::filesystems::blockdriver::driver::init_all(
+            crate::pci::devices(),
+            self.page_table_root,
+            &mut self.allocator as *mut _,
+        );
+
+        #[cfg(target_arch = "x86_64")]
+        crate::usb::xhci::init_all(
             crate::pci::devices(),
             self.page_table_root,
             &mut self.allocator as *mut _,
