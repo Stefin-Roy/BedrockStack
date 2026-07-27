@@ -239,6 +239,11 @@ fn test_msix_inactive_on_boot() -> Result<(), &'static str> {
         Some(d) => d,
         None => return Err("SKIP"),
     };
+    // Skip if this is the XHCI controller — our driver enables MSI-X
+    // at init, before module tests run.
+    if dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
+        return Err("SKIP");
+    }
     let cap = caps::find(dev, CAP_MSIX).ok_or("MSI-X cap lookup failed")?;
     let mc = caps::read_u16(dev, &cap, 2);
     if mc & (1 << 14) != 0 { return Err("MSI-X already enabled at boot"); }

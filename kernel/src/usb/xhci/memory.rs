@@ -181,12 +181,6 @@ impl TrbRing {
     }
 
     pub fn flush(&self) {
-        let end = self.virt + (self.trb_count as u64) * 16;
-        let mut addr = self.virt;
-        while addr < end {
-            unsafe { core::arch::asm!("clflush [{}]", in(reg) addr as *const u8, options(nostack, preserves_flags)); }
-            addr += 64;
-        }
     }
 }
 

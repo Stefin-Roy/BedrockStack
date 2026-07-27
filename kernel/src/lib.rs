@@ -298,6 +298,17 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
+        {
+            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::puts(" ===\n");
+        }
+
+        #[cfg(target_arch = "x86_64")]
         let block_devices = crate::filesystems::blockdriver::driver::init_all(
             crate::pci::devices(),
             self.page_table_root,
@@ -305,11 +316,33 @@ impl Kernel {
         );
 
         #[cfg(target_arch = "x86_64")]
+        {
+            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::puts(" ===\n");
+        }
+
+        #[cfg(target_arch = "x86_64")]
         crate::usb::xhci::init_all(
             crate::pci::devices(),
             self.page_table_root,
             &mut self.allocator as *mut _,
         );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
+            crate::drivers::serial::SerialPort::put_u64(
+                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::puts(" ===\n");
+        }
 
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");

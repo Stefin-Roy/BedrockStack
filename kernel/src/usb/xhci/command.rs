@@ -76,7 +76,8 @@ pub fn submit_no_op(
 }
 
 pub fn wait_for_completion(_regs: &XhciRegisters) -> Result<u32, &'static str> {
-    for _ in 0..100000 {
+    let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
+    loop {
         if let Some((_slot_id, cc, param)) = super::event::last_command_completion() {
             if cc == 1 {
                 return Ok(param);
@@ -85,6 +86,9 @@ pub fn wait_for_completion(_regs: &XhciRegisters) -> Result<u32, &'static str> {
             }
         }
         super::event::consume_pending_events();
+        if timeout.expired() {
+            break;
+        }
         core::hint::spin_loop();
     }
     Err("command completion timeout")

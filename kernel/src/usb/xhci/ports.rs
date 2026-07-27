@@ -43,7 +43,8 @@ impl UsbPorts {
             let portsc = self.port_regs.read_portsc(port_num);
             if portsc & PORTSC_PP == 0 {
                 self.port_regs.write_portsc(port_num, portsc | PORTSC_PP);
-                for _ in 0..1000 { core::hint::spin_loop(); }
+                let mut t = crate::platform::x86_64_pc::apic::ApicTimeout::new(10);
+                while !t.expired() { core::hint::spin_loop(); }
             }
 
             if portsc & PORTSC_CCS != 0 {
@@ -80,9 +81,13 @@ impl UsbPorts {
         portsc |= PORTSC_PR;
         self.port_regs.write_portsc(port_num, portsc);
 
-        for _ in 0..100000 {
+        let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(500);
+        loop {
             let ps = self.port_regs.read_portsc(port_num);
             if ps & PORTSC_PR == 0 {
+                break;
+            }
+            if timeout.expired() {
                 break;
             }
             core::hint::spin_loop();

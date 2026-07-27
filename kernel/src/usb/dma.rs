@@ -1,10 +1,9 @@
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
+use crate::mm::vmm::{PageFlags, Vmm};
 
-/// USB DMA VMM region sits below ACPI VMM (which is at KERNEL_VMA_BASE - 0x10000000).
-/// ACPI VMM floor = KERNEL_VMA_BASE - 0x10000000 - 0x20000000.
-/// USB DMA sits below that: start at ACPI floor, grow down 512 MiB.
-const USB_VMM_VADDR: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000;
+/// USB DMA VMM region: below AHCI VMM (0xFFFFFF7FB0000000).
+/// AHCI is 1280 MiB below KERNEL_VMA_BASE; USB is another 1 GiB below that.
+const USB_VMM_VADDR: u64 = 0xFFFFFF7F70000000;
 const USB_VMM_VADDR_FLOOR: u64 = USB_VMM_VADDR - 0x2000_0000;
 
 pub struct DmaBuffer {
@@ -53,6 +52,10 @@ impl UsbDmaAllocator {
         Ok(va)
     }
 
+    fn dma_flags() -> PageFlags {
+        PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE
+    }
+
     pub fn alloc_page(&mut self) -> Option<DmaBuffer> {
         let alloc = unsafe { &mut *self.alloc };
         let phys = alloc.alloc()?;
@@ -61,13 +64,7 @@ impl UsbDmaAllocator {
             return None;
         }
         self.next_vaddr = va;
-        Vmm::from_root(self.root).map(
-            alloc,
-            va,
-            phys,
-            4096,
-            PageFlags::READ | PageFlags::WRITE,
-        );
+        Vmm::from_root(self.root).map(alloc, va, phys, 4096, Self::dma_flags());
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096) }
         Some(DmaBuffer {
             phys,
@@ -85,13 +82,7 @@ impl UsbDmaAllocator {
             return None;
         }
         self.next_vaddr = va;
-        Vmm::from_root(self.root).map(
-            alloc,
-            va,
-            phys,
-            size,
-            PageFlags::READ | PageFlags::WRITE,
-        );
+        Vmm::from_root(self.root).map(alloc, va, phys, size, Self::dma_flags());
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
         Some(DmaBuffer {
             phys,

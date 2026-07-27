@@ -126,7 +126,13 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<(), &'s
 
     event::set_event_ring_info(er_buf.virt, er_buf.phys, er_buf.trb_count as u32, er_buf.dequeue_index);
     event::set_erdp_register_va(rt_va);
+    event::set_op_base_va(regs.op_base());
 
+    // Enable MSI-X FIRST so the xHC has a valid interrupt target before
+    // the interrupter is armed and the controller starts.
+    setup_interrupts(dev, rt_va, mmio_va, dma, ac64);
+
+    // Now it is safe to arm the interrupter and start the controller.
     unsafe {
         let iman_off = rt_va + 0x20;
         core::ptr::write_volatile(iman_off as *mut u32, registers::IMAN_IE);
@@ -137,19 +143,48 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<(), &'s
     regs.write_op32(registers::OP_USBCMD,
         registers::USBCMD_RUN | registers::USBCMD_INTE | registers::USBCMD_HSEE);
 
-    for _ in 0..1000 {
-        if regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0 {
-            break;
+    {
+        use crate::platform::x86_64_pc::apic::ApicTimeout;
+        let mut timeout = ApicTimeout::new(500);
+        loop {
+            if regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0 {
+                break;
+            }
+            if timeout.expired() {
+                SerialPort::puts("[xhci] start timeout\n");
+                break;
+            }
+            core::hint::spin_loop();
         }
-        core::hint::spin_loop();
     }
     SerialPort::puts("[xhci] controller running\n");
 
-    setup_interrupts(dev, rt_va, mmio_va, ac64);
+    event::drain_pending_and_clear_intr();
 
     let port_regs = registers::PortRegisterSet::new(mmio_va, caplength);
     let mut usb_ports = ports::UsbPorts::new(max_ports, port_regs);
     usb_ports.init_ports()?;
+
+    event::drain_pending_and_clear_intr();
+
+    {
+        use crate::drivers::serial::SerialPort;
+        let usbsts = regs.read_op32(registers::OP_USBSTS);
+        let iman = unsafe { core::ptr::read_volatile((rt_va + 0x20) as *const u32) };
+        let portsc = regs.read_portsc(1);
+        let erdp_lo = unsafe { core::ptr::read_volatile((rt_va + 0x38) as *const u32) };
+        let erdp_hi = unsafe { core::ptr::read_volatile((rt_va + 0x3C) as *const u32) };
+        let erdp = (erdp_lo as u64) | ((erdp_hi as u64) << 32);
+        SerialPort::puts("[xhci] dump: USBSTS=0x");
+        SerialPort::put_hex(usbsts as u64);
+        SerialPort::puts(" IMAN=0x");
+        SerialPort::put_hex(iman as u64);
+        SerialPort::puts(" PORTSC1=0x");
+        SerialPort::put_hex(portsc as u64);
+        SerialPort::puts(" ERDP=0x");
+        SerialPort::put_hex(erdp);
+        SerialPort::puts("\n");
+    }
 
     let _ = enumerate_initial_ports(&mut usb_ports, &cmd_ring, dma,
         regs.doorbell_va(), er_buf.virt, er_buf.trb_count as u32, max_slots);
@@ -203,16 +238,19 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
 
 fn controller_reset(regs: &registers::XhciRegisters) {
     use crate::drivers::serial::SerialPort;
+    use crate::platform::x86_64_pc::apic::ApicTimeout;
     let cmd = regs.read_op32(registers::OP_USBCMD);
     regs.write_op32(registers::OP_USBCMD, cmd | registers::USBCMD_HCRST);
-    for _ in 0..1000 {
+    let mut timeout = ApicTimeout::new(500);
+    loop {
         if regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0 {
             break;
         }
+        if timeout.expired() {
+            SerialPort::puts("[xhci] reset timeout\n");
+            break;
+        }
         core::hint::spin_loop();
-    }
-    if regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST != 0 {
-        SerialPort::puts("[xhci] reset timeout\n");
     }
 }
 
@@ -246,9 +284,10 @@ fn alloc_scratchpad_array(
     Ok(buf)
 }
 
-fn setup_interrupts(dev: &PciDevice, rt_va: u64, mmio_va: u64, _ac64: bool) {
+fn setup_interrupts(dev: &PciDevice, rt_va: u64, mmio_va: u64, dma: &mut UsbDmaAllocator, _ac64: bool) {
     use crate::arch::x86_64::idt;
     use crate::pci::caps;
+    use crate::drivers::serial::SerialPort;
 
     let bsp_apic_id = unsafe {
         let lapic = crate::platform::x86_64_pc::apic::lapic_base();
@@ -259,19 +298,49 @@ fn setup_interrupts(dev: &PciDevice, rt_va: u64, mmio_va: u64, _ac64: bool) {
     let msix_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSIX);
     let msi_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSI);
 
-    if let Some(cap) = msix_cap {
-        if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
-            crate::pci::msix::program_entry(dev, cap, mmio_va, 0, vector, bsp_apic_id);
-            crate::pci::msix::enable(dev, cap, mmio_va, 1, vector, bsp_apic_id);
-            crate::drivers::serial::SerialPort::puts("[xhci] MSI-X enabled\n");
-        }
-        return;
-    }
-
+    // Try MSI first (avoids MADT table BAR writes that may corrupt regs at 0x3000)
     if let Some(ref cap) = msi_cap {
         if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
             crate::pci::msi::enable(dev, cap, vector, bsp_apic_id);
             crate::drivers::serial::SerialPort::puts("[xhci] MSI enabled\n");
+            return;
+        }
+    }
+
+    if let Some(cap) = msix_cap {
+        if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
+            let info = crate::pci::msix::table_info(dev, cap);
+            SerialPort::puts("[xhci] MSI-X BIR=");
+            SerialPort::put_u64(info.bir as u64);
+            SerialPort::puts(" table_offset=0x");
+            SerialPort::put_hex(info.table_offset);
+            SerialPort::puts(" entries=");
+            SerialPort::put_u64(info.table_size as u64);
+            SerialPort::puts("\n");
+
+            let bar_va = if info.bir == 0 {
+                mmio_va
+            } else {
+                let phys = match crate::pci::bar::bar(dev, info.bir) {
+                    crate::pci::bar::Bar::Memory { addr, .. } => addr,
+                    _ => {
+                        SerialPort::puts("[xhci] MSI-X BAR not memory\n");
+                        return;
+                    }
+                };
+                match dma.map_mmio(phys, 0x10000) {
+                    Ok(va) => va,
+                    Err(e) => {
+                        SerialPort::puts("[xhci] MSI-X BAR map: ");
+                        SerialPort::puts(e);
+                        SerialPort::puts("\n");
+                        return;
+                    }
+                }
+            };
+            crate::pci::msix::program_entry(dev, cap, bar_va, 0, vector, bsp_apic_id);
+            crate::pci::msix::enable(dev, cap, bar_va, 1, vector, bsp_apic_id);
+            SerialPort::puts("[xhci] MSI-X enabled\n");
         }
         return;
     }

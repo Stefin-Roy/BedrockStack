@@ -1,5 +1,11 @@
 use crate::drivers::serial::SerialPort;
 
+static mut XHCI_IRQ_COUNT: u64 = 0;
+
+pub fn irq_count() -> u64 {
+    unsafe { XHCI_IRQ_COUNT }
+}
+
 static XHCI_ER_VADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static XHCI_ER_PADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static XHCI_ER_SIZE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
@@ -19,12 +25,44 @@ pub fn set_erdp_register_va(rt_va: u64) {
     XHCI_RT_VA.store(rt_va, core::sync::atomic::Ordering::Relaxed);
 }
 
+static XHCI_OP_VA: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_op_base_va(op_va: u64) {
+    XHCI_OP_VA.store(op_va, core::sync::atomic::Ordering::Relaxed);
+}
+
 fn erdp_ptr(paddr: u64, dequeue_index: u16) -> u64 {
     paddr + (dequeue_index as u64) * 16
 }
 
+pub fn drain_pending_and_clear_intr() {
+    let er_vaddr = XHCI_ER_VADDR.load(core::sync::atomic::Ordering::Relaxed);
+    if er_vaddr == 0 { return; }
+    consume_pending_events();
+    let op_va = XHCI_OP_VA.load(core::sync::atomic::Ordering::Relaxed);
+    if op_va != 0 {
+        unsafe {
+            core::ptr::write_volatile((op_va + 0x04) as *mut u32, 1 << 3);
+        }
+    }
+    let rt_va = XHCI_RT_VA.load(core::sync::atomic::Ordering::Relaxed);
+    if rt_va != 0 {
+        unsafe {
+            let iman = core::ptr::read_volatile((rt_va + 0x20) as *const u32);
+            core::ptr::write_volatile((rt_va + 0x20) as *mut u32, (iman & 2) | 1);
+        }
+    }
+}
+
 pub fn xhci_irq_handler() {
+    unsafe { XHCI_IRQ_COUNT += 1; }
     crate::arch::x86_64::idt::verify_integrity();
+    let op_va = XHCI_OP_VA.load(core::sync::atomic::Ordering::Relaxed);
+    if op_va != 0 {
+        unsafe {
+            core::ptr::write_volatile((op_va + 0x04) as *mut u32, 1 << 3);
+        }
+    }
     consume_pending_events();
 }
 
@@ -56,9 +94,6 @@ pub fn consume_pending_events() {
 
     for _ in 0..er_trb_count {
         let trb_va = er_vaddr + (dequeue as u64) * 16;
-        unsafe {
-            core::arch::asm!("clflush [{}]", in(reg) (trb_va + 12) as *const u8, options(nostack, preserves_flags));
-        }
         let control = unsafe { core::ptr::read_volatile((trb_va + 12) as *const u32) };
 
         if (control & 1) != expected_cycle {
@@ -108,6 +143,11 @@ pub fn consume_pending_events() {
             unsafe {
                 core::ptr::write_volatile(erdp_off as *mut u32, erdp_val as u32);
                 core::ptr::write_volatile((erdp_off + 4) as *mut u32, (erdp_val >> 32) as u32);
+            }
+            let iman_off = rt_va + 0x20;
+            unsafe {
+                let iman = core::ptr::read_volatile(iman_off as *const u32);
+                core::ptr::write_volatile(iman_off as *mut u32, (iman & 2) | 1);
             }
         }
     }

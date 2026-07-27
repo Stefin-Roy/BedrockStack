@@ -91,7 +91,13 @@ fn device_irq_handler(vector: u8) {
 }
 
 extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(33); }
-extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) { device_irq_handler(34); }
+static mut VEC34_COUNT: u64 = 0;
+pub fn vec34_count() -> u64 { unsafe { VEC34_COUNT } }
+
+extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) {
+    unsafe { VEC34_COUNT += 1; }
+    device_irq_handler(34);
+}
 extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(35); }
 extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(36); }
 extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(37); }
