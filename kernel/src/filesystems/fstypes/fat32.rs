@@ -575,11 +575,15 @@ fn set_timestamps(entry: &mut [u8; DIR_ENTRY_SIZE]) {
 fn decode_sfn(sfn: &[u8; MAX_SFN_LEN]) -> String {
     let mut name = String::new();
     let stem_end = sfn[..8].iter().rposition(|&b| b != b' ').map(|p| p + 1).unwrap_or(0);
-    name.push_str(core::str::from_utf8(&sfn[..stem_end]).unwrap_or(""));
+    for b in &sfn[..stem_end] {
+        name.push((*b as char).to_ascii_lowercase());
+    }
     let ext_start = sfn[8..11].iter().position(|&b| b == b' ').unwrap_or(3);
     if ext_start > 0 {
         name.push('.');
-        name.push_str(core::str::from_utf8(&sfn[8..8 + ext_start]).unwrap_or(""));
+        for b in &sfn[8..8 + ext_start] {
+            name.push((*b as char).to_ascii_lowercase());
+        }
     }
     name
 }
@@ -659,7 +663,7 @@ fn needs_vfat(name: &str) -> bool {
 
 fn decode_vfat_name(entries: &[[u8; DIR_ENTRY_SIZE]]) -> String {
     let mut utf16_buf: Vec<u16> = Vec::new();
-    for entry in entries.iter() {
+    for entry in entries.iter().rev() {
         if entry[0] == DIR_DELETED || entry[0] & 0x1F == 0 { continue; }
         for j in 0..13 {
             let c = get_vfat_char(entry, j);

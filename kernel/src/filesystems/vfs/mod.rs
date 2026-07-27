@@ -401,6 +401,9 @@ pub fn read(fd: u32, buf: &mut [u8]) -> Result<usize, VfsError> {
 
 pub fn write(fd: u32, buf: &[u8]) -> Result<usize, VfsError> {
     let file = FD_TABLE.get(fd)?;
+    if file.inode.file_type == FileType::Directory {
+        return Err(VfsError::IsADirectory);
+    }
     if !file.flags.contains(OpenFlags::WRITE) {
         return Err(VfsError::BadFileDescriptor);
     }
