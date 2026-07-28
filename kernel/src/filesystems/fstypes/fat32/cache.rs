@@ -12,8 +12,10 @@ const MAX_FAT_CACHE_ENTRIES: usize = 4096;
 pub(crate) struct FatCache {
     sectors: HashMap<u64, [u8; SECTOR_SIZE]>,
     dirty: HashSet<u64>,
-    access_gen: HashMap<u64, u64>,
-    gen_counter: u64,
+    /// Eviction clock: circular buffer of LBAs in insertion order.
+    /// Clock hand advances on each eviction, sweeping until finding a non-dirty sector.
+    clock: Vec<u64>,
+    clock_hand: usize,
 }
 
 impl FatCache {
@@ -21,8 +23,8 @@ impl FatCache {
         FatCache {
             sectors: HashMap::new(),
             dirty: HashSet::new(),
-            access_gen: HashMap::new(),
-            gen_counter: 0,
+            clock: Vec::with_capacity(MAX_FAT_CACHE_ENTRIES),
+            clock_hand: 0,
         }
     }
 
@@ -32,8 +34,8 @@ impl FatCache {
             read_sectors(device, lba, 1, &mut buf)?;
             self.maybe_evict();
             self.sectors.insert(lba, buf);
+            self.clock.push(lba);
         }
-        self.touch(lba);
         Ok(self.sectors.get(&lba).unwrap())
     }
 
@@ -43,9 +45,9 @@ impl FatCache {
             read_sectors(device, lba, 1, &mut buf)?;
             self.maybe_evict();
             self.sectors.insert(lba, buf);
+            self.clock.push(lba);
         }
         self.dirty.insert(lba);
-        self.touch(lba);
         Ok(self.sectors.get_mut(&lba).unwrap())
     }
 
@@ -65,28 +67,23 @@ impl FatCache {
         Ok(())
     }
 
-    fn touch(&mut self, lba: u64) {
-        let gen_val = self.gen_counter;
-        self.gen_counter = gen_val.wrapping_add(1);
-        self.access_gen.insert(lba, gen_val);
-    }
-
     fn maybe_evict(&mut self) {
         if self.sectors.len() < MAX_FAT_CACHE_ENTRIES {
             return;
         }
         let target = MAX_FAT_CACHE_ENTRIES - MAX_FAT_CACHE_ENTRIES / 4;
-        let mut evictable: Vec<(u64, u64)> = self.sectors.keys()
-            .filter_map(|lba| {
-                if self.dirty.contains(lba) { return None; }
-                Some((*lba, self.access_gen.get(lba).copied().unwrap_or(0)))
-            })
-            .collect();
-        evictable.sort_by_key(|(_, g)| *g);
-        let n_evict = self.sectors.len().saturating_sub(target);
-        for (lba, _) in evictable.iter().take(n_evict) {
-            self.sectors.remove(lba);
-            self.access_gen.remove(lba);
+        while self.sectors.len() > target {
+            if self.clock.is_empty() { break; }
+            if self.clock_hand >= self.clock.len() {
+                self.clock_hand = 0;
+            }
+            let lba = self.clock[self.clock_hand];
+            if !self.dirty.contains(&lba) {
+                self.sectors.remove(&lba);
+                self.clock.swap_remove(self.clock_hand);
+            } else {
+                self.clock_hand += 1;
+            }
         }
     }
 }

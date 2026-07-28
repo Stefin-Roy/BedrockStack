@@ -101,17 +101,8 @@ impl Console {
         if total == 0 {
             return;
         }
-        for row in 1..self.max_rows {
-            let src = row * line_len;
-            let dst = (row - 1) * line_len;
-            for col in 0..line_len {
-                self.screen_chars[dst + col] = self.screen_chars[src + col];
-            }
-        }
-        let last_start = (self.max_rows - 1) * line_len;
-        for col in 0..line_len {
-            self.screen_chars[last_start + col] = b' ';
-        }
+        self.screen_chars.copy_within(line_len..total, 0);
+        self.screen_chars[total - line_len..total].fill(b' ');
     }
 
     fn scroll(&mut self) {

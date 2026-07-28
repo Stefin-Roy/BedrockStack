@@ -136,6 +136,8 @@ impl FileSystem for Fat32FileSystem {
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
+            chain_cache: Mutex::new(None),
+            chain_cache_dirty: AtomicBool::new(false),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(Inode::new(root_ops.clone()));

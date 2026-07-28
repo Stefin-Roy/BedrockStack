@@ -3,6 +3,7 @@
 #[cfg(feature = "display_log")]
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use core::hint::spin_loop;
 
 #[cfg(target_arch = "x86_64")]
 type Inner = common::serial::x86_64::SerialPort;
@@ -62,17 +63,18 @@ impl SerialPort {
 
         let mut need_prefix = cpu_id.is_some() && should_prefix;
 
-        for &b in s.as_bytes() {
+        let bytes = s.as_bytes();
+        let has_nl = bytes.last() == Some(&b'\n');
+        LAST_WAS_NL.store(has_nl, Ordering::Relaxed);
+
+        for &b in bytes {
             if need_prefix {
                 write_prefix(cpu_id.unwrap());
                 need_prefix = false;
             }
             Inner::putc(b);
             if b == b'\n' {
-                LAST_WAS_NL.store(true, Ordering::Relaxed);
                 need_prefix = cpu_id.is_some();
-            } else {
-                LAST_WAS_NL.store(false, Ordering::Relaxed);
             }
         }
 
@@ -196,23 +198,27 @@ fn format_dec(mut val: u64, buf: &mut [u8; 20]) -> &str {
 }
 
 fn acquire_locks() -> Option<()> {
-    // Per-CPU re-entrancy guard.
     if let Some(pc) = crate::smp::try_current_per_cpu() {
         while pc.serial_locked.swap(1, Ordering::Acquire) != 0 {
-            core::hint::spin_loop();
+            while pc.serial_locked.load(Ordering::Relaxed) != 0 {
+                spin_loop();
+            }
         }
         compiler_fence(Ordering::SeqCst);
 
         while GLOBAL_LOCK.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
+            while GLOBAL_LOCK.load(Ordering::Relaxed) {
+                spin_loop();
+            }
         }
         compiler_fence(Ordering::SeqCst);
 
         Some(())
     } else {
-        // Before SMP init — just take the global lock.
         while GLOBAL_LOCK.swap(true, Ordering::Acquire) {
-            core::hint::spin_loop();
+            while GLOBAL_LOCK.load(Ordering::Relaxed) {
+                spin_loop();
+            }
         }
         compiler_fence(Ordering::SeqCst);
         None

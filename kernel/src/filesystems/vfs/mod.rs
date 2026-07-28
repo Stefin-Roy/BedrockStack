@@ -236,23 +236,8 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
 
 /// Check whether a dentry is in the tree rooted at `mount_root`.
 fn dentry_belongs_to_mount(dentry: &Arc<Dentry>, mount_root: &Arc<Dentry>) -> bool {
-    if Arc::ptr_eq(dentry, mount_root) {
-        return true;
-    }
-    // Walk up to the root
-    let mut current = dentry.clone();
-    loop {
-        let parent = current.parent.lock().upgrade();
-        match parent {
-            Some(p) => {
-                if Arc::ptr_eq(&p, mount_root) {
-                    return true;
-                }
-                current = p;
-            }
-            None => return false,
-        }
-    }
+    let target_mid = mount_root.get_mount_id();
+    target_mid != 0 && dentry.get_mount_id() == target_mid
 }
 
 // ---------------------------------------------------------------------------
@@ -634,15 +619,19 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
             return Err(VfsError::CrossDeviceLink);
         }
         let size = child_ops.size();
-        let mut buf = alloc::vec![0u8; size as usize];
-        if size > 0 {
-            child_ops.read_at(0, &mut buf)?;
-        }
         let new_child_ops = new_ops.create(&new_name)?;
         if size > 0 {
-            if new_child_ops.write_at(0, &buf).is_err() {
-                let _ = new_ops.unlink(&new_name);
-                return Err(VfsError::IOError);
+            const CHUNK: u64 = 65536;
+            let mut pos = 0u64;
+            while pos < size {
+                let read_size = ((size - pos) as usize).min(CHUNK as usize);
+                let mut buf = alloc::vec![0u8; read_size];
+                child_ops.read_at(pos, &mut buf)?;
+                if new_child_ops.write_at(pos, &buf).is_err() {
+                    let _ = new_ops.unlink(&new_name);
+                    return Err(VfsError::IOError);
+                }
+                pos += read_size as u64;
             }
         }
         old_ops.unlink(&old_name).map_err(|e| {

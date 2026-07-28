@@ -1,7 +1,6 @@
 use alloc::string::String;
 use alloc::string::ToString;
 use alloc::vec::Vec;
-use alloc::format;
 use hashbrown::HashSet;
 
 use super::bpb::{DIR_ENTRY_SIZE, MAX_SFN_LEN};
@@ -76,10 +75,20 @@ pub fn sfn_from_name(name: &str, existing_sfns: &HashSet<[u8; MAX_SFN_LEN]>) -> 
     }
 
     let mut counter = 1u32;
+    let mut suffix_buf = [0u8; 7];
+    suffix_buf[0] = b'~';
     loop {
-        let suffix = format!("~{}", counter);
-        let suffix_bytes = suffix.as_bytes();
-        if suffix_bytes.len() > 6 { return None; }
+        let suffix_len = {
+            let mut n = counter;
+            let mut p = 6;
+            while n > 0 {
+                p -= 1;
+                suffix_buf[p] = b'0' + (n % 10) as u8;
+                n /= 10;
+            }
+            6 - p
+        };
+        let suffix_bytes = &suffix_buf[..suffix_len + 1];
         let stem_avail = 8 - suffix_bytes.len();
         let stem_trunc = &stem.as_bytes()[..stem.len().min(stem_avail)];
         let mut sfn = [b' '; MAX_SFN_LEN];

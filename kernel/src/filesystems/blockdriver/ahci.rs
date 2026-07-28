@@ -18,8 +18,9 @@
 //!   - Interrupt-driven completion with polling fallback
 //!   - Multi-port and multi-controller support
 
+use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -32,6 +33,22 @@ use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
 
 const AHCI_MAX_SLOTS: usize = 32;
 const MAX_PRDT: usize = 64;
+
+/// Flush a cache line, using CLFLUSHOPT if available (pipelined, ~40 cycles vs ~200).
+fn cache_flush_line(addr: *const u8) {
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    static HAS_OPT: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        let res = unsafe { core::arch::x86_64::__cpuid(7) };
+        HAS_OPT.store((res.ebx >> 23) & 1 == 1, Ordering::Relaxed);
+        CHECKED.store(true, Ordering::Relaxed);
+    }
+    if HAS_OPT.load(Ordering::Relaxed) {
+        unsafe { asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags)); }
+    } else {
+        unsafe { asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags)); }
+    }
+}
 
 #[allow(dead_code)]
 mod ghc {
@@ -262,7 +279,7 @@ impl AhciPort {
         // APIC timer counter may not advance during a tight MMIO polling
         // loop, preventing ApicTimeout from ever expiring.
         let mut iterations: u64 = 0;
-        const MAX_ITERATIONS: u64 = 500_000_000;
+        const MAX_ITERATIONS: u64 = 50_000_000;
 
         // Clear any stale IRQ flag before waiting.
         self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
@@ -514,14 +531,14 @@ impl AhciPort {
         unsafe {
             let mut cl = ct_va & !63u64;
             while cl < ct_end {
-                core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags));
+                cache_flush_line(cl as *const u8);
                 cl += 64;
             }
             let hdr_vaddr = self.cl_vaddr + (tag as u64) * 32;
             let hdr_end = hdr_vaddr + 32;
             let mut cl2 = hdr_vaddr & !63u64;
             while cl2 < hdr_end {
-                core::arch::asm!("clflush [{}]", in(reg) cl2 as *const u8, options(nostack, preserves_flags));
+                cache_flush_line(cl2 as *const u8);
                 cl2 += 64;
             }
         }
@@ -746,7 +763,7 @@ impl BlockDevice for AhciPort {
                 let end = va + sz;
                 let mut cl = va & !63u64;
                 while cl < end {
-                    unsafe { core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags)); }
+                    cache_flush_line(cl as *const u8);
                     cl += 64;
                 }
             }
@@ -765,7 +782,7 @@ impl BlockDevice for AhciPort {
                         let end = va + sz;
                         let mut cl = va & !63u64;
                         while cl < end {
-                            unsafe { core::arch::asm!("clflush [{}]", in(reg) cl as *const u8, options(nostack, preserves_flags)); }
+                            cache_flush_line(cl as *const u8);
                             cl += 64;
                         }
                     }

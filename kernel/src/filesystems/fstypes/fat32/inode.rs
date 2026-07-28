@@ -42,10 +42,12 @@ pub struct Fat32Inode {
     pub(crate) parent_clus: u32,
     pub(crate) entry_name: String,
     pub(crate) unlinked: AtomicBool,
-    pub(crate) dir_cache: Mutex<Option<(u64, Vec<DirEntrySlot>)>>,
+    pub(crate) dir_cache: Mutex<Option<(u64, Arc<Vec<DirEntrySlot>>)>>,
     pub(crate) dir_generation: AtomicU64,
     pub(crate) dir_lock: Mutex<()>,
     pub(crate) write_lock: Mutex<()>,
+    pub(crate) chain_cache: Mutex<Option<Arc<Vec<u32>>>>,
+    pub(crate) chain_cache_dirty: AtomicBool,
 }
 
 impl Drop for Fat32Inode {
@@ -73,13 +75,13 @@ impl Fat32Inode {
         self.dir_generation.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn get_dir_slots(&self) -> Result<Vec<DirEntrySlot>, VfsError> {
+    fn get_dir_slots(&self) -> Result<Arc<Vec<DirEntrySlot>>, VfsError> {
         let generation = self.dir_generation.load(Ordering::Relaxed);
         {
             let cache = self.dir_cache.lock();
             if let Some((g, ref slots)) = *cache {
                 if g == generation {
-                    return Ok(slots.clone());
+                    return Ok(Arc::clone(slots));
                 }
             }
         }
@@ -90,14 +92,43 @@ impl Fat32Inode {
             crate::drivers::serial::dump_put_hex(first as u64);
             crate::drivers::serial::dump_puts("\n");
         });
-        let slots = read_dir_slots(&self.sb, first)?;
+        let slots = Arc::new(read_dir_slots(&self.sb, first)?);
         fat_trace!({
             crate::drivers::serial::dump_puts("[DBG:fat32] get_dir_slots got ");
             crate::drivers::serial::dump_put_hex(slots.len() as u64);
             crate::drivers::serial::dump_puts(" slots\n");
         });
-        *self.dir_cache.lock() = Some((generation, slots.clone()));
+        *self.dir_cache.lock() = Some((generation, Arc::clone(&slots)));
         Ok(slots)
+    }
+
+    fn invalidate_chain_cache(&self) {
+        self.chain_cache_dirty.store(true, Ordering::Relaxed);
+    }
+
+    fn ensure_chain_cache(&self) -> Result<Arc<Vec<u32>>, VfsError> {
+        let dirty = self.chain_cache_dirty.load(Ordering::Relaxed);
+        if !dirty {
+            let cache = self.chain_cache.lock();
+            if let Some(ref arc) = *cache {
+                return Ok(Arc::clone(arc));
+            }
+        }
+        let first = self.first_clus.load(Ordering::Relaxed);
+        let mut v = Vec::new();
+        if first >= 2 && first < super::fat::EOC_MARKER {
+            let mut c = first;
+            loop {
+                v.push(c);
+                let next = self.sb.read_fat_entry(c)?;
+                if next >= super::fat::EOC_MARKER { break; }
+                c = next;
+            }
+        }
+        let arc = Arc::new(v);
+        *self.chain_cache.lock() = Some(Arc::clone(&arc));
+        self.chain_cache_dirty.store(false, Ordering::Relaxed);
+        Ok(arc)
     }
 }
 
@@ -111,19 +142,16 @@ impl InodeOps for Fat32Inode {
         let clus_size = self.sb.bpb.byts_per_clus as u64;
         let total = (buf.len() as u64).min(file_size - offset) as usize;
         let start_idx = (offset / clus_size) as u32;
-        let mut current = if start_idx == 0 {
-            first
-        } else {
-            self.sb.chain_cluster_at(first, start_idx)?
-        };
 
-        if current >= EOC_MARKER || current < 2 { return Ok(0); }
+        let chain = self.ensure_chain_cache()?;
+        if chain.is_empty() { return Ok(0); }
+        let mut ci = start_idx as usize;
+        let mut current = if ci < chain.len() { chain[ci] } else { return Ok(0); };
 
         let clus_bytes = clus_size as usize;
         let mut cluster_buf = alloc::vec![0u8; clus_bytes];
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
-        let mut _rd_iters = 0u32;
 
         while done < total {
             read_cluster(&self.sb, current, &mut cluster_buf)?;
@@ -132,13 +160,10 @@ impl InodeOps for Fat32Inode {
             buf[done..done + want].copy_from_slice(&cluster_buf[clus_off..clus_off + want]);
             done += want;
             if done >= total { break; }
-            current = self.sb.read_fat_entry(current)?;
-            if current >= EOC_MARKER { break; }
+            ci += 1;
+            if ci >= chain.len() { break; }
+            current = chain[ci];
             clus_off = 0;
-            _rd_iters += 1;
-            if _rd_iters > self.sb.bpb.total_clus + 2 {
-                return Err(VfsError::IOError);
-            }
         }
         Ok(done)
     }
@@ -157,7 +182,12 @@ impl InodeOps for Fat32Inode {
 
         let mut current_first_clus = self.first_clus.load(Ordering::Relaxed);
         if needed_clus > 0 {
-            let have = self.sb.chain_len(current_first_clus)?;
+            let have = if current_first_clus == 0 {
+                0
+            } else {
+                let chain = self.ensure_chain_cache()?;
+                chain.len() as u32
+            };
             if have < needed_clus {
                 if current_first_clus == 0 {
                     current_first_clus = self.sb.alloc_cluster()?;
@@ -166,25 +196,24 @@ impl InodeOps for Fat32Inode {
                         self.sb.extend_chain(current_first_clus, needed_clus - 1)?;
                     }
                     self.first_clus.store(current_first_clus, Ordering::Relaxed);
+                    self.invalidate_chain_cache();
                     self.sync_clus_and_size()?;
                 } else {
                     self.sb.extend_chain(current_first_clus, needed_clus - have)?;
+                    self.invalidate_chain_cache();
                 }
             }
         }
 
         let start_idx = (offset / clus_size) as u32;
-        let mut current = if start_idx == 0 {
-            current_first_clus
-        } else {
-            self.sb.chain_cluster_at(current_first_clus, start_idx)?
-        };
+        let chain = self.ensure_chain_cache()?;
+        let mut ci = start_idx as usize;
+        let mut current = if ci < chain.len() { chain[ci] } else { return Err(VfsError::IOError); };
 
         let clus_bytes = clus_size as usize;
         let mut cluster_buf = alloc::vec![0u8; clus_bytes];
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
-        let mut _wr_iters = 0u32;
 
         while done < buf.len() {
             let need_rmw = clus_off != 0
@@ -201,13 +230,10 @@ impl InodeOps for Fat32Inode {
             write_cluster(&self.sb, current, &cluster_buf)?;
             done += want;
             if done >= buf.len() { break; }
-            current = self.sb.read_fat_entry(current)?;
-            if current >= EOC_MARKER { break; }
+            ci += 1;
+            if ci >= chain.len() { break; }
+            current = chain[ci];
             clus_off = 0;
-            _wr_iters += 1;
-            if _wr_iters > self.sb.bpb.total_clus + 2 {
-                return Err(VfsError::IOError);
-            }
         }
 
         self.sb.flush_fat_cache()?;
@@ -232,12 +258,12 @@ impl InodeOps for Fat32Inode {
 
     fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
         if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
-        let slots = if name == ".." {
-            read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?
+        let slots: Arc<Vec<DirEntrySlot>> = if name == ".." {
+            Arc::new(read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?)
         } else {
             self.get_dir_slots()?
         };
-        for slot in &slots {
+        for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 let fc = first_clus_from_entry(&slot.sfn_entry);
                 let actual_clus = if name == ".." && fc == 0 { self.sb.bpb.root_clus } else { fc };
@@ -257,6 +283,8 @@ impl InodeOps for Fat32Inode {
                     dir_generation: AtomicU64::new(0),
                     dir_lock: Mutex::new(()),
                     write_lock: Mutex::new(()),
+                    chain_cache: Mutex::new(None),
+                    chain_cache_dirty: AtomicBool::new(false),
                 }) as Arc<dyn InodeOps>);
             }
         }
@@ -315,6 +343,8 @@ impl InodeOps for Fat32Inode {
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
+            chain_cache: Mutex::new(None),
+            chain_cache_dirty: AtomicBool::new(false),
         }) as Arc<dyn InodeOps>)
     }
 
@@ -327,7 +357,7 @@ impl InodeOps for Fat32Inode {
         let slots = self.get_dir_slots()?;
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink got slots\n"));
         let mut found = false;
-        for slot in &slots {
+        for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 if slot.sfn_entry[0x0B] & ATTR_DIRECTORY != 0 {
                     return Err(VfsError::IsADirectory);
@@ -428,6 +458,8 @@ impl InodeOps for Fat32Inode {
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
+            chain_cache: Mutex::new(None),
+            chain_cache_dirty: AtomicBool::new(false),
         }) as Arc<dyn InodeOps>)
     }
 
@@ -439,7 +471,7 @@ impl InodeOps for Fat32Inode {
         let slots = self.get_dir_slots()?;
         let mut target_clus = 0u32;
         let mut found = false;
-        for slot in &slots {
+        for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 let attr = slot.sfn_entry[0x0B];
                 if attr & ATTR_DIRECTORY == 0 { return Err(VfsError::NotADirectory); }
@@ -466,7 +498,7 @@ impl InodeOps for Fat32Inode {
         let slots = self.get_dir_slots()?;
         fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] readdir got slots\n"));
         let mut entries = Vec::with_capacity(slots.len());
-        for slot in &slots {
+        for slot in &*slots {
             let name = decode_entry_name(slot);
             if name.is_empty() || name == "." || name == ".." { continue; }
             let fc = first_clus_from_entry(&slot.sfn_entry);
@@ -492,7 +524,7 @@ impl InodeOps for Fat32Inode {
 
         let slots = self.get_dir_slots()?;
         let mut target = None;
-        for slot in &slots {
+        for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(old_name) {
                 target = Some(slot);
                 break;
@@ -568,7 +600,7 @@ impl InodeOps for Fat32Inode {
         let clus_size = self.sb.bpb.byts_per_clus;
         let needed = if new_size == 0 { 0 } else { ((new_size as u64 - 1) / clus_size as u64 + 1) as u32 };
         let current_first = self.first_clus.load(Ordering::Relaxed);
-        let have = self.sb.chain_len(current_first)?;
+        let have = if current_first == 0 { 0 } else { self.ensure_chain_cache()?.len() as u32 };
 
         if new_size == 0 && current_first != 0 {
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
@@ -578,10 +610,12 @@ impl InodeOps for Fat32Inode {
             self.sb.flush_fat_cache()?;
             self.first_clus.store(0, Ordering::Relaxed);
             self.size.store(0, Ordering::Relaxed);
+            self.invalidate_chain_cache();
         } else if needed < have && current_first != 0 {
             self.sb.truncate_chain(current_first, needed)?;
             self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
+            self.invalidate_chain_cache();
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            None, Some(new_size))?;
         } else if needed > have {
@@ -601,6 +635,7 @@ impl InodeOps for Fat32Inode {
             self.sb.extend_chain(current_first, needed - have)?;
             self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
+            self.invalidate_chain_cache();
             update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                            None, Some(new_size))?;
         } else {

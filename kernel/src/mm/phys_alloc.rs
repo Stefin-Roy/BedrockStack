@@ -147,11 +147,36 @@ impl BitmapAllocator {
     /// Returns physical address of allocated frame, or None if no frames available.
     pub fn alloc(&mut self) -> Option<u64> {
         // INV-PA-02: linear scan, find first free frame
-        for i in self.next_free..self.total_frames {
-            if self.is_free(i) {
-                self.set_used(i);
-                self.next_free = i + 1;
-                let addr = (i as u64) * 4096;
+        // Scan 64 bits (one u64 word) at a time for ~64× throughput.
+        let total_words = (self.total_frames + 63) / 64;
+        let bitmap_u64 = self.bitmap as *const u64;
+
+        let start_word = self.next_free / 64;
+        let start_bit = self.next_free % 64;
+
+        // First pass: start_word .. total_words
+        for wi in start_word..total_words {
+            let w = unsafe { *bitmap_u64.add(wi) };
+            // Invert: 1 bits = free frames, 0 bits = used frames
+            let candidates = !w
+                // Skip bits before start_bit in the first word
+                & if wi == start_word && start_bit > 0 {
+                    !((1u64 << start_bit) - 1)
+                } else {
+                    !0u64
+                }
+                // Mask out bits beyond total_frames in the last word
+                & if wi == total_words - 1 && self.total_frames % 64 != 0 {
+                    (1u64 << (self.total_frames % 64)) - 1
+                } else {
+                    !0u64
+                };
+            if candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                let idx = wi * 64 + bit;
+                self.set_used(idx);
+                self.next_free = idx + 1;
+                let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
                     "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",
@@ -160,13 +185,22 @@ impl BitmapAllocator {
                 return Some(addr);
             }
         }
-        // Wrap-around: scan from 0 to next_free in case earlier frames
-        // were freed or next_free was initialised past usable frames.
-        for i in 0..self.next_free {
-            if self.is_free(i) {
-                self.set_used(i);
-                self.next_free = i + 1;
-                let addr = (i as u64) * 4096;
+
+        // Wrap-around: scan from 0 to start_word
+        for wi in 0..start_word {
+            let w = unsafe { *bitmap_u64.add(wi) };
+            let candidates = !w
+                & if wi == total_words - 1 && self.total_frames % 64 != 0 {
+                    (1u64 << (self.total_frames % 64)) - 1
+                } else {
+                    !0u64
+                };
+            if candidates != 0 {
+                let bit = candidates.trailing_zeros() as usize;
+                let idx = wi * 64 + bit;
+                self.set_used(idx);
+                self.next_free = idx + 1;
+                let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
                     "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",

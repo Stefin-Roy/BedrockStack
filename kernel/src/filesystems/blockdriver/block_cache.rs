@@ -9,7 +9,6 @@ const CACHE_SIZE: usize = 4096;
 
 struct CachedSector {
     data: [u8; 512],
-    access_gen: u64,
 }
 
 pub struct CachedDevice {
@@ -19,22 +18,16 @@ pub struct CachedDevice {
 
 struct BlockCache {
     sectors: HashMap<u64, CachedSector>,
-    gen_counter: u64,
+    clock: Vec<u64>,
+    clock_hand: usize,
 }
 
 impl BlockCache {
     fn new() -> Self {
         BlockCache {
             sectors: HashMap::new(),
-            gen_counter: 0,
-        }
-    }
-
-    fn touch(&mut self, lba: u64) {
-        let g = self.gen_counter;
-        self.gen_counter = g.wrapping_add(1);
-        if let Some(entry) = self.sectors.get_mut(&lba) {
-            entry.access_gen = g;
+            clock: Vec::with_capacity(CACHE_SIZE),
+            clock_hand: 0,
         }
     }
 
@@ -43,13 +36,14 @@ impl BlockCache {
             return;
         }
         let target = CACHE_SIZE - CACHE_SIZE / 4;
-        let mut evictable: Vec<(u64, u64)> = self.sectors.iter()
-            .map(|(lba, entry)| (*lba, entry.access_gen))
-            .collect();
-        evictable.sort_by_key(|&(_, g)| g);
-        let n = self.sectors.len().saturating_sub(target);
-        for (lba, _) in evictable.iter().take(n) {
-            self.sectors.remove(lba);
+        while self.sectors.len() > target {
+            if self.clock.is_empty() { break; }
+            if self.clock_hand >= self.clock.len() {
+                self.clock_hand = 0;
+            }
+            let lba = self.clock[self.clock_hand];
+            self.sectors.remove(&lba);
+            self.clock.swap_remove(self.clock_hand);
         }
     }
 
@@ -60,9 +54,9 @@ impl BlockCache {
             let c = device.submit(&[req]).map_err(|_| ())?;
             if !c.all_ok() { return Err(()); }
             self.maybe_evict();
-            self.sectors.insert(lba, CachedSector { data: buf, access_gen: 0 });
+            self.sectors.insert(lba, CachedSector { data: buf });
+            self.clock.push(lba);
         }
-        self.touch(lba);
         Ok(&self.sectors.get(&lba).unwrap().data)
     }
 
@@ -92,9 +86,11 @@ impl BlockCache {
         if count <= 1 && buf.len() == 512 {
             let mut sector = [0u8; 512];
             sector.copy_from_slice(buf);
-            self.maybe_evict();
-            self.sectors.insert(lba, CachedSector { data: sector, access_gen: 0 });
-            self.touch(lba);
+            if !self.sectors.contains_key(&lba) {
+                self.maybe_evict();
+                self.clock.push(lba);
+            }
+            self.sectors.insert(lba, CachedSector { data: sector });
         }
         Ok(())
     }
