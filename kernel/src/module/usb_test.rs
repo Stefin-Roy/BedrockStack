@@ -237,7 +237,7 @@ fn test_trb_factory_address_device() -> Result<(), &'static str> {
     let ttype = trb.trb_type();
     if ttype != memory::TRB_TYPE_ADDRESS_DEVICE { return Err("wrong TRB type"); }
     if trb.parameter != ctx_phys { return Err("param mismatch"); }
-    if trb.status >> 24 != 1 { return Err("slot_id in status wrong"); }
+    if (trb.control >> 24) & 0xFF != 1 { return Err("slot_id wrong"); }
     if trb.control & memory::TRB_IOC == 0 { return Err("missing IOC"); }
     if trb.control & memory::TRB_BSR != 0 { return Err("BSR should not be set"); }
     Ok(())
@@ -246,7 +246,7 @@ fn test_trb_factory_address_device() -> Result<(), &'static str> {
 fn test_trb_factory_address_device_bsr() -> Result<(), &'static str> {
     let trb = memory::make_address_device_trb(0x20000, 2, true);
     if trb.control & memory::TRB_BSR == 0 { return Err("BSR should be set"); }
-    if trb.status >> 24 != 2 { return Err("slot_id wrong"); }
+    if (trb.control >> 24) & 0xFF != 2 { return Err("slot_id wrong"); }
     Ok(())
 }
 
@@ -255,7 +255,7 @@ fn test_trb_factory_configure_endpoint() -> Result<(), &'static str> {
     let ttype = trb.trb_type();
     if ttype != memory::TRB_TYPE_CONFIGURE_ENDPOINT { return Err("wrong TRB type"); }
     if trb.parameter != 0x30000 { return Err("param mismatch"); }
-    if trb.status >> 24 != 3 { return Err("slot_id wrong"); }
+    if (trb.control >> 24) & 0xFF != 3 { return Err("slot_id wrong"); }
     if trb.control & memory::TRB_DC != 0 { return Err("DC should not be set"); }
     Ok(())
 }
