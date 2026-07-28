@@ -135,7 +135,7 @@ if not exist "%QEMU_PATH%" (
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
-    -device qemu-xhci ^
+    -device qemu-xhci,msi=on,msix=on ^
     -device usb-storage,drive=usb_disk ^
     -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
     -device virtio-net,netdev=net0 ^
@@ -393,7 +393,7 @@ if not exist "%QEMU_PATH%" (
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
-    -device qemu-xhci ^
+    -device qemu-xhci,msix=on ^
     -device usb-storage,drive=usb_disk ^
     -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
     -device virtio-net,netdev=net0 ^

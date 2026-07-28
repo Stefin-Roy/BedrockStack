@@ -60,7 +60,7 @@ impl ConfigDescriptor {
     }
 
     pub fn total_length(&self) -> u16 {
-        unsafe { core::ptr::addr_of!(self.w_total_length).read_unaligned() }
+        u16::from_le(unsafe { core::ptr::addr_of!(self.w_total_length).read_unaligned() })
     }
 
     pub fn num_interfaces(&self) -> u8 {
@@ -169,7 +169,7 @@ impl EndpointDescriptor {
     }
 
     pub fn max_packet_size(&self) -> u16 {
-        unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() }
+        u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() }) & 0x07FF
     }
 
     pub fn interval(&self) -> u8 {
@@ -203,20 +203,35 @@ impl SsEndpointCompanionDescriptor {
     pub fn max_burst(&self) -> u8 {
         unsafe { core::ptr::addr_of!(self.b_max_burst).read_unaligned() }
     }
+
+    pub fn bytes_per_interval(&self) -> u16 {
+        u16::from_le(unsafe { core::ptr::addr_of!(self.w_bytes_per_interval).read_unaligned() })
+    }
 }
 
 pub fn parse_config_descriptors(data: &[u8]) {
+    // Determine the total configuration length from the config descriptor header.
+    let total_len = if data.len() >= size_of::<ConfigDescriptor>() {
+        match ConfigDescriptor::parse(data) {
+            Some(cfg) => cfg.total_length() as usize,
+            None => return,
+        }
+    } else {
+        return;
+    };
+
+    let limit = data.len().min(total_len);
     let mut offset = 0;
-    while offset < data.len() {
-        if offset + 2 > data.len() {
+    while offset < limit {
+        if offset + 2 > limit {
             break;
         }
         let len = data[offset] as usize;
         let desc_type = data[offset + 1];
-        if len == 0 {
+        if len < 2 {
             break;
         }
-        if offset + len > data.len() {
+        if offset + len > limit {
             break;
         }
         match desc_type {
@@ -229,7 +244,9 @@ pub fn parse_config_descriptors(data: &[u8]) {
             super::DESC_ENDPOINT => {
                 let _ = EndpointDescriptor::parse(&data[offset..]);
             }
-            super::DESC_SS_EP_COMPANION => {}
+            super::DESC_SS_EP_COMPANION => {
+                let _ = SsEndpointCompanionDescriptor::parse(&data[offset..]);
+            }
             _ => {}
         }
         offset += len;

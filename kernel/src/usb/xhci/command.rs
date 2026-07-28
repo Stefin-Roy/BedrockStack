@@ -1,5 +1,4 @@
 use super::memory;
-use super::registers::XhciRegisters;
 
 pub fn ring_doorbell(doorbell_va: u64, slot_id: u8, target: u8) {
     let db_ptr = (doorbell_va + (slot_id as u64) * 4) as *mut u32;
@@ -12,6 +11,27 @@ pub fn ring_command_doorbell(doorbell_va: u64) {
     ring_doorbell(doorbell_va, 0, 0);
 }
 
+/// Wait for a command completion event with a 5 s timeout.
+/// Returns `(slot_id, completion_code)` on success.
+fn wait_for_completion() -> Result<(u8, u8), &'static str> {
+    let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
+    loop {
+        if let Some((slot_id, cc, _param)) = super::event::last_command_completion() {
+            if cc == 1 {
+                return Ok((slot_id, cc));
+            } else {
+                return Err("command failed");
+            }
+        }
+        super::event::consume_pending_events();
+        if timeout.expired() {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    Err("command completion timeout")
+}
+
 pub fn submit_enable_slot(
     cmd_ring: &mut memory::TrbRing,
     doorbell_va: u64,
@@ -20,7 +40,8 @@ pub fn submit_enable_slot(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    Ok(0)
+    let (slot_id, _cc) = wait_for_completion()?;
+    Ok(slot_id)
 }
 
 pub fn submit_address_device(
@@ -34,6 +55,7 @@ pub fn submit_address_device(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
+    wait_for_completion()?;
     Ok(())
 }
 
@@ -48,6 +70,7 @@ pub fn submit_configure_endpoint(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
+    wait_for_completion()?;
     Ok(())
 }
 
@@ -61,6 +84,7 @@ pub fn submit_evaluate_context(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
+    wait_for_completion()?;
     Ok(())
 }
 
@@ -72,24 +96,6 @@ pub fn submit_no_op(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
+    wait_for_completion()?;
     Ok(())
-}
-
-pub fn wait_for_completion(_regs: &XhciRegisters) -> Result<u32, &'static str> {
-    let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
-    loop {
-        if let Some((_slot_id, cc, param)) = super::event::last_command_completion() {
-            if cc == 1 {
-                return Ok(param);
-            } else {
-                return Err("command failed");
-            }
-        }
-        super::event::consume_pending_events();
-        if timeout.expired() {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    Err("command completion timeout")
 }

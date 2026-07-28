@@ -4,6 +4,8 @@ use super::Module;
 use super::fat32_test::Fat32Test;
 #[cfg(target_arch = "x86_64")]
 use super::msix_test::MsixTest;
+#[cfg(target_arch = "x86_64")]
+use super::usb_test::UsbTest;
 use super::vfs_test::VfsTest;
 use framebuffer::Framebuffer;
 use framebuffer::Display as _;
@@ -34,6 +36,7 @@ static MODULES: &[&dyn Module] = &[
     &HelloModule,
     &Fat32Test,
     &MsixTest,
+    &UsbTest,
     &VfsTest,
 ];
 

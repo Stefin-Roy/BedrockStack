@@ -1,4 +1,5 @@
 use super::caps::{self, PciCapability};
+use super::ecam;
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
 
@@ -32,12 +33,7 @@ pub fn cap_info(dev: &PciDevice, cap: &PciCapability) -> (bool, bool) {
 pub fn enable(dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8) {
     let mc = caps::read_u16(dev, cap, MC_OFF);
 
-    // Number of requested vectors (MME = 000 → 1 vector).
-    let mme: u16 = 0;
-    // Clear enable bit first.
-    let mc_off = mc & !1;
-
-    // Read MMC (number of messages the device can send).
+    // Read MMC (number of messages the device can send) before we modify MC.
     let mmc = (mc >> 1) & 0x7;
     SerialPort::puts("[msi] enabling: vector=");
     SerialPort::put_u64(vector as u64);
@@ -47,8 +43,15 @@ pub fn enable(dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8
     SerialPort::put_u64(mmc as u64);
     SerialPort::puts("\n");
 
-    // Write Message Address: 0xFEE00000 | (apic_id << 12)
-    // Physical mode, no redirection hint.
+    // Number of requested vectors (MME = 000 → 1 vector).
+    let mme: u16 = 0;
+
+    // Step 1: Disable MSI and clear MME bits before touching address/data
+    // (PCI spec requires MSI to be disabled while modifying these fields).
+    let mc_disabled = mc & !(1 | (0x7 << 4));
+    caps::write_u16(dev, cap, MC_OFF, mc_disabled);
+
+    // Step 2: Program Message Address and Data.
     let addr: u32 = 0xFEE00000 | ((dest_apic_id as u32) << 12);
     caps::write_u32(dev, cap, MA_OFF, addr);
 
@@ -64,9 +67,23 @@ pub fn enable(dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8
         caps::write_u16(dev, cap, MD_OFF_32, data);
     }
 
-    // Set MME + enable bit.
-    let mc_on = mc_off | 1 | (mme << 4);
+    // Step 3: Enable memory space, Bus Master, and disable INTx in PCI
+    // Command register.  Bus Master is required for MSI memory writes.
+    let cmd = ecam::read_u16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
+    ecam::write_u16(
+        dev.segment, dev.bus, dev.device, dev.function, 0x04,
+        cmd | (1 << 1) | (1 << 2) | (1 << 10),
+    );
+
+    // Step 4: Set MME + enable bit.
+    let mc_on = mc_disabled | 1 | (mme << 4);
     caps::write_u16(dev, cap, MC_OFF, mc_on);
+
+    // Step 5: If the device supports Per-Vector Masking, unmask vector 0.
+    if mc & (1 << 8) != 0 {
+        let mask_off = if mc & (1 << 7) != 0 { 16u16 } else { 12u16 };
+        caps::write_u32(dev, cap, mask_off, 0);
+    }
 
     SerialPort::puts("[msi] enabled\n");
 }

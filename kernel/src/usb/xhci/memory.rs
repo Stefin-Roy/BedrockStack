@@ -29,7 +29,7 @@ pub const TRB_TC: u32 = 1 << 1;
 pub const TRB_ISP: u32 = 1 << 2;
 pub const TRB_NS: u32 = 1 << 3;
 pub const TRB_CHAIN: u32 = 1 << 4;
-pub const TRB_ENT: u32 = 1 << 5;
+pub const TRB_ENT: u32 = 1 << 1;
 pub const TRB_BSR: u32 = 1 << 9;
 pub const TRB_DC: u32 = 1 << 10;
 pub const TRB_IOC: u32 = 1 << 5;
@@ -134,9 +134,12 @@ impl TrbRing {
         let phys = self.phys + (idx as u64) * 16;
         let next = self.enqueue_index + 1;
         if next >= self.trb_count {
+            // Write the Link TRB with the *current* cycle bit so the
+            // controller sees a valid TRB.  Then toggle for the new
+            // segment and wrap the enqueue pointer.
+            self.write_link_trb(self.trb_count as usize);
             self.enqueue_index = 0;
             self.cycle ^= 1;
-            self.write_link_trb(self.trb_count as usize);
         } else {
             self.enqueue_index = next;
         }
@@ -154,9 +157,9 @@ impl TrbRing {
         let phys = self.phys + (idx as u64) * 16;
         let next = self.enqueue_index + 1;
         if next >= self.trb_count {
+            self.write_link_trb(self.trb_count as usize);
             self.enqueue_index = 0;
             self.cycle ^= 1;
-            self.write_link_trb(self.trb_count as usize);
         } else {
             self.enqueue_index = next;
         }
@@ -187,7 +190,7 @@ impl TrbRing {
 pub struct InputControlContext {
     pub drop_flags: u32,
     pub add_flags: u32,
-    _rsvd: [u32; 5],
+    _rsvd: [u32; 6],
     pub slot_context: [u32; 8],
     pub ep_contexts: [[u32; 8]; 31],
 }
@@ -197,7 +200,7 @@ impl InputControlContext {
         InputControlContext {
             drop_flags: 0,
             add_flags: 0,
-            _rsvd: [0; 5],
+            _rsvd: [0; 6],
             slot_context: [0u32; 8],
             ep_contexts: [[0u32; 8]; 31],
         }
@@ -208,7 +211,7 @@ pub fn make_setup_stage_trb(setup: &[u8; 8], trt: u32) -> Trb {
     let param = u64::from_le_bytes([
         setup[0], setup[1], setup[2], setup[3], setup[4], setup[5], setup[6], setup[7],
     ]);
-    Trb::new(param, 8, (TRB_TYPE_SETUP_STAGE as u32) << 10 | trt | TRB_IOC)
+    Trb::new(param, 8, (TRB_TYPE_SETUP_STAGE as u32) << 10 | trt | TRB_IOC | TRB_IDT)
 }
 
 pub fn make_data_stage_trb(phys: u64, len: u32, dir_in: bool) -> Trb {
@@ -239,7 +242,8 @@ pub fn make_address_device_trb(input_ctx_phys: u64, slot_id: u8, bsr: bool) -> T
         control |= TRB_BSR;
     }
     control |= TRB_IOC;
-    Trb::new(input_ctx_phys, (slot_id as u32) << 24, control)
+    control |= (slot_id as u32) << 24;
+    Trb::new(input_ctx_phys, 0, control)
 }
 
 pub fn make_configure_endpoint_trb(input_ctx_phys: u64, slot_id: u8, deconfigure: bool) -> Trb {
@@ -248,11 +252,15 @@ pub fn make_configure_endpoint_trb(input_ctx_phys: u64, slot_id: u8, deconfigure
         control |= TRB_DC;
     }
     control |= TRB_IOC;
-    Trb::new(input_ctx_phys, (slot_id as u32) << 24, control)
+    control |= (slot_id as u32) << 24;
+    Trb::new(input_ctx_phys, 0, control)
 }
 
 pub fn make_evaluate_context_trb(ctx_phys: u64, slot_id: u8) -> Trb {
-    Trb::new(ctx_phys, (slot_id as u32) << 24, (TRB_TYPE_EVALUATE_CONTEXT as u32) << 10 | TRB_IOC)
+    let mut control = (TRB_TYPE_EVALUATE_CONTEXT as u32) << 10;
+    control |= TRB_IOC;
+    control |= (slot_id as u32) << 24;
+    Trb::new(ctx_phys, 0, control)
 }
 
 pub fn make_normal_trb(data_phys: u64, len: u32, slot_id: u8, endpoint_id: u8) -> Trb {

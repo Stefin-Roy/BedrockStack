@@ -197,28 +197,28 @@ fn test_msix_mc_register() -> Result<(), &'static str> {
     // Save original MC.
     let saved_mc = caps::read_u16(dev, &cap, 2);
 
-    // Clear Enable (bit 14), set Function Mask (bit 15).
+    // Clear Function Mask (bit 14), set MSI-X Enable (bit 15).
     caps::write_u16(dev, &cap, 2, (saved_mc & !(1 << 14)) | (1 << 15));
     let mc = caps::read_u16(dev, &cap, 2);
-    if mc & (1 << 15) == 0 {
-        caps::write_u16(dev, &cap, 2, saved_mc);
-        return Err("MSI-X Function Mask bit not set");
-    }
     if mc & (1 << 14) != 0 {
         caps::write_u16(dev, &cap, 2, saved_mc);
-        return Err("MSI-X still enabled after clearing enable bit");
+        return Err("MSI-X Function Mask still set after clearing");
+    }
+    if mc & (1 << 15) == 0 {
+        caps::write_u16(dev, &cap, 2, saved_mc);
+        return Err("MSI-X Enable not set after write");
     }
 
-    // Set Enable (bit 14), clear Function Mask (bit 15).
+    // Set Function Mask (bit 14), clear MSI-X Enable (bit 15).
     caps::write_u16(dev, &cap, 2, (saved_mc & !(1 << 15)) | (1 << 14));
     let mc = caps::read_u16(dev, &cap, 2);
     if mc & (1 << 14) == 0 {
         caps::write_u16(dev, &cap, 2, saved_mc);
-        return Err("MSI-X enable bit not set after write");
+        return Err("MSI-X Function Mask not set after write");
     }
     if mc & (1 << 15) != 0 {
         caps::write_u16(dev, &cap, 2, saved_mc);
-        return Err("MSI-X Function Mask still set");
+        return Err("MSI-X Enable still set after clearing");
     }
 
     // Restore.
@@ -246,7 +246,7 @@ fn test_msix_inactive_on_boot() -> Result<(), &'static str> {
     }
     let cap = caps::find(dev, CAP_MSIX).ok_or("MSI-X cap lookup failed")?;
     let mc = caps::read_u16(dev, &cap, 2);
-    if mc & (1 << 14) != 0 { return Err("MSI-X already enabled at boot"); }
+    if mc & (1 << 15) != 0 { return Err("MSI-X already enabled at boot"); }
     Ok(())
 }
 
@@ -257,9 +257,9 @@ fn test_msix_table_size_sane() -> Result<(), &'static str> {
     };
     let cap = caps::find(dev, CAP_MSIX).ok_or("MSI-X cap lookup failed")?;
     let info = pci::msix::table_info(dev, &cap);
-    // ICH9 supports up to 6 ports; the table has at least 2 entries.
+    // PCI MSI-X encodes table sizes from 1 through 2048 entries.
     if info.table_size < 1 { return Err("MSI-X table size < 1"); }
-    if info.table_size > 8 { return Err("MSI-X table size implausible (>8)"); }
+    if info.table_size > 2048 { return Err("MSI-X table size exceeds architectural limit"); }
     Ok(())
 }
 

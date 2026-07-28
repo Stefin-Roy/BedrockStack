@@ -61,13 +61,20 @@ impl UsbPorts {
                 SerialPort::puts(speed_str);
                 SerialPort::puts("\n");
 
-                self.reset_port_by_idx(i)?;
+                // SuperSpeed ports auto-enable on link training; explicit
+                // reset is required only for USB 2.0 (and below) ports.
+                if speed != 4 {
+                    self.reset_port_by_idx(i)?;
+                }
             }
 
             let portsc_now = self.port_regs.read_portsc(port_num);
             let status = portsc_now & PORTSC_STATUS_BITS;
             if status != 0 {
-                self.port_regs.write_portsc(port_num, portsc_now);
+                // PORTSC_PED is RW1C – never write 1 back or the port
+                // is instantly disabled.  Mask it out here so we only
+                // clear the change bits (17..23) without touching PED.
+                self.port_regs.write_portsc(port_num, portsc_now & !PORTSC_PED);
             }
         }
         Ok(())
@@ -77,9 +84,10 @@ impl UsbPorts {
         let port_num = self.ports[idx].port_num;
         self.ports[idx].resetting = true;
 
-        let mut portsc = self.port_regs.read_portsc(port_num);
-        portsc |= PORTSC_PR;
-        self.port_regs.write_portsc(port_num, portsc);
+        let portsc = self.port_regs.read_portsc(port_num);
+        // Mask out PED (RW1C) and change bits (RW1C) so the write doesn't
+        // accidentally disable the port or clear unhandled status flags.
+        self.port_regs.write_portsc(port_num, (portsc & !(PORTSC_PED | PORTSC_STATUS_BITS)) | PORTSC_PR);
 
         let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(500);
         loop {
@@ -159,9 +167,14 @@ impl UsbPorts {
             self.ports[idx].enabled = false;
         }
 
-        let status_bits = portsc & PORTSC_STATUS_BITS;
+        // Re-read PORTSC: reset_port_by_idx() above may have changed PED
+        // and set new change bits (PRC).  Using the stale `portsc` would
+        // disable the port (write PED=1 back, RW1C) and miss new change
+        // bits.
+        let portsc_final = self.port_regs.read_portsc(port_num);
+        let status_bits = portsc_final & PORTSC_STATUS_BITS;
         if status_bits != 0 {
-            self.port_regs.write_portsc(port_num, portsc);
+            self.port_regs.write_portsc(port_num, portsc_final & !PORTSC_PED);
         }
 
         Ok(())

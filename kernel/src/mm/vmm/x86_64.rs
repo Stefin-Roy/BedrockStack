@@ -45,7 +45,11 @@ fn page_flags_to_x86(flags: PageFlags) -> PageTableFlags {
         f |= PageTableFlags::NO_EXECUTE;
     }
     if flags.contains(PageFlags::NO_CACHE) {
-        f |= PageTableFlags::NO_CACHE;
+        // Need BOTH PCD and PWT for UC (PAT index 3 = 0 × 4 + 2 × 1 + 1 × 1).
+        // With only PCD (bit 4), PAT index = 2 → WT (Write-Through),
+        // which allows cache hits on reads giving stale data.
+        f |= PageTableFlags::NO_CACHE;         // PCD
+        f |= PageTableFlags::WRITE_THROUGH;    // PWT
     }
     if flags.contains(PageFlags::WRITE_COMBINING) {
         // PAT index 1 (001): PWT=1, PCD=0, PAT=0
