@@ -20,7 +20,6 @@ pub struct UsbDmaAllocator {
 }
 
 unsafe impl Send for UsbDmaAllocator {}
-unsafe impl Sync for UsbDmaAllocator {}
 
 impl UsbDmaAllocator {
     pub fn new(root: u64, alloc: *mut BitmapAllocator) -> Self {
@@ -33,9 +32,10 @@ impl UsbDmaAllocator {
     }
 
     pub fn map_mmio(&mut self, paddr: u64, size: u64) -> Result<u64, &'static str> {
+        let page_aligned = (size + 4095) & !4095;
         let va = self
             .next_vaddr
-            .checked_sub(size)
+            .checked_sub(page_aligned)
             .ok_or("USB DMA: address space exhausted (overflow)")?;
         if va < self.vaddr_floor {
             return Err("USB DMA: address space exhausted");
@@ -46,7 +46,7 @@ impl UsbDmaAllocator {
             alloc,
             va,
             paddr,
-            size,
+            page_aligned,
             PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
         );
         Ok(va)
@@ -57,13 +57,13 @@ impl UsbDmaAllocator {
     }
 
     pub fn alloc_page(&mut self) -> Option<DmaBuffer> {
-        let alloc = unsafe { &mut *self.alloc };
-        let phys = alloc.alloc()?;
         let va = self.next_vaddr.checked_sub(4096)?;
         if va < self.vaddr_floor {
             return None;
         }
         self.next_vaddr = va;
+        let alloc = unsafe { &mut *self.alloc };
+        let phys = alloc.alloc()?;
         Vmm::from_root(self.root).map(alloc, va, phys, 4096, Self::dma_flags());
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096) }
         Some(DmaBuffer {
@@ -74,14 +74,14 @@ impl UsbDmaAllocator {
     }
 
     pub fn alloc_contiguous(&mut self, count: usize) -> Option<DmaBuffer> {
-        let alloc = unsafe { &mut *self.alloc };
-        let phys = alloc.alloc_contiguous(count)?;
         let size = (count as u64) * 4096;
         let va = self.next_vaddr.checked_sub(size)?;
         if va < self.vaddr_floor {
             return None;
         }
         self.next_vaddr = va;
+        let alloc = unsafe { &mut *self.alloc };
+        let phys = alloc.alloc_contiguous(count)?;
         Vmm::from_root(self.root).map(alloc, va, phys, size, Self::dma_flags());
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
         Some(DmaBuffer {
