@@ -138,9 +138,8 @@ pub fn read_cap_data32(base: u64, offset: u64, reg: u16) -> u32 {
 
 pub fn read_protocol_string(base: u64, offset: u64) -> [u8; 20] {
     let mut buf = [0u8; 20];
-    for i in 0..20 {
-        buf[i] = unsafe { core::ptr::read_volatile((base + offset + 12 + i as u64) as *const u8) };
-    }
+    let name = unsafe { core::ptr::read_volatile((base + offset + 4) as *const u32) };
+    buf[0..4].copy_from_slice(&name.to_le_bytes());
     buf
 }
 
@@ -149,7 +148,7 @@ pub struct HcsParams1(u32);
 impl HcsParams1 {
     pub fn from(raw: u32) -> Self { HcsParams1(raw) }
     pub fn max_slots(&self) -> u8 { (self.0 & 0xFF) as u8 }
-    pub fn max_intrs(&self) -> u8 { ((self.0 >> 8) & 0x7FF) as u8 }
+    pub fn max_intrs(&self) -> u16 { ((self.0 >> 8) & 0x7FF) as u16 }
     pub fn max_ports(&self) -> u8 { ((self.0 >> 24) & 0xFF) as u8 }
 }
 
@@ -159,8 +158,8 @@ impl HcsParams2 {
     pub fn from(raw: u32) -> Self { HcsParams2(raw) }
     pub fn erst_max(&self) -> u8 { ((self.0 >> 4) & 0xF) as u8 }
     pub fn scratchpad_bufs(&self) -> u16 {
-        let lo = (self.0 >> 27) & 0x1F;
-        let hi = (self.0 >> 21) & 0x1F;
+        let hi = (self.0 >> 27) & 0x1F;
+        let lo = (self.0 >> 21) & 0x1F;
         ((hi as u16) << 5) | lo as u16
     }
 }
