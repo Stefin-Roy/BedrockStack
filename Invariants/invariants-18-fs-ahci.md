@@ -1,6 +1,6 @@
 # AHCI Block Driver — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/filesystems/blockdriver/{mod,traits,ahci}.rs`
 **Status:** Stable (x86_64 only)
 
@@ -8,11 +8,11 @@
 
 ## State Invariants
 
-**AHCI-001 — AHCI is initialized once during `Kernel::run()`:**
+**AHCI-001 — AHCI is initialized via `blockdriver::driver::init_all()` during `Kernel::run()`:**
 Scans PCI bus for the AHCI controller (Q35 ICH9), maps its BAR using
 the kernel VMM (with NO_CACHE), performs controller reset, enables
-ports, and allocates command tables.
-- Location: `kernel/src/filesystems/blockdriver/ahci.rs` (init flow)
+ports, and allocates command tables. Returns `Vec<Arc<dyn BlockDevice>>`.
+- Location: `kernel/src/filesystems/blockdriver/driver.rs` (init flow)
 
 **AHCI-002 — MMIO registers are accessed via volatile pointers:**
 All MMIO read/write uses `read_volatile`/`write_volatile` to prevent
@@ -89,10 +89,10 @@ must be below `PCI_VADDR_FLOOR`.
 
 ## API Contracts
 
-**AHCI-API-001 — `ahci::init(page_table_root, phys_allocator)`:**
-Scans PCI, finds AHCI controller, resets it, probes ports, and
-registers discovered devices with the VFS block device layer.
-Must be called after PCI init and VMM activation.
+**AHCI-API-001 — `blockdriver::driver::init_all(devices, page_table_root, phys_allocator)`:**
+Scans the PCI device list for AHCI controllers, resets them, probes
+ports, and returns `Vec<Arc<dyn BlockDevice>>`. Must be called after
+PCI init and VMM activation. On x86_64 only.
 
 **AHCI-API-002 — `BlockDevice` trait:**
 ```rust

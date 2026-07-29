@@ -1,6 +1,6 @@
 # PCI Subsystem — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/pci/{mod,ecam,enumerate}.rs`
 **Status:** Stable
 

@@ -1,7 +1,7 @@
 # RISC-V64 Architecture — Invariants
 
-**Version:** 0.2.0
-**Source:** `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline,serial}.rs`, `kernel/src/dtb.rs`
+**Version:** 0.3.0
+**Source:** `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline}.rs`, `kernel/src/dtb.rs`
 **Status:** Stable
 
 ---
@@ -18,16 +18,7 @@ Identity mapping + higher-half kernel alias at `KERNEL_VMA_BASE + phys`.
 with NX. Framebuffer area strips EXECUTE.
 - Location: `kernel/src/arch/riscv64/paging.rs:80-90`
 
-**RISCV-003 — NULL page and stack guard are unmapped:**
-Same 4 KiB hole-punching as x86_64 in the identity map loop.
-- Location: `kernel/src/arch/riscv64/paging.rs:43-51`
 
-**RISCV-007 — Identity map covers `[0, max_addr)` without hardcoded 4 GiB ceiling:**
-`max_addr = fb_end.max(allocator.alloc_end())`, rounded to 2 MiB.
-The hardcoded 4 GiB minimum was removed. MMIO regions (UART at 0x10000000,
-PLIC at 0x0C000000, HTIF at 0x40008000) sit below typical RAM (0x80000000)
-and are covered automatically.
-- Location: `kernel/src/arch/riscv64/paging.rs`
 
 **RISCV-004 — Trap handler saves/restores all 32 GPRs + `sepc` + `sstatus`:**
 `__trap_entry` allocates a `TrapFrame` (256 bytes) on the stack,
@@ -44,6 +35,22 @@ Reset) extensions. Uses the standard SBI calling convention:
 First tries DTB parsing (`crate::dtb::parse_cpus`), falls back to
 ACPI MADT data. BSP hart ID read from PLIC.
 - Location: `kernel/src/arch/riscv64/mod.rs:74-89`
+
+**RISCV-007 — Identity map covers `[0, max_addr)` without hardcoded 4 GiB ceiling:**
+`max_addr = fb_end.max(allocator.alloc_end())`, rounded to 2 MiB.
+The hardcoded 4 GiB minimum was removed. MMIO regions (UART at 0x10000000,
+PLIC at 0x0C000000, HTIF at 0x40008000) sit below typical RAM (0x80000000)
+and are covered automatically.
+- Location: `kernel/src/arch/riscv64/paging.rs`
+
+**RISCV-008 — NULL page and stack guard are unmapped:**
+Same 4 KiB hole-punching as x86_64 in the identity map loop.
+- Location: `kernel/src/arch/riscv64/paging.rs:43-51`
+
+**RISCV-009 — W^X enforced (identical logic to x86_64):**
+`.text` = READ + EXECUTE, `.rodata` = READ, everything else = READ + WRITE
+with NX. Framebuffer area strips EXECUTE.
+- Location: `kernel/src/arch/riscv64/paging.rs:80-90`
 
 ---
 

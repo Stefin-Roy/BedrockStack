@@ -1,7 +1,7 @@
 # Bootloader — Invariants
 
-**Version:** 0.2.0
-**Source:** `boot/src/main.rs`, `boot/src/elf.rs`, `boot/src/allocator.rs`
+**Version:** 0.3.0
+**Source:** `boot/src/main.rs`, `boot/src/elf.rs`, `boot/src/allocator.rs`, `boot/src/limiter.rs`
 **Status:** Stable
 
 ---
@@ -13,51 +13,53 @@ The physical span `[p_paddr, p_paddr + p_memsz)` for each `PT_LOAD` segment
 is reserved via UEFI `allocate_pages(Address, LOADER_DATA)` before copying.
 This prevents firmware/boot-services allocations from sitting under the kernel.
 - Location: `boot/src/elf.rs:130-178`
-- Validates: `p_memsz >= p_filesz`, `e_phentsize >= 56`, segment bounds.
+- Validates: `p_memsz >= p_filesz`, `e_phentsize >= 56`, segment bounds,
+  `p_offset + p_filesz` within `elf_data` bounds, architecture match.
 
 **BOOT-002 — Memory map is built from the FINAL map after `exit_boot_services`:**
 The region buffer capacity is pre-allocated (over-provisioned by `* 2 + 256`).
 If the final map exceeds capacity, the bootloader HALTS rather than silently
 truncating. Only `CONVENTIONAL` memory is `Usable`; all other types are
 `Reserved` so the kernel never hands out frames holding live data.
-- Location: `boot/src/main.rs:90-162`
-- `classify_memory()` at `boot/src/main.rs:185-196`
+Hypervisor detection filters >4 GiB conventional regions (x86_64 only).
+- Location: `boot/src/main.rs:120-200`
+- `classify_memory()` at `boot/src/main.rs:239-250`
 
 **BOOT-003 — Framebuffer info transfer buffer contains one valid entry:**
 Pre-allocated as `alloc::vec![fb_info]`, leaked via `core::mem::forget`.
-- Location: `boot/src/main.rs:94,168`
+- Location: `boot/src/main.rs:124,126,206`
 
 **BOOT-004 — All transfer buffers use OS_DATA memory type (0x80000001), with LOADER_DATA fallback:**
 Custom `#[global_allocator]` backed by `uefi::boot::allocate_pool(OS_DATA, ...)`.
 If `OS_DATA` is rejected (some real firmware rejects OEM types), falls back to
 `LOADER_DATA`. All `Vec` allocations persist after `exit_boot_services`.
-- Location: `boot/src/allocator.rs`, `boot/src/main.rs:21-22`
+- Location: `boot/src/allocator.rs`, `boot/src/main.rs:24-25`
 
 **BOOT-005 — Kernel stack is 64 KB + 1 guard page per BSP:**
 The guard page is the lowest page; its physical address is passed to the
 kernel so it can be left unmapped. The stack is page-allocated (not a Vec),
 so it is leaked implicitly (no `forget` needed).
-- Location: `boot/src/main.rs:102-116`
+- Location: `boot/src/main.rs:28,128-139`
 
 **BOOT-006 — Heap transfer buffers are leaked before `exit_boot_services`:**
 `core::mem::forget(regions_buf)` and `core::mem::forget(fb_buf)` prevent
 Rust from calling `dealloc` after UEFI teardown.
-- Location: `boot/src/main.rs:167-168`
+- Location: `boot/src/main.rs:205-206`
 
 **BOOT-007 — RSDP is discovered from UEFI config table before boot services end:**
 Config table entries are invalid after `exit_boot_services`.
-- Location: `boot/src/main.rs:119,200-214`
+- Location: `boot/src/main.rs:148-149,254-269`
 
 **BOOT-008 — `GOP BltOnly` returns zeroed `FramebufferInfo` (not fatal):**
 If the framebuffer has no linear address, the bootloader logs a warning and
 returns `FramebufferInfo::zeroed()` so the kernel can fall back to serial-only
 operation. Never panics.
-- Location: `boot/src/main.rs:234-238`
+- Location: `boot/src/main.rs:368-371`
 
 **BOOT-009 — ELF loading rejects PIE executables (`ET_DYN`):**
 Only `ET_EXEC` (type 2) is accepted. Accepting `ET_DYN` would silently jump
-to a wrong entry point.
-- Location: `boot/src/elf.rs:105-107`
+to a wrong entry point. Machine type validated against target arch.
+- Location: `boot/src/elf.rs:107-121`
 
 **BOOT-010 — Multiboot2/GRUB entry via `kernelmb2` feature:**
 A second boot path exists via Multiboot2 (GRUB). An assembly trampoline in
@@ -80,13 +82,26 @@ The bootloader executes `CLI` (disable interrupts) before `MOV RSP` to
 prevent firmware IDT from handling an interrupt on the kernel's unprotected
 stack. `CLD` guarantees the SysV ABI direction-flag invariant before any
 `cld`-dependent string operation in the kernel.
-- Location: `boot/src/main.rs`
+- Location: `boot/src/main.rs:434-438`
 
 **BOOT-013 — `FramebufferInfo::zeroed()` provides safe default:**
 When GOP is unavailable (missing handle, open failure, or BltOnly), a
 zeroed `FramebufferInfo` (address=0, bpp=0) is returned. The kernel's
 display subsystem treats a null framebuffer pointer as a safe no-op.
-- Location: `common/src/types.rs`
+- Location: `common/src/types.rs:42-51`
+
+**BOOT-014 — Framebuffer pixel format is parsed from `PixelBitmask`:**
+`parse_bitmask()` checks whether each channel's mask is byte-aligned.
+Non-byte-aligned masks (e.g. 5:6:5) fall back to BGR 32bpp. Byte-offset
+comparison determines RGB vs BGR order.
+- Location: `boot/src/main.rs:277-326`
+
+**BOOT-015 — `cpu_slow` mode configures Intel-only MSRs after EBS:**
+Gated behind `#[cfg(feature = "cpu_slow")]`. Runs just before jumping to
+kernel. Writes to IA32_CLOCK_MODULATION, IA32_ENERGY_PERF_BIAS,
+IA32_PERF_CTL, and IA32_HWP_REQUEST MSRs to force minimum power state.
+Skips on non-Intel or under hypervisors.
+- Location: `boot/src/main.rs:214-218`, `boot/src/limiter.rs`
 
 ## Safety Invariants
 
@@ -99,14 +114,14 @@ physical memory is writable and does not overlap critical regions.
 `entry` must be a valid kernel entry point. `stack_top` must be valid
 writable memory (stack grows downward). `regions_ptr` / `fb_ptr` must point
 to valid, non-dangling data. This function does not return.
-- Location: `boot/src/main.rs:260-268`
+- Location: `boot/src/main.rs:417-425`
 
 **BOOT-S003 — Kernel entry ABI (x86_64):**
 sysv64 calling convention: `rdi=regions_ptr, rsi=regions_len, rdx=fb_ptr,
 rcx=stack_guard, r8=rsdp_addr`. `rsdp_addr` is 0 if RSDP not found.
 For the Multiboot2 path, the `Kernel::new()` call additionally receives
 `rsdp_data: Option<&'static [u8]>` in lieu of `rsdp_addr`.
-- Location: `boot/src/main.rs:281-292`, `kernel/src/arch/x86_64/multiboot2.rs`
+- Location: `boot/src/main.rs:442-449`, `kernel/src/arch/x86_64/multiboot2.rs`
 
 ---
 
@@ -114,14 +129,15 @@ For the Multiboot2 path, the `Kernel::new()` call additionally receives
 
 **BOOT-API-001 — `elf::load_elf` input:**
 Validates ELF magic, class (64-bit), encoding (little-endian), machine type
-matching target arch. Program headers must have `phentsize >= 56`.
-- Location: `boot/src/elf.rs:82-128`
+matching target arch. Program headers must have `phentsize >= 56`. Validates
+segment data fits within `elf_data` before copying.
+- Location: `boot/src/elf.rs:82-170`
 
 **BOOT-API-002 — Transfer buffer capacity:**
 `regions_buf` capacity is over-provisioned as `est_entries * 2 + 256`.
 The bootloader HALTS if capacity is exceeded (post-exit allocation is
 impossible).
-- Location: `boot/src/main.rs:90-93,150-155`
+- Location: `boot/src/main.rs:120-123,188-193`
 
 ---
 

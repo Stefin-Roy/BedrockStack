@@ -1,7 +1,7 @@
 # x86_64 Architecture — Invariants
 
-**Version:** 0.2.0
-**Source:** `kernel/src/arch/x86_64/{gdt,idt,paging,trampoline,serial,mod}.rs`
+**Version:** 0.3.0
+**Source:** `kernel/src/arch/x86_64/{gdt,idt,paging,trampoline,mod}.rs`
 **Status:** Stable
 
 ---
@@ -16,50 +16,62 @@ firmware huge-page mappings that would silently block our flags.
 **PAGING-002 — Identity mapping covers `[0, ram_end)`, framebuffer extension beyond:**
 `ram_end = allocator.alloc_end().max(apic_base + PAGE_4K)` rounded to 2 MiB.
 No hardcoded 4 GiB minimum. Bulk RAM uses 2 MiB huge pages; kernel image,
-NULL page's 2 MiB chunk, and guard page's chunk use 4 KiB pages.
+NULL page's 2 MiB chunk, guard page's chunk, APIC page, and trampoline page
+use 4 KiB pages. Framebuffer overlapping pages use WRITE_COMBINING.
 If the framebuffer sits above `ram_end`, a separate identity-map extension
 covers `[fb_map_start, fb_map_end)` with `WRITE_COMBINING` caching.
-- Location: `kernel/src/arch/x86_64/paging.rs:36-81`
+- Location: `kernel/src/arch/x86_64/paging.rs:50-112`
 
 **PAGING-003 — W^X policy:**
 No page is both writable and executable. `.text` = READ + EXECUTE, `.rodata`
-= READ + NX, everything else = WRITE + NX. Requires EFER.NXE and CR0.WP,
-both enabled in `setup()`.
-- Location: `kernel/src/arch/x86_64/paging.rs:41-44,97-111`
+= READ + NX, `.rela.dyn` = READ, everything else = READ + WRITE + NX.
+Requires EFER.NXE and CR0.WP, both enabled in `setup()`.
+- Location: `kernel/src/arch/x86_64/paging.rs:41-45,140-154`
 
 **PAGING-004 — NULL page (frame 0) is unmapped:**
 The first 4 KiB of the first 2 MiB chunk is skipped during mapping.
 Null dereferences fault instead of corrupting memory.
-- Location: `kernel/src/arch/x86_64/paging.rs:61-63`
+- Location: `kernel/src/arch/x86_64/paging.rs:73-75`
 
 **PAGING-005 — Stack guard page is unmapped:**
 The guard page's physical address (passed from bootloader) is skipped
 during identity mapping. Stack overflow hits the unmapped page and
 faults to the double-fault handler (via IST).
-- Location: `kernel/src/arch/x86_64/paging.rs:47,61-63`
+- Location: `kernel/src/arch/x86_64/paging.rs:48,73-75`
 
 **PAGING-006 — Trampoline code at `0x8000` is executable:**
 The page at physical address `0x8000` is mapped with EXECUTE permission.
-- Location: `kernel/src/arch/x86_64/paging.rs:66-68`
+- Location: `kernel/src/arch/x86_64/paging.rs:78-80`
 
 **PAGING-007 — PAT entry 1 programmed as Write-Combining (01h):**
 `init_pat_wc()` writes `IA32_PAT` MSR (0x277) so that PAT entry 1
 (bits 15:8) is `01h` (WC). Called at the top of `paging::setup()`,
 before any identity-map entries are created.
-- Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/arch/x86_64/paging.rs`
+- Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/arch/x86_64/paging.rs:39`
 
 **PAGING-008 — Framebuffer identity map uses WRITE_COMBINING (not NO_CACHE):**
 Identity-map pages that overlap the bootloader framebuffer region are
 mapped with `PageFlags::WRITE_COMBINING` instead of `PageFlags::NO_CACHE`.
 This enables the CPU to coalesce flush stores into burst writes over the bus.
 APIC and other MMIO regions remain mapped as `NO_CACHE`.
-- Location: `kernel/src/arch/x86_64/paging.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs:150-152`
 
 **PAGING-009 — Local APIC MMIO is identity-mapped as NO_CACHE:**
 The `IA32_APIC_BASE` MSR is read during `paging::setup()` and the local
 APIC 4 KiB page is mapped as `NO_CACHE` in the identity page tables.
 This ensures the APIC registers are accessible before `Arch::init()`.
-- Location: `kernel/src/arch/x86_64/paging.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs:52-53,81-83`
+
+**PAGING-010 — `setup()` takes framebuffer `bpp` parameter:**
+`paging::setup()` now receives `framebuffer_bpp: u8` to correctly compute
+the framebuffer size (`stride * height * bpp`) for identity-map coverage
+and cache-attribute decisions.
+- Location: `kernel/src/arch/x86_64/paging.rs:25-37`
+
+**PAGING-011 — `leaf_flags()` handles `.rela.dyn` section:**
+The per-page permission function additionally tests
+`[rela_dyn_start, rela_dyn_end)` for READ-only (non-executable) mapping.
+- Location: `kernel/src/arch/x86_64/paging.rs:143-144`
 
 ---
 
@@ -96,11 +108,11 @@ The BSP builds the IDT in `IDT.call_once(|| ...)`. APs reload it via
 descriptor to switch stacks on entry.
 - Location: `kernel/src/arch/x86_64/idt.rs:53-57`
 
-**IDT-003 — APIC timer at vector 32 with interrupt gate:`
+**IDT-003 — APIC timer at vector 32 with interrupt gate:**
 `.disable_interrupts(true)` — clears IF so no nested interrupts.
 - Location: `kernel/src/arch/x86_64/idt.rs:60`
 
-**IDT-004 — All exception handlers (except breakpoint) log and halt:`
+**IDT-004 — All exception handlers (except breakpoint) log and halt:**
 Delegates to `kerneldump::dump_full_fault()` with vector and error code.
 - Location: `kernel/src/arch/x86_64/idt.rs:87-137`
 

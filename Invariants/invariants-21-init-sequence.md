@@ -1,6 +1,6 @@
 # Boot Initialization Sequence — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/lib.rs`, `kernel/src/main.rs`, `boot/src/main.rs`
 **Status:** Stable
 
@@ -15,14 +15,19 @@ The following dependencies MUST be respected:
   │  bootloader (UEFI)               │    │  GRUB loads kernel ELF    │
   │  ├── ELF loaded to phys mem      │    │  ├── 32-bit asm entry     │
   │  ├── RSDP from config table      │    │  ├── Identity-map 1 GiB   │
-  │  └── Memory map from EBS         │    │  ├── Enter long mode      │
-  └────────────────┬─────────────────┘    │  └── rust_entry_mb2()     │
-                   │                      └───────────┬───────────────┘
+  │  ├── Memory map from EBS         │    │  ├── Enter long mode      │
+  │  ├── cpu_slow MSRs (Intel-only)  │    │  └── rust_entry_mb2()     │
+  │  └── jump_to_kernel(CLI+CLD)     │    └───────────┬───────────────┘
+  └────────────────┬─────────────────┘                │
                    └────────────┬──────────────────────┘
                                 ▼
                     Kernel::new()
+                    ├── acpi_log::init()
+                    ├── find_bitmap_region()
+                    ├── KernelLayout (sections from linker symbols)
                     ├── BitmapAllocator::new()
-                    ├── Framebuffer::new() (detects bpp from GOP/GRUB tag)
+                    ├── Reserve kernel image region
+                    ├── Framebuffer::new() (with shadow buffer)
                     ├── heap::init()
                     │
                     ▼
@@ -31,11 +36,11 @@ The following dependencies MUST be respected:
                     ├── smp::early_init_bsp()
                     ├── switch_to_higher_half()
                     │   └── Arch::setup_virt_mem()
-                    │       (builds identity + higher-half page tables)
+                    │       (identity + higher-half, NXE+WP, PAT WC)
                     ├── Vmm::activate()
-                    │   (switches CR3 / SATP)
+                    │   (switches CR3 / SATP; ACPI VMM also initted)
                     ├── enable_framebuffer_log()
-                    │   (Console init moved here — after page tables
+                    │   (Console via set_console() — after page tables
                     │    cover framebuffer physical address)
                     ├── CurrentArch::init()
                     │   ├── GDT::init()
@@ -48,20 +53,30 @@ The following dependencies MUST be respected:
                     ├── IOAPIC::init() [x86_64 only]
                     ├── smp::init()
                     │   ├── Arch::discover_cpus()
-                    │   ├── Allocate AP stacks
+                    │   ├── Allocate AP stacks (alloc_contiguous)
+                    │   ├── Configure PerCpu slots
                     │   └── Arch::wake_aps()
                     ├── Arch::enable_interrupts()
                     │
                     ▼
                     Kernel::run()
-                    ├── PCI::init()
-                    ├── AHCI::init() [x86_64 only]
+                    ├── heap::set_phys_allocator() (re-point after move)
+                    ├── IDT protect (.idt section read-only) [x86_64]
+                    ├── PCI::init() (ECAM mapping + bus enumeration)
+                    ├── blockdriver::driver::init_all() [x86_64]
+                    │   └── AHCI + block_devices returned
+                    ├── USB/xHCI::init_all() [x86_64]
                     ├── VFS::init()
                     │   ├── fstypes::register_all()
                     │   ├── Mount tmpfs on A>
-                    │   └── Create tmp/dev
+                    │   └── Mount ESP fat32 on B> [x86_64]
                     ├── module::init_all()
-                    └── Halt loop
+                    │   ├── HelloModule
+                    │   ├── Fat32Test (B>)
+                    │   ├── MsixTest [x86_64]
+                    │   ├── UsbTest [x86_64]
+                    │   └── VfsTest (A>)
+                    └── Halt loop (hlt/wfi)
 ```
 
 ---
@@ -86,7 +101,8 @@ Page-table intermediate frames are allocated from `BitmapAllocator`.
 `init()` (before any heap activity) so that the heap can grow through
 the correct `PHYS_ALLOCATOR` pointer. This prevents stale-pointer
 corruption during `log::info!`, string formatting, or Vec allocations.
-- Location: `kernel/src/lib.rs:` `init()` → `set_phys_allocator()`
+Also re-called at the start of `Kernel::run()` after the final move.
+- Location: `kernel/src/lib.rs:` `init()` → `set_phys_allocator()`, `run()` → `set_phys_allocator()`
 
 **INIT-004 — Physical allocator must exist before heap init:**
 Heap pages are allocated from `BitmapAllocator`.
@@ -114,15 +130,25 @@ APs may generate interrupts that the I/O APIC must route.
 
 **INIT-010 — Page tables must be set up before framebuffer console init:**
 Framebuffer memory must be identity-mapped before `enable_framebuffer_log()`
-creates a `Console` that draws to the framebuffer. Console init was moved
-from `Kernel::new()` to `Kernel::init()` after `switch_to_higher_half()` to
-ensure page tables cover the framebuffer physical address.
+calls `set_console()` with a `Console` that draws to the framebuffer.
+Console init moved from `Kernel::new()` to after `switch_to_higher_half()`.
 - Location: `kernel/src/lib.rs:` `switch_to_higher_half()` then `enable_framebuffer_log()`
 
 **INIT-011 — Interrupts must be enabled after SMP init:**
 AP startup uses IPIs (x86_64) or SBI ecalls (RISC-V). Interrupts are
 enabled only after all CPUs are running.
 - Location: `kernel/src/lib.rs:` `smp::init()` → `enable_interrupts()`
+
+**INIT-011b — `acpi_log::init()` runs first in `Kernel::new()`:**
+Before any allocator or heap initialization, the ACPI log subsystem is
+initialized to capture early boot messages.
+- Location: `kernel/src/lib.rs:88-89`
+
+**INIT-011c — Framebuffer shadow buffer allocated from `BitmapAllocator`:**
+During `Kernel::new()`, a contiguous shadow buffer is allocated from the
+physical allocator (size = `stride * height * bpp`). This provides a
+cacheable drawing surface before page tables map the real framebuffer.
+- Location: `kernel/src/lib.rs:124-132`
 
 **INIT-012 — RSDP discovery must happen before `exit_boot_services`:**
 UEFI config table entries are invalid after boot services end.
@@ -142,12 +168,24 @@ All `Vec` allocations use OS_DATA allocator; `forget` prevents dealloc
 after exit.
 - Location: `boot/src/main.rs:` buffer allocation before `exit_boot_services()`
 
-**INIT-016 — VFS init must happen after PCI and AHCI init:**
-VFS mounts block devices discovered by PCI/AHCI.
-- Location: `kernel/src/lib.rs:` PCI → AHCI → VFS
+**INIT-016 — PCI init must happen before AHCI and xHCI init:**
+AHCI and xHCI device discovery scans the PCI device list built by `pci::init()`.
+- Location: `kernel/src/lib.rs:` PCI → AHCI → xHCI
+
+**INIT-016b — IDT lock-down happens at start of `Kernel::run()`:**
+The `.idt` section is made read-only after all IDT initialization is
+complete, preventing wild writes from corrupting the interrupt table.
+- Location: `kernel/src/lib.rs:284-289`
+
+**INIT-016c — VFS init happens after block driver init:**
+VFS mounts block devices discovered by AHCI. The ESP (first partition on
+first block device) is mounted as `B>` (fat32) after VFS init.
+- Location: `kernel/src/lib.rs:` block drivers → VFS → partition mount
 
 **INIT-017 — Module init runs last:**
 Modules may use VFS, display, and all other initialized subsystems.
+The x86_64 module list includes: `HelloModule`, `Fat32Test`, `MsixTest`,
+`UsbTest`, `VfsTest`. Non-x86_64 targets exclude `MsixTest` and `UsbTest`.
 - Location: `kernel/src/lib.rs:` `init_all()` at end of `run()`
 
 ---

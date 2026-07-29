@@ -1,7 +1,7 @@
 # Common Crate — Invariants
 
-**Version:** 0.2.0
-**Source:** `common/src/types.rs`, `common/src/serial.rs`
+**Version:** 0.3.0
+**Source:** `common/src/types.rs`
 **Status:** Stable — shared protocol between bootloader and kernel
 
 ---
@@ -12,34 +12,36 @@
 All hand-off types (`MemoryRegion`, `FramebufferInfo`, `PixelFormat`) are
 `#[repr(C)]` so the bootloader and kernel (compiled as separate binaries)
 agree on memory layout.
-- Location: `common/src/types.rs:7,15,40`
+- Location: `common/src/types.rs:7,29,93`
 
 **COMMON-002 — MemoryRegionKind covers all UEFI memory types:**
 The enum variants map 1:1 to the UEFI memory types that the kernel needs
 to distinguish. Unknown UEFI types are classified as `Reserved`.
-- Location: `common/src/types.rs:15-26`, `boot/src/main.rs:185-196`
+- Location: `common/src/types.rs:15-26`, `boot/src/main.rs:239-250`
 
 **COMMON-003 — `FramebufferInfo.stride` is pixels, not bytes:**
-`Bytes per row = stride * 4`. This matches UEFI GOP semantics.
-- Location: `common/src/types.rs:35-36`
+`Bytes per row = stride * bpp`. This matches UEFI GOP semantics.
+- Location: `common/src/types.rs:35`
 
-**COMMON-004 — Serial `IoBackend` trait provides register-level abstraction:**
-The same `SerialPort<B>` code drives both x86 port I/O and RISC-V MMIO UART.
-- Location: `common/src/serial.rs:8-11`
+**COMMON-004 — `FramebufferInfo.draw_rect()` is safe on any `FramebufferInfo`:**
+Returns immediately if `address == 0` or `bpp < 3`. Uses volatile stores
+to prevent compiler reordering of pixel writes, respecting `Rgb` vs `Bgr`
+format. Writes `0xFF` to the alpha byte for bpp>=4.
+- Location: `common/src/types.rs:57-91`
 
 ---
 
 ## Safety Invariants
 
 **COMMON-S001 — Port I/O correctness (x86_64 backend):**
+Previously documented at `common/src/serial.rs`. The `IoBackend` abstraction
+now lives in `common/src/serial/` with per-architecture backends.
 The inline asm `in`/`out` instructions are safe to call at any time because
 they only access the 16550 UART at fixed port `0x3F8 + offset`.
-- Location: `common/src/serial.rs:107-121`
 
 **COMMON-S002 — MMIO read/write correctness (RISC-V backend):**
 The volatile reads/writes to `0x10000000 + offset` are safe to call because
 the UART MMIO region is identity-mapped in the page tables.
-- Location: `common/src/serial.rs:138-146`
 
 ---
 
@@ -48,12 +50,15 @@ the UART MMIO region is identity-mapped in the page tables.
 **COMMON-API-001 — `IoBackend::read_reg` / `write_reg`:**
 Called with `offset` values 0..=7 (the 16550 register indices). Callers must
 ensure the underlying hardware is initialized first.
-- Location: `common/src/serial.rs:9-10`
 
-**COMMON-API-002 — `SerialPort<B>::init()`:**
+**COMMON-API-002 — `SerialPort::init()`:**
 Must be called before any other `SerialPort` method. Configures 115200 8N1
 with FIFO enabled.
-- Location: `common/src/serial.rs:31-38`
+
+**COMMON-API-003 — `FramebufferInfo::draw_rect(x, y, w, h, r, g, b)`:**
+Safe to call with any `FramebufferInfo`. No-op if address/bpp are invalid.
+Caller must ensure the framebuffer memory is identity-mapped. Uses volatile
+stores to avoid optimization of display writes.
 
 ---
 
@@ -63,4 +68,4 @@ with FIFO enabled.
   bare-metal RISC-V targets, enforced by the workspace `Cargo.toml`
   dependencies.
 - `PixelFormat::BltOnly` is refused at boot time (no linear framebuffer).
-  See `boot/src/main.rs:234-238`.
+  See `boot/src/main.rs:368-371`.

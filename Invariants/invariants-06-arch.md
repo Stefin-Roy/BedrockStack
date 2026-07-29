@@ -1,6 +1,6 @@
 # Architecture Abstraction — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/arch/mod.rs`
 **Status:** Stable
 
@@ -21,6 +21,8 @@ Called from `Kernel::init()` as the first step after `Kernel::new()`.
 The caller is responsible for `Vmm::activate()` after the Vmm is fully
 built. This allows the caller to stash the root pointer and initialize
 ACPI VMM before switching page tables.
+Passes framebuffer dimensions (phys_addr, height, stride, bpp) so the
+framebuffer region can be mapped with appropriate cache attributes.
 - Location: `kernel/src/arch/mod.rs:33-48`
 
 **ARCH-004 — `discover_cpus()` returns BSP first, APs after:**
@@ -34,7 +36,8 @@ entry is `(hardware_id, enabled)`.
 
 **ARCH-S001 — `Arch::setup_virt_mem` safety:**
 `allocator` must be initialised and have free frames for page-table
-intermediate tables.
+intermediate tables. `layout` must describe the kernel's memory sections
+accurately for W^X enforcement.
 - Location: `kernel/src/arch/mod.rs:39-41`
 
 **ARCH-S002 — `Arch::wake_aps` safety:**

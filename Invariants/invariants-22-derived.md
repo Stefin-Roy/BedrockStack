@@ -1,6 +1,6 @@
 # Derived Properties — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Description:** Higher-level correctness properties that follow from the
 subsystem invariants in files `invariants-01` through `invariants-21`.
 

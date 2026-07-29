@@ -1,6 +1,6 @@
 # tmpfs — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/filesystems/fstypes/{mod,tmpfs}.rs`
 **Status:** Stable
 

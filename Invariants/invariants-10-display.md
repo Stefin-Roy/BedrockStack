@@ -1,8 +1,8 @@
 # Display / Framebuffer — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.2.0 (legacy — superseded by `invariants-10-graphics-framebuffer.md`)
 **Source:** `kernel/src/display/{mod,framebuffer}.rs`
-**Status:** Stable
+**Status:** Legacy — active framebuffer code is in `graphics/Framebuffer/`
 
 ---
 

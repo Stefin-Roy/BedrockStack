@@ -15,7 +15,7 @@ The QEMU virt machine PLIC base address (`0xC000000`) is mapped and
 priority/threshold registers are configured.
 - Location: `kernel/src/platform/riscv_virt/plic.rs`
 
-**PLIC-002 — Hart ID is stored in a global `AtomicUsize`:`
+**PLIC-002 — Hart ID is stored in a global `AtomicUsize`:**
 Used for SBI communication and per-CPU identification.
 - Location: `kernel/src/platform/riscv_virt/plic.rs`
 
@@ -28,7 +28,7 @@ timer interrupts are managed via SBI `set_timer` ecalls.
 
 ### HTIF (Host-Target Interface)
 
-**HTIF-004 — HTIF provides console putchar/getchar on QEMU:`
+**HTIF-004 — HTIF provides console putchar/getchar on QEMU:**
 Alternative to SBI legacy console. Base at `0x40008000` (QEMU virt).
 - Location: `kernel/src/platform/riscv_virt/htif.rs`
 
@@ -55,10 +55,10 @@ Maps PLIC MMIO, configures priority thresholds. Called during
 **PLIC-API-002 — `plic::enable_irq(irq_id, hart_id)`:**
 Enables a specific interrupt for a given hart.
 
-**CLINT-API-001 — `clint::set_timer(stime_value)`:`
+**CLINT-API-001 — `clint::set_timer(stime_value)`:**
 Programs the `mtimecmp` register (or delegates to SBI).
 
-**HTIF-API-001 — `htif::putchar(c)` / `htif::getchar() → i32`:`
+**HTIF-API-001 — `htif::putchar(c)` / `htif::getchar() → i32`:**
 Blocking console I/O.
 
 ---

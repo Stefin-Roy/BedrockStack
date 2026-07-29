@@ -55,16 +55,16 @@ before a new IPI is sent.
 No stray interrupts fire before entries are explicitly configured.
 - Location: `kernel/src/platform/x86_64_pc/ioapic.rs:80-83`
 
-**IOAPIC-002 — I/O APIC registers accessed via volatile MMIO:`
+**IOAPIC-002 — I/O APIC registers accessed via volatile MMIO:**
 MMIO region mapped as RW + NO_CACHE. Read/write sequences use the
 Intel-specified index/data register pair.
 - Location: `kernel/src/platform/x86_64_pc/ioapic.rs:32-51`
 
-**IOAPIC-003 — Redirection entry writes: high DWORD first, then low:`
+**IOAPIC-003 — Redirection entry writes: high DWORD first, then low:**
 Per Intel specification, the low DWORD write triggers the update.
 - Location: `kernel/src/platform/x86_64_pc/ioapic.rs:121-124`
 
-**IOAPIC-004 — Global state behind `Mutex<Option<IoApicState>>`:`
+**IOAPIC-004 — Global state behind `Mutex<Option<IoApicState>>`:**
 All operations lock the global mutex. `enable_irq` returns `None` if
 GSI not managed by this IOAPIC or if vectors exhausted.
 - Location: `kernel/src/platform/x86_64_pc/ioapic.rs:30,96-98,101-107`

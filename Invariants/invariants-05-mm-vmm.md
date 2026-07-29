@@ -1,6 +1,6 @@
 # Virtual Memory Manager — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/mm/vmm/mod.rs`, `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/mm/vmm/riscv64.rs`
 **Status:** Stable
 
@@ -9,25 +9,26 @@
 ## State Invariants
 
 **VMM-001 — Page-aligned mapping:**
-All `map` calls require `vaddr` and `paddr` to be 4 KiB-aligned.
-`map_2m` requires 2 MiB alignment. Panics on violation.
-- Location: `kernel/src/mm/vmm/mod.rs:116-117,137-138`
+`map_4k` requires `vaddr` and `paddr` to be 4 KiB-aligned. `map_2m` requires
+2 MiB alignment. `map()` delegates to both, auto-selecting page size. Panics
+on misalignment.
+- Location: `kernel/src/mm/vmm/mod.rs:114-148`
 
 **VMM-002 — No double-map:**
 Mapping an already-mapped page panics. The arch-specific walkers assert
 that the target PTE is not present before writing.
-- Location: `kernel/src/mm/vmm/mod.rs:108`
+- Location: `kernel/src/mm/vmm/mod.rs:112`
 
 **VMM-003 — `map()` auto-selects 2 MiB vs 4 KiB pages:**
 When both ends are 2 MiB-aligned and `remaining >= 2 MiB`, huge pages are
-used. The remainder uses 4 KiB pages.
-- Location: `kernel/src/mm/vmm/mod.rs:170-184`
+used via `map_2m`. The remainder uses 4 KiB pages via `map_4k`.
+- Location: `kernel/src/mm/vmm/mod.rs:158-190`
 
-**VMM-004 — Higher-half alias at `KERNEL_VMA_BASE`:**
-The kernel image is also mapped at `KERNEL_VMA_BASE + phys_addr` for each
+**VMM-004 — Higher-half alias at `KERNEL_VMA_BASE` (0xFFFFFF8000000000):**
+The kernel image is mapped at `KERNEL_VMA_BASE + phys_addr` for each
 4 KiB page, with identical permissions. This provides a kernel-space view
 without changing the linker script.
-- Location: `kernel/src/mm/vmm/mod.rs:74`
+- Location: `kernel/src/mm/vmm/mod.rs:79`, `kernel/src/arch/x86_64/paging.rs:129-134`
 
 **VMM-005 — VMM manages intermediate page-table frames:**
 When creating page-table entries, the arch-specific code allocates frames
@@ -41,7 +42,14 @@ from `BitmapAllocator` for intermediate tables. These frames are never freed
 No hardcoded 4 GiB minimum. If the framebuffer sits above `ram_end`, it is
 identity-mapped as a separate extension with `WRITE_COMBINING` (x86_64) or
 `NO_CACHE` (RISC-V).
-- Location: `kernel/src/arch/x86_64/paging.rs:36-38`, `kernel/src/arch/riscv64/paging.rs`
+- Location: `kernel/src/arch/x86_64/paging.rs:55-58`, `kernel/src/arch/riscv64/paging.rs`
+
+**VMM-007 — `init_pat_wc` and `make_read_only_both` are re-exported:**
+`init_pat_wc()` (programs PAT MSR entry 1 as WC) is re-exported at
+`vmm::init_pat_wc`. `make_read_only_both()` is re-exported at
+`vmm::make_read_only_both` for making kernel pages read-only in both
+identity and higher-half mappings.
+- Location: `kernel/src/mm/vmm/mod.rs:14,16`
 
 ---
 
@@ -49,7 +57,7 @@ identity-mapped as a separate extension with `WRITE_COMBINING` (x86_64) or
 
 **VMM-S001 — `Vmm::new` safety:**
 Allocates one zeroed frame from the allocator. The frame must not be in use.
-- Location: `kernel/src/mm/vmm/mod.rs:85-91`
+- Location: `kernel/src/mm/vmm/mod.rs:90-97`
 
 **VMM-S002 — `Vmm::activate` safety:**
 Must be called after the page table is fully built and before any code
@@ -63,31 +71,46 @@ relies on the new mappings. On x86_64, loads CR3. On RISC-V, writes SATP.
 **VMM-API-001 — `Vmm::new(alloc)` → `Vmm`:**
 Returns a `Vmm` with a single zeroed root table frame. Panics if allocator
 is exhausted.
+- Location: `kernel/src/mm/vmm/mod.rs:90-97`
 
 **VMM-API-002 — `Vmm::from_root(root)` → `Vmm`:**
 Wraps an existing root frame (no allocation). Used by ACPI and PCI VMMs
 that share the kernel page table root.
+- Location: `kernel/src/mm/vmm/mod.rs:100-102`
 
 **VMM-API-003 — `Vmm::map(alloc, vaddr, paddr, size, flags)`:**
 Maps a contiguous `[vaddr, vaddr+size)` to `[paddr, paddr+size)`.
 All arguments must be page-aligned, `size > 0`, `size` page-aligned.
-Panics on double-map or OOM for intermediate tables.
+Panics on double-map or OOM for intermediate tables. Auto-selects 2 MiB
+vs 4 KiB pages.
+- Location: `kernel/src/mm/vmm/mod.rs:158-190`
 
-**VMM-API-004 — `Vmm::unmap(alloc, vaddr, size)`:**
+**VMM-API-004 — `Vmm::map_4k(alloc, vaddr, paddr, flags)`:**
+Maps a single 4 KiB page. Panics if already mapped or OOM.
+- Location: `kernel/src/mm/vmm/mod.rs:114-127`
+
+**VMM-API-005 — `Vmm::map_2m(alloc, vaddr, paddr, flags)`:**
+Maps a single 2 MiB huge page. Panics on alignment violation or OOM.
+- Location: `kernel/src/mm/vmm/mod.rs:135-148`
+
+**VMM-API-006 — `Vmm::unmap(alloc, vaddr, size)`:**
 Unmaps 4 KiB pages. Intermediate tables are NOT freed (leaked intentionally
-for simplicity).
+for simplicity). `unmap_4k()` unmaps a single page, returning `false` if
+not mapped.
+- Location: `kernel/src/mm/vmm/mod.rs:197-214`
 
-**VMM-API-005 — `Vmm::translate(vaddr)` → `Option<u64>`:**
+**VMM-API-007 — `Vmm::translate(vaddr)` → `Option<u64>`:**
 Walks the page table without TLB lookups. Returns the physical address or
 `None` if not mapped.
+- Location: `kernel/src/mm/vmm/mod.rs:220-225`
 
-**VMM-API-006 — `PageFlags` encoding:**
+**VMM-API-008 — `PageFlags` encoding:**
 `READ=1, WRITE=2, EXECUTE=4, NO_CACHE=8, USER=16, WRITE_COMBINING=32`.
 Translated to native PTE bits inside each arch module.
 On x86_64, `WRITE_COMBINING` sets `PWT=1, PCD=0, PAT=0` (PAT index 1),
 requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 `init_pat_wc()` before any such mapping is created.
-- Location: `kernel/src/mm/vmm/mod.rs:30-34`, `kernel/src/mm/vmm/x86_64.rs`
+- Location: `kernel/src/mm/vmm/mod.rs:33-39`, `kernel/src/mm/vmm/x86_64.rs`
 
 ---
 
@@ -104,3 +127,5 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 - On x86_64, `WRITE_COMBINING` requires PAT programming (`init_pat_wc()`)
   before any page with that flag is mapped. This is done at the start of
   `paging::setup()`, before any identity-map entries are created.
+- `KERNEL_VMA_BASE = 0xFFFFFF8000000000` provides the higher-half view
+  of the kernel image.

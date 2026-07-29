@@ -1,6 +1,6 @@
 # Kernel Fault Dump — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/kerneldump/{mod,dump,disasm}.rs`
 **Status:** Stable (x86_64 only)
 
@@ -25,6 +25,14 @@ This ensures diagnostics work for framebuffers and PCIe MMIO above 4 GiB.
 **DUMP-003 — Disassembler covers x86_64 common instructions:**
 `kernel/src/kerneldump/disasm.rs` implements a simple decoder capable
 of printing the bytes around the faulting RIP.
+
+**DUMP-004 — Dump output uses `drivers::serial::dump_*` lock-free functions:**
+All dump output goes through `dump_puts()`, `dump_put_hex()`, etc. which
+bypass the normal two-level serial spinlock. This is safe because the
+fault handler runs on a single CPU with interrupts disabled, guaranteeing
+no concurrent serial access.
+- Location: `kernel/src/kerneldump/dump.rs:13`
+- Also used by: `arch/x86_64/idt.rs` (divide-error/#GP pre-dump), `platform/x86_64_pc/apic.rs` (timeout BUG), `filesystems/fstypes/fat32/` (debug trace)
 
 ---
 

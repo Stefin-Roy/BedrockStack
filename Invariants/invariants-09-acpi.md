@@ -1,6 +1,6 @@
 # ACPI Subsystem — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs`
 **Status:** Stable
 

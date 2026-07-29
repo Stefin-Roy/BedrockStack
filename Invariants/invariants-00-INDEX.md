@@ -1,9 +1,9 @@
 # BedrockOS Invariants — Index
 
-**Version:** 0.3.0
-**Date:** 2026-07-24
+**Version:** 0.4.0
+**Date:** 2026-07-29
 **Status:** All subsystems documented — MM, Arch (x86_64, RISC-V), ACPI, Display, PCI, Platform,
-Module, Drivers, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition
+Module, Drivers, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
 
 ---
 
@@ -32,19 +32,20 @@ Rust module hierarchy under `kernel/src/`.
 | 09 | `invariants-09-acpi.md` | ACPI subsystem | `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs` |
 | 10 | `invariants-10-display.md` | Display / framebuffer (legacy) | `kernel/src/display/{mod,framebuffer}.rs` |
 | 10g | `invariants-10-graphics-framebuffer.md` | Graphics framebuffer (active) | `graphics/Framebuffer/src/{display,framebuffer,console,color}.rs` |
-| 11 | `invariants-11-module.md` | Module system | `kernel/src/module/{mod,registry,vfs_test}.rs` |
+| 11 | `invariants-11-module.md` | Module system | `kernel/src/module/{mod,registry,fat32_test,msix_test,usb_test,vfs_test}.rs` |
 | 12 | `invariants-12-pci.md` | PCI subsystem | `kernel/src/pci/{mod,ecam,enumerate}.rs` |
 | 13 | `invariants-13-platform-x86_64.md` | x86_64 platform | `kernel/src/platform/x86_64_pc/{apic,ioapic,pit}.rs` |
 | 14 | `invariants-14-platform-riscv64.md` | RISC-V platform | `kernel/src/platform/riscv_virt/{plic,clint,htif}.rs` |
-| 15 | `invariants-15-drivers-serial.md` | Serial driver | `kernel/src/drivers/serial.rs` |
+| 15 | `invariants-15-drivers-serial.md` | Serial driver (+ display_log) | `kernel/src/drivers/serial.rs` |
 | 16 | `invariants-16-fs-vfs.md` | VFS core | `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types}.rs` |
 | 17 | `invariants-17-fs-tmpfs.md` | tmpfs | `kernel/src/filesystems/fstypes/{mod,tmpfs}.rs` |
 | 18 | `invariants-18-fs-ahci.md` | AHCI block driver | `kernel/src/filesystems/blockdriver/{mod,traits,ahci}.rs` |
 | 19 | `invariants-19-fs-partition.md` | Partition tables (MBR/GPT) + FAT32 BPB | `kernel/src/filesystems/partition/{mod,mbr,gpt}.rs`, `kernel/src/filesystems/fstypes/fat32.rs` |
 | 19s | `invariants-19-smp.md` | SMP | `kernel/src/smp/mod.rs` |
 | 20 | `invariants-20-kerneldump.md` | Fault dump | `kernel/src/kerneldump/{mod,dump,disasm}.rs` |
-| 21 | `invariants-21-init-sequence.md` | Boot ordering | `kernel/src/lib.rs`, `kernel/src/main.rs` |
+| 21 | `invariants-21-init-sequence.md` | Boot ordering (incl. xHCI, USB, ESP mount) | `kernel/src/lib.rs`, `kernel/src/main.rs` |
 | 22 | `invariants-22-derived.md` | Derived properties | All |
+| 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,dma,xhci/{mod,registers,memory,event,command,device,ports},usb/{mod,descriptors}}.rs` |
 
 ---
 
@@ -93,6 +94,7 @@ When modifying code, verify that relevant invariants still hold:
 - [ ] **VFS**: IrqMutex discipline, dentry/inode lifetime, dcache consistency
 - [ ] **TMPFS**: atomic counter, per-inode locking, no deadlock
 - [ ] **AHCI**: DMA safety, MMIO ordering, PRDT bounds, timeout handling, NCQ vs non-NCQ FIS selection
+- [ ] **USB/xHCI**: MMIO mapping, event ring/TRB management, IRQ handling, device enumeration
 - [ ] **FAT**: BPB discriminant validation (RootEntCnt, FATSz16, FATSz32), per-field bounds checks
 - [ ] **PCI**: ECAM VMM, read/write alignment, device enumeration
 - [ ] **KERNELDUMP**: re-entrancy guard, NMI safety

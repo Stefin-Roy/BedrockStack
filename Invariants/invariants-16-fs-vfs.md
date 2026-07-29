@@ -1,6 +1,6 @@
 # VFS Core — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
 **Source:** `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types,error}.rs`
 **Status:** Stable
 
@@ -153,8 +153,8 @@ statistics via `statfs()`.
 
 ## Design Notes
 
-- VFS currently only supports `tmpfs`. Block-backed filesystems are for
-  future implementation.
+- VFS supports `tmpfs` (always) and `fat32` (x86_64, via the ESP/block device).
+  The ESP is mounted on `B>` during `Kernel::run()`.
 - `/dev` is not populated; no device special file type exists. Console
   I/O goes through `SerialPort` and `Framebuffer` directly, not through VFS.
 - Standard FDs 0/1/2 are placeholder files in `A>tmp/`. They will be
