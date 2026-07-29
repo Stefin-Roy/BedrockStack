@@ -4,6 +4,7 @@ pub mod command;
 pub mod event;
 pub mod ports;
 pub mod device;
+pub mod context;
 
 use crate::pci::PciDevice;
 use crate::usb::dma::{DmaBuffer, UsbDmaAllocator};
@@ -198,7 +199,7 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<(), &'s
         SerialPort::puts("\n");
     }
 
-    let _ = enumerate_initial_ports(&mut usb_ports, &cmd_ring, dma,
+    let _ = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
         regs.doorbell_va(), er_buf.virt, er_buf.trb_count as u32, max_slots);
 
     // Verify message-interrupt delivery with a No-Op command.
@@ -529,19 +530,25 @@ fn setup_interrupts(
 
 fn enumerate_initial_ports(
     usb_ports: &mut ports::UsbPorts,
-    _cmd_ring: &memory::TrbRing,
-    _dma: &mut UsbDmaAllocator,
-    _doorbell_va: u64,
+    cmd_ring: &mut memory::TrbRing,
+    dma: &mut UsbDmaAllocator,
+    doorbell_va: u64,
     _er_vaddr: u64,
     _er_trb_count: u32,
     _max_slots: u8,
 ) -> Result<(), &'static str> {
-    use crate::drivers::serial::SerialPort;
+    use crate::usb::xhci::device::DeviceSlotManager;
+    let mut mgr = DeviceSlotManager::new();
     for port in &usb_ports.ports {
         if port.enabled && port.connected {
-            SerialPort::puts("[xhci]  port ");
-            SerialPort::put_u64(port.port_num as u64);
-            SerialPort::puts(": device ready\n");
+            if let Err(e) = mgr.enumerate_port(cmd_ring, doorbell_va, dma, port.port_num, port.speed) {
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[xhci]  port ");
+                SerialPort::put_u64(port.port_num as u64);
+                SerialPort::puts(" enum failed: ");
+                SerialPort::puts(e);
+                SerialPort::puts("\n");
+            }
         }
     }
     Ok(())

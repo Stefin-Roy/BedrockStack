@@ -79,6 +79,7 @@ pub fn read_event_completion_at(trb_va: u64) -> (u32, u8, u8, u32) {
 }
 
 static LAST_CMD_STATE: AtomicU64 = AtomicU64::new(0);
+static LAST_TRANSFER_STATE: AtomicU64 = AtomicU64::new(0);
 
 pub fn consume_pending_events() {
     let er_vaddr = XHCI_ER_VADDR.load(Ordering::Relaxed);
@@ -104,8 +105,7 @@ pub fn consume_pending_events() {
                 let param = unsafe { core::ptr::read_volatile(trb_va as *const u64) };
                 let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
                 let cc = (status >> 24) as u8;
-                let slot_id = ((status >> 8) & 0xFF) as u8;
-                // Atomically publish all three fields with the seen flag (bit 63).
+                let slot_id = ((control >> 24) & 0xFF) as u8;
                 let state = (slot_id as u64) | ((cc as u64) << 8) | ((param as u64) << 16) | (1u64 << 63);
                 LAST_CMD_STATE.store(state, Ordering::Release);
             }
@@ -116,7 +116,20 @@ pub fn consume_pending_events() {
                 SerialPort::put_u64(port_id);
                 SerialPort::puts("\n");
             }
-            37 | 32 => {}
+            32 => {
+                let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
+                let cc = (status >> 24) as u8;
+                let remaining = status & 0xFFFFFF;
+                let slot_id = ((control >> 24) & 0xFF) as u8;
+                let ep_id = ((control >> 16) & 0x1F) as u8;
+                let state = (slot_id as u64) << 48
+                    | (ep_id as u64) << 40
+                    | (cc as u64) << 32
+                    | (remaining as u64)
+                    | (1u64 << 63);
+                LAST_TRANSFER_STATE.store(state, Ordering::Release);
+            }
+            37 => {}
             _ => {}
         }
 
@@ -158,6 +171,19 @@ pub fn last_command_completion() -> Option<(u8, u8, u32)> {
         let cc = (state >> 8) as u8;
         let param = (state >> 16) as u32;
         Some((slot, cc, param))
+    } else {
+        None
+    }
+}
+
+pub fn last_transfer_completion() -> Option<(u8, u8, u8, u32)> {
+    let state = LAST_TRANSFER_STATE.swap(0, Ordering::AcqRel);
+    if state & (1u64 << 63) != 0 {
+        let slot_id = (state >> 48) as u8;
+        let ep_id = (state >> 40) as u8;
+        let cc = (state >> 32) as u8;
+        let remaining = state as u32;
+        Some((slot_id, ep_id, cc, remaining))
     } else {
         None
     }

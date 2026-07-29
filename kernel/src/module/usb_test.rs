@@ -6,6 +6,7 @@ use crate::usb::usb;
 use crate::usb::usb::descriptors;
 use crate::usb::xhci::memory::{self, Trb, InputControlContext};
 use crate::usb::xhci::device::UsbDevice;
+use crate::usb::xhci::context;
 use super::Module;
 
 static PASS: AtomicU32 = AtomicU32::new(0);
@@ -445,6 +446,57 @@ fn test_usb_device_speed_max_packet() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn test_init_icc_for_address_device() -> Result<(), &'static str> {
+    let mut icc = InputControlContext::new_slot();
+    context::init_icc_for_address_device(&mut icc, 3, 1, 64, 0x10000);
+
+    if icc.add_flags != 0x3 {
+        return Err("add_flags should be 0x3");
+    }
+    if icc.drop_flags != 0 {
+        return Err("drop_flags should be 0");
+    }
+
+    let entries = (icc.slot_context[0] >> 27) & 0x1F;
+    let dw1 = icc.slot_context[1];
+    let speed = (dw1 >> 24) & 0xF;
+    let port_num = (dw1 >> 16) & 0xFF;
+    if speed != 3 {
+        return Err("slot speed wrong");
+    }
+    if port_num != 1 {
+        return Err("slot port_num wrong");
+    }
+    if entries != 1 {
+        return Err("slot entries wrong");
+    }
+
+    let ep_dw1 = icc.ep_contexts[0][1];
+    let mps = (ep_dw1 >> 16) & 0xFFFF;
+    let ep_type = (ep_dw1 >> 3) & 0x7;
+    let cerr = (ep_dw1 >> 1) & 0x3;
+    if mps != 64 {
+        return Err("EP0 MPS wrong");
+    }
+    if ep_type != 0 {
+        return Err("EP0 type not control");
+    }
+    if cerr != 3 {
+        return Err("EP0 CErr wrong");
+    }
+
+    if icc.ep_contexts[0][2] & 1 != 1 {
+        return Err("EP0 DCS not set");
+    }
+
+    let dw4 = icc.ep_contexts[0][4];
+    if dw4 & 0xFFFF != 8 {
+        return Err("EP0 avg_trb_len wrong");
+    }
+
+    Ok(())
+}
+
 pub struct UsbTest;
 
 impl Module for UsbTest {
@@ -489,6 +541,7 @@ impl Module for UsbTest {
         t!("trb_flag_constants", test_trb_flag_constants());
         t!("event_completion_codes", test_event_completion_constants());
         t!("input_control_ctx", test_input_control_context());
+        t!("icc_address_device", test_init_icc_for_address_device());
         t!("usb_device_create", test_usb_device_creation());
         t!("usb_device_speed_mps", test_usb_device_speed_max_packet());
 
