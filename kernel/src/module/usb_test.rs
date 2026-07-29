@@ -5,7 +5,6 @@ use crate::drivers::serial::SerialPort;
 use crate::usb::usb;
 use crate::usb::usb::descriptors;
 use crate::usb::xhci::memory::{self, Trb, InputControlContext};
-use crate::usb::xhci::device::UsbDevice;
 use crate::usb::xhci::context;
 use super::Module;
 
@@ -425,30 +424,9 @@ fn test_input_control_context() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn test_usb_device_creation() -> Result<(), &'static str> {
-    let dev = UsbDevice::new(1, 3, usb::SPEED_SS);
-    if dev.slot_id != 1 { return Err("slot_id wrong"); }
-    if dev.port_num != 3 { return Err("port_num wrong"); }
-    if dev.speed != usb::SPEED_SS { return Err("speed wrong"); }
-    if dev.max_packet_size0 != 512 { return Err("SS max_packet should be 512"); }
-    Ok(())
-}
-
-fn test_usb_device_speed_max_packet() -> Result<(), &'static str> {
-    let ls = UsbDevice::new(1, 1, usb::SPEED_LS);
-    if ls.max_packet_size0 != 8 { return Err("LS max_packet should be 8"); }
-    let fs = UsbDevice::new(2, 1, usb::SPEED_FS);
-    if fs.max_packet_size0 != 64 { return Err("FS max_packet should be 64"); }
-    let hs = UsbDevice::new(3, 1, usb::SPEED_HS);
-    if hs.max_packet_size0 != 64 { return Err("HS max_packet should be 64"); }
-    let ss = UsbDevice::new(4, 1, usb::SPEED_SS);
-    if ss.max_packet_size0 != 512 { return Err("SS max_packet should be 512"); }
-    Ok(())
-}
-
 fn test_init_icc_for_address_device() -> Result<(), &'static str> {
     let mut icc = InputControlContext::new_slot();
-    context::init_icc_for_address_device(&mut icc, 3, 1, 64, 0x10000);
+    context::init_icc_for_address_device(&mut icc, 3, 1, 64, 0x10000, 1);
 
     if icc.add_flags != 0x3 {
         return Err("add_flags should be 0x3");
@@ -542,8 +520,6 @@ impl Module for UsbTest {
         t!("event_completion_codes", test_event_completion_constants());
         t!("input_control_ctx", test_input_control_context());
         t!("icc_address_device", test_init_icc_for_address_device());
-        t!("usb_device_create", test_usb_device_creation());
-        t!("usb_device_speed_mps", test_usb_device_speed_max_packet());
 
         let p = PASS.load(Ordering::Relaxed);
         let s = SKIP.load(Ordering::Relaxed);

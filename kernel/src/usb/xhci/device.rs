@@ -9,26 +9,6 @@ use crate::usb::xhci::context::{self, EndpointConfig};
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing, InputControlContext};
 
-pub struct UsbDevice {
-    pub slot_id: u8,
-    pub port_num: u8,
-    pub speed: u8,
-    pub max_packet_size0: u16,
-}
-
-impl UsbDevice {
-    pub fn new(slot_id: u8, port_num: u8, speed: u8) -> Self {
-        let max_pkt: u16 = match speed {
-            usb::SPEED_LS => 8,
-            usb::SPEED_FS => 64,
-            usb::SPEED_HS => 64,
-            usb::SPEED_SS => 512,
-            _ => 64,
-        };
-        UsbDevice { slot_id, port_num, speed, max_packet_size0: max_pkt }
-    }
-}
-
 pub struct DeviceSlot {
     pub slot_id: u8,
     pub port_num: u8,
@@ -224,7 +204,7 @@ pub fn get_config_descriptor_full(
         bulk_in_dci: 0, bulk_out_dci: 0,
         bulk_in_mps: 0, bulk_out_mps: 0,
     };
-    let mut ifaces = [zero; 4];
+    let mut ifaces = [zero; 8];
     let mut iface_count: u8 = 0;
     let mut cur_iface_num: u8 = 0;
     let mut cur_alt_setting: u8 = 0;
@@ -351,9 +331,17 @@ pub fn configure_device(
     doorbell_va: u64,
     dma: &mut UsbDmaAllocator,
 ) -> Result<(), &'static str> {
+    // Per xHCI §4.8.1, SET_CONFIGURATION to the USB device MUST precede
+    // the Configure Endpoint command to the xHC.
+    if slot.config_value != 0 {
+        let setup = SetupPacket::set_configuration(slot.config_value);
+        submit_control(slot, doorbell_va, &setup, 0, 0, false)?;
+    }
+
     let icc = unsafe { &mut *(slot.icc_va as *mut InputControlContext) };
     *icc = InputControlContext::new_slot();
 
+    let mut ring_pairs: Vec<(u8, TrbRing)> = Vec::new();
     let mut endpoints: Vec<EndpointConfig> = Vec::new();
 
     if slot.bulk_out_dci != 0 {
@@ -369,7 +357,7 @@ pub fn configure_device(
             max_burst: 0,
             interval: 0,
         });
-        slot.ep_rings.push((dci, ring));
+        ring_pairs.push((dci, ring));
     }
 
     if slot.bulk_in_dci != 0 {
@@ -385,17 +373,15 @@ pub fn configure_device(
             max_burst: 0,
             interval: 0,
         });
-        slot.ep_rings.push((dci, ring));
+        ring_pairs.push((dci, ring));
     }
 
-    context::init_icc_for_configure_endpoint(icc, slot.speed, slot.port_num, slot.mps, slot.ep0_ring.phys, &endpoints);
+    // Only push to slot.ep_rings once all allocations succeeded.
+    slot.ep_rings.extend(ring_pairs);
+
+    context::init_icc_for_configure_endpoint(icc, slot.speed, slot.port_num, slot.address, slot.mps, slot.ep0_ring.phys, &endpoints);
 
     command::submit_configure_endpoint(cmd_ring, doorbell_va, slot.icc_phys, slot.slot_id, false)?;
-
-    if slot.config_value != 0 {
-        let setup = SetupPacket::set_configuration(slot.config_value);
-        submit_control(slot, doorbell_va, &setup, 0, 0, false)?;
-    }
 
     SerialPort::puts("[xhci]  configured slot=");
     SerialPort::put_u64(slot.slot_id as u64);
@@ -422,6 +408,9 @@ pub fn submit_bulk(
     data_phys: u64,
     data_len: u32,
 ) -> Result<(), &'static str> {
+    if data_len > 65536 {
+        return Err("bulk xfer exceeds 64 KiB per TRB");
+    }
     let trb = memory::make_normal_trb(data_phys, data_len);
     ring.enqueue(&trb);
     ring.flush();
@@ -475,50 +464,57 @@ impl DeviceSlotManager {
 
         let icc_buf = dma.alloc_page().ok_or("OOM for ICC")?;
         let desc_buf = dma.alloc_page().ok_or("OOM for desc")?;
-
         let ep0_ring = TrbRing::new(dma, 4096)?;
 
         let bsr = speed == usb::SPEED_FS;
-        let mps_bsr: u16 = if bsr {
-            8
+
+        // Phase 1: Address Device.  For Full-Speed, use BSR (MPS=8, address=0)
+        // per USB 2.0 §9.3.1.  For other speeds, use known MPS and the real
+        // address.
+        let (mps, address) = if bsr {
+            (8u16, 0u8)
         } else {
-            match speed {
+            let mps = match speed {
                 usb::SPEED_LS => 8,
                 usb::SPEED_HS => 64,
                 usb::SPEED_SS => 512,
                 _ => 64,
-            }
+            };
+            (mps, self.next_address)
         };
 
         let icc = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
         *icc = InputControlContext::new_slot();
-        context::init_icc_for_address_device(icc, speed, port_num, mps_bsr, ep0_ring.phys);
-
-        let address = self.next_address;
+        context::init_icc_for_address_device(icc, speed, port_num, mps, ep0_ring.phys, address);
         command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, bsr)?;
 
-        let mps = if bsr { 8 } else { mps_bsr };
         let mut slot = DeviceSlot::new(
-            slot_id,
-            port_num,
-            speed,
-            mps,
-            icc_buf.phys,
-            icc_buf.virt,
-            ep0_ring,
-            address,
+            slot_id, port_num, speed, mps,
+            icc_buf.phys, icc_buf.virt, ep0_ring, address,
         );
 
-        get_device_descriptor(&mut slot, doorbell_va, desc_buf.phys, desc_buf.virt)?;
-
         if bsr {
-            let desc_mps_raw = unsafe { core::ptr::read_volatile((icc_buf.virt + 7) as *const u8) };
-            let desc_mps = if desc_mps_raw < 8 { 8 } else { desc_mps_raw as u16 };
+            // Read first 8 bytes of device descriptor to discover bMaxPacketSize0
+            // (USB 2.0 §9.4.3).  Reading 18 bytes with unknown MPS is unsafe — the
+            // xHC may mishandle the split transfer on some implementations.
+            let setup8 = SetupPacket::get_descriptor(usb::DESC_DEVICE, 0, 0, 8);
+            submit_control(&mut slot, doorbell_va, &setup8, desc_buf.phys, 8, true)?;
+            let desc_mps_raw = unsafe { core::ptr::read_volatile((desc_buf.virt + 7) as *const u8) };
+            let real_mps = if desc_mps_raw < 8 { 8 } else { desc_mps_raw as u16 };
+
+            // Re-address with correct MPS and real device address (BSR=0).
             let icc2 = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
             *icc2 = InputControlContext::new_slot();
-            context::init_icc_for_address_device(icc2, speed, port_num, desc_mps, slot.ep0_ring.phys);
+            context::init_icc_for_address_device(icc2, speed, port_num, real_mps, slot.ep0_ring.phys, self.next_address);
             command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, false)?;
-            slot.mps = desc_mps;
+            slot.address = self.next_address;
+            slot.mps = real_mps;
+
+            // Read full 18-byte descriptor for vendor/product IDs.
+            get_device_descriptor(&mut slot, doorbell_va, desc_buf.phys, desc_buf.virt)?;
+        } else {
+            // Non-BSR path: MPS is known from speed table, read full descriptor.
+            get_device_descriptor(&mut slot, doorbell_va, desc_buf.phys, desc_buf.virt)?;
         }
 
         self.next_address += 1;

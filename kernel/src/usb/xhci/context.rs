@@ -29,8 +29,9 @@ pub struct EndpointConfig {
     pub interval: u8,
 }
 
-fn init_slot_context(ctx: &mut [u32; 8], speed: u8, port_num: u8, context_entries: u8) {
-    ctx[0] = (context_entries as u32) << SLOT_CTX_ENTRIES_SHIFT;
+fn init_slot_context(ctx: &mut [u32; 8], speed: u8, port_num: u8, context_entries: u8, address: u8) {
+    ctx[0] = (context_entries as u32) << SLOT_CTX_ENTRIES_SHIFT
+        | (address as u32) << 24;
     ctx[1] = (port_num as u32) << SLOT1_PORT_NUM_SHIFT
         | (speed as u32) << SLOT1_SPEED_SHIFT;
     for i in 2..8 {
@@ -77,10 +78,11 @@ pub fn init_icc_for_address_device(
     port_num: u8,
     mps: u16,
     dequeue_phys: u64,
+    address: u8,
 ) {
     icc.drop_flags = 0;
     icc.add_flags = 0x3;
-    init_slot_context(&mut icc.slot_context, speed, port_num, 1);
+    init_slot_context(&mut icc.slot_context, speed, port_num, 1, address);
     init_ep0_context(&mut icc.ep_contexts[0], mps, dequeue_phys, 3, 8);
 }
 
@@ -88,6 +90,7 @@ pub fn init_icc_for_configure_endpoint(
     icc: &mut InputControlContext,
     speed: u8,
     port_num: u8,
+    address: u8,
     ep0_mps: u16,
     ep0_dequeue_phys: u64,
     endpoints: &[EndpointConfig],
@@ -101,7 +104,7 @@ pub fn init_icc_for_configure_endpoint(
         }
         icc.add_flags |= 1u32 << (ep.dci as u32);
     }
-    init_slot_context(&mut icc.slot_context, speed, port_num, max_dci);
+    init_slot_context(&mut icc.slot_context, speed, port_num, max_dci, address);
     init_ep0_context(&mut icc.ep_contexts[0], ep0_mps, ep0_dequeue_phys, 3, 8);
     for ep in endpoints {
         let ep_index = (ep.dci - 1) as usize;
