@@ -34,16 +34,13 @@ impl BitmapAllocator {
     /// # Safety
     /// - bitmap_region is a valid (base, size) pair within a Usable region
     /// - memory_map is valid and describes physical memory
-    /// Find the highest physical address of any Usable memory region.
     fn find_max_addr(memory_map: &[MemoryRegion]) -> u64 {
-        let mut max_addr = 0u64;
-        for region in memory_map {
-            if region.kind == MemoryRegionKind::Usable {
-                let end = region.base.saturating_add(region.size);
-                if end > max_addr { max_addr = end; }
-            }
-        }
-        max_addr
+        memory_map
+            .iter()
+            .filter(|r| r.kind == MemoryRegionKind::Usable)
+            .map(|r| r.base.saturating_add(r.size))
+            .max()
+            .unwrap_or(0)
     }
 
     pub unsafe fn new(
@@ -56,6 +53,18 @@ impl BitmapAllocator {
         let (region_base, region_size) = bitmap_region;
         assert!(region_size > 0, "no usable memory region for bitmap");
         let region_end = region_base + region_size;
+
+        for r in memory_map {
+            SerialPort::puts("[mmap] base=");
+            SerialPort::put_hex(r.base);
+            SerialPort::puts(" size=");
+            SerialPort::put_hex(r.size);
+            SerialPort::puts(" end=");
+            SerialPort::put_hex(r.base.saturating_add(r.size));
+            SerialPort::puts(" kind=");
+            SerialPort::put_u64(r.kind as u64);
+            SerialPort::puts("\n");
+        }
 
         let max_addr = Self::find_max_addr(memory_map);
         let total_frames = (max_addr as usize + 4095) / 4096;
@@ -120,19 +129,12 @@ impl BitmapAllocator {
         }
     }
 
-    /// Highest physical address managed by this allocator (exclusive).
+    /// Highest physical address of any usable region (exclusive).
     ///
-    /// Used by virtual-memory setup to ensure all managed RAM is mapped.
-    pub fn managed_end(&self) -> u64 {
-        (self.total_frames as u64) * 4096
-    }
-
-    /// Highest address backed by *physical RAM* that this allocator can hand
-    /// out (exclusive). This is the true end of usable memory, NOT the end of
-    /// the address space (which can be terabytes due to huge MMIO/address-
-    /// space holes). Page-table mapping must be bounded by this, otherwise we
-    /// would try to fabricate page tables for address ranges that have no real
-    /// RAM behind them.
+    /// This is the top of the last usable RAM chunk, NOT the end of a contiguous
+    /// block. The bitmap may cover holes between usable regions, but the page-table
+    /// mapper must map from 0 to this bound to make all allocatable frames accessible.
+    /// Holes (PCI MMIO, framebuffer, etc.) are managed by never clearing their bits.
     pub fn alloc_end(&self) -> u64 {
         self.alloc_end
     }

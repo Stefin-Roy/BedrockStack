@@ -172,16 +172,7 @@ fn main() -> Status {
         if desc.page_count == 0 {
             continue;
         }
-        // SAFETY/ROBUSTNESS: OVMF/QEMU commonly report gigantic "conventional"
-        // regions in the high address space (e.g. 12 GiB @ 0xfd00000000) that are
-        // NOT backed by real RAM. Mapping or allocating from them makes the kernel
-        // fabricate page tables for nonexistent memory. On real hardware these
-        // >4 GiB regions are genuine RAM — we only filter them under hypervisors
-        // (detected via CPUID hypervisor bit).
-        #[cfg(target_arch = "x86_64")]
-        if is_hypervisor() && desc.ty == MemoryType::CONVENTIONAL && desc.phys_start >= 0x1_0000_0000 {
-            continue;
-        }
+
         // Cannot grow the buffer after exit_boot_services. If we ever exceed the
         // reserved capacity, halt loudly instead of silently dropping regions
         // (which would let the kernel hand out reserved frames).
@@ -220,14 +211,6 @@ fn main() -> Status {
     unsafe {
         jump_to_kernel(entry, stack_top, regions_ptr, regions_len, fb_ptr, stack_guard, rsdp_addr);
     }
-}
-
-/// Detect whether the CPU is running under a hypervisor (KVM, Hyper-V, etc.)
-/// via the CPUID hypervisor present bit (ECX bit 31 of leaf 1).
-#[cfg(target_arch = "x86_64")]
-fn is_hypervisor() -> bool {
-    let result = core::arch::x86_64::__cpuid(1);
-    (result.ecx >> 31) & 1 != 0
 }
 
 /// Classify a UEFI memory type into our kernel-facing region kind.

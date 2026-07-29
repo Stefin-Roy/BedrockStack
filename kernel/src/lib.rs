@@ -125,6 +125,9 @@ impl Kernel {
             .checked_mul(framebuffer.height as u64)
             .and_then(|v| v.checked_mul(framebuffer.bpp as u64))
             .expect("framebuffer size overflow") as usize;
+        // Belt-and-suspenders: reserve the framebuffer's physical range in the
+        // allocator so we never hand out the GPU's own memory as system RAM.
+        allocator.reserve_range(framebuffer.address, fb_size as u64);
         let fb_pages = (fb_size + 4095) / 4096;
         let shadow_phys = allocator
             .alloc_contiguous(fb_pages)
