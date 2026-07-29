@@ -6,6 +6,9 @@ pub mod ports;
 pub mod device;
 pub mod context;
 
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::pci::PciDevice;
 use crate::usb::dma::{DmaBuffer, UsbDmaAllocator};
 
@@ -25,8 +28,9 @@ pub fn init_all(
     pci_devices: &[PciDevice],
     root: u64,
     alloc: *mut crate::mm::phys_alloc::BitmapAllocator,
-) {
+) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
+    let mut usb_block_devices = Vec::new();
     for dev in pci_devices {
         if dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
             SerialPort::puts("[xhci] XHCI controller at ");
@@ -39,7 +43,10 @@ pub fn init_all(
 
             let mut dma = UsbDmaAllocator::new(root, alloc);
             match init_controller(dev, &mut dma) {
-                Ok(()) => SerialPort::puts("[xhci] controller ready\n"),
+                Ok(block_devs) => {
+                    SerialPort::puts("[xhci] controller ready\n");
+                    usb_block_devices.extend(block_devs);
+                }
                 Err(e) => {
                     SerialPort::puts("[xhci] init failed: ");
                     SerialPort::puts(e);
@@ -48,9 +55,10 @@ pub fn init_all(
             }
         }
     }
+    usb_block_devices
 }
 
-fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<(), &'static str> {
+fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
     let phys_base = match crate::pci::bar::bar(dev, 0) {
@@ -199,13 +207,81 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<(), &'s
         SerialPort::puts("\n");
     }
 
-    let _ = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
+    let mut dev_mgr = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
         regs.doorbell_va(), er_buf.virt, er_buf.trb_count as u32, max_slots);
 
     // Verify message-interrupt delivery with a No-Op command.
     verify_message_interrupt_delivery(&mut cmd_ring, regs.doorbell_va(), &regs, dev, msix_fallback);
 
-    Ok(())
+    let doorbell_va = regs.doorbell_va();
+
+    // Step 2: full configuration + class driver binding
+    let mut block_devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
+    for i in 0..dev_mgr.slots.len() {
+        let slot = &mut dev_mgr.slots[i];
+        if slot.interface_class != 0 || slot.config_value != 0 {
+            continue; // already configured
+        }
+
+        if let Err(e) = device::get_config_descriptor_full(slot, doorbell_va, slot.icc_phys, slot.icc_va) {
+            SerialPort::puts("[xhci]  config desc failed: ");
+            SerialPort::puts(e);
+            SerialPort::puts("\n");
+            continue;
+        }
+
+        if slot.interface_class == 0 {
+            continue;
+        }
+
+        if let Err(e) = device::configure_device(slot, &mut cmd_ring, doorbell_va, dma) {
+            SerialPort::puts("[xhci]  configure failed: ");
+            SerialPort::puts(e);
+            SerialPort::puts("\n");
+            continue;
+        }
+
+        if slot.interface_class == crate::usb::usb::CLASS_MASS_STORAGE && slot.bulk_in_dci != 0 && slot.bulk_out_dci != 0 {
+            SerialPort::puts("[xhci]  found USB mass storage\n");
+
+            let mut bulk_out_ring = None;
+            let mut bulk_in_ring = None;
+            let mut i = 0;
+            while i < slot.ep_rings.len() {
+                let (dci, _) = slot.ep_rings[i];
+                if dci == slot.bulk_out_dci {
+                    bulk_out_ring = Some(slot.ep_rings.remove(i));
+                } else if dci == slot.bulk_in_dci {
+                    bulk_in_ring = Some(slot.ep_rings.remove(i));
+                } else {
+                    i += 1;
+                }
+            }
+            let bulk_out_ring = bulk_out_ring.ok_or("missing bulk OUT ring")?.1;
+            let bulk_in_ring = bulk_in_ring.ok_or("missing bulk IN ring")?.1;
+
+            match crate::usb::class::mass_storage::UsbMassStorageDevice::new(
+                doorbell_va,
+                slot.slot_id,
+                slot.bulk_out_dci,
+                slot.bulk_in_dci,
+                bulk_out_ring,
+                bulk_in_ring,
+                dma,
+            ) {
+                Ok(dev) => {
+                    block_devices.push(dev);
+                }
+                Err(e) => {
+                    SerialPort::puts("[xhci]  mass storage init failed: ");
+                    SerialPort::puts(e);
+                    SerialPort::puts("\n");
+                }
+            }
+        }
+    }
+
+    Ok(block_devices)
 }
 
 fn verify_message_interrupt_delivery(
@@ -536,7 +612,7 @@ fn enumerate_initial_ports(
     _er_vaddr: u64,
     _er_trb_count: u32,
     _max_slots: u8,
-) -> Result<(), &'static str> {
+) -> device::DeviceSlotManager {
     use crate::usb::xhci::device::DeviceSlotManager;
     let mut mgr = DeviceSlotManager::new();
     for port in &usb_ports.ports {
@@ -551,5 +627,5 @@ fn enumerate_initial_ports(
             }
         }
     }
-    Ok(())
+    mgr
 }

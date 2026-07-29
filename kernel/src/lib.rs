@@ -312,7 +312,7 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
-        let block_devices = crate::filesystems::blockdriver::driver::init_all(
+        let mut block_devices = crate::filesystems::blockdriver::driver::init_all(
             crate::pci::devices(),
             self.page_table_root,
             &mut self.allocator as *mut _,
@@ -330,7 +330,7 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
-        crate::usb::xhci::init_all(
+        let usb_block_devices = crate::usb::xhci::init_all(
             crate::pci::devices(),
             self.page_table_root,
             &mut self.allocator as *mut _,
@@ -346,6 +346,9 @@ impl Kernel {
                 crate::usb::xhci::event::irq_count());
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
+
+        #[cfg(target_arch = "x86_64")]
+        block_devices.extend(usb_block_devices);
 
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");

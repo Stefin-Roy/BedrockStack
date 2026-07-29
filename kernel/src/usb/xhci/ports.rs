@@ -65,6 +65,12 @@ impl UsbPorts {
                 // reset is required only for USB 2.0 (and below) ports.
                 if speed != 4 {
                     self.reset_port_by_idx(i)?;
+                } else {
+                    // SS ports auto-enable on link training
+                    let ps = self.port_regs.read_portsc(port_num);
+                    if ps & PORTSC_PED != 0 {
+                        self.ports[i].enabled = true;
+                    }
                 }
             }
 

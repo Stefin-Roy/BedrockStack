@@ -268,7 +268,7 @@ fn test_trb_factory_configure_endpoint_deconfig() -> Result<(), &'static str> {
 }
 
 fn test_trb_factory_normal() -> Result<(), &'static str> {
-    let trb = memory::make_normal_trb(0x40000, 1024, 1, 2);
+    let trb = memory::make_normal_trb(0x40000, 1024);
     let ttype = trb.trb_type();
     if ttype != memory::TRB_TYPE_NORMAL { return Err("wrong TRB type"); }
     if trb.parameter != 0x40000 { return Err("data_phys mismatch"); }
@@ -478,8 +478,8 @@ fn test_init_icc_for_address_device() -> Result<(), &'static str> {
     if mps != 64 {
         return Err("EP0 MPS wrong");
     }
-    if ep_type != 0 {
-        return Err("EP0 type not control");
+    if ep_type != 4 {
+        return Err("EP0 type not control (expected 4 per xHCI spec)");
     }
     if cerr != 3 {
         return Err("EP0 CErr wrong");

@@ -263,11 +263,9 @@ pub fn make_evaluate_context_trb(ctx_phys: u64, slot_id: u8) -> Trb {
     Trb::new(ctx_phys, 0, control)
 }
 
-pub fn make_normal_trb(data_phys: u64, len: u32, slot_id: u8, endpoint_id: u8) -> Trb {
+pub fn make_normal_trb(data_phys: u64, len: u32) -> Trb {
     let mut control = (TRB_TYPE_NORMAL as u32) << 10;
     control |= TRB_IOC;
-    control |= (slot_id as u32) << 24;
-    control |= (endpoint_id as u32) << 16;
     Trb::new(data_phys, len, control)
 }
 

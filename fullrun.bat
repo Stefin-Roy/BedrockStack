@@ -3,12 +3,13 @@ setlocal EnableDelayedExpansion
 
 REM ============================================================
 REM  BedrockOS - Full Build + (Image) + QEMU  (debug, no TUI)
-REM  Usage: fullrun.bat [arch] [boot_mode]
-REM    arch:      x86_64 (default) | riscv64
-REM    boot_mode: uefi (default) | grub
-REM              grub: builds kernel with kernelmb2 feature, creates
-REM                    GRUB standalone UEFI image via WSL, boots via
-REM                    multiboot2 (x86_64 only)
+REM  Usage: fullrun.bat [arch] [boot_mode] [extra_features]
+REM    arch:           x86_64 (default) | riscv64
+REM    boot_mode:      uefi (default) | grub
+REM                   grub: builds kernel with kernelmb2 feature, creates
+REM                         GRUB standalone UEFI image via WSL, boots via
+REM                         multiboot2 (x86_64 only)
+REM    extra_features: extra kernel cargo features, e.g. usb_trace (optional)
 REM  Logs everything to target\fullrun.log
 REM ============================================================
 
@@ -22,6 +23,7 @@ set ARCH=%1
 if "%ARCH%"=="" set ARCH=x86_64
 set BOOT_MODE=%2
 if "%BOOT_MODE%"=="" set BOOT_MODE=uefi
+set EXTRA_FEATURES=%3
 
 REM Set to 1 to gate the CPU slow mode feature (Intel-only, x86_64 only).
 set CPU_SLOW=1
@@ -68,8 +70,10 @@ if not exist "%OVMF_PATH%" (
 echo [1/4] Building kernel (x86_64-unknown-none, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set CARGO_FEATURES=--features display_log
-if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log cpu_slow"
+set BASE_FEATURES=display_log
+if "%CPU_SLOW%"=="1" set BASE_FEATURES=display_log cpu_slow
+if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
+set CARGO_FEATURES=--features "%BASE_FEATURES%"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
@@ -162,7 +166,10 @@ echo.
 echo [1/2] Building kernel (riscv64gc-unknown-none-elf, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build --target riscv64gc-unknown-none-elf -p kernel --features display_log 2>&1
+set BASE_FEATURES=display_log
+if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
+set CARGO_FEATURES=--features "%BASE_FEATURES%"
+cargo build --target riscv64gc-unknown-none-elf -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"
@@ -258,8 +265,10 @@ if not exist "%OVMF_PATH%" (
 echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set CARGO_FEATURES=--features "display_log kernelmb2"
-if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features "display_log kernelmb2"
+set BASE_FEATURES=display_log kernelmb2
+if "%CPU_SLOW%"=="1" set BASE_FEATURES=display_log kernelmb2
+if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
+set CARGO_FEATURES=--features "%BASE_FEATURES%"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
