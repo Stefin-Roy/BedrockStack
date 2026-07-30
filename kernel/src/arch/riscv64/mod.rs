@@ -8,16 +8,13 @@ pub mod trap;
 pub struct Riscv64;
 
 use core::arch::asm;
-use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::Vmm;
 use crate::platform::riscv_virt::plic;
-use crate::smp::ApContext;
 use crate::KernelLayout;
-use super::Arch;
 
-impl Arch for Riscv64 {
-    fn init() {
+impl Riscv64 {
+    pub fn init() {
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: trap handler\n");
         trap::init();
         // Set BSP's APIC/hart ID before PLIC init so scontext() can read it.
@@ -33,7 +30,7 @@ impl Arch for Riscv64 {
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init done\n");
     }
 
-    fn init_ap(_cpu_id: u32) {
+    pub fn init_ap(_cpu_id: u32) {
         // Set up trap vector for this hart.
         trap::init();
         // S-mode interrupt enable in sie.
@@ -42,25 +39,25 @@ impl Arch for Riscv64 {
         }
     }
 
-    fn halt() {
+    pub fn halt() {
         unsafe { asm!("wfi"); }
     }
 
-    fn disable_interrupts() {
+    pub fn disable_interrupts() {
         unsafe { asm!("csrci sstatus, 2"); }
     }
 
-    fn enable_interrupts() {
+    pub fn enable_interrupts() {
         unsafe { asm!("csrsi sstatus, 2"); }
     }
 
-    fn are_interrupts_enabled() -> bool {
+    pub fn are_interrupts_enabled() -> bool {
         let stval: u64;
         unsafe { asm!("csrr {}, sstatus", out(reg) stval); }
         (stval & 2) != 0
     }
 
-    fn setup_virt_mem(
+    pub fn setup_virt_mem(
         allocator: &mut BitmapAllocator,
         layout: &KernelLayout,
         stack_guard: u64,
@@ -72,28 +69,5 @@ impl Arch for Riscv64 {
         paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride, fb_bpp)
     }
 
-    fn discover_cpus(acpi: Option<&AcpiSubsystem>) -> alloc::vec::Vec<(u32, bool)> {
-        // First try DTB (passed via a global set by the boot code).
-        if let Some(dtb) = crate::platform::riscv_virt::get_dtb_ptr() {
-            let cpus = crate::dtb::parse_cpus(dtb);
-            if !cpus.is_empty() {
-                return cpus;
-            }
-        }
-        // Fall back to ACPI MADT if available.
-        if let Some(ref acpi) = acpi {
-            if !acpi.cpus.is_empty() {
-                return acpi.cpus.clone();
-            }
-        }
-        alloc::vec::Vec::new()
-    }
 
-    unsafe fn wake_aps(
-        allocator: &mut BitmapAllocator,
-        page_table_root: u64,
-        aps: &[ApContext],
-    ) -> usize {
-        unsafe { trampoline::start_aps(allocator, page_table_root, aps) }
-    }
 }

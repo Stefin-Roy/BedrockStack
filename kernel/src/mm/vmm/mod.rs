@@ -223,4 +223,21 @@ impl Vmm {
         #[cfg(target_arch = "riscv64")]
         return riscv64::translate(self.root, vaddr);
     }
+
+    /// Flush the TLB (entirety).
+    pub fn flush_tlb(&self) {
+        #[cfg(target_arch = "x86_64")]
+        unsafe {
+            core::arch::asm!("mov rax, cr3; mov cr3, rax", options(nostack, preserves_flags));
+        }
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("sfence.vma", options(nostack));
+        }
+    }
 }
+
+// Service capability traits for Vmm are not yet implemented because
+// the inherent `map`/`unmap` methods require a `&mut BitmapAllocator`
+// parameter.  The `VirtualMemoryManager` trait will be implemented once
+// that dependency is resolved (e.g. by storing the allocator inside Vmm).

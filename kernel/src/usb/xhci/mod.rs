@@ -318,7 +318,7 @@ fn verify_message_interrupt_delivery(
         if timeout.expired() {
             break;
         }
-        <crate::arch::CurrentArch as crate::arch::Arch>::halt();
+        crate::arch::CurrentArch::halt();
     }
 
     // Snapshot the controller before polling/acknowledging the event.  IP=1
@@ -327,7 +327,7 @@ fn verify_message_interrupt_delivery(
     let iman_before_poll = unsafe { core::ptr::read_volatile((_regs.runtime_va() + 0x20) as *const u32) };
     let usbsts_before_poll = _regs.read_op32(registers::OP_USBSTS);
     SerialPort::puts("[xhci] irq snapshot: IF=");
-    SerialPort::put_u64(<crate::arch::CurrentArch as crate::arch::Arch>::are_interrupts_enabled() as u64);
+    SerialPort::put_u64(crate::arch::CurrentArch::are_interrupts_enabled() as u64);
     SerialPort::puts(" USBSTS=0x");
     SerialPort::put_hex(usbsts_before_poll as u64);
     SerialPort::puts(" IMAN=0x");
@@ -393,7 +393,7 @@ fn verify_message_interrupt_delivery(
             command::ring_command_doorbell(doorbell_va);
             let mut msi_timeout = ApicTimeout::new(100);
             while event::irq_count() == msi_before && !msi_timeout.expired() {
-                <crate::arch::CurrentArch as crate::arch::Arch>::halt();
+                crate::arch::CurrentArch::halt();
             }
             SerialPort::puts("[xhci] MSI fallback delivery: irq=");
             SerialPort::put_u64(event::irq_count() - msi_before);

@@ -20,6 +20,9 @@ pub struct BitmapAllocator {
     kernel_end: u64,
 }
 
+unsafe impl Send for BitmapAllocator {}
+unsafe impl Sync for BitmapAllocator {}
+
 impl BitmapAllocator {
     /// Create a new allocator.
     ///
@@ -325,6 +328,39 @@ fn clear_region(bitmap: *mut u8, region: &MemoryRegion, total_frames: usize) {
         unsafe {
             *bitmap.add(frame / 8) &= !(1 << (frame % 8));
         }
+    }
+}
+
+// ── Service capability traits ─────────────────────────────────────────
+
+use crate::services::capability::Capability;
+use crate::services::phys_mem::PhysicalMemoryAllocator;
+
+impl Capability for BitmapAllocator {
+    fn name(&self) -> &str {
+        "bitmap-allocator"
+    }
+}
+
+impl PhysicalMemoryAllocator for BitmapAllocator {
+    fn alloc_frames(&mut self, count: usize) -> Result<u64, ()> {
+        if count == 1 {
+            self.alloc().ok_or(())
+        } else {
+            self.alloc_contiguous(count).ok_or(())
+        }
+    }
+
+    fn free_frames(&mut self, addr: u64, _count: usize) {
+        unsafe { self.free(addr); }
+    }
+
+    fn reserve_region(&mut self, start: u64, end: u64) {
+        self.reserve_region(start, end);
+    }
+
+    fn total_frames(&self) -> usize {
+        self.total_frames()
     }
 }
 

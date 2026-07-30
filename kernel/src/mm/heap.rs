@@ -188,13 +188,26 @@ pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
     unsafe { PHYS_ALLOCATOR = phys as *mut BitmapAllocator; }
 }
 
-unsafe fn phys_allocator() -> &'static mut BitmapAllocator {
+/// Return a raw pointer to the physical allocator (may be null if uninitialised).
+pub fn phys_allocator_raw() -> *mut BitmapAllocator {
+    unsafe { PHYS_ALLOCATOR }
+}
+
+/// Return a mutable reference to the physical allocator.
+///
+/// # Panics
+/// Panics if the allocator has not been initialised yet.
+pub fn get_phys_allocator_mut() -> &'static mut BitmapAllocator {
     let ptr = unsafe { PHYS_ALLOCATOR };
     if ptr.is_null() {
-        SerialPort::puts("[heap] FATAL: no physical allocator for growth\n");
+        SerialPort::puts("[heap] FATAL: no physical allocator\n");
         loop {}
     }
     unsafe { &mut *ptr }
+}
+
+unsafe fn phys_allocator() -> &'static mut BitmapAllocator {
+    get_phys_allocator_mut()
 }
 
 /// Initialise the kernel heap.

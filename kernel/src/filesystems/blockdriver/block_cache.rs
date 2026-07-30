@@ -125,6 +125,7 @@ impl CachedDevice {
 
 impl BlockDevice for CachedDevice {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
+        #[cfg(target_arch = "x86_64")]
         crate::arch::x86_64::idt::verify_integrity();
         let mut cache = self.cache.lock();
         let mut completed = 0u32;

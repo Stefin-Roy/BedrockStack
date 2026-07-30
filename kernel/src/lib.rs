@@ -19,9 +19,10 @@ pub mod platform;
 #[cfg(target_arch = "x86_64")]
 pub mod usb;
 pub mod smp;
+pub mod services;
 
 use acpi::AcpiSubsystem;
-use arch::{Arch, CurrentArch};
+use arch::CurrentArch;
 use boot::{FramebufferInfo, MemoryRegion};
 use framebuffer::Framebuffer;
 
@@ -70,6 +71,7 @@ pub struct Kernel {
     rsdp_data: Option<&'static [u8]>,
     acpi: Option<AcpiSubsystem>,
     page_table_root: u64,
+    services: Option<&'static crate::services::KernelServices>,
 }
 
 impl Kernel {
@@ -159,7 +161,13 @@ impl Kernel {
             rsdp_data,
             acpi: None,
             page_table_root: 0,
+            services: None,
         }
+    }
+
+    /// Access the service container (panics if not yet initialised).
+    fn svc(&self) -> &crate::services::KernelServices {
+        self.services.as_ref().expect("KernelServices not initialised")
     }
 
     pub fn init(&mut self) {
@@ -187,15 +195,26 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();
 
+        // Build the service container for capability-based dispatch.
+        let acpi_static = self.acpi.as_ref().map(|a| unsafe { &*(a as *const crate::acpi::AcpiSubsystem) });
+        let svc = alloc::boxed::Box::new(crate::services::init_services(
+            self.page_table_root,
+            &mut self.allocator as *mut _,
+            acpi_static,
+        ));
+        let svc_static: &'static crate::services::KernelServices = alloc::boxed::Box::leak(svc);
+        crate::services::set_global(svc_static);
+        self.services = Some(svc_static);
+
         // Initialise SMP — discover and start Application Processors.
         let ncpus = unsafe {
-            crate::smp::init(&mut self.allocator, self.page_table_root, self.acpi.as_ref())
+            crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc())
         };
         log::info!("SMP: {} CPU(s) online", ncpus);
         crate::drivers::serial::SerialPort::puts("[init] SMP done, enabling interrupts\n");
 
         // Enable interrupts after arch init, page tables, and SMP are live.
-        CurrentArch::enable_interrupts();
+        self.svc().platform.enable_interrupts();
     }
 
     /// Parse the ACPI interrupt model and initialise I/O APIC(s).
@@ -364,7 +383,7 @@ impl Kernel {
 
         init_all(&mut self.framebuffer);
         loop {
-            CurrentArch::halt();
+            self.svc().platform.halt();
         }
     }
 }

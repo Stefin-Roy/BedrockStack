@@ -1,7 +1,5 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use crate::mm::phys_alloc::BitmapAllocator;
-use crate::arch::Arch;
-use crate::arch::CurrentArch;
+use crate::services::KernelServices;
 
 /// Cache-line-aligned per-AP ready flag, avoiding false sharing between CPUs.
 #[repr(align(64))]
@@ -170,14 +168,14 @@ pub struct ApContext {
 /// # Safety
 /// Must be called after heap, page tables, ACPI, and IOAPIC init.
 pub unsafe fn init(
-    allocator: &mut BitmapAllocator,
     page_table_root: u64,
     acpi: Option<&crate::acpi::AcpiSubsystem>,
+    services: &KernelServices,
 ) -> u32 {
     use crate::drivers::serial::SerialPort;
     SerialPort::puts("[smp] init\n");
 
-    let cpus = CurrentArch::discover_cpus(acpi);
+    let cpus = services.cpu.discover_cpus(acpi);
     let _bsp_id = cpus.first().map(|(id, _)| *id).unwrap_or(0);
 
     let mut ap_list = alloc::vec::Vec::new();
@@ -186,7 +184,7 @@ pub unsafe fn init(
             continue;
         }
         let cpu_id = cpu_id_offset as u32;
-        let stack_top = allocate_ap_stack(allocator, cpu_id);
+        let stack_top = allocate_ap_stack(cpu_id);
 
         let pc = unsafe { &mut PER_CPU_SLOTS[cpu_id as usize] };
         pc.self_ptr = pc as *const PerCpu;
@@ -218,7 +216,7 @@ pub unsafe fn init(
         return 1;
     }
 
-    let started = unsafe { CurrentArch::wake_aps(allocator, page_table_root, &ap_list) };
+    let started = unsafe { services.cpu.wake_aps(page_table_root, &ap_list) };
 
     SerialPort::puts("[smp] APs started: ");
     SerialPort::put_u64(started as u64);
@@ -227,9 +225,9 @@ pub unsafe fn init(
     total
 }
 
-fn allocate_ap_stack(allocator: &mut BitmapAllocator, _cpu_id: u32) -> u64 {
+fn allocate_ap_stack(_cpu_id: u32) -> u64 {
     const AP_STACK_PAGES: usize = 17;
-    let base = allocator
+    let base = crate::mm::heap::get_phys_allocator_mut()
         .alloc_contiguous(AP_STACK_PAGES)
         .expect("SMP: OOM for AP stack");
     base + AP_STACK_PAGES as u64 * 4096

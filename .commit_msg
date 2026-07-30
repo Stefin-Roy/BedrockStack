@@ -1,0 +1,279 @@
+kernel: replace compile-time Arch trait with runtime service capability traits
+
+This commit completes a multi-phase refactor that replaces the old
+compile-time #[cfg(target_arch)] dispatch pattern--where every driver
+and subsystem branched on the Arch trait implementation--with a unified
+runtime service-container model.  The Arch trait is deleted, all PCI
+internals use the global kernel_services() accessor, and every kernel
+subsystem now speaks through dyn Trait references collected in a single
+KernelServices struct.
+
+=== Why the Arch trait had to go ===
+
+The original design used pub trait Arch (in arch/mod.rs) with associated
+fn discover_cpus(), wake_aps(), halt(), disable_interrupts(), and so on.
+Each impl block was behind #[cfg(target_arch = "x86_64")] or
+#[cfg(target_arch = "riscv64")], selected at compile time through the
+CurrentArch alias.
+
+This worked but carried four chronic problems:
+
+1.  Monolithic trait, rigid dispatch.  Every architectural capability
+    (timers, interrupts, PCI config space, MSI allocation, DMA, ACPI)
+    was either exposed through the Arch trait or wired ad-hoc via static
+    functions.  Adding a new capability required changing one trait
+    definition, two impl blocks, and updating all call sites.  There
+    was no way to compose or stub capabilities independently--riscv64
+    had to implement wake_aps() even though it had no SMP trampoline
+    on QEMU virt.
+
+2.  No runtime polymorphism.  The CurrentArch alias selected exactly one
+    implementation at link time.  Features like "probe which interrupt
+    model the firmware set up" or "fall back from MSI to MSI-X" or
+    "provide a null DMA allocator on hardware without an IOMMU" were
+    impossible to express without piling more cfg-gates into the trait
+    impl.
+
+3.  Ecam coupling.  The PCI subsystem (caps.rs, enumerate.rs, msi.rs,
+    msix.rs) imported super::ecam directly and called read_u8/write_u16
+    etc.  This meant every PCI config-space access was hard-wired to
+    the ECAM implementation--no alternative host-bridge interface, no
+    unit-test injection, no riscv64 stub that returns 0xFFFF for
+    "no PCI bus".
+
+4.  init() coupling and static friction.  smp::init() imported Arch and
+    CurrentArch to call discover_cpus() and wake_aps().  Kernel::init()
+    called CurrentArch::enable_interrupts().  Every new architectural
+    dependency became another import chain that tied the whole kernel
+    together at compile time.
+
+=== What the service-container model provides ===
+
+The new architecture defines fine-grained capability traits under
+kernel/src/services/.  Each trait covers exactly one concern:
+
+    Capability              -- supertrait providing name() (for debug)
+    TimerProvider           -- now_ns, sleep_ns, register_tick_handler
+    InterruptManager        -- register/unregister handler, enable, disable, eoi
+    PhysicalMemoryAllocator -- alloc/free/reserve frames
+    VirtualMemoryManager    -- map, unmap, translate, root, flush_tlb
+    SerialConsole           -- putc, puts, put_hex, put_u64
+    PlatformControl         -- shutdown, reset, halt, interrupt control
+    CpuManager              -- cpu_id, cpu_count, IPI, discover_cpus, wake_aps
+    PciConfigSpace          -- PCI config read8/16/32 write8/16/32
+    MsiAllocator            -- allocate/release MSI vectors, message address/data
+    DmaAllocator            -- alloc_page, alloc_contiguous, map_mmio, virt_to_phys
+    BlockDevice             -- submit, sector_count, model_string
+    PciDeviceManager        -- device list, BARs, MSI/MSI-X config
+    AcpiProvider            -- interrupt model, PCI regions, CPUs, MMIO mapping
+
+Each trait is implemented by a provider struct in an arch-specific
+subdirectory (services/x86_64/ or services/riscv64/).  Providers are
+assembled at boot time by init_services() into a single KernelServices
+container, which is leaked as a &'static reference and exposed via the
+global kernel_services() accessor.
+
+Call sites that once wrote:
+
+    CurrentArch::enable_interrupts()
+    CurrentArch::discover_cpus(acpi)
+    ecam::read_u16(seg, bus, dev, fn, reg)
+
+now write:
+
+    kernel_services().platform.enable_interrupts()
+    kernel_services().cpu.discover_cpus(acpi)
+    kernel_services().pci_cfg.read16(seg, bus, dev, fn, reg)
+
+=== The Arch trait removal (Phase 5) ===
+
+When the service-container was fully operational, the remaining Arch
+trait methods (init, init_ap, halt, disable_interrupts,
+enable_interrupts, are_interrupts_enabled, setup_virt_mem, discover_cpus,
+wake_aps) were pure dead code--every consumer had been migrated to the
+equivalent service:
+
+  - halt/disables/enables -> self.svc().platform.* (in lib.rs)
+  - discover_cpus/wake_aps -> services.cpu.* (in smp/mod.rs)
+  - halt() in xhci/mod.rs -> CurrentArch::halt() (inherent, not trait)
+
+What changed per file:
+
+  arch/mod.rs
+    Removed the trait definition entirely.  The file now only re-exports
+    the two arch modules behind cfg gates and provides the CurrentArch
+    alias.
+
+  arch/x86_64/mod.rs and arch/riscv64/mod.rs
+    Changed from impl Arch for X86_64 (and impl Arch for Riscv64) to
+    inherent impl blocks with pub fn.  This preserves the functions for
+    callers that still use them (e.g. X86_64::init() in main.rs) while
+    eliminating the trait dispatch layer.
+
+    Both method bodies (discover_cpus and wake_aps) were removed from
+    the arch modules entirely because:
+      - discover_cpus     -> moved into X86Cpu / RiscvCpu providers
+      - wake_aps          -> moved into X86Cpu / RiscvCpu providers
+
+  arch/x86_64/trampoline.rs and arch/riscv64/trampoline.rs
+    Removed use crate::arch::Arch imports (no longer needed).
+
+  main.rs
+    Changed use kernel::arch::{Arch, CurrentArch} to
+    use kernel::arch::CurrentArch only (Arch no longer exists).
+
+  lib.rs
+    Added svc() helper and called self.svc().platform.enable_interrupts()
+    and self.svc().platform.halt() instead of CurrentArch::*.
+
+  usb/xhci/mod.rs
+    Replaced <CurrentArch as Arch>::halt() and
+    <CurrentArch as Arch>::are_interrupts_enabled() with the inherent
+    CurrentArch::halt() and CurrentArch::are_interrupts_enabled() calls
+    (now that these are regular methods, not trait methods, the
+    qualified-syntax call is no longer needed).
+
+  filesystems/vfs/irq.rs
+    Removed the unused use crate::arch::Arch import.
+
+=== PCI internals migration ===
+
+The four PCI files that imported ecam directly now route through the
+global service:
+
+  pci/caps.rs           -- all read_u8/16/32, write_u8/16/32 -> pci_cfg.*
+  pci/enumerate.rs      -- all read_u8/16/32 -> pci_cfg.*
+  pci/msi.rs            -- all ecam::read_u16/write_u16 -> pci_cfg.*
+  pci/msix.rs           -- all ecam::read_u16/write_u16 -> pci_cfg.*
+
+Each file now has a local fn cfg() helper that calls
+kernel_services().pci_cfg, keeping the diff minimal and the cfg
+reference at the point of use.
+
+=== Extended service interfaces ===
+
+PciConfigSpace gained write8 and write16 methods (previously only
+read8/16/32 existed, but msi/msix needed byte and word writes).
+
+InterruptManager gained unregister_handler (to complement register_handler).
+
+The Capability supertrait gained Send + Sync bounds, enforcing that
+every provider must be thread-safe (since kernel_services() is
+accessible from any CPU).
+
+BitmapAllocator received unsafe impl Send + Sync (it is protected by
+external locking via the heap module's PHYS_ALLOCATOR pointer).
+
+=== IDT/timer tick callback ===
+
+The x86_64 IDT timer handler previously called apic_eoi() directly
+with no mechanism for a higher-level tick dispatcher to hook in.
+The timer service provider (ApicTimer) needed a way to receive tick
+notifications.
+
+Added:
+  - TIMER_TICK_CALLBACK static AtomicPtr<fn()> in idt.rs
+  - set_timer_tick_callback() to install the callback
+  - timer_handler() now invokes the callback before EOI
+
+Also made DEVICE_VECTOR_BASE, NUM_DEVICE_VECTORS pub, and added
+register_device_handler_at(vector, handler) for the InterruptManager
+provider to use.
+
+=== SMP allocator decoupling ===
+
+smp::init() previously took &mut BitmapAllocator and passed it to
+Arch::discover_cpus and Arch::wake_aps.  With the trait gone, the
+allocator argument is no longer needed--the CPU manager providers
+hold their own reference to the allocator (via heap::get_phys_allocator_mut
+or a stashed pointer).
+
+smp::init() now takes (page_table_root, acpi, services) and calls
+services.cpu.discover_cpus() / services.cpu.wake_aps().  The
+internal allocate_ap_stack() also switched from a passed-in allocator
+to calling heap::get_phys_allocator_mut() directly.
+
+=== mm/vmm TLB flush ===
+
+Vmm gained a flush_tlb() method (reload CR3 on x86, sfence.vma on riscv)
+so the VirtualMemoryManager trait can provide TLB coherence without
+calling into raw asm!() at every call site.
+
+=== Minor fixes discovered during the refactor ===
+
+riscv64 mfence -> fence
+  The msix.rs module had a raw mfence instruction that doesn't exist on
+  riscv64.  It is now gated on target_arch = x86_64; riscv64 uses the
+  equivalent fence instruction.
+
+block_cache verify_integrity gate
+  CachedDevice::submit() called verify_integrity() which is x86_64-only
+  (it reads IDT registers).  Gated on target_arch = x86_64.
+
+usb_test module gate
+  The USB test module depends on xHCI which is x86_64-only.  Now gated
+  on target_arch = x86_64.
+
+=== New files (33 services .rs files) ===
+
+services/mod.rs
+  KernelServices struct with 10 capability fields, init_services(),
+  set_global(), kernel_services().
+
+services/capability.rs             -- Capability trait (Send + Sync)
+services/timer.rs                  -- TimerProvider trait
+services/interrupts.rs             -- InterruptManager trait
+services/phys_mem.rs               -- PhysicalMemoryAllocator trait
+services/virt_mem.rs               -- VirtualMemoryManager trait
+services/serial.rs                 -- SerialConsole trait + KernelSerial provider
+services/platform.rs               -- PlatformControl trait
+services/cpu.rs                    -- CpuManager trait
+services/pci_config.rs             -- PciConfigSpace trait
+services/msi.rs                    -- MsiAllocator trait
+services/dma.rs                    -- DmaAllocator trait + KernelDma provider
+services/block_device.rs           -- BlockDevice trait
+services/pci_device.rs             -- PciDeviceManager trait
+services/acpi.rs                   -- AcpiProvider trait
+services/ecam_pci_config.rs        -- EcamPciConfig provider (both archs)
+services/null_msi.rs               -- NullMsi provider (riscv64 stub)
+
+services/x86_64/mod.rs             -- x86_64 provider module
+services/x86_64/apic_timer.rs      -- ApicTimer (TimerProvider)
+services/x86_64/x86_interrupts.rs  -- X86Interrupts (InterruptManager)
+services/x86_64/x86_platform.rs    -- X86Platform (PlatformControl)
+services/x86_64/x86_cpu.rs         -- X86Cpu (CpuManager)
+services/x86_64/x86_msi.rs         -- X86Msi (MsiAllocator)
+services/x86_64/x86_pci_device.rs  -- X86PciDevice (PciDeviceManager)
+services/x86_64/x86_acpi.rs        -- X86Acpi (AcpiProvider)
+services/x86_64/x86_serial.rs      -- x86_64 serial support
+
+services/riscv64/mod.rs            -- riscv64 provider module
+services/riscv64/sbi_timer.rs      -- SbiTimer (TimerProvider)
+services/riscv64/riscv_interrupts.rs -- RiscvInterrupts (InterruptManager)
+services/riscv64/riscv_platform.rs -- RiscvPlatform (PlatformControl)
+services/riscv64/riscv_cpu.rs      -- RiscvCpu (CpuManager)
+services/riscv64/riscv_pci_device.rs -- RiscvPciDevice (PciDeviceManager, stub)
+services/riscv64/riscv_acpi.rs     -- RiscvAcpi (AcpiProvider, stub)
+
+=== Build verification ===
+
+cargo build --target x86_64-unknown-none -p kernel --features "display_log cpu_slow"
+  -> clean
+
+cargo build --target x86_64-unknown-uefi -p boot
+  -> clean
+
+cargo build --target riscv64gc-unknown-none-elf -p kernel --lib --features display_log
+  -> clean (lib only; bin has pre-existing linker error for __idt_start/__idt_end)
+
+=== Pre-existing issues (unchanged) ===
+
+- riscv64 bin link: __idt_start, __idt_end symbols referenced in lib.rs
+  KernelLayout but not defined in linker-riscv64.ld
+- SerialPort calls (~200 sites) remain direct; KernelSerial wraps the same
+  Inner struct so this is purely a naming convention decision.
+
+=== temp-plan.md ===
+
+Rewritten to reflect completed architecture: trait table, provider table,
+build commands, and a list of removed items.

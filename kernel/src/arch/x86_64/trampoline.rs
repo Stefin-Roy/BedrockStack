@@ -1,6 +1,5 @@
 //! x86_64 SMP trampoline — real-mode startup code for Application Processors.
 
-use crate::arch::Arch;
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::platform::x86_64_pc::apic;

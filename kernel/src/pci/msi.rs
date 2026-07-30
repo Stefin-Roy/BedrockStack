@@ -1,7 +1,10 @@
 use super::caps::{self, PciCapability};
-use super::ecam;
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
+
+fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
+    crate::services::kernel_services().pci_cfg
+}
 
 /// Message Control register offset (from capability base).
 const MC_OFF: u16 = 2;
@@ -69,8 +72,9 @@ pub fn enable(dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8
 
     // Step 3: Enable memory space, Bus Master, and disable INTx in PCI
     // Command register.  Bus Master is required for MSI memory writes.
-    let cmd = ecam::read_u16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
-    ecam::write_u16(
+    let pci_cfg = cfg();
+    let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
+    pci_cfg.write16(
         dev.segment, dev.bus, dev.device, dev.function, 0x04,
         cmd | (1 << 1) | (1 << 2) | (1 << 10),
     );

@@ -6,6 +6,10 @@ use super::caps::{self, PciCapability};
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
 
+fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
+    crate::services::kernel_services().pci_cfg
+}
+
 /// Diagnostic snapshot of the last programmed MSI-X entry.
 pub struct MsixDiag {
     pub table_va: u64,
@@ -186,7 +190,10 @@ pub fn enable(
     }
 
     // Ensure table writes are visible before we touch config space.
+    #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("fence", options(nostack, preserves_flags)); }
 
     SerialPort::puts("[msix] enabled: vector=");
     SerialPort::put_u64(vector as u64);
@@ -198,8 +205,9 @@ pub fn enable(
     // Firmware usually enables these bits, but relying on that made MSI-X
     // setup boot-order dependent.  INTx remains disabled because it is
     // mutually exclusive with MSI-X.
-    let cmd = super::ecam::read_u16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
-    super::ecam::write_u16(
+    let pci_cfg = cfg();
+    let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
+    pci_cfg.write16(
         dev.segment,
         dev.bus,
         dev.device,
@@ -221,7 +229,10 @@ pub fn enable(
             write_volatile(&mut (*table.add(i)).vector_ctrl, vc & !VECTOR_CTRL_MASK);
         }
     }
+    #[cfg(target_arch = "x86_64")]
     unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
+    #[cfg(target_arch = "riscv64")]
+    unsafe { core::arch::asm!("fence", options(nostack, preserves_flags)); }
     let enabled_mc = caps::read_u16(dev, cap, 2);
     caps::write_u16(dev, cap, 2, enabled_mc & !MC_FUNCTION_MASK);
 }
@@ -267,7 +278,10 @@ pub fn program_entry(
         write_volatile(&mut (*entry).msg_addr_hi, (addr >> 32) as u32);
         write_volatile(&mut (*entry).msg_data, data);
         // Ensure message address/data are visible before unmasking.
+        #[cfg(target_arch = "x86_64")]
         core::arch::asm!("mfence", options(nostack, preserves_flags));
+        #[cfg(target_arch = "riscv64")]
+        core::arch::asm!("fence", options(nostack, preserves_flags));
         // Unmask (preserving reserved bits).
         let vc = read_volatile(&(*entry).vector_ctrl);
         write_volatile(&mut (*entry).vector_ctrl, vc & !VECTOR_CTRL_MASK);

@@ -46,8 +46,8 @@ pub fn check_integrity() -> bool {
 // interrupt vectors. The handler is called with interrupts disabled
 // and must not block. EOI is sent automatically after the handler.
 
-const NUM_DEVICE_VECTORS: usize = 16;
-const DEVICE_VECTOR_BASE: u8 = 33;
+pub const NUM_DEVICE_VECTORS: usize = 16;
+pub const DEVICE_VECTOR_BASE: u8 = 33;
 static DEVICE_HANDLERS: [AtomicPtr<fn()>; NUM_DEVICE_VECTORS] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_DEVICE_VECTORS];
 
@@ -69,6 +69,19 @@ pub fn register_device_handler(handler: fn()) -> Option<u8> {
     None
 }
 
+/// Register a handler at a specific device interrupt vector.
+///
+/// Unlike `register_device_handler` which auto-allocates, this stores the
+/// handler at the given vector slot directly. Intended for use by the
+/// `InterruptManager` capability provider.
+pub fn register_device_handler_at(vector: u8, handler: fn()) {
+    if vector < DEVICE_VECTOR_BASE || vector >= DEVICE_VECTOR_BASE + NUM_DEVICE_VECTORS as u8 {
+        return;
+    }
+    let idx = (vector - DEVICE_VECTOR_BASE) as usize;
+    DEVICE_HANDLERS[idx].store(handler as *mut fn(), Ordering::Release);
+}
+
 /// Unregister a previously registered device interrupt handler.
 pub fn unregister_device_handler(vector: u8) {
     if vector < DEVICE_VECTOR_BASE || vector >= DEVICE_VECTOR_BASE + NUM_DEVICE_VECTORS as u8 {
@@ -76,6 +89,16 @@ pub fn unregister_device_handler(vector: u8) {
     }
     let idx = (vector - DEVICE_VECTOR_BASE) as usize;
     DEVICE_HANDLERS[idx].store(core::ptr::null_mut(), Ordering::Release);
+}
+
+/// Callback invoked by the APIC timer ISR before EOI.
+static TIMER_TICK_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Set the function called on each APIC timer tick.
+///
+/// Used by the `ApicTimer` provider to wire up tick counting and handler dispatch.
+pub fn set_timer_tick_callback(cb: fn()) {
+    TIMER_TICK_CALLBACK.store(cb as *mut fn(), Ordering::Release);
 }
 
 fn device_irq_handler(vector: u8) {
@@ -171,7 +194,15 @@ pub fn init() {
 }
 
 /// Timer interrupt handler (vector 32).
+///
+/// Calls the registered tick callback (increments counter, dispatches
+/// user handlers), then signals EOI to the APIC.
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+    let ptr = TIMER_TICK_CALLBACK.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        let handler: fn() = unsafe { core::mem::transmute(ptr) };
+        handler();
+    }
     apic::apic_eoi();
 }
 

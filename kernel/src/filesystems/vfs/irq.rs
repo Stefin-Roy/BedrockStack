@@ -1,8 +1,6 @@
 use core::ops::{Deref, DerefMut};
 use spin::Mutex;
 
-use crate::arch::Arch;
-
 pub struct IrqMutex<T> {
     inner: Mutex<T>,
 }

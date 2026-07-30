@@ -4,7 +4,6 @@
 //! with `a0 = hart_id`, `a1 = PerCpu pointer`.  The trampoline sets `tp` and
 //! `sp`, then jumps to the Rust `ap_entry_riscv` which enables the MMU.
 
-use crate::arch::Arch;
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::smp::{ApContext, per_cpu_by_id, current_per_cpu};

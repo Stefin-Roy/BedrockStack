@@ -4,7 +4,7 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::global_asm;
 use core::panic::PanicInfo;
-use kernel::arch::{Arch, CurrentArch};
+use kernel::arch::CurrentArch;
 #[cfg(any(target_arch = "riscv64", not(feature = "kernelmb2")))]
 use kernel::boot::FramebufferInfo;
 #[cfg(not(feature = "kernelmb2"))]
