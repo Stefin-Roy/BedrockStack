@@ -265,7 +265,7 @@ if not exist "%OVMF_PATH%" (
 echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set BASE_FEATURES=display_log kernelmb2
+set BASE_FEATURES=display_log kernelmb2 usb_trace
 if "%CPU_SLOW%"=="1" set BASE_FEATURES=display_log kernelmb2
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=--features "%BASE_FEATURES%"
@@ -294,12 +294,12 @@ set GRUB_CFG_CACHED=%GRUB_CFG%.cached
 set GRUB_SKIP=0
 if exist "%GRUB_EFI%" if exist "%GRUB_CFG_CACHED%" (
     > "%TARGET_DIR%\_grub_cmp.cfg" (
-    echo set timeout=1
+    echo set timeout=0
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1024x768x32
+    echo set gfxmode=1920x1080x32
     echo set gfxpayload=keep
     echo.
     echo menuentry "BedrockOS" {

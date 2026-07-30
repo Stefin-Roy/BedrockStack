@@ -1,4 +1,5 @@
 use super::memory;
+use crate::drivers::serial::SerialPort;
 
 pub fn ring_doorbell(doorbell_va: u64, slot_id: u8, target: u8) {
     let db_ptr = (doorbell_va + (slot_id as u64) * 4) as *mut u32;
@@ -11,7 +12,7 @@ pub fn ring_command_doorbell(doorbell_va: u64) {
     ring_doorbell(doorbell_va, 0, 0);
 }
 
-/// Wait for a command completion event with a 5 s timeout.
+/// Wait for a command completion event with a 5 s timeout.
 /// Returns `(slot_id, completion_code)` on success.
 fn wait_for_completion() -> Result<(u8, u8), &'static str> {
     let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
@@ -20,6 +21,11 @@ fn wait_for_completion() -> Result<(u8, u8), &'static str> {
             if cc == 1 {
                 return Ok((slot_id, cc));
             } else {
+                SerialPort::puts("[xhci] CMD FAIL cc=");
+                SerialPort::put_u64(cc as u64);
+                SerialPort::puts(" slot=");
+                SerialPort::put_u64(slot_id as u64);
+                SerialPort::puts("\n");
                 return Err("command failed");
             }
         }
@@ -29,6 +35,7 @@ fn wait_for_completion() -> Result<(u8, u8), &'static str> {
         }
         core::hint::spin_loop();
     }
+    SerialPort::puts("[xhci] CMD TIMEOUT\n");
     Err("command completion timeout")
 }
 

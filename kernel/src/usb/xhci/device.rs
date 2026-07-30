@@ -113,16 +113,17 @@ fn submit_control(
         2
     };
 
-    // Setup Stage — always chained to the next TRB (Data or Status)
-    let setup_control = (memory::TRB_TYPE_SETUP_STAGE as u32) << 10
+    // Setup Stage — chain only when followed by a Data Stage (per xHCI §4.11.2.3)
+    let mut setup_control = (memory::TRB_TYPE_SETUP_STAGE as u32) << 10
         | (trt << 16)
-        | memory::TRB_IDT
-        | memory::TRB_CHAIN;
+        | memory::TRB_IDT;
+    if data_len > 0 {
+        setup_control |= memory::TRB_CHAIN;
+    }
     slot.ep0_ring.enqueue_raw(param, 8, setup_control);
 
     if data_len > 0 {
         let data_control = (memory::TRB_TYPE_DATA_STAGE as u32) << 10
-            | memory::TRB_CHAIN
             | if dir_in { memory::TRB_DIR_IN } else { 0 };
         slot.ep0_ring.enqueue_raw(data_phys, data_len as u32, data_control);
     }
@@ -379,7 +380,7 @@ pub fn configure_device(
     // Only push to slot.ep_rings once all allocations succeeded.
     slot.ep_rings.extend(ring_pairs);
 
-    context::init_icc_for_configure_endpoint(icc, slot.speed, slot.port_num, slot.address, slot.mps, slot.ep0_ring.phys, &endpoints);
+    context::init_icc_for_configure_endpoint(icc, slot.speed, slot.port_num, &endpoints);
 
     command::submit_configure_endpoint(cmd_ring, doorbell_va, slot.icc_phys, slot.slot_id, false)?;
 
@@ -485,7 +486,7 @@ impl DeviceSlotManager {
 
         let icc = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
         *icc = InputControlContext::new_slot();
-        context::init_icc_for_address_device(icc, speed, port_num, mps, ep0_ring.phys, address);
+        context::init_icc_for_address_device(icc, speed, port_num, mps, ep0_ring.phys);
         command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, bsr)?;
 
         let mut slot = DeviceSlot::new(
@@ -505,7 +506,7 @@ impl DeviceSlotManager {
             // Re-address with correct MPS and real device address (BSR=0).
             let icc2 = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
             *icc2 = InputControlContext::new_slot();
-            context::init_icc_for_address_device(icc2, speed, port_num, real_mps, slot.ep0_ring.phys, self.next_address);
+            context::init_icc_for_address_device(icc2, speed, port_num, real_mps, slot.ep0_ring.phys);
             command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, false)?;
             slot.address = self.next_address;
             slot.mps = real_mps;

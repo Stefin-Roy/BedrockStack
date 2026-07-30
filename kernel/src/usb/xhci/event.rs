@@ -106,14 +106,23 @@ pub fn consume_pending_events() {
                 let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
                 let cc = (status >> 24) as u8;
                 let slot_id = ((control >> 24) & 0xFF) as u8;
+                SerialPort::puts("[xhci] evt: CMD cc=");
+                SerialPort::put_u64(cc as u64);
+                SerialPort::puts(" slot=");
+                SerialPort::put_u64(slot_id as u64);
+                SerialPort::puts(" cycle=");
+                SerialPort::put_u64((control & 1) as u64);
+                SerialPort::puts("\n");
                 let state = (slot_id as u64) | ((cc as u64) << 8) | ((param as u64) << 16) | (1u64 << 63);
                 LAST_CMD_STATE.store(state, Ordering::Release);
             }
             34 => {
                 let param = unsafe { core::ptr::read_volatile(trb_va as *const u64) };
                 let port_id = (param >> 24) & 0xFF;
-                SerialPort::puts("[xhci] evt: port change port=");
+                SerialPort::puts("[xhci] evt: PORT_CHANGE port=");
                 SerialPort::put_u64(port_id);
+                SerialPort::puts(" cycle=");
+                SerialPort::put_u64((control & 1) as u64);
                 SerialPort::puts("\n");
             }
             32 => {
@@ -122,6 +131,15 @@ pub fn consume_pending_events() {
                 let remaining = status & 0xFFFFFF;
                 let slot_id = ((control >> 24) & 0xFF) as u8;
                 let ep_id = ((control >> 16) & 0x1F) as u8;
+                SerialPort::puts("[xhci] evt: XFER cc=");
+                SerialPort::put_u64(cc as u64);
+                SerialPort::puts(" slot=");
+                SerialPort::put_u64(slot_id as u64);
+                SerialPort::puts(" ep=");
+                SerialPort::put_u64(ep_id as u64);
+                SerialPort::puts(" len=");
+                SerialPort::put_u64(remaining as u64);
+                SerialPort::puts("\n");
                 let state = (slot_id as u64) << 48
                     | (ep_id as u64) << 40
                     | (cc as u64) << 32
@@ -129,8 +147,18 @@ pub fn consume_pending_events() {
                     | (1u64 << 63);
                 LAST_TRANSFER_STATE.store(state, Ordering::Release);
             }
-            37 => {}
-            _ => {}
+            37 => {
+                SerialPort::puts("[xhci] evt: HOST_CTRL cycle=");
+                SerialPort::put_u64((control & 1) as u64);
+                SerialPort::puts("\n");
+            }
+            _ => {
+                SerialPort::puts("[xhci] evt: UNKNOWN type=");
+                SerialPort::put_u64(trb_type as u64);
+                SerialPort::puts(" cycle=");
+                SerialPort::put_u64((control & 1) as u64);
+                SerialPort::puts("\n");
+            }
         }
 
         dequeue = (dequeue + 1) % er_trb_count as u16;

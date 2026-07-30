@@ -84,6 +84,8 @@ struct UsbMassStorageInner {
     tag: u32,
     data_page_phys: u64,
     data_page_va: u64,
+    csw_page_phys: u64,
+    csw_page_va: u64,
 }
 
 impl UsbMassStorageInner {
@@ -107,10 +109,10 @@ impl UsbMassStorageInner {
             self.doorbell_va,
             self.slot_id,
             self.bulk_in_dci,
-            self.data_page_phys,
+            self.csw_page_phys,
             13,
         )?;
-        let csw_bytes = unsafe { core::slice::from_raw_parts(self.data_page_va as *const u8, 13) };
+        let csw_bytes = unsafe { core::slice::from_raw_parts(self.csw_page_va as *const u8, 13) };
         unsafe {
             core::ptr::copy_nonoverlapping(csw_bytes.as_ptr(), csw as *mut Csw as *mut u8, 13);
         }
@@ -199,6 +201,7 @@ impl UsbMassStorageDevice {
         dma: &mut crate::usb::dma::UsbDmaAllocator,
     ) -> Result<Arc<Self>, &'static str> {
         let data_page = dma.alloc_page().ok_or("OOM for USB MSD data page")?;
+        let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;
 
         let inner = Mutex::new(UsbMassStorageInner {
             doorbell_va,
@@ -210,6 +213,8 @@ impl UsbMassStorageDevice {
             tag: 1,
             data_page_phys: data_page.phys,
             data_page_va: data_page.virt,
+            csw_page_phys: csw_page.phys,
+            csw_page_va: csw_page.virt,
         });
 
         let mut model = [0u8; 32];

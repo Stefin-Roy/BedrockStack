@@ -1,3 +1,4 @@
+use core::sync::atomic::{fence, Ordering};
 use crate::usb::dma::UsbDmaAllocator;
 
 pub const TRB_TYPE_NORMAL: u8 = 1;
@@ -31,41 +32,41 @@ pub const TRB_NS: u32 = 1 << 3;
 pub const TRB_CHAIN: u32 = 1 << 4;
 pub const TRB_ENT: u32 = 1 << 1;
 pub const TRB_BSR: u32 = 1 << 9;
-pub const TRB_DC: u32 = 1 << 10;
+pub const TRB_DC: u32 = 1 << 9;
 pub const TRB_IOC: u32 = 1 << 5;
 pub const TRB_IDT: u32 = 1 << 6;
-pub const TRB_SIA: u32 = 1 << 6;
+pub const TRB_SIA: u32 = 1 << 31;
 
 pub const TRB_DIR_IN: u32 = 1 << 16;
 
 pub const LINK_TOGGLE_CYCLE: u32 = 1 << 1;
 
-pub const EVT_TRANSFER: u32 = 1 << 24;
-pub const EVT_COMMAND_COMPLETION: u32 = (1 << 24) | (2 << 16);
-pub const EVT_PORT_STATUS_CHANGE: u32 = (1 << 24) | (3 << 16);
-pub const EVT_MFINDEX_WRAP: u32 = (1 << 24) | (4 << 16);
-pub const EVT_HOST_CONTROLLER: u32 = (1 << 24) | (5 << 16);
-pub const EVT_DEVICE_NOTIFICATION: u32 = (1 << 24) | (6 << 16);
+pub const EVT_TRANSFER: u32 = 32 << 10;
+pub const EVT_COMMAND_COMPLETION: u32 = 33 << 10;
+pub const EVT_PORT_STATUS_CHANGE: u32 = 34 << 10;
+pub const EVT_MFINDEX_WRAP: u32 = 39 << 10;
+pub const EVT_HOST_CONTROLLER: u32 = 37 << 10;
+pub const EVT_DEVICE_NOTIFICATION: u32 = 38 << 10;
 
-pub const CMD_COMPLETION: u16 = 1;
-pub const CMD_SUCCESS: u16 = 2;
-pub const CMD_DATA_BUFFER_ERROR: u16 = 3;
-pub const CMD_BABBLE_DETECTED: u16 = 4;
-pub const CMD_USB_TRANSACTION_ERROR: u16 = 5;
-pub const CMD_TRB_ERROR: u16 = 6;
-pub const CMD_STALL_ERROR: u16 = 7;
-pub const CMD_RESOURCE_ERROR: u16 = 8;
-pub const CMD_BANDWIDTH_ERROR: u16 = 9;
-pub const CMD_NO_SLOTS_ERROR: u16 = 10;
-pub const CMD_INVALID_STREAM_TYPE: u16 = 11;
-pub const CMD_SLOT_NOT_ENABLED: u16 = 12;
-pub const CMD_EP_NOT_ENABLED: u16 = 13;
-pub const CMD_SHORT_PACKET: u16 = 14;
-pub const CMD_RING_UNDERRUN: u16 = 15;
-pub const CMD_RING_OVERRUN: u16 = 16;
-pub const CMD_VF_ER_FULL: u16 = 17;
-pub const CMD_PARAM_ERROR: u16 = 18;
-pub const CMD_CONTEXT_STATE_ERROR: u16 = 19;
+pub const CMD_INVALID: u16 = 0;
+pub const CMD_SUCCESS: u16 = 1;
+pub const CMD_DATA_BUFFER_ERROR: u16 = 2;
+pub const CMD_BABBLE_DETECTED: u16 = 3;
+pub const CMD_USB_TRANSACTION_ERROR: u16 = 4;
+pub const CMD_TRB_ERROR: u16 = 5;
+pub const CMD_STALL_ERROR: u16 = 6;
+pub const CMD_RESOURCE_ERROR: u16 = 7;
+pub const CMD_BANDWIDTH_ERROR: u16 = 8;
+pub const CMD_NO_SLOTS_ERROR: u16 = 9;
+pub const CMD_INVALID_STREAM_TYPE: u16 = 10;
+pub const CMD_SLOT_NOT_ENABLED: u16 = 11;
+pub const CMD_EP_NOT_ENABLED: u16 = 12;
+pub const CMD_SHORT_PACKET: u16 = 13;
+pub const CMD_RING_UNDERRUN: u16 = 14;
+pub const CMD_RING_OVERRUN: u16 = 15;
+pub const CMD_VF_ER_FULL: u16 = 16;
+pub const CMD_PARAM_ERROR: u16 = 17;
+pub const CMD_CONTEXT_STATE_ERROR: u16 = 18;
 
 #[repr(C)]
 pub struct Trb {
@@ -112,6 +113,18 @@ impl TrbRing {
 
         unsafe { core::ptr::write_bytes(buf.virt as *mut u8, 0, buf.size) };
 
+        // Write a valid Link TRB at the segment end so the xHC can wrap.
+        let link_idx = (trb_count - 1) as usize;
+        let link_va = buf.virt + (link_idx as u64) * 16;
+        unsafe {
+            core::ptr::write_volatile(link_va as *mut u64, buf.phys);
+            core::ptr::write_volatile((link_va + 8) as *mut u32, 0);
+            core::ptr::write_volatile(
+                (link_va + 12) as *mut u32,
+                (TRB_TYPE_LINK as u32) << 10 | LINK_TOGGLE_CYCLE | TRB_TC | 1,
+            );
+        }
+
         Ok(TrbRing {
             phys: buf.phys,
             virt: buf.virt,
@@ -126,7 +139,7 @@ impl TrbRing {
         let idx = self.enqueue_index as usize;
         let va = self.virt + (idx as u64) * 16;
         unsafe {
-            let control = trb.control | self.cycle;
+            let control = (trb.control & !1) | self.cycle;
             core::ptr::write_volatile(va as *mut u64, trb.parameter);
             core::ptr::write_volatile((va + 8) as *mut u32, trb.status);
             core::ptr::write_volatile((va + 12) as *mut u32, control);
@@ -152,7 +165,7 @@ impl TrbRing {
         unsafe {
             core::ptr::write_volatile(va as *mut u64, parameter);
             core::ptr::write_volatile((va + 8) as *mut u32, status);
-            core::ptr::write_volatile((va + 12) as *mut u32, control | self.cycle);
+            core::ptr::write_volatile((va + 12) as *mut u32, (control & !1) | self.cycle);
         }
         let phys = self.phys + (idx as u64) * 16;
         let next = self.enqueue_index + 1;
@@ -184,9 +197,11 @@ impl TrbRing {
     }
 
     pub fn flush(&self) {
+        fence(Ordering::SeqCst);
     }
 }
 
+#[repr(C)]
 pub struct InputControlContext {
     pub drop_flags: u32,
     pub add_flags: u32,
@@ -211,7 +226,7 @@ pub fn make_setup_stage_trb(setup: &[u8; 8], trt: u32) -> Trb {
     let param = u64::from_le_bytes([
         setup[0], setup[1], setup[2], setup[3], setup[4], setup[5], setup[6], setup[7],
     ]);
-    Trb::new(param, 8, (TRB_TYPE_SETUP_STAGE as u32) << 10 | trt | TRB_IOC | TRB_IDT)
+    Trb::new(param, 8, (TRB_TYPE_SETUP_STAGE as u32) << 10 | ((trt & 3) << 16) | TRB_IDT)
 }
 
 pub fn make_data_stage_trb(phys: u64, len: u32, dir_in: bool) -> Trb {
@@ -219,13 +234,12 @@ pub fn make_data_stage_trb(phys: u64, len: u32, dir_in: bool) -> Trb {
     if dir_in {
         control |= TRB_DIR_IN;
     }
-    control |= TRB_CHAIN;
     Trb::new(phys, len, control)
 }
 
 pub fn make_status_stage_trb(dir_in: bool) -> Trb {
     let mut control = (TRB_TYPE_STATUS_STAGE as u32) << 10;
-    if dir_in {
+    if !dir_in {
         control |= TRB_DIR_IN;
     }
     control |= TRB_IOC;
@@ -241,7 +255,6 @@ pub fn make_address_device_trb(input_ctx_phys: u64, slot_id: u8, bsr: bool) -> T
     if bsr {
         control |= TRB_BSR;
     }
-    control |= TRB_IOC;
     control |= (slot_id as u32) << 24;
     Trb::new(input_ctx_phys, 0, control)
 }
@@ -251,14 +264,12 @@ pub fn make_configure_endpoint_trb(input_ctx_phys: u64, slot_id: u8, deconfigure
     if deconfigure {
         control |= TRB_DC;
     }
-    control |= TRB_IOC;
     control |= (slot_id as u32) << 24;
     Trb::new(input_ctx_phys, 0, control)
 }
 
 pub fn make_evaluate_context_trb(ctx_phys: u64, slot_id: u8) -> Trb {
     let mut control = (TRB_TYPE_EVALUATE_CONTEXT as u32) << 10;
-    control |= TRB_IOC;
     control |= (slot_id as u32) << 24;
     Trb::new(ctx_phys, 0, control)
 }
@@ -266,7 +277,7 @@ pub fn make_evaluate_context_trb(ctx_phys: u64, slot_id: u8) -> Trb {
 pub fn make_normal_trb(data_phys: u64, len: u32) -> Trb {
     let mut control = (TRB_TYPE_NORMAL as u32) << 10;
     control |= TRB_IOC;
-    Trb::new(data_phys, len, control)
+    Trb::new(data_phys, len & 0x1FFFF, control)
 }
 
 pub fn make_no_op_command_trb() -> Trb {
