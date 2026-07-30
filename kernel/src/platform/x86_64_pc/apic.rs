@@ -62,6 +62,13 @@ fn wrmsr(msr: u32, val: u64) {
     unsafe { asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack)); }
 }
 
+fn rdtsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    (lo as u64) | ((hi as u64) << 32)
+}
+
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 
 /// Map an xAPIC MMIO register offset to its x2APIC MSR index.
@@ -104,55 +111,77 @@ pub fn timer_init_count() -> u32 {
     BSP_TIMER_COUNT.load(Ordering::Relaxed)
 }
 
-/// Tracks APIC timer state for implementing a poll-with-timeout.
+/// TSC-backed poll timeout. Replaces the old APIC-counter-based `ApicTimeout`.
 ///
-/// The APIC timer runs at TIMER_HZ (1000 Hz) — each period is 1ms.
-/// `ApicTimeout` tracks how many times the counter has wrapped (fired)
-/// and computes elapsed milliseconds since construction.
-pub struct ApicTimeout {
-    start_count: u32,
-    init_count: u32,
-    deadline_ms: u64,
-    wraps: u64,
-    last_count: u32,
+/// Works at any point after `apic::init()` has finished calibration — no
+/// dependency on a running periodic APIC timer.
+pub struct PollTimeout {
+    deadline_ns: u64,
 }
 
-impl ApicTimeout {
-    /// Create a timeout that will expire after `ms` milliseconds.
-    ///
-    /// Must be called after `apic::init()` has started the BSP's LAPIC timer.
+impl PollTimeout {
     pub fn new(ms: u64) -> Self {
-        Self {
-            start_count: timer_current_count(),
-            init_count: timer_init_count(),
-            deadline_ms: ms,
-            wraps: 0,
-            last_count: timer_current_count(),
-        }
+        Self { deadline_ns: tsc_now_ns() + ms * 1_000_000 }
     }
 
-    /// Returns `true` if the deadline has passed.
-    pub fn expired(&mut self) -> bool {
-        let cur = timer_current_count();
-        if cur > self.last_count {
-            self.wraps += 1;
-        }
-        self.last_count = cur;
-
-        let init = self.init_count as u64;
-        if init == 0 {
-            crate::drivers::serial::dump_puts("[APIC] BUG: ApicTimeout::expired() — init_count is 0!\n");
-            crate::drivers::serial::dump_puts("[APIC] start_count=");
-            crate::drivers::serial::dump_put_hex(self.start_count as u64);
-            crate::drivers::serial::dump_puts(" deadline_ms=");
-            crate::drivers::serial::dump_put_hex(self.deadline_ms);
-            crate::drivers::serial::dump_puts("\n");
-            loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); } }
-        }
-        let elapsed_ticks = (self.start_count as u64 + self.wraps * init).saturating_sub(cur as u64);
-        let elapsed_ms = elapsed_ticks * (TIMER_PERIOD_MS as u64) / init;
-        elapsed_ms >= self.deadline_ms
+    pub fn expired(&self) -> bool {
+        tsc_now_ns() >= self.deadline_ns
     }
+}
+
+/// Returns the calibrated TSC frequency in Hz.
+pub fn tsc_hz() -> u64 {
+    TSC_HZ.load(Ordering::Relaxed)
+}
+
+/// Returns the TSC value captured at boot calibration.
+pub fn tsc_boot() -> u64 {
+    TSC_BOOT.load(Ordering::Relaxed)
+}
+
+/// Returns the calibrated APIC frequency in Hz.
+pub fn apic_hz() -> u64 {
+    APIC_HZ.load(Ordering::Relaxed)
+}
+
+/// Read TSC and convert to nanoseconds since boot.
+///
+/// Uses divide-first arithmetic to avoid u64 overflow (the naive
+/// `delta * 1_000_000_000 / hz` overflows after ~9 s of uptime).
+/// Returns 0 before calibration.
+pub fn tsc_now_ns() -> u64 {
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return 0;
+    }
+    let boot = TSC_BOOT.load(Ordering::Relaxed);
+    let now = rdtsc();
+    let delta = now.wrapping_sub(boot);
+
+    //  delta / hz  → whole seconds
+    //  delta % hz  → remainder (sub-second ticks)
+    let secs = delta / hz;
+    let remainder = delta % hz;
+
+    let ns = secs * 1_000_000_000
+        + (remainder * 1_000_000_000) / hz;
+    ns
+}
+
+/// Program the LAPIC timer for a one-shot interrupt after `count` ticks.
+///
+/// The timer fires once on vector `TIMER_VECTOR`, then stops until
+/// reprogrammed.  Call `timer_stop()` to cancel a pending shot.
+pub fn oneshot_timer_set(count: u32) {
+    lapic_write(LAPIC_LVT_TIMER, TIMER_VECTOR as u32);
+    lapic_write(LAPIC_INIT_COUNT, count);
+}
+
+/// Mask (stop) the LAPIC timer.  No further interrupts will fire until
+/// `oneshot_timer_set()` is called again.
+pub fn timer_stop() {
+    lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000);
+    lapic_write(LAPIC_INIT_COUNT, 0);
 }
 
 pub fn read_apic_id() -> u8 {
@@ -244,6 +273,15 @@ pub const TIMER_PERIOD_MS: u32 = (1000 / TIMER_HZ) as u32;
 /// Calibrated APIC timer count shared between BSP and APs.
 pub(crate) static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
+/// Calibrated TSC frequency in Hz.
+pub(crate) static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// TSC value captured at boot (during calibration).
+pub(crate) static TSC_BOOT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Calibrated APIC timer frequency in Hz.
+pub(crate) static APIC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 fn calibrate_via_pit() -> u32 {
     SerialPort::puts("[apic] calibrating via PIT\n");
 
@@ -254,6 +292,9 @@ fn calibrate_via_pit() -> u32 {
     lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000); // masked
     lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
     lapic_write(LAPIC_INIT_COUNT, 0xFFFF_FFFF);
+
+    // Sample TSC right when the APIC counter starts.
+    let tsc_start = rdtsc();
 
     // Unmask and let it begin counting.
     let mut lvt = lapic_read(LAPIC_LVT_TIMER);
@@ -274,6 +315,9 @@ fn calibrate_via_pit() -> u32 {
         return 1_000_000;
     }
 
+    // Sample TSC at PIT expiry.
+    let tsc_end = rdtsc();
+
     // Number of LAPIC ticks during the PIT interval.
     let current = lapic_read(LAPIC_CURR_COUNT);
     let elapsed = 0xFFFF_FFFFu32.wrapping_sub(current) as u64;
@@ -293,14 +337,29 @@ fn calibrate_via_pit() -> u32 {
     //   -------------  * PIT_HZ
     //    PIT_RELOAD
     //
-    let apic_hz = elapsed * PIT_HZ / PIT_RELOAD;
+    let apic_hz_val = elapsed * PIT_HZ / PIT_RELOAD;
 
     SerialPort::puts("[apic] estimated APIC frequency: ");
-    SerialPort::put_u64(apic_hz);
+    SerialPort::put_u64(apic_hz_val);
     SerialPort::puts(" Hz\n");
 
+    APIC_HZ.store(apic_hz_val, core::sync::atomic::Ordering::Relaxed);
+
+    // TSC frequency (Hz) from the same PIT interval.
+    let tsc_elapsed = tsc_end.wrapping_sub(tsc_start);
+    if tsc_elapsed > 0 {
+        let tsc_hz_val = tsc_elapsed * PIT_HZ / PIT_RELOAD;
+        TSC_HZ.store(tsc_hz_val, core::sync::atomic::Ordering::Relaxed);
+        TSC_BOOT.store(tsc_start, core::sync::atomic::Ordering::Relaxed);
+        SerialPort::puts("[apic] estimated TSC frequency: ");
+        SerialPort::put_u64(tsc_hz_val);
+        SerialPort::puts(" Hz\n");
+    } else {
+        SerialPort::puts("[apic] WARN: TSC elapsed zero, using APIC-based clocksource\n");
+    }
+
     // Initial LAPIC count for the requested interrupt frequency.
-    let count = (apic_hz / TIMER_HZ) as u32;
+    let count = (apic_hz_val / TIMER_HZ) as u32;
 
     SerialPort::puts("[apic] calibrated timer count: ");
     SerialPort::put_u64(count as u64);
@@ -336,11 +395,10 @@ pub fn init_ap() {
 
     lapic_write(LAPIC_TPR, 0);
 
-    // AP LAPIC timer: use the calibrated count from BSP (same frequency).
-    let lvt = (TIMER_VECTOR as u32) | (1 << 17);
-    lapic_write(LAPIC_LVT_TIMER, lvt);
+    // AP LAPIC timer: masked one-shot, ready but never fires until armed.
+    lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000);
     lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
-    lapic_write(LAPIC_INIT_COUNT, BSP_TIMER_COUNT.load(core::sync::atomic::Ordering::Relaxed));
+    lapic_write(LAPIC_INIT_COUNT, 0);
 
     SerialPort::puts("[apic] AP init done\n");
 }
@@ -383,10 +441,11 @@ pub fn init() {
     let init_count = calibrate_via_pit();
     BSP_TIMER_COUNT.store(init_count, core::sync::atomic::Ordering::Relaxed);
 
-    let lvt = (TIMER_VECTOR as u32) | (1 << 17);
-    lapic_write(LAPIC_LVT_TIMER, lvt);
+    // Leave timer in masked one-shot mode.  The UniversalTimer's clockevent
+    // will arm it when the first one-shot deadline is set.
+    lapic_write(LAPIC_LVT_TIMER, (TIMER_VECTOR as u32) | 0x10000);
     lapic_write(LAPIC_DIVIDE_CONFIG, 0x0B);
-    lapic_write(LAPIC_INIT_COUNT, init_count);
+    lapic_write(LAPIC_INIT_COUNT, 0);
 
-    SerialPort::puts("[apic] timer started at 1000 Hz\n");
+    SerialPort::puts("[apic] timer calibrated, waiting for first deadline\n");
 }

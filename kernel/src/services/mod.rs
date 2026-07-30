@@ -1,5 +1,8 @@
 pub mod capability;
-pub mod timer;
+pub mod clocksource;
+pub mod clockevent;
+pub mod timer_queue;
+pub mod universal_timer;
 pub mod interrupts;
 pub mod phys_mem;
 pub mod virt_mem;
@@ -23,7 +26,7 @@ pub mod riscv64;
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 
-use timer::TimerProvider;
+use universal_timer::UniversalTimer;
 use interrupts::InterruptManager;
 use serial::SerialConsole;
 use platform::PlatformControl;
@@ -39,7 +42,7 @@ use acpi::AcpiProvider;
 /// Built once during `Kernel::init()` after arch init completes.
 /// Accessed via `Kernel::svc()` throughout the rest of the boot sequence.
 pub struct KernelServices {
-    pub timer: &'static dyn TimerProvider,
+    pub timer: &'static dyn UniversalTimer,
     pub interrupts: &'static dyn InterruptManager,
     pub serial: &'static dyn SerialConsole,
     pub platform: &'static dyn PlatformControl,

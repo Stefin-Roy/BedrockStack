@@ -165,8 +165,8 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<Vec<Arc
         registers::USBCMD_RUN | registers::USBCMD_INTE | registers::USBCMD_HSEE);
 
     {
-        use crate::platform::x86_64_pc::apic::ApicTimeout;
-        let mut timeout = ApicTimeout::new(500);
+        use crate::platform::x86_64_pc::apic::PollTimeout;
+        let timeout = PollTimeout::new(500);
         loop {
             if regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0 {
                 break;
@@ -292,7 +292,7 @@ fn verify_message_interrupt_delivery(
     msix_fallback: Option<MsixFallback>,
 ) {
     use crate::drivers::serial::SerialPort;
-    use crate::platform::x86_64_pc::apic::ApicTimeout;
+    use crate::platform::x86_64_pc::apic::PollTimeout;
     use crate::usb::xhci::event;
 
     let before = event::irq_count();
@@ -308,7 +308,7 @@ fn verify_message_interrupt_delivery(
     // until after this diagnostic has already reported a false failure.
     // HLT yields to the interrupt/device scheduler and wakes on the LAPIC
     // timer or the xHCI message interrupt.
-    let mut timeout = ApicTimeout::new(100);
+    let timeout = PollTimeout::new(100);
     let mut irq_fired = false;
     loop {
         if event::irq_count() != before {
@@ -391,7 +391,7 @@ fn verify_message_interrupt_delivery(
             cmd_ring.enqueue(&memory::make_no_op_command_trb());
             cmd_ring.flush();
             command::ring_command_doorbell(doorbell_va);
-            let mut msi_timeout = ApicTimeout::new(100);
+            let msi_timeout = PollTimeout::new(100);
             while event::irq_count() == msi_before && !msi_timeout.expired() {
                 crate::arch::CurrentArch::halt();
             }
@@ -452,10 +452,10 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
 
 fn controller_reset(regs: &registers::XhciRegisters) {
     use crate::drivers::serial::SerialPort;
-    use crate::platform::x86_64_pc::apic::ApicTimeout;
+    use crate::platform::x86_64_pc::apic::PollTimeout;
     let cmd = regs.read_op32(registers::OP_USBCMD);
     regs.write_op32(registers::OP_USBCMD, cmd | registers::USBCMD_HCRST);
-    let mut timeout = ApicTimeout::new(500);
+    let timeout = PollTimeout::new(500);
     loop {
         if regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0 {
             break;

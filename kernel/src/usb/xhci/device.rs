@@ -67,7 +67,7 @@ impl DeviceSlot {
 }
 
 fn wait_for_transfer(slot_id: u8, ep_id: u8) -> Result<u8, &'static str> {
-    let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
+    let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(5000);
     loop {
         if let Some((sid, eid, cc, _remaining)) = event::last_transfer_completion() {
             if sid == slot_id && eid == ep_id {

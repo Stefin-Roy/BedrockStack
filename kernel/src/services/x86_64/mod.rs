@@ -1,4 +1,3 @@
-pub mod apic_timer;
 pub mod x86_interrupts;
 pub mod x86_platform;
 pub mod x86_cpu;
@@ -26,7 +25,7 @@ pub fn x86_services(
     });
 
     KernelServices {
-        timer: apic_timer::init(),
+        timer: crate::services::universal_timer::universal_timer(),
         interrupts: x86_interrupts::init(),
         serial: x86_serial::init(),
         platform: x86_platform::init(),

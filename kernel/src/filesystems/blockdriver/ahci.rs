@@ -92,16 +92,6 @@ const SSTS_DET_ESTAB: u32 = 3;
 const TFD_ERR: u32 = 1 << 0;
 const PRDT_IOC: u32 = 1 << 31;
 
-// The LAPIC timer normally provides the wall-clock deadline for AHCI polling.
-// Do not rely on it exclusively, though: a stopped/misconfigured timer used to
-// leave the BSP spinning forever during controller discovery.  This is a
-// deliberately generous last-resort bound; normal QEMU hardware completes
-// these operations long before it is reached.
-// QEMU may defer an AHCI completion until it regains a scheduling slice.  A
-// tight guest polling loop can consume a million iterations before that
-// happens, so this guard must be far larger than normal command latency.
-const POLL_FALLBACK_LIMIT: u32 = 100_000_000;
-
 #[derive(Clone, Copy)]
 struct Hba { vaddr: u64 }
 
@@ -143,73 +133,15 @@ struct Slot {
     ct_vaddr: u64,
 }
 
-// ── APIC timer helpers ──────────────────────────────────────────
-
-fn init_count() -> u32 { apic::timer_init_count() }
-fn curr_count() -> u32 { apic::timer_current_count() }
-
-fn elapsed_ticks(start: u32, wraps: u32) -> u32 {
-    let i = init_count();
-    let c = curr_count();
-    if wraps == 0 {
-        start.wrapping_sub(c)
-    } else {
-        start.wrapping_add(wraps.wrapping_mul(i + 1)).wrapping_sub(c)
-    }
-}
-
-fn ticks_to_ms(t: u32) -> u32 {
-    let (i, p) = (init_count(), apic::TIMER_PERIOD_MS);
-    if i == 0 { return 0; }
-    (t as u64 * p as u64 / i as u64) as u32
-}
-
-fn ms_to_ticks(ms: u32) -> u32 {
-    let (i, p) = (init_count(), apic::TIMER_PERIOD_MS);
-    if i == 0 { return 10_000_000; }
-    (ms as u64 * i as u64 / p as u64) as u32
-}
-
-/// True when either the LAPIC deadline has passed or its counter is not
-/// progressing.  The latter guard makes every MMIO polling loop finite even
-/// when timer setup failed.
-///
-/// `wraps` counts how many times the periodic down-counter has wrapped past
-/// zero, which is needed because the APIC timer runs in periodic mode and the
-/// counter alone can only represent ~1 ms of elapsed time.
-fn poll_timed_out(start: u32, deadline: u32, wraps: &mut u32, previous: &mut u32, stagnant: &mut u32) -> bool {
-    let current = curr_count();
-    if current == *previous {
-        *stagnant = stagnant.saturating_add(1);
-    } else {
-        if current > *previous {
-            *wraps = wraps.wrapping_add(1);
-        }
-        *previous = current;
-        *stagnant = 0;
-    }
-    elapsed_ticks(start, *wraps) >= deadline || *stagnant >= POLL_FALLBACK_LIMIT
-}
+// ── Timeout helper ──────────────────────────────────────────────
 
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
     if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-    if init_count() != 0 {
-        let deadline = ms_to_ticks(100);
-        let start = curr_count();
-        let mut wraps = 0;
-        let mut previous = start;
-        let mut stagnant = 0;
-        loop {
-            if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-            if poll_timed_out(start, deadline, &mut wraps, &mut previous, &mut stagnant) { return false; }
-            core::hint::spin_loop();
-        }
-    } else {
-        for _ in 0..POLL_FALLBACK_LIMIT {
-            if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-            core::hint::spin_loop();
-        }
-        false
+    let timeout = apic::PollTimeout::new(100);
+    loop {
+        if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+        if timeout.expired() { return false; }
+        core::hint::spin_loop();
     }
 }
 
@@ -269,15 +201,8 @@ impl AhciPort {
     /// Wait for one or more command slots to complete.
     /// Polls both PxCI and PxSACT until all mask bits are cleared.
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
-        use crate::platform::x86_64_pc::apic::ApicTimeout;
-
-        // APIC-based timeout (5 s) — only valid after the LAPIC timer has
-        // been calibrated during apic::init().
-        let apic_ok = apic::timer_init_count() != 0;
-        let mut timeout = if apic_ok { Some(ApicTimeout::new(5000)) } else { None };
-        // Safety iteration limit for emulators (e.g. QEMU TCG) where the
-        // APIC timer counter may not advance during a tight MMIO polling
-        // loop, preventing ApicTimeout from ever expiring.
+        // TSC-backed timeout (5 s).
+        let timeout = apic::PollTimeout::new(5000);
         let mut iterations: u64 = 0;
         const MAX_ITERATIONS: u64 = 50_000_000;
 
@@ -315,10 +240,9 @@ impl AhciPort {
                 return Ok(());
             }
 
-            // Timeout check: APIC wall-clock timer, or iteration counter
-            // fallback for emulators (TCG) where the APIC CCR is stuck.
-            let expired = timeout.as_mut().map_or(false, |t| t.expired());
-            if expired || iterations >= MAX_ITERATIONS {
+            // Timeout check: TSC wall-clock timer, or iteration counter
+            // fallback for emulators (TCG).
+            if timeout.expired() || iterations >= MAX_ITERATIONS {
                 // One last check — the command may have completed between the
                 // last CI read and the timeout decision.
                 if self.hba.pr32(self.port, port_off::CI) & tag_mask == 0
@@ -590,25 +514,19 @@ impl AhciPort {
         // Issue COMRESET via SCTL.DET = 1
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
         self.hba.pw32(self.port, port_off::SCTL, (sctl & !0x0F) | 1);
-        let start = curr_count();
-        let mut wraps = 0;
-        let mut previous = start;
-        let mut stagnant = 0;
-        while !poll_timed_out(start, ms_to_ticks(2), &mut wraps, &mut previous, &mut stagnant) {
+        let reset_hold = apic::PollTimeout::new(2);
+        while !reset_hold.expired() {
             core::hint::spin_loop();
         }
         self.hba.pw32(self.port, port_off::SCTL, sctl & !0x0F);
 
         // Wait up to 100ms for device to re-establish
-        let start = curr_count();
-        let mut wraps = 0;
-        let mut previous = start;
-        let mut stagnant = 0;
+        let re_establish = apic::PollTimeout::new(100);
         loop {
             if self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB {
                 break;
             }
-            if poll_timed_out(start, ms_to_ticks(100), &mut wraps, &mut previous, &mut stagnant) {
+            if re_establish.expired() {
                 SerialPort::puts("[ahci] port reset timeout\n");
                 return Err("port reset timeout");
             }

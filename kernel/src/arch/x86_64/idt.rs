@@ -91,14 +91,15 @@ pub fn unregister_device_handler(vector: u8) {
     DEVICE_HANDLERS[idx].store(core::ptr::null_mut(), Ordering::Release);
 }
 
-/// Callback invoked by the APIC timer ISR before EOI.
-static TIMER_TICK_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
+/// Callback invoked by the BSP's APIC timer ISR before EOI.
+static TIMER_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
 
-/// Set the function called on each APIC timer tick.
+/// Set the function called on each APIC timer interrupt.
 ///
-/// Used by the `ApicTimer` provider to wire up tick counting and handler dispatch.
-pub fn set_timer_tick_callback(cb: fn()) {
-    TIMER_TICK_CALLBACK.store(cb as *mut fn(), Ordering::Release);
+/// Used by `UniversalTimer` to wire up queue processing and clockevent
+/// reprogramming.
+pub fn set_timer_callback(cb: fn()) {
+    TIMER_CALLBACK.store(cb as *mut fn(), Ordering::Release);
 }
 
 fn device_irq_handler(vector: u8) {
@@ -195,10 +196,18 @@ pub fn init() {
 
 /// Timer interrupt handler (vector 32).
 ///
-/// Calls the registered tick callback (increments counter, dispatches
-/// user handlers), then signals EOI to the APIC.
+/// On the BSP: calls the registered universal timer tick (processes
+/// expired timers and reprograms the APIC one-shot), then signals EOI.
+/// On APs: just acknowledges and returns — APs never arm their LAPIC
+/// timer.
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    let ptr = TIMER_TICK_CALLBACK.load(Ordering::Acquire);
+    // APs should not receive timer interrupts, but if one slips through
+    // (e.g. a broadcast), just EOI and return.
+    if crate::smp::current_cpu_id() != 0 {
+        apic::apic_eoi();
+        return;
+    }
+    let ptr = TIMER_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
         handler();

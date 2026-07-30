@@ -226,7 +226,7 @@ pub unsafe fn start_aps(
 
     // Phase 3: Parallel poll with 30ms timeout
     SerialPort::puts("[trampoline] Phase 3: polling\n");
-    let mut timeout = apic::ApicTimeout::new(30);
+    let timeout = apic::PollTimeout::new(30);
     let mut started_ok = 0usize;
     while started_ok < aps.len() {
         if timeout.expired() {
@@ -299,7 +299,7 @@ pub extern "C" fn ap_entry64() -> ! {
 }
 
 fn apic_delay_ms(ms: u64) {
-    let mut t = apic::ApicTimeout::new(ms);
+    let t = apic::PollTimeout::new(ms);
     while !t.expired() {
         core::hint::spin_loop();
     }
@@ -307,9 +307,8 @@ fn apic_delay_ms(ms: u64) {
 
 /// Busy-wait for at least `us` microseconds.
 ///
-/// The APIC timer has 1ms granularity, so sub-millisecond waits round up
-/// to the next 1ms boundary. This is fine — the MP spec only requires a
-/// *minimum* delay of 200µs between INIT and SIPI.
+/// Rounds up to the next millisecond. The MP spec only requires a
+/// *minimum* delay of 200µs between INIT and SIPI, so 1ms is fine.
 fn apic_delay_us(_us: u64) {
     apic_delay_ms(1);
 }

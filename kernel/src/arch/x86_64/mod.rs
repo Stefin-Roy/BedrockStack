@@ -9,6 +9,10 @@ pub mod trampoline;
 mod multiboot2;
 
 use crate::platform::x86_64_pc::apic;
+use crate::services::capability::Capability;
+use crate::services::clockevent::Clockevent;
+use crate::services::clocksource::Clocksource;
+use crate::services::universal_timer;
 
 pub struct X86_64;
 
@@ -27,6 +31,13 @@ impl X86_64 {
         apic::init();
         // Record the BSP's APIC ID after APIC init.
         crate::smp::set_bsp_hardware_id(apic::read_full_apic_id());
+
+        // Initialise the universal timer as early as possible — before
+        // services, before SMP, before interrupts are enabled.
+        universal_timer::early_init(
+            &X86TscClocksource,
+            &ApicOneShotClockevent,
+        );
     }
 
     pub fn init_ap(_cpu_id: u32) {
@@ -62,6 +73,66 @@ impl X86_64 {
     ) -> Vmm {
         paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride, fb_bpp)
     }
+}
 
+// ── TSC clocksource ───────────────────────────────────────────────
 
+pub struct X86TscClocksource;
+
+impl Capability for X86TscClocksource {
+    fn name(&self) -> &str {
+        "x86-tsc"
+    }
+}
+
+impl Clocksource for X86TscClocksource {
+    fn now_ns(&self) -> u64 {
+        apic::tsc_now_ns()
+    }
+}
+
+// ── APIC one-shot clockevent ──────────────────────────────────────
+//
+// Converts absolute nanosecond deadlines into APIC timer ticks and
+// programs the LAPIC in one-shot mode.
+
+pub struct ApicOneShotClockevent;
+
+impl Capability for ApicOneShotClockevent {
+    fn name(&self) -> &str {
+        "apic-oneshot"
+    }
+}
+
+impl Clockevent for ApicOneShotClockevent {
+    /// Program the APIC timer to fire at (or slightly after) `deadline_ns`.
+    ///
+    /// The APIC timer is programmed as a one-shot.  The actual interrupt
+    /// may arrive slightly late due to APIC tick granularity, but never
+    /// before the requested deadline.
+    fn set_deadline(&self, deadline_ns: u64) {
+        let now = apic::tsc_now_ns();
+        if deadline_ns <= now {
+            // Already past — fire as soon as possible (minimum 1 tick).
+            apic::oneshot_timer_set(1);
+            return;
+        }
+        let delta_ns = deadline_ns - now;
+        let apic_hz = apic::apic_hz();
+        if apic_hz == 0 {
+            // Not calibrated (shouldn't happen) — skip.
+            return;
+        }
+        // delta_ns * apic_hz / 1_000_000_000, avoiding overflow.
+        let count = if delta_ns < 1_000_000_000 {
+            (delta_ns * apic_hz) / 1_000_000_000
+        } else {
+            (delta_ns / 1_000_000_000) * apic_hz
+        };
+        apic::oneshot_timer_set(core::cmp::max(1, count as u32));
+    }
+
+    fn stop(&self) {
+        apic::timer_stop();
+    }
 }

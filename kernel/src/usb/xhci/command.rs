@@ -15,7 +15,7 @@ pub fn ring_command_doorbell(doorbell_va: u64) {
 /// Wait for a command completion event with a 5 s timeout.
 /// Returns `(slot_id, completion_code)` on success.
 fn wait_for_completion() -> Result<(u8, u8), &'static str> {
-    let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(5000);
+    let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(5000);
     loop {
         if let Some((slot_id, cc, _param)) = super::event::last_command_completion() {
             if cc == 1 {

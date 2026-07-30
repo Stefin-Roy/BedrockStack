@@ -43,7 +43,7 @@ impl UsbPorts {
             let portsc = self.port_regs.read_portsc(port_num);
             if portsc & PORTSC_PP == 0 {
                 self.port_regs.write_portsc(port_num, portsc | PORTSC_PP);
-                let mut t = crate::platform::x86_64_pc::apic::ApicTimeout::new(10);
+                let t = crate::platform::x86_64_pc::apic::PollTimeout::new(10);
                 while !t.expired() { core::hint::spin_loop(); }
             }
 
@@ -95,7 +95,7 @@ impl UsbPorts {
         // accidentally disable the port or clear unhandled status flags.
         self.port_regs.write_portsc(port_num, (portsc & !(PORTSC_PED | PORTSC_STATUS_BITS)) | PORTSC_PR);
 
-        let mut timeout = crate::platform::x86_64_pc::apic::ApicTimeout::new(500);
+        let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(500);
         loop {
             let ps = self.port_regs.read_portsc(port_num);
             if ps & PORTSC_PR == 0 {

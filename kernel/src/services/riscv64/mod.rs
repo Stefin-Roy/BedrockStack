@@ -1,4 +1,3 @@
-pub mod sbi_timer;
 pub mod riscv_interrupts;
 pub mod riscv_platform;
 pub mod riscv_cpu;
@@ -15,7 +14,7 @@ pub fn riscv_services(
     _acpi: Option<&'static AcpiSubsystem>,
 ) -> KernelServices {
     KernelServices {
-        timer: sbi_timer::init(),
+        timer: crate::services::universal_timer::universal_timer(),
         interrupts: riscv_interrupts::init(),
         serial: crate::services::serial::init(),
         platform: riscv_platform::init(),
