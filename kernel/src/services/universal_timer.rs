@@ -1,5 +1,5 @@
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use spin::Once;
 
@@ -225,4 +225,79 @@ pub fn universal_timer() -> &'static dyn UniversalTimer {
 /// Convenience: return the raw impl pointer for the ISR tick handler.
 pub fn universal_timer_impl() -> &'static UniversalTimerImpl {
     *UNIVERSAL_TIMER.get().expect("UniversalTimer not initialised")
+}
+
+// ── Blocking waits ────────────────────────────────────────────────
+//
+// These register a one-shot timer that sets a static wake flag, then HLT
+// until it fires.  The timer ISR wakes us; we never busy-spin on the TSC.
+
+static WAKE_FLAG: AtomicBool = AtomicBool::new(false);
+
+fn wake_callback(context: *mut u8) {
+    unsafe {
+        (*(context as *const AtomicBool)).store(true, Ordering::SeqCst);
+    }
+}
+
+/// Wait until `done()` returns true, or `deadline_ns` (absolute) passes.
+///
+/// Yields the CPU via HLT, waking on device IRQs or a 1 ms periodic wake
+/// timer, and re-evaluates `done()` after each wake.  This means pure
+/// register-poll waits (port reset, controller start) progress even when no
+/// interrupt is generated.  Returns `true` if `done()` became true before
+/// the deadline.
+///
+/// Falls back to a spin loop if IRQs are disabled (the timer ISR could
+/// never run, so HLT would sleep forever).
+pub fn wait_until_cond(deadline_ns: u64, done: &dyn Fn() -> bool) -> bool {
+    if !crate::arch::CurrentArch::are_interrupts_enabled() {
+        loop {
+            if done() {
+                return true;
+            }
+            if universal_timer().now_ns() >= deadline_ns {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    // Periodic 1 ms wake: guarantees done() is re-checked at a bounded
+    // cadence even if the hardware never raises an interrupt.
+    let id = universal_timer().set_periodic(
+        1_000_000,
+        wake_callback,
+        &WAKE_FLAG as *const AtomicBool as *mut u8,
+    );
+    loop {
+        if done() {
+            universal_timer().cancel(id);
+            return true;
+        }
+        if universal_timer().now_ns() >= deadline_ns {
+            universal_timer().cancel(id);
+            // One last chance — the condition may have just become true.
+            return done();
+        }
+        WAKE_FLAG.store(false, Ordering::SeqCst);
+        while !WAKE_FLAG.load(Ordering::SeqCst) {
+            crate::arch::CurrentArch::halt();
+        }
+    }
+}
+
+/// Block until `now_ns() >= deadline_ns` (absolute), yielding the CPU.
+pub fn wait_until(deadline_ns: u64) {
+    wait_until_cond(deadline_ns, &|| false);
+}
+
+/// Block for `ms` milliseconds, yielding the CPU.
+pub fn sleep_ms(ms: u64) {
+    wait_until(universal_timer().now_ns() + ms * 1_000_000);
+}
+
+/// Current monotonic time in nanoseconds.
+pub fn now_ns() -> u64 {
+    universal_timer().now_ns()
 }

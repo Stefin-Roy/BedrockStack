@@ -161,6 +161,14 @@ fn probe_device(device: Arc<dyn BlockDevice>, stats: &mut WalkStats) {
         let part_dev: Arc<dyn BlockDevice> = Arc::new(PartitionDevice::new(device.clone(), part));
         SerialPort::puts("[FAT32_LS]     #");
         SerialPort::put_u64(part.number as u64);
+        SerialPort::puts(" start_lba=0x");
+        SerialPort::put_hex(part.start_lba);
+        SerialPort::puts(" end_lba=0x");
+        SerialPort::put_hex(part.end_lba);
+        SerialPort::puts(" size=");
+        SerialPort::put_u64(part.size_sectors);
+        SerialPort::puts(" type=0x");
+        SerialPort::put_hex(part.partition_type as u64);
         SerialPort::puts(" -> ");
         SerialPort::putc(letter as u8);
         SerialPort::puts("> ... ");

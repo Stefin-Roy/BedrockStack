@@ -1,3 +1,4 @@
+use crate::drivers::serial::SerialPort;
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
 
@@ -22,11 +23,33 @@ pub(crate) struct Bpb {
     pub active_fat: u8,
 }
 
+fn dump_bpb_failure(sector: &[u8; SECTOR_SIZE], reason: &str) {
+    SerialPort::puts("[bpb] parse failed: ");
+    SerialPort::puts(reason);
+    SerialPort::puts("\n[bpb] bytes 0x00..0x0F: ");
+    for b in &sector[0x00..0x10] {
+        SerialPort::put_hex(*b as u64);
+        SerialPort::putc(b' ');
+    }
+    SerialPort::puts("\n[bpb] bytes 0x0B..0x3F: ");
+    for b in &sector[0x0B..0x40] {
+        SerialPort::put_hex(*b as u64);
+        SerialPort::putc(b' ');
+    }
+    SerialPort::puts("\n[bpb] bytes 0x1F0..0x1FF: ");
+    for b in &sector[0x1F0..0x200] {
+        SerialPort::put_hex(*b as u64);
+        SerialPort::putc(b' ');
+    }
+    SerialPort::puts("\n");
+}
+
 pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let mut sector = [0u8; SECTOR_SIZE];
     read_sectors(device, 0, 1, &mut sector)?;
 
     if sector[510] != 0x55 || sector[511] != 0xAA {
+        dump_bpb_failure(&sector, "no 0x55AA boot signature in partition sector 0");
         return Err(VfsError::InvalidDevice);
     }
 
@@ -41,6 +64,15 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let fsinfo_sec = u16::from_le_bytes([sector[0x30], sector[0x31]]);
 
     if root_ent_cnt != 0 || fat_sz16 != 0 || fat_sz32 == 0 {
+        let mut port = SerialPort::new();
+        use core::fmt::Write;
+        write!(
+            port,
+            "[bpb] not FAT32: root_ent_cnt={} fat_sz16={} fat_sz32=0x{:08x}\n",
+            root_ent_cnt, fat_sz16, fat_sz32
+        )
+        .ok();
+        dump_bpb_failure(&sector, "not a FAT32 BPB (FAT12/16 or other)");
         return Err(VfsError::InvalidDevice);
     }
 

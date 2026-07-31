@@ -31,7 +31,8 @@ if not exist "%IMAGE_PATH%" (
 if not exist "%OVMF_PATH%" copy /Y "%OVMF_CODE_SRC%" "%OVMF_PATH%" >nul
 copy /Y "%OVMF_VARS_SRC%" "%OVMF_VARS%" >nul
 if not exist "%NVME_IMAGE%" (
-    "%QEMU_DIR%\qemu-img" create -f raw "%NVME_IMAGE%" 64M >nul 2>&1
+    echo Creating demo FAT32 USB disk image...
+    python "%~dp0make_demo_drive.py" --output "%NVME_IMAGE%"
 )
 echo Running QEMU with BedrockOS (x86_64^)...
 "%QEMU_PATH%" ^

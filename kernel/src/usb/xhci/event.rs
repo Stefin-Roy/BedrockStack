@@ -1,6 +1,13 @@
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::drivers::serial::SerialPort;
+
+macro_rules! usb_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "usb_trace")]
+        $($arg)*
+    };
+}
 
 static XHCI_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 
@@ -81,6 +88,49 @@ pub fn read_event_completion_at(trb_va: u64) -> (u32, u8, u8, u32) {
 static LAST_CMD_STATE: AtomicU64 = AtomicU64::new(0);
 static LAST_TRANSFER_STATE: AtomicU64 = AtomicU64::new(0);
 
+// ── Port-change event queue ───────────────────────────────────────
+//
+// PORT_CHANGE (type 34) events are pushed by the ISR and drained by the
+// init path (and, once hot-plug lands, the idle loop).  Lock-free SPSC:
+// the ISR is the only producer, the BSP init path the only consumer, both
+// on the same CPU.  Port ids are u8, so a 64-entry ring never overflows in
+// practice (max_ports <= 255, but a ring that wraps just coalesces).
+
+const PORT_EVENT_CAP: usize = 64;
+
+static PORT_EVENTS: [AtomicU8; PORT_EVENT_CAP] = [const { AtomicU8::new(0) }; PORT_EVENT_CAP];
+static PORT_EVENTS_HEAD: AtomicU64 = AtomicU64::new(0);
+static PORT_EVENTS_TAIL: AtomicU64 = AtomicU64::new(0);
+
+fn port_events_push(port_id: u8) {
+    let head = PORT_EVENTS_HEAD.load(Ordering::Acquire);
+    let tail = PORT_EVENTS_TAIL.load(Ordering::Relaxed);
+    if head - tail >= PORT_EVENT_CAP as u64 {
+        return; // full — drop; the init drain re-reads PORTSC anyway
+    }
+    PORT_EVENTS[(head % PORT_EVENT_CAP as u64) as usize].store(port_id, Ordering::Relaxed);
+    core::sync::atomic::fence(Ordering::Release);
+    PORT_EVENTS_HEAD.store(head + 1, Ordering::Release);
+}
+
+/// Pop the next queued port id, or `None`.
+pub fn take_port_change() -> Option<u8> {
+    let tail = PORT_EVENTS_TAIL.load(Ordering::Acquire);
+    let head = PORT_EVENTS_HEAD.load(Ordering::Relaxed);
+    if tail == head {
+        return None;
+    }
+    let port_id = PORT_EVENTS[(tail % PORT_EVENT_CAP as u64) as usize].load(Ordering::Relaxed);
+    core::sync::atomic::fence(Ordering::Acquire);
+    PORT_EVENTS_TAIL.store(tail + 1, Ordering::Release);
+    Some(port_id)
+}
+
+/// True if any port-change events are pending.
+pub fn port_change_pending() -> bool {
+    PORT_EVENTS_HEAD.load(Ordering::Acquire) != PORT_EVENTS_TAIL.load(Ordering::Acquire)
+}
+
 pub fn consume_pending_events() {
     let er_vaddr = XHCI_ER_VADDR.load(Ordering::Relaxed);
     if er_vaddr == 0 {
@@ -106,24 +156,29 @@ pub fn consume_pending_events() {
                 let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
                 let cc = (status >> 24) as u8;
                 let slot_id = ((control >> 24) & 0xFF) as u8;
-                SerialPort::puts("[xhci] evt: CMD cc=");
-                SerialPort::put_u64(cc as u64);
-                SerialPort::puts(" slot=");
-                SerialPort::put_u64(slot_id as u64);
-                SerialPort::puts(" cycle=");
-                SerialPort::put_u64((control & 1) as u64);
-                SerialPort::puts("\n");
+                usb_trace!({
+                    SerialPort::puts("[xhci] evt: CMD cc=");
+                    SerialPort::put_u64(cc as u64);
+                    SerialPort::puts(" slot=");
+                    SerialPort::put_u64(slot_id as u64);
+                    SerialPort::puts(" cycle=");
+                    SerialPort::put_u64((control & 1) as u64);
+                    SerialPort::puts("\n");
+                });
                 let state = (slot_id as u64) | ((cc as u64) << 8) | ((param as u64) << 16) | (1u64 << 63);
                 LAST_CMD_STATE.store(state, Ordering::Release);
             }
             34 => {
                 let param = unsafe { core::ptr::read_volatile(trb_va as *const u64) };
                 let port_id = (param >> 24) & 0xFF;
-                SerialPort::puts("[xhci] evt: PORT_CHANGE port=");
-                SerialPort::put_u64(port_id);
-                SerialPort::puts(" cycle=");
-                SerialPort::put_u64((control & 1) as u64);
-                SerialPort::puts("\n");
+                usb_trace!({
+                    SerialPort::puts("[xhci] evt: PORT_CHANGE port=");
+                    SerialPort::put_u64(port_id);
+                    SerialPort::puts(" cycle=");
+                    SerialPort::put_u64((control & 1) as u64);
+                    SerialPort::puts("\n");
+                });
+                port_events_push(port_id as u8);
             }
             32 => {
                 let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
@@ -131,15 +186,17 @@ pub fn consume_pending_events() {
                 let remaining = status & 0xFFFFFF;
                 let slot_id = ((control >> 24) & 0xFF) as u8;
                 let ep_id = ((control >> 16) & 0x1F) as u8;
-                SerialPort::puts("[xhci] evt: XFER cc=");
-                SerialPort::put_u64(cc as u64);
-                SerialPort::puts(" slot=");
-                SerialPort::put_u64(slot_id as u64);
-                SerialPort::puts(" ep=");
-                SerialPort::put_u64(ep_id as u64);
-                SerialPort::puts(" len=");
-                SerialPort::put_u64(remaining as u64);
-                SerialPort::puts("\n");
+                usb_trace!({
+                    SerialPort::puts("[xhci] evt: XFER cc=");
+                    SerialPort::put_u64(cc as u64);
+                    SerialPort::puts(" slot=");
+                    SerialPort::put_u64(slot_id as u64);
+                    SerialPort::puts(" ep=");
+                    SerialPort::put_u64(ep_id as u64);
+                    SerialPort::puts(" len=");
+                    SerialPort::put_u64(remaining as u64);
+                    SerialPort::puts("\n");
+                });
                 let state = (slot_id as u64) << 48
                     | (ep_id as u64) << 40
                     | (cc as u64) << 32
@@ -148,16 +205,20 @@ pub fn consume_pending_events() {
                 LAST_TRANSFER_STATE.store(state, Ordering::Release);
             }
             37 => {
-                SerialPort::puts("[xhci] evt: HOST_CTRL cycle=");
-                SerialPort::put_u64((control & 1) as u64);
-                SerialPort::puts("\n");
+                usb_trace!({
+                    SerialPort::puts("[xhci] evt: HOST_CTRL cycle=");
+                    SerialPort::put_u64((control & 1) as u64);
+                    SerialPort::puts("\n");
+                });
             }
             _ => {
-                SerialPort::puts("[xhci] evt: UNKNOWN type=");
-                SerialPort::put_u64(trb_type as u64);
-                SerialPort::puts(" cycle=");
-                SerialPort::put_u64((control & 1) as u64);
-                SerialPort::puts("\n");
+                usb_trace!({
+                    SerialPort::puts("[xhci] evt: UNKNOWN type=");
+                    SerialPort::put_u64(trb_type as u64);
+                    SerialPort::puts(" cycle=");
+                    SerialPort::put_u64((control & 1) as u64);
+                    SerialPort::puts("\n");
+                });
             }
         }
 
@@ -204,8 +265,38 @@ pub fn last_command_completion() -> Option<(u8, u8, u32)> {
     }
 }
 
+/// Non-destructive peek at the latest command completion (does not clear
+/// `LAST_CMD_STATE`).  For wait-loop predicates that must not consume the
+/// event before the caller reads it.
+pub fn peek_last_command_completion() -> Option<(u8, u8, u32)> {
+    let state = LAST_CMD_STATE.load(Ordering::Acquire);
+    if state & (1u64 << 63) != 0 {
+        let slot = state as u8;
+        let cc = (state >> 8) as u8;
+        let param = (state >> 16) as u32;
+        Some((slot, cc, param))
+    } else {
+        None
+    }
+}
+
 pub fn last_transfer_completion() -> Option<(u8, u8, u8, u32)> {
     let state = LAST_TRANSFER_STATE.swap(0, Ordering::AcqRel);
+    if state & (1u64 << 63) != 0 {
+        let slot_id = (state >> 48) as u8;
+        let ep_id = (state >> 40) as u8;
+        let cc = (state >> 32) as u8;
+        let remaining = state as u32;
+        Some((slot_id, ep_id, cc, remaining))
+    } else {
+        None
+    }
+}
+
+/// Non-destructive peek at the latest transfer completion (does not clear
+/// `LAST_TRANSFER_STATE`).
+pub fn peek_last_transfer_completion() -> Option<(u8, u8, u8, u32)> {
+    let state = LAST_TRANSFER_STATE.load(Ordering::Acquire);
     if state & (1u64 << 63) != 0 {
         let slot_id = (state >> 48) as u8;
         let ep_id = (state >> 40) as u8;

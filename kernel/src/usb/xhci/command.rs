@@ -15,28 +15,27 @@ pub fn ring_command_doorbell(doorbell_va: u64) {
 /// Wait for a command completion event with a 5 s timeout.
 /// Returns `(slot_id, completion_code)` on success.
 fn wait_for_completion() -> Result<(u8, u8), &'static str> {
-    let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(5000);
-    loop {
-        if let Some((slot_id, cc, _param)) = super::event::last_command_completion() {
-            if cc == 1 {
-                return Ok((slot_id, cc));
-            } else {
-                SerialPort::puts("[xhci] CMD FAIL cc=");
-                SerialPort::put_u64(cc as u64);
-                SerialPort::puts(" slot=");
-                SerialPort::put_u64(slot_id as u64);
-                SerialPort::puts("\n");
-                return Err("command failed");
-            }
-        }
+    use crate::services::universal_timer::{now_ns, wait_until_cond};
+    let deadline = now_ns() + 5_000_000_000;
+    let completed = wait_until_cond(deadline, &|| {
         super::event::consume_pending_events();
-        if timeout.expired() {
-            break;
-        }
-        core::hint::spin_loop();
+        super::event::peek_last_command_completion().is_some()
+    });
+    if !completed {
+        SerialPort::puts("[xhci] CMD TIMEOUT\n");
+        return Err("command completion timeout");
     }
-    SerialPort::puts("[xhci] CMD TIMEOUT\n");
-    Err("command completion timeout")
+    let (slot_id, cc, _param) = super::event::last_command_completion().unwrap();
+    if cc == 1 {
+        Ok((slot_id, cc))
+    } else {
+        SerialPort::puts("[xhci] CMD FAIL cc=");
+        SerialPort::put_u64(cc as u64);
+        SerialPort::puts(" slot=");
+        SerialPort::put_u64(slot_id as u64);
+        SerialPort::puts("\n");
+        Err("command failed")
+    }
 }
 
 pub fn submit_enable_slot(

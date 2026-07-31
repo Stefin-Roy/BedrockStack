@@ -25,7 +25,6 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::platform::x86_64_pc::apic;
 use super::dma;
 use super::dma::DmaAllocator;
 use super::driver::StorageDriver;
@@ -136,13 +135,10 @@ struct Slot {
 // ── Timeout helper ──────────────────────────────────────────────
 
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
+    use crate::services::universal_timer::{now_ns, wait_until_cond};
     if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-    let timeout = apic::PollTimeout::new(100);
-    loop {
-        if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
-        if timeout.expired() { return false; }
-        core::hint::spin_loop();
-    }
+    let deadline = now_ns() + 100_000_000;
+    wait_until_cond(deadline, &|| hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB)
 }
 
 // ── Port state ──────────────────────────────────────────────────
@@ -201,63 +197,40 @@ impl AhciPort {
     /// Wait for one or more command slots to complete.
     /// Polls both PxCI and PxSACT until all mask bits are cleared.
     fn wait_slots(&self, tag_mask: u32) -> Result<(), &'static str> {
-        // TSC-backed timeout (5 s).
-        let timeout = apic::PollTimeout::new(5000);
-        let mut iterations: u64 = 0;
-        const MAX_ITERATIONS: u64 = 50_000_000;
+        use crate::services::universal_timer::{now_ns, wait_until_cond};
 
         // Clear any stale IRQ flag before waiting.
         self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
-        loop {
-            iterations += 1;
 
-            // Fast path: IRQ fired — re-check hardware completion status.
+        // HLT-based wait: yields to the AHCI IRQ / universal timer instead
+        // of busy-spinning (which starves device emulation under TCG).
+        let deadline = now_ns() + 5_000_000_000;
+        let done = &|| {
             if self.irq_completed.load(core::sync::atomic::Ordering::Acquire) != 0 {
                 self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
-                let ci = self.hba.pr32(self.port, port_off::CI);
-                let sact = self.hba.pr32(self.port, port_off::SACT);
-                if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
-                    let tfd = self.hba.pr32(self.port, port_off::TFD);
-                    if tfd & TFD_ERR != 0 {
-                        let serr = self.hba.pr32(self.port, port_off::SERR);
-                        self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
-                        return Err("AHCI cmd error");
-                    }
-                    return Ok(());
-                }
-                continue;
             }
-            // Polling fallback (also catches commands on non-IRQ paths).
             let ci = self.hba.pr32(self.port, port_off::CI);
             let sact = self.hba.pr32(self.port, port_off::SACT);
-            if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
-                let tfd = self.hba.pr32(self.port, port_off::TFD);
-                if tfd & TFD_ERR != 0 {
-                    let serr = self.hba.pr32(self.port, port_off::SERR);
-                    self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
-                    return Err("AHCI cmd error");
-                }
-                return Ok(());
-            }
+            (ci & tag_mask) == 0 && (sact & tag_mask) == 0
+        };
+        let completed = wait_until_cond(deadline, done);
 
-            // Timeout check: TSC wall-clock timer, or iteration counter
-            // fallback for emulators (TCG).
-            if timeout.expired() || iterations >= MAX_ITERATIONS {
-                // One last check — the command may have completed between the
-                // last CI read and the timeout decision.
-                if self.hba.pr32(self.port, port_off::CI) & tag_mask == 0
-                    && self.hba.pr32(self.port, port_off::SACT) & tag_mask == 0
-                {
-                    let tfd = self.hba.pr32(self.port, port_off::TFD);
-                    if tfd & TFD_ERR == 0 { return Ok(()); }
-                }
-                let tfd = self.hba.pr32(self.port, port_off::TFD);
+        // Decode the completion status after the wait (done() is a peek).
+        let ci = self.hba.pr32(self.port, port_off::CI);
+        let sact = self.hba.pr32(self.port, port_off::SACT);
+        let tfd = self.hba.pr32(self.port, port_off::TFD);
+        let _ = completed;
+        if (ci & tag_mask) == 0 && (sact & tag_mask) == 0 {
+            if tfd & TFD_ERR != 0 {
                 let serr = self.hba.pr32(self.port, port_off::SERR);
                 self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
-                return Err("AHCI timeout");
+                return Err("AHCI cmd error");
             }
-            core::hint::spin_loop();
+            return Ok(());
         }
+        let serr = self.hba.pr32(self.port, port_off::SERR);
+        self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
+        Err("AHCI timeout")
     }
 
     fn dump_err(&self, tag_mask: u32, err: u8, serr: u32) {
@@ -514,23 +487,19 @@ impl AhciPort {
         // Issue COMRESET via SCTL.DET = 1
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
         self.hba.pw32(self.port, port_off::SCTL, (sctl & !0x0F) | 1);
-        let reset_hold = apic::PollTimeout::new(2);
-        while !reset_hold.expired() {
-            core::hint::spin_loop();
-        }
+        crate::services::universal_timer::sleep_ms(2);
         self.hba.pw32(self.port, port_off::SCTL, sctl & !0x0F);
 
         // Wait up to 100ms for device to re-establish
-        let re_establish = apic::PollTimeout::new(100);
-        loop {
-            if self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB {
-                break;
-            }
-            if re_establish.expired() {
-                SerialPort::puts("[ahci] port reset timeout\n");
-                return Err("port reset timeout");
-            }
-            core::hint::spin_loop();
+        use crate::services::universal_timer::{now_ns, wait_until_cond};
+        let deadline = now_ns() + 100_000_000;
+        let established = wait_until_cond(
+            deadline,
+            &|| self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB,
+        );
+        if !established {
+            SerialPort::puts("[ahci] port reset timeout\n");
+            return Err("port reset timeout");
         }
 
         // Restore port registers that may have been cleared by COMRESET.

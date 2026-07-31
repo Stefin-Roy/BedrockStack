@@ -67,23 +67,23 @@ impl DeviceSlot {
 }
 
 fn wait_for_transfer(slot_id: u8, ep_id: u8) -> Result<u8, &'static str> {
-    let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(5000);
-    loop {
-        if let Some((sid, eid, cc, _remaining)) = event::last_transfer_completion() {
-            if sid == slot_id && eid == ep_id {
-                if cc == 1 || cc == 13 {
-                    return Ok(cc);
-                }
-                return Err("transfer failed");
-            }
-        }
+    use crate::services::universal_timer::{now_ns, wait_until_cond};
+    let deadline = now_ns() + 5_000_000_000;
+    let completed = wait_until_cond(deadline, &|| {
         event::consume_pending_events();
-        if timeout.expired() {
-            break;
-        }
-        core::hint::spin_loop();
+        event::peek_last_transfer_completion()
+            .map(|(sid, eid, _cc, _remaining)| sid == slot_id && eid == ep_id)
+            .unwrap_or(false)
+    });
+    if !completed {
+        return Err("transfer timeout");
     }
-    Err("transfer timeout")
+    let (_sid, _eid, cc, _remaining) = event::last_transfer_completion().unwrap();
+    if cc == 1 || cc == 13 {
+        Ok(cc)
+    } else {
+        Err("transfer failed")
+    }
 }
 
 fn submit_control(

@@ -165,17 +165,14 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<Vec<Arc
         registers::USBCMD_RUN | registers::USBCMD_INTE | registers::USBCMD_HSEE);
 
     {
-        use crate::platform::x86_64_pc::apic::PollTimeout;
-        let timeout = PollTimeout::new(500);
-        loop {
-            if regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0 {
-                break;
-            }
-            if timeout.expired() {
-                SerialPort::puts("[xhci] start timeout\n");
-                break;
-            }
-            core::hint::spin_loop();
+        use crate::services::universal_timer::{now_ns, wait_until_cond};
+        let deadline = now_ns() + 500_000_000;
+        let running = wait_until_cond(
+            deadline,
+            &|| regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0,
+        );
+        if !running {
+            SerialPort::puts("[xhci] start timeout\n");
         }
     }
     SerialPort::puts("[xhci] controller running\n");
@@ -185,6 +182,29 @@ fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<Vec<Arc
     let port_regs = registers::PortRegisterSet::new(mmio_va, caplength);
     let mut usb_ports = ports::UsbPorts::new(max_ports, port_regs);
     usb_ports.init_ports()?;
+
+    // Event-driven port detection: PORT_CHANGE events are queued by the ISR
+    // while devices finish link-training.  Drain them (and process any that
+    // arrived during the power-on settle) for a bounded window so devices
+    // that raise CSC shortly after power-on still get enumerated.
+    {
+        use crate::services::universal_timer::{now_ns, sleep_ms};
+        let detect_deadline = now_ns() + 500_000_000;
+        loop {
+            while let Some(port_id) = event::take_port_change() {
+                if let Err(e) = usb_ports.handle_port_status_change(port_id) {
+                    SerialPort::puts("[xhci] port change err: ");
+                    SerialPort::puts(e);
+                    SerialPort::puts("\n");
+                }
+            }
+            if now_ns() >= detect_deadline {
+                break;
+            }
+            event::drain_pending_and_clear_intr();
+            sleep_ms(10);
+        }
+    }
 
     event::drain_pending_and_clear_intr();
 
@@ -292,7 +312,6 @@ fn verify_message_interrupt_delivery(
     msix_fallback: Option<MsixFallback>,
 ) {
     use crate::drivers::serial::SerialPort;
-    use crate::platform::x86_64_pc::apic::PollTimeout;
     use crate::usb::xhci::event;
 
     let before = event::irq_count();
@@ -307,19 +326,12 @@ fn verify_message_interrupt_delivery(
     // emulation, delaying the command completion (and its MSI/MSI-X write)
     // until after this diagnostic has already reported a false failure.
     // HLT yields to the interrupt/device scheduler and wakes on the LAPIC
-    // timer or the xHCI message interrupt.
-    let timeout = PollTimeout::new(100);
-    let mut irq_fired = false;
-    loop {
-        if event::irq_count() != before {
-            irq_fired = true;
-            break;
-        }
-        if timeout.expired() {
-            break;
-        }
-        crate::arch::CurrentArch::halt();
-    }
+    // timer or the xHCI message interrupt.  The universal timer guarantees
+    // the halt cannot sleep past the deadline even if the MSI-X route never
+    // raises a device IRQ.
+    use crate::services::universal_timer::{now_ns, wait_until_cond};
+    let deadline = now_ns() + 100_000_000;
+    let irq_fired = wait_until_cond(deadline, &|| event::irq_count() != before);
 
     // Snapshot the controller before polling/acknowledging the event.  IP=1
     // together with USBSTS.EINT=1 proves that the xHC requested an interrupt;
@@ -391,10 +403,8 @@ fn verify_message_interrupt_delivery(
             cmd_ring.enqueue(&memory::make_no_op_command_trb());
             cmd_ring.flush();
             command::ring_command_doorbell(doorbell_va);
-            let msi_timeout = PollTimeout::new(100);
-            while event::irq_count() == msi_before && !msi_timeout.expired() {
-                crate::arch::CurrentArch::halt();
-            }
+            let msi_deadline = now_ns() + 100_000_000;
+            wait_until_cond(msi_deadline, &|| event::irq_count() != msi_before);
             SerialPort::puts("[xhci] MSI fallback delivery: irq=");
             SerialPort::put_u64(event::irq_count() - msi_before);
             SerialPort::puts("\n");
@@ -423,12 +433,14 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
                 let name = registers::read_protocol_string(mmio_va, off);
                 let nul_pos = name.iter().position(|&c| c == 0).unwrap_or(20);
                 let name_str = core::str::from_utf8(&name[..nul_pos]).unwrap_or("?");
+                // xHCI Supported Protocol Capability layout:
+                //   +2: Minor Revision, +3: Major Revision, +4: name string,
+                //   +8: Port Offset, +9: Port Count.
                 let port_info = registers::read_cap_data32(mmio_va, off, 8);
-                let comp_port_off = (port_info >> 24) as u8;
-                let comp_port_cnt = (port_info >> 8) as u8;
-                let rev = registers::read_cap_data32(mmio_va, off, 4);
-                let rev_major = rev & 0xFF;
-                let rev_minor = (rev >> 8) & 0xFF;
+                let comp_port_off = (port_info & 0xFF) as u8;
+                let comp_port_cnt = ((port_info >> 8) & 0xFF) as u8;
+                let rev_major = registers::read_cap_id(mmio_va, off + 3);
+                let rev_minor = registers::read_cap_id(mmio_va, off + 2);
                 SerialPort::puts("[xhci] ");
                 SerialPort::puts(name_str);
                 SerialPort::puts(" v");
@@ -452,19 +464,16 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
 
 fn controller_reset(regs: &registers::XhciRegisters) {
     use crate::drivers::serial::SerialPort;
-    use crate::platform::x86_64_pc::apic::PollTimeout;
     let cmd = regs.read_op32(registers::OP_USBCMD);
     regs.write_op32(registers::OP_USBCMD, cmd | registers::USBCMD_HCRST);
-    let timeout = PollTimeout::new(500);
-    loop {
-        if regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0 {
-            break;
-        }
-        if timeout.expired() {
-            SerialPort::puts("[xhci] reset timeout\n");
-            break;
-        }
-        core::hint::spin_loop();
+    use crate::services::universal_timer::{now_ns, wait_until_cond};
+    let deadline = now_ns() + 500_000_000;
+    let done = wait_until_cond(
+        deadline,
+        &|| regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0,
+    );
+    if !done {
+        SerialPort::puts("[xhci] reset timeout\n");
     }
 }
 

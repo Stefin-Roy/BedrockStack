@@ -12,6 +12,8 @@ const CSW_SIGNATURE: u32 = 0x53425355;
 const DIR_IN: u8 = 0x80;
 const DIR_OUT: u8 = 0x00;
 
+const CBW_OFFSET: u64 = 512;
+
 #[repr(C, packed)]
 struct Cbw {
     d_cbw_signature: u32,
@@ -91,14 +93,18 @@ struct UsbMassStorageInner {
 impl UsbMassStorageInner {
     fn bot_send_cbw(&mut self, cbw_bytes: &[u8; 31]) -> Result<(), &'static str> {
         unsafe {
-            core::ptr::copy_nonoverlapping(cbw_bytes.as_ptr(), self.data_page_va as *mut u8, 31);
+            core::ptr::copy_nonoverlapping(
+                cbw_bytes.as_ptr(),
+                (self.data_page_va + CBW_OFFSET) as *mut u8,
+                31,
+            );
         }
         device::submit_bulk(
             &mut self.bulk_out_ring,
             self.doorbell_va,
             self.slot_id,
             self.bulk_out_dci,
-            self.data_page_phys,
+            self.data_page_phys + CBW_OFFSET,
             31,
         )
     }

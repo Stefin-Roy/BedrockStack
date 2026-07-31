@@ -88,8 +88,8 @@ fn test_msi_cap_info() -> Result<(), &'static str> {
     let dev = find_ahci().ok_or("no AHCI controller")?;
     let cap = caps::find(dev, CAP_MSI).ok_or("MSI cap not found")?;
     let (is_64bit, has_pvm) = pci::msi::cap_info(dev, &cap);
-    // ICH9 on Q35 always has 64-bit MSI; per-vector masking depends on rev.
-    if !is_64bit { return Err("ICH9 AHCI MSI should be 64-bit"); }
+    // No hardcoded 64-bit assumption: real AHCI controllers commonly
+    // implement 32-bit MSI.  Just verify cap_info agrees with the hardware.
     let mc = caps::read_u16(dev, &cap, 2);
     if is_64bit != ((mc >> 7) & 1 != 0) { return Err("cap_info 64-bit disagrees with hardware"); }
     if has_pvm != ((mc >> 8) & 1 != 0) { return Err("cap_info PVM disagrees with hardware"); }
@@ -194,31 +194,74 @@ fn test_msix_mc_register() -> Result<(), &'static str> {
     };
     let cap = caps::find(dev, CAP_MSIX).ok_or("MSI-X cap lookup failed")?;
 
-    // Save original MC.
+    // Skip devices whose MSI-X is already enabled (e.g. the xHCI controller,
+    // which this kernel's driver enables at init).  Touching those while they
+    // are live risks disabling a working interrupt route.
     let saved_mc = caps::read_u16(dev, &cap, 2);
+    SerialPort::puts("[MSIXTEST]  mc_reg target bus=");
+    SerialPort::put_u64(dev.bus as u64);
+    SerialPort::puts(" dev=");
+    SerialPort::put_u64(dev.device as u64);
+    SerialPort::puts(" fn=");
+    SerialPort::put_u64(dev.function as u64);
+    SerialPort::puts(" vid=0x");
+    SerialPort::put_hex(dev.vendor_id as u64);
+    SerialPort::puts(" did=0x");
+    SerialPort::put_hex(dev.device_id as u64);
+    SerialPort::puts(" mc=0x");
+    SerialPort::put_hex(saved_mc as u64);
+    SerialPort::puts("\n");
+    if saved_mc & (1 << 15) != 0 {
+        return Err("SKIP");
+    }
 
-    // Clear Function Mask (bit 14), set MSI-X Enable (bit 15).
-    caps::write_u16(dev, &cap, 2, (saved_mc & !(1 << 14)) | (1 << 15));
+    // Never combine MSI-X Enable (bit 15) with a cleared Function Mask
+    // (bit 14): on real hardware the first MSI-X device is active and its
+    // table may hold stale/pending entries, so unmasking while enabled
+    // raises a spurious interrupt and hangs the kernel.  QEMU masks this
+    // because its first MSI-X device is idle.  Test the bits independently:
+    // mask is toggled with Enable=0, Enable is toggled with mask=1.
+    let restore = |saved: u16| caps::write_u16(dev, &cap, 2, saved);
+
+    // 1. With Enable=0, clear Function Mask.
+    caps::write_u16(dev, &cap, 2, saved_mc & !(1 << 14));
     let mc = caps::read_u16(dev, &cap, 2);
     if mc & (1 << 14) != 0 {
-        caps::write_u16(dev, &cap, 2, saved_mc);
+        restore(saved_mc);
         return Err("MSI-X Function Mask still set after clearing");
     }
+    if mc & (1 << 15) != 0 {
+        restore(saved_mc);
+        return Err("MSI-X Enable unexpectedly set");
+    }
+
+    // 2. With Enable=0, set Function Mask.
+    caps::write_u16(dev, &cap, 2, saved_mc | (1 << 14));
+    let mc = caps::read_u16(dev, &cap, 2);
+    if mc & (1 << 14) == 0 {
+        restore(saved_mc);
+        return Err("MSI-X Function Mask not set after write");
+    }
+
+    // 3. With Function Mask=1, set Enable.  No interrupt can be delivered
+    //    while the whole function is masked, even with pending table entries.
+    caps::write_u16(dev, &cap, 2, (saved_mc | (1 << 14)) | (1 << 15));
+    let mc = caps::read_u16(dev, &cap, 2);
     if mc & (1 << 15) == 0 {
-        caps::write_u16(dev, &cap, 2, saved_mc);
+        restore(saved_mc);
         return Err("MSI-X Enable not set after write");
     }
 
-    // Set Function Mask (bit 14), clear MSI-X Enable (bit 15).
-    caps::write_u16(dev, &cap, 2, (saved_mc & !(1 << 15)) | (1 << 14));
+    // 4. Clear Enable while keeping Function Mask set.
+    caps::write_u16(dev, &cap, 2, (saved_mc | (1 << 14)) & !(1 << 15));
     let mc = caps::read_u16(dev, &cap, 2);
-    if mc & (1 << 14) == 0 {
-        caps::write_u16(dev, &cap, 2, saved_mc);
-        return Err("MSI-X Function Mask not set after write");
-    }
     if mc & (1 << 15) != 0 {
-        caps::write_u16(dev, &cap, 2, saved_mc);
+        restore(saved_mc);
         return Err("MSI-X Enable still set after clearing");
+    }
+    if mc & (1 << 14) == 0 {
+        restore(saved_mc);
+        return Err("MSI-X Function Mask lost while testing Enable");
     }
 
     // Restore.

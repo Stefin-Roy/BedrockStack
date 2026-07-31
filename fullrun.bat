@@ -46,10 +46,10 @@ set NVME_IMAGE=%TARGET_DIR%\nvme.img
 
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
-REM Create a blank NVMe test disk image if missing
+REM Create a demo FAT32 USB disk image if missing
 if not exist "%NVME_IMAGE%" (
-    echo [fullrun] Creating NVMe test disk image...
-    "%QEMU_DIR%\qemu-img" create -f raw "%NVME_IMAGE%" 64M >nul 2>&1
+    echo [fullrun] Creating demo FAT32 USB disk image...
+    python "%SCRIPT_DIR%make_demo_drive.py" --output "%NVME_IMAGE%"
 )
 
 echo ============================================> "%LOG_FILE%"
@@ -243,8 +243,8 @@ set GRUB_EFI=%TARGET_DIR%\grub_bootx64.efi
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
 if not exist "%NVME_IMAGE%" (
-    echo [fullrun] Creating NVMe test disk image...
-    "%QEMU_DIR%\qemu-img" create -f raw "%NVME_IMAGE%" 64M >nul 2>&1
+    echo [fullrun] Creating demo FAT32 USB disk image...
+    python "%SCRIPT_DIR%make_demo_drive.py" --output "%NVME_IMAGE%"
 )
 
 echo ============================================> "%LOG_FILE%"

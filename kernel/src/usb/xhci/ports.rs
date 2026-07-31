@@ -43,9 +43,16 @@ impl UsbPorts {
             let portsc = self.port_regs.read_portsc(port_num);
             if portsc & PORTSC_PP == 0 {
                 self.port_regs.write_portsc(port_num, portsc | PORTSC_PP);
-                let t = crate::platform::x86_64_pc::apic::PollTimeout::new(10);
-                while !t.expired() { core::hint::spin_loop(); }
+                // Let the port power rail settle before reading PORTSC again.
+                // The earlier read was taken *before* power was applied, so
+                // its CCS bit is stale (controllers power ports down at reset).
+                crate::services::universal_timer::sleep_ms(20);
             }
+
+            // Fresh read: this is the authoritative power-on state.  Devices
+            // still mid link-training raise a PORT_CHANGE event afterwards;
+            // detection is event-driven, not a poll loop here.
+            let portsc = self.port_regs.read_portsc(port_num);
 
             if portsc & PORTSC_CCS != 0 {
                 let speed = (portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
@@ -95,22 +102,16 @@ impl UsbPorts {
         // accidentally disable the port or clear unhandled status flags.
         self.port_regs.write_portsc(port_num, (portsc & !(PORTSC_PED | PORTSC_STATUS_BITS)) | PORTSC_PR);
 
-        let timeout = crate::platform::x86_64_pc::apic::PollTimeout::new(500);
-        loop {
-            let ps = self.port_regs.read_portsc(port_num);
-            if ps & PORTSC_PR == 0 {
-                break;
-            }
-            if timeout.expired() {
-                break;
-            }
-            core::hint::spin_loop();
+        let deadline = crate::services::universal_timer::now_ns() + 500_000_000;
+        let pr_cleared = crate::services::universal_timer::wait_until_cond(
+            deadline,
+            &|| self.port_regs.read_portsc(port_num) & PORTSC_PR == 0,
+        );
+        if !pr_cleared {
+            return Err("port reset timeout");
         }
 
         let portsc_after = self.port_regs.read_portsc(port_num);
-        if portsc_after & PORTSC_PR != 0 {
-            return Err("port reset timeout");
-        }
 
         if portsc_after & PORTSC_PED != 0 {
             self.ports[idx].enabled = true;
