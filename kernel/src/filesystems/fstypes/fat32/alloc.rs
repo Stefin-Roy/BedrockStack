@@ -48,14 +48,27 @@ impl Fat32SuperBlock {
     }
 
     pub fn scan_free_clusters(&self) -> Result<u32, VfsError> {
-        let fat = self.read_fat_bulk()?;
-        let n = self.bpb.total_clus;
+        let fat_idx = self.bpb.active_fat_idx();
+        let first_lba = self.bpb.fat_sector_lba(fat_idx, 0);
+        let nsec = self.bpb.fat_sz32;
+        let total_clus = self.bpb.total_clus as u64;
         let mut count = 0u32;
-        for c in 2..2 + n {
-            let off = (c as usize) * 4;
-            let val = u32::from_le_bytes(fat[off..off + 4].try_into().unwrap());
-            if val & 0x0FFFFFFF == FREE_CLUSTER {
-                count += 1;
+        let mut buf = [0u8; SECTOR_SIZE];
+        let first_valid = 2u64;
+        let last_valid = first_valid + total_clus - 1;
+        for sec in 0..nsec as u64 {
+            read_sectors(&*self.device, first_lba + sec, 1, &mut buf)?;
+            let entry_base = sec * 128;
+            for i in 0..128 {
+                let entry_idx = entry_base + i;
+                if entry_idx < first_valid || entry_idx > last_valid {
+                    continue;
+                }
+                let off = (i * 4) as usize;
+                let val = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if val & 0x0FFFFFFF == FREE_CLUSTER {
+                    count += 1;
+                }
             }
         }
         Ok(count)

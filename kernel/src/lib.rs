@@ -367,7 +367,10 @@ impl Kernel {
         }
 
         #[cfg(target_arch = "x86_64")]
-        block_devices.extend(usb_block_devices);
+        {
+            block_devices.extend(usb_block_devices);
+            *crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock() = block_devices.clone();
+        }
 
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");

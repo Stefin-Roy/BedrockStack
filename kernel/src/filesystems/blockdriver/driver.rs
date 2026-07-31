@@ -19,6 +19,8 @@ pub trait StorageDriver: Send + Sync {
 
 static REGISTRY: Mutex<Vec<&'static dyn StorageDriver>> = Mutex::new(Vec::new());
 
+pub static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
+
 pub fn register(driver: &'static dyn StorageDriver) {
     REGISTRY.lock().push(driver);
 }

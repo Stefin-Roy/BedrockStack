@@ -1,8 +1,5 @@
 use crate::filesystems::vfs::error::VfsError;
 
-use super::io::read_sectors;
-use super::bpb::SECTOR_SIZE;
-
 pub(super) const EOC_MARKER: u32 = 0x0FFFFFF8;
 pub(super) const FREE_CLUSTER: u32 = 0x00000000;
 
@@ -35,24 +32,6 @@ impl Fat32SuperBlock {
         let bytes = (value & 0x0FFFFFFF).to_le_bytes();
         sector[offset as usize..offset as usize + 4].copy_from_slice(&bytes);
         Ok(())
-    }
-
-    const PRDT_MAX_SECTORS: u32 = 504;
-
-    pub fn read_fat_bulk(&self) -> Result<alloc::vec::Vec<u8>, VfsError> {
-        let fat_idx = self.bpb.active_fat_idx();
-        let first_lba = self.bpb.fat_sector_lba(fat_idx, 0);
-        let nsec = self.bpb.fat_sz32;
-        let mut fat = alloc::vec![0u8; nsec as usize * SECTOR_SIZE];
-        let chunk = Self::PRDT_MAX_SECTORS;
-        let mut done = 0u32;
-        while done < nsec {
-            let take = core::cmp::min(chunk, nsec - done);
-            let off = done as usize * SECTOR_SIZE;
-            read_sectors(&*self.device, first_lba + done as u64, take, &mut fat[off..])?;
-            done += take;
-        }
-        Ok(fat)
     }
 
     pub fn flush_fat_cache(&self) -> Result<(), VfsError> {

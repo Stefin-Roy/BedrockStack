@@ -1,6 +1,7 @@
 //! Module registry for static module dispatch.
 
 use super::Module;
+use super::fat32_ls::Fat32Ls;
 use super::fat32_test::Fat32Test;
 #[cfg(target_arch = "x86_64")]
 use super::msix_test::MsixTest;
@@ -37,6 +38,7 @@ static MODULES: &[&dyn Module] = &[
     &Fat32Test,
     &MsixTest,
     &UsbTest,
+    &Fat32Ls,
     &VfsTest,
 ];
 
@@ -44,6 +46,7 @@ static MODULES: &[&dyn Module] = &[
 static MODULES: &[&dyn Module] = &[
     &HelloModule,
     &Fat32Test,
+    &Fat32Ls,
     &VfsTest,
 ];
 
