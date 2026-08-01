@@ -1,3 +1,9 @@
+//! CPU slow-mode (Intel throttling) shared by the bootloader and the kernel.
+//!
+//! A single guarded implementation lives here so both crates cannot drift
+//! apart (the kernel copy previously lacked the hypervisor/feature guards
+//! and could #GP on CPUs without the MSRs).
+
 use core::arch::asm;
 
 const IA32_PERF_CTL: u32 = 0x199;
@@ -9,25 +15,29 @@ const IA32_HWP_REQUEST: u32 = 0x774;
 pub unsafe fn wrmsr(msr: u32, val: u64) {
     let low = val as u32;
     let high = (val >> 32) as u32;
-    asm!(
-        "wrmsr",
-        in("ecx") msr,
-        in("eax") low,
-        in("edx") high,
-        options(nomem, nostack, preserves_flags)
-    );
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 #[inline]
 pub unsafe fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
-    asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack, preserves_flags)
-    );
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
     (low as u64) | ((high as u64) << 32)
 }
 
@@ -37,17 +47,19 @@ pub unsafe fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     let ebx_out: u32;
     let ecx: u32;
     let edx: u32;
-    asm!(
-        "push rbx",
-        "cpuid",
-        "mov {ebx_out:e}, ebx",
-        "pop rbx",
-        ebx_out = out(reg) ebx_out,
-        inout("eax") leaf => eax,
-        inout("ecx") subleaf => ecx,
-        out("edx") edx,
-        options(nomem, preserves_flags)
-    );
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            "pop rbx",
+            ebx_out = out(reg) ebx_out,
+            inout("eax") leaf => eax,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
+            options(nomem, preserves_flags)
+        );
+    }
     (eax, ebx_out, ecx, edx)
 }
 

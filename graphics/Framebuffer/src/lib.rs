@@ -1,6 +1,4 @@
 #![no_std]
-#[cfg(feature = "scrollback")]
-extern crate alloc;
 
 pub mod color;
 pub mod console;

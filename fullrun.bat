@@ -26,7 +26,7 @@ if "%BOOT_MODE%"=="" set BOOT_MODE=uefi
 set EXTRA_FEATURES=%3
 
 REM Set to 1 to gate the CPU slow mode feature (Intel-only, x86_64 only).
-set CPU_SLOW=1
+if "%CPU_SLOW%"=="" set CPU_SLOW=1
 
 if /i "%ARCH%"=="x86_64" if /i "%BOOT_MODE%"=="grub" goto :arch_x86_64_grub
 if /i "%ARCH%"=="x86_64" goto :arch_x86_64
@@ -266,7 +266,7 @@ echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 set BASE_FEATURES=display_log kernelmb2 usb_trace
-if "%CPU_SLOW%"=="1" set BASE_FEATURES=display_log kernelmb2
+if "%CPU_SLOW%"=="1" set BASE_FEATURES=%BASE_FEATURES% cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=--features "%BASE_FEATURES%"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1

@@ -1,8 +1,10 @@
-//! Custom global allocator using OS_DATA memory type.
+//! Custom global allocator using the OS_DATA memory type.
 //!
-//! All allocations use MemoryType 0x80000001 (OS_DATA), which persists
-//! after exit_boot_services. This allows Vec allocations to survive
-//! the UEFI boot services teardown.
+//! All allocations use MemoryType 0x80000001 (OS_DATA). These regions stay
+//! owned by us after ExitBootServices: the post-exit memory map still lists
+//! them, `classify_memory` maps them to `Reserved`, and the kernel's frame
+//! allocator only hands out `Usable` frames — so nothing is ever reused or
+//! handed out by the kernel.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::mem::size_of;
@@ -26,14 +28,7 @@ unsafe impl GlobalAlloc for OsDataAllocator {
             if let Ok(ptr) = boot::allocate_pool(OS_DATA, layout.size()) {
                 return ptr.as_ptr();
             }
-            // Fallback: some firmware rejects OEM types — try LOADER_DATA.
-            // These allocations survive exit_boot_services because it is
-            // called with OS_DATA; on real hardware where OS_DATA fails
-            // this best-effort fallback at least lets the boot proceed.
-            return match boot::allocate_pool(MemoryType::LOADER_DATA, layout.size()) {
-                Ok(ptr) => ptr.as_ptr(),
-                Err(_) => core::ptr::null_mut(),
-            };
+            return core::ptr::null_mut();
         }
 
         let total = match layout
@@ -47,12 +42,7 @@ unsafe impl GlobalAlloc for OsDataAllocator {
 
         let base = match boot::allocate_pool(OS_DATA, total) {
             Ok(ptr) => ptr.as_ptr() as usize,
-            Err(_) => {
-                match boot::allocate_pool(MemoryType::LOADER_DATA, total) {
-                    Ok(ptr) => ptr.as_ptr() as usize,
-                    Err(_) => return core::ptr::null_mut(),
-                }
-            }
+            Err(_) => return core::ptr::null_mut(),
         };
 
         let aligned = (base + size_of::<usize>() + align - 1) & !(align - 1);

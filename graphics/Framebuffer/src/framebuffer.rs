@@ -210,9 +210,10 @@ impl Display for Framebuffer {
             return false;
         }
         let Some(offset) = self.checked_offset(x, y) else { return false; };
-        let pixel = color.to_pixel_u32(self.pixel_format);
+        let pixel = color.to_pixel_bytes(self.pixel_format);
+        let bpp = self.bpp_usize();
         unsafe {
-            *(self.shadow.add(offset) as *mut u32) = pixel;
+            write_pixel_bytes(self.shadow, offset, bpp, &pixel);
         }
         self.mark_dirty(x, y, 1, 1);
         true
@@ -222,21 +223,21 @@ impl Display for Framebuffer {
         if self.shadow.is_null() || w == 0 || h == 0 {
             return;
         }
-        let pixel = color.to_pixel_u32(self.pixel_format);
+        let pixel = color.to_pixel_bytes(self.pixel_format);
+        let bpp = self.bpp_usize();
         for row in 0..h {
             let py = y + row;
             if py >= self.height {
                 break;
             }
             let Some(off) = self.checked_offset(x, py) else { continue };
-            let base = unsafe { self.shadow.add(off) as *mut u32 };
             let mut col = 0;
             while col < w {
                 let px = x + col;
                 if px >= self.width {
                     break;
                 }
-                unsafe { *base.add(col) = pixel; }
+                unsafe { write_pixel_bytes(self.shadow, off + col * bpp, bpp, &pixel); }
                 col += 1;
             }
         }
@@ -312,15 +313,15 @@ pub(crate) unsafe fn draw_glyph_raw(
 
     let glyph = FONT[ch as usize];
     let bpp = bpp as usize;
-    let fg_pixel = fg.to_pixel_u32(pixel_format);
-    let bg_pixel = bg.to_pixel_u32(pixel_format);
+    let fg_pixel = fg.to_pixel_bytes(pixel_format);
+    let bg_pixel = bg.to_pixel_bytes(pixel_format);
 
     for row in 0..16 {
         let py = y + row;
         if py >= height {
             break;
         }
-        let base = unsafe { buf.add(py * stride * bpp + x * bpp) as *mut u32 };
+        let base = unsafe { buf.add(py * stride * bpp + x * bpp) };
         for col in 0..8 {
             let px = x + col;
             if px >= width {
@@ -331,8 +332,24 @@ pub(crate) unsafe fn draw_glyph_raw(
             } else {
                 bg_pixel
             };
-            unsafe { *base.add(col) = pixel; }
+            unsafe { write_pixel_bytes(base, col * bpp, bpp, &pixel); }
         }
     }
     true
+}
+
+/// Write a pixel of `bpp` bytes at `buf + offset`.  `px` is the 4-byte BGR/RGB
+/// channel layout from [`Color::to_pixel_bytes`]; for `bpp < 4` only the first
+/// `bpp` bytes are stored (the trailing alpha byte is dropped).
+#[inline]
+unsafe fn write_pixel_bytes(buf: *mut u8, offset: usize, bpp: usize, px: &[u8; 4]) {
+    match bpp {
+        4 => unsafe { *(buf.add(offset) as *mut u32) = u32::from_le_bytes(*px) },
+        2 => unsafe { *(buf.add(offset) as *mut u16) = u16::from_le_bytes([px[0], px[1]]) },
+        _ => {
+            for i in 0..bpp {
+                unsafe { *buf.add(offset + i) = px[i] };
+            }
+        }
+    }
 }

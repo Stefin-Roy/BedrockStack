@@ -1,13 +1,4 @@
-use crate::color::Color;
 use crate::display::Display;
-
-#[cfg(feature = "scrollback")]
-use alloc::vec::Vec;
-#[cfg(feature = "scrollback")]
-use alloc::vec;
-
-#[cfg(feature = "scrollback")]
-const SCROLLBACK_LINES: usize = 1024;
 
 pub struct Console {
     display: *mut dyn Display,
@@ -15,16 +6,6 @@ pub struct Console {
     cursor_row: usize,
     max_cols: usize,
     max_rows: usize,
-    fg_color: Color,
-    bg_color: Color,
-    #[cfg(feature = "scrollback")]
-    screen_chars: Vec<u8>,
-    #[cfg(feature = "scrollback")]
-    scrollback: Vec<u8>,
-    #[cfg(feature = "scrollback")]
-    scrollback_lines: usize,
-    #[cfg(feature = "scrollback")]
-    view_offset: isize,
 }
 
 impl Console {
@@ -33,30 +14,13 @@ impl Console {
         let h = display.height();
         let max_cols = if w > 0 { w / 8 } else { 0 };
         let max_rows = if h > 0 { h / 16 } else { 0 };
-        #[cfg(feature = "scrollback")]
-        let screen_chars = vec![b' '; max_cols * max_rows];
         Console {
             display: unsafe { core::mem::transmute::<&mut dyn Display, *mut dyn Display>(display) },
             cursor_col: 0,
             cursor_row: 0,
             max_cols,
             max_rows,
-            fg_color: Color::WHITE,
-            bg_color: Color::BLACK,
-            #[cfg(feature = "scrollback")]
-            screen_chars,
-            #[cfg(feature = "scrollback")]
-            scrollback: Vec::with_capacity(max_cols * SCROLLBACK_LINES),
-            #[cfg(feature = "scrollback")]
-            scrollback_lines: 0,
-            #[cfg(feature = "scrollback")]
-            view_offset: -1,
         }
-    }
-
-    pub fn set_colors(&mut self, fg: Color, bg: Color) {
-        self.fg_color = fg;
-        self.bg_color = bg;
     }
 
     fn display_mut(&mut self) -> &mut dyn Display {
@@ -71,53 +35,13 @@ impl Console {
             return;
         }
 
-        #[cfg(feature = "scrollback")]
-        {
-            if self.view_offset >= 0 {
-                return;
-            }
-            let idx = self.cursor_row * self.max_cols + self.cursor_col;
-            if idx < self.screen_chars.len() {
-                self.screen_chars[idx] = ch;
-            }
-        }
-
         self.display_mut().draw_char(x, y, ch);
-    }
-
-    #[cfg(feature = "scrollback")]
-    fn push_scrollback_line(&mut self) {
-        for col in 0..self.max_cols {
-            let ch = self.screen_chars[col];
-            self.scrollback.push(ch);
-        }
-        self.scrollback_lines += 1;
-    }
-
-    #[cfg(feature = "scrollback")]
-    fn shift_screen_up(&mut self) {
-        let line_len = self.max_cols;
-        let total = line_len * self.max_rows;
-        if total == 0 {
-            return;
-        }
-        self.screen_chars.copy_within(line_len..total, 0);
-        self.screen_chars[total - line_len..total].fill(b' ');
     }
 
     fn scroll(&mut self) {
         if self.display_mut().height() <= 16 {
             return;
         }
-
-        #[cfg(feature = "scrollback")]
-        {
-            if self.view_offset < 0 {
-                self.push_scrollback_line();
-                self.shift_screen_up();
-            }
-        }
-
         self.display_mut().scroll_up(16);
     }
 
@@ -165,13 +89,11 @@ impl Console {
     }
 
     /// Clear the display to the background colour and reset the cursor to the
-    /// top-left corner.  Also clears the scrollback screen buffer.
+    /// top-left corner.
     pub fn clear(&mut self) {
         self.display_mut().clear();
         self.cursor_col = 0;
         self.cursor_row = 0;
-        #[cfg(feature = "scrollback")]
-        self.screen_chars.fill(b' ');
         self.display_mut().flush();
     }
 
@@ -193,73 +115,5 @@ impl Console {
 
     pub fn flush(&mut self) {
         self.display_mut().flush();
-    }
-
-    #[cfg(feature = "scrollback")]
-    pub fn scroll_back(&mut self, lines: usize) {
-        if self.scrollback_lines == 0 {
-            return;
-        }
-        let target = self.view_offset - lines as isize;
-        self.view_offset = target.max(-1).min(self.scrollback_lines as isize - 1);
-        self.redraw_from_scrollback();
-    }
-
-    #[cfg(feature = "scrollback")]
-    pub fn scroll_forward(&mut self, lines: usize) {
-        let target = self.view_offset + lines as isize;
-        if target >= -1 {
-            self.view_offset = target.min(self.scrollback_lines as isize - 1);
-            self.redraw_from_scrollback();
-        }
-    }
-
-    #[cfg(feature = "scrollback")]
-    pub fn reset_scroll(&mut self) {
-        self.view_offset = -1;
-        self.redraw_from_scrollback();
-    }
-
-    #[cfg(feature = "scrollback")]
-    fn redraw_from_scrollback(&mut self) {
-        let view_offset = self.view_offset;
-        let max_rows = self.max_rows;
-        let max_cols = self.max_cols;
-        let scrollback_lines = self.scrollback_lines;
-        let display_ptr = self.display;
-
-        if view_offset < 0 {
-            let display = unsafe { &mut *display_ptr };
-            display.clear();
-            for row in 0..max_rows {
-                for col in 0..max_cols {
-                    let idx = row * max_cols + col;
-                    let ch = self.screen_chars[idx];
-                    if ch != b' ' {
-                        let x = col * 8;
-                        let y = row * 16;
-                        display.draw_char(x, y, ch);
-                    }
-                }
-            }
-            display.flush();
-            return;
-        }
-
-        let start_line = view_offset as usize;
-        let end_line = (start_line + max_rows).min(scrollback_lines);
-        let display = unsafe { &mut *display_ptr };
-        display.clear();
-        for sb_line in start_line..end_line {
-            let row = sb_line - start_line;
-            let base = sb_line * max_cols;
-            for col in 0..max_cols {
-                let ch = self.scrollback[base + col];
-                let x = col * 8;
-                let y = row * 16;
-                display.draw_char(x, y, ch);
-            }
-        }
-        display.flush();
     }
 }

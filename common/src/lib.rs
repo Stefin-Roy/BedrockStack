@@ -10,4 +10,7 @@
 pub mod serial;
 pub mod types;
 
+#[cfg(target_arch = "x86_64")]
+pub mod cpu_slow;
+
 pub use types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};

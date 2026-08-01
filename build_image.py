@@ -46,8 +46,10 @@ def run(cmd, **kwargs):
     return result
 
 
-def build(target, profile, packages=None):
+def build(target, profile, packages=None, features=None):
     cmd = ["cargo", "build", "--target", target, "--profile", profile]
+    if features:
+        cmd.extend(["--features", features])
     if packages:
         for p in packages:
             cmd.extend(["-p", p])
@@ -56,9 +58,9 @@ def build(target, profile, packages=None):
 
 def create_fat32_image(efi_binary_path, profile):
     """Create a minimal FAT32 image with the EFI binary."""
-    # For now, just create a raw image and copy the EFI binary
-    # The user will need to manually create the FAT32 structure
-    # or install mtools
+    # Prefer mtools, then mkfs.fat; only fall back to a raw copy when neither
+    # is installed. Both tools build the FAT32 structure (and copy the kernel)
+    # automatically.
 
     os.makedirs(BUILD_DIR, exist_ok=True)
 
@@ -290,7 +292,7 @@ def main():
 
     if not args.skip_build:
         print("Building boot crate (UEFI)...")
-        build("x86_64-unknown-uefi", profile, ["boot"])
+        build("x86_64-unknown-uefi", profile, ["boot"], features="cpu_slow")
         print("Building kernel crate...")
         build("x86_64-unknown-none", profile, ["kernel"])
 

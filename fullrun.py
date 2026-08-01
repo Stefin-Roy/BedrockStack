@@ -154,20 +154,22 @@ class BuildApp(App):
         self.write_log(f"[bold blue]Building {package} ({profile})...[/]")
 
         if package in ("boot", "all"):
-            self.build_target("x86_64-unknown-uefi", profile, "boot")
+            self.build_target("x86_64-unknown-uefi", profile, "boot", features="cpu_slow")
 
         if package in ("kernel", "all"):
             self.build_target("x86_64-unknown-none", profile, "kernel")
 
         self.write_log("[bold green]Build complete![/]")
 
-    def build_target(self, target: str, profile: str, pkg: str):
+    def build_target(self, target: str, profile: str, pkg: str, features: str = None):
         cmd = [
             "cargo", "build",
             "--target", target,
             "--profile", profile,
             "-p", pkg,
         ]
+        if features:
+            cmd.extend(["--features", features])
         self.write_log(f"  $ {' '.join(cmd)}")
         try:
             result = subprocess.run(

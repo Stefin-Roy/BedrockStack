@@ -42,58 +42,51 @@ Copies `(height - rows) * stride * bpp` bytes upward, then zeroes the
 vacated rows at the bottom. If `rows >= height`, clears the entire buffer.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:124-141`
 
-**DISP-008 — `Console` stores foreground/background colors:**
-Defaults to white-on-black. `set_colors()` updates both for subsequent
-character draws.
-- Location: `graphics/Framebuffer/src/console.rs:41-43`
+**DISP-008 — `Console` renders white-on-black:**
+All character drawing uses fixed foreground `Color::WHITE` on background
+`Color::BLACK`; there is no per-console color state.
+- Location: `graphics/Framebuffer/src/framebuffer.rs` (`draw_char`)
 
 **DISP-009 — `bpp` parameter is consistent:**
 `Framebuffer`, `Console`, and paging all receive the same `bpp` value.
 `FramebufferInfo.bpp` is set by the bootloader (default 4 for UEFI GOP).
 - Location: `common/src/types.rs:38`, `boot/src/main.rs:254`
 
-**DISP-010 — Scrollback buffer (feature = "scrollback"):**
-Console maintains a `screen_chars` buffer tracking the current on-screen
-characters. On scroll, the top line is pushed into `scrollback` before
-the framebuffer is shifted. `scroll_back()`/`scroll_forward()`/`reset_scroll()`
-redraw from the scrollback buffer.
-- Location: `graphics/Framebuffer/src/console.rs` (feature-gated)
-
-**DISP-011 — Shadow buffer for cached drawing:**
+**DISP-010 — Shadow buffer for cached drawing:**
 `Framebuffer` allocates a cacheable RAM shadow buffer (`shadow: *mut u8`)
 from the kernel page allocator as contiguous physical pages. All drawing
 primitives (`put_pixel`, `fill_rect`, `clear`, `draw_glyph_raw`) write to
-the shadow buffer via regular cached stores (packed `u32` values), never
-directly to the real scanout framebuffer.
+the shadow buffer via regular cached stores sized to `bpp`, never directly
+to the real scanout framebuffer.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
-**DISP-012 — Dirty rectangle tracking:**
+**DISP-011 — Dirty rectangle tracking:**
 Each drawing primitive expands a dirty bounding box (`dirty_x1`, `dirty_y1`,
 `dirty_x2`, `dirty_y2`) via `mark_dirty()`. The dirty region coalesces
 multiple small writes (e.g. a line of text glyphs) into a single
 rectangular copy on the next `flush()`.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
-**DISP-013 — Deferred flushing to real framebuffer:**
+**DISP-012 — Deferred flushing to real framebuffer:**
 Drawing primitives never flush automatically. `flush()` copies only the
 dirty scanlines from shadow to real fb via `core::ptr::copy_nonoverlapping`
 (bulk memcpy). `flush_full()` copies the entire buffer. `scroll_up()` and
 `clear()` mark the full screen dirty and call `flush()` inline.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
-**DISP-014 — Console delegates to `Display` trait:**
+**DISP-013 — Console delegates to `Display` trait:**
 `Console` stores a `*mut dyn Display` (lifetime-erased via `core::mem::transmute`)
 instead of duplicating `fb_ptr`, `stride`, `bpp`, `width`, `height`, and
 `pixel_format`. All drawing (`draw_char`, `scroll_up`, `clear`, `flush`)
 delegates through the `Display` trait interface.
 - Location: `graphics/Framebuffer/src/console.rs`
 
-**DISP-015 — Console flushes once per string output:**
+**DISP-014 — Console flushes once per string output:**
 `Console::puts()` writes the entire string then calls `Display::flush()` once.
 `Console::putc_and_flush()` provides single-character immediate visibility.
 - Location: `graphics/Framebuffer/src/console.rs`
 
-**DISP-016 — `Framebuffer::new()` requires shadow address:**
+**DISP-015 — `Framebuffer::new()` requires shadow address:**
 `shadow_addr: u64` parameter provides the physical address of the shadow
 buffer. `shadow_ptr()` and `shadow_slice()`/`shadow_slice_mut()` expose the
 shadow for direct access.
@@ -109,10 +102,10 @@ valid for `stride * height * bpp` bytes of writable memory each.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:17-19`
 
 **DISP-S002 — `draw_glyph_raw()` safety:**
-Writes packed `u32` values to `buf` (the shadow buffer, not the real fb).
+Writes `bpp` bytes per pixel to `buf` (the shadow buffer, not the real fb).
 The computed offset is validated by bounds checks. The write is unsafe
 because it dereferences the raw pointer.
-- Location: `graphics/Framebuffer/src/framebuffer.rs:192-201`
+- Location: `graphics/Framebuffer/src/framebuffer.rs` (`write_pixel_bytes`)
 
 **DISP-S003 — `clear()` safety:**
 Zeroes `stride * height * bpp` bytes in the shadow buffer via
@@ -151,7 +144,7 @@ Provides:
 - `fill_rect(x, y, w, h, color)`
 - `scroll_up(rows)`
 - `clear()`
-- `flush()` (default no-op)
+- `flush()` (required — no default no-op)
 - `width() → usize`
 - `height() → usize`
 
@@ -162,13 +155,9 @@ copies the entire buffer. Both reset the dirty flag.
 
 **DISP-API-004 — `Console`:**
 Wraps a `&mut dyn Display` pointer for cursor-based text output. All
-drawing delegates to the trait interface. Default colors are white-on-black;
-`set_colors(fg, bg)` overrides them. `puts()` flushes once after writing
-the entire string. `putc_and_flush()` for single-character visibility.
-
-With feature `scrollback` enabled, the last `SCROLLBACK_LINES` (1024) of
-scrolled-off content are available via `scroll_back()`, `scroll_forward()`,
-and `reset_scroll()`.
+drawing delegates to the trait interface. Text renders white-on-black.
+`puts()` flushes once after writing the entire string.
+`putc_and_flush()` for single-character visibility.
 
 ---
 
@@ -183,10 +172,7 @@ and `reset_scroll()`.
   format-aware `to_pixel_bytes()` for BGR/RGB byte ordering.
 - The `draw_glyph_raw` function is `pub(crate)` to both `Framebuffer` and
   `Console`, eliminating the code duplication that existed in v0.2.0.
-- Scrollback stores raw character bytes in a flat `Vec<u8>`. Each line
-  contributes `max_cols` bytes. The buffer is capped at `SCROLLBACK_LINES`
-  lines (oldest lines are dropped when full).
-- Drawing primitives pack pixel data as `u32` via `Color::to_pixel_u32()`
+- Drawing primitives pack pixel data as `bpp` bytes via `Color::to_pixel_bytes()`
   and write to the shadow buffer with regular non-volatile stores. Only
   `flush()` uses `copy_nonoverlapping` to transfer the dirty region to the
   real scanout buffer. This is safe because the shadow buffer is in

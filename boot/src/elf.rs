@@ -112,10 +112,7 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
     }
 
     // Validate the kernel's machine type matches the bootloader's target.
-    #[cfg(target_arch = "x86_64")]
     const EXPECTED_MACHINE: u16 = 0x3E; // EM_X86_64
-    #[cfg(target_arch = "riscv64")]
-    const EXPECTED_MACHINE: u16 = 0xF3; // EM_RISCV
     if e_machine != EXPECTED_MACHINE {
         return Err("Architecture mismatch between bootloader and kernel");
     }

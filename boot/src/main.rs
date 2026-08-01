@@ -14,8 +14,6 @@ use uefi::fs::FileSystem;
 
 mod allocator;
 mod elf;
-#[cfg(feature = "cpu_slow")]
-mod limiter;
 
 use common::serial::x86_64::SerialPort;
 use common::types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
@@ -142,7 +140,7 @@ fn main() -> Status {
 
     // Stack grows downward. Align the top DOWN to 16 bytes, then subtract 8 to
     // emulate the post-`call` stack state the calling convention expects at
-    // function entry (RSP % 16 == 8 on x86_64 SysV; RISC-V uses a0-a7).
+    // function entry (RSP % 16 == 8 on x86_64 SysV).
     let stack_top = (((stack_region_top) & !0xF) - 8) as *const u8;
 
     // 5. Find ACPI RSDP in the UEFI configuration table (before exit_boot_services).
@@ -157,8 +155,9 @@ fn main() -> Status {
     // 7. Exit boot services — after this, only runtime services remain.
     //    The returned map is the authoritative post-exit memory map.
     //    uefi-rs handles the memory-map-key dance internally; if the
-    //    firmware refuses the transition the library will panic with a
-    //    clear message rather than leaving us in an inconsistent state.
+    //    firmware refuses the transition the library logs a warning and
+    //    performs a cold machine reset (uefi-0.37.0/src/boot.rs) rather
+    //    than returning an error.
     let mmap = unsafe { uefi::boot::exit_boot_services(Some(allocator::OS_DATA)) };
 
     fb_info.draw_rect(64, 0, 64, 64, 0, 255, 0);  // M2: GREEN — after exit_boot_services
@@ -205,7 +204,7 @@ fn main() -> Status {
     #[cfg(feature = "cpu_slow")]
     {
         SerialPort::puts("[boot] Enabling CPU slow mode...\n");
-        unsafe { limiter::enable_cpu_slow_mode() };
+        unsafe { common::cpu_slow::enable_cpu_slow_mode() };
     }
 
     unsafe {
@@ -286,7 +285,6 @@ fn parse_bitmask(bm: &PixelBitmask) -> (PixelFormat, u8) {
 
     // Byte offset of each channel in the pixel DWORD (0 = LSB, 3 = MSB).
     let r_byte = (bm.red.trailing_zeros() / 8) as u8;
-    let _g_byte = (bm.green.trailing_zeros() / 8) as u8;
     let b_byte = (bm.blue.trailing_zeros() / 8) as u8;
 
     // If Blue occupies a lower byte than Red, the native order is BGR.
@@ -406,7 +404,6 @@ unsafe fn jump_to_kernel(
     stack_guard: u64,
     rsdp_addr: u64,
 ) -> ! {
-    #[cfg(target_arch = "x86_64")]
     unsafe {
         core::arch::asm!(
             // Firmware state must not leak into the kernel entry ABI.  In
