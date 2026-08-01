@@ -1,6 +1,7 @@
 # Bootloader — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Source:** `boot/src/main.rs`, `boot/src/elf.rs`, `boot/src/allocator.rs`, `boot/src/limiter.rs`
 **Status:** Stable
 
@@ -21,13 +22,16 @@ The region buffer capacity is pre-allocated (over-provisioned by `* 2 + 256`).
 If the final map exceeds capacity, the bootloader HALTS rather than silently
 truncating. Only `CONVENTIONAL` memory is `Usable`; all other types are
 `Reserved` so the kernel never hands out frames holding live data.
-Hypervisor detection filters >4 GiB conventional regions (x86_64 only).
-- Location: `boot/src/main.rs:120-200`
-- `classify_memory()` at `boot/src/main.rs:239-250`
+Every `CONVENTIONAL` region is trusted at any address — the old hypervisor
+filter that dropped >4 GiB conventional regions was **removed**: OVMF/QEMU
+report 64-bit MMIO as `Reserved`, so trusting UEFI's map loses no RAM while
+keeping the kernel's identity map correct.
+- Location: `boot/src/main.rs:162,171-191` (`exit_boot_services`, map loop)
+- `classify_memory()` at `boot/src/main.rs:222-233`
 
 **BOOT-003 — Framebuffer info transfer buffer contains one valid entry:**
 Pre-allocated as `alloc::vec![fb_info]`, leaked via `core::mem::forget`.
-- Location: `boot/src/main.rs:124,126,206`
+- Location: `boot/src/main.rs:124,126`
 
 **BOOT-004 — All transfer buffers use OS_DATA memory type (0x80000001), with LOADER_DATA fallback:**
 Custom `#[global_allocator]` backed by `uefi::boot::allocate_pool(OS_DATA, ...)`.
@@ -39,22 +43,23 @@ If `OS_DATA` is rejected (some real firmware rejects OEM types), falls back to
 The guard page is the lowest page; its physical address is passed to the
 kernel so it can be left unmapped. The stack is page-allocated (not a Vec),
 so it is leaked implicitly (no `forget` needed).
-- Location: `boot/src/main.rs:28,128-139`
+- Location: `boot/src/main.rs:28,132-141`
 
 **BOOT-006 — Heap transfer buffers are leaked before `exit_boot_services`:**
 `core::mem::forget(regions_buf)` and `core::mem::forget(fb_buf)` prevent
 Rust from calling `dealloc` after UEFI teardown.
-- Location: `boot/src/main.rs:205-206`
+- Location: `boot/src/main.rs:196-197`
 
 **BOOT-007 — RSDP is discovered from UEFI config table before boot services end:**
 Config table entries are invalid after `exit_boot_services`.
-- Location: `boot/src/main.rs:148-149,254-269`
+- Location: `boot/src/main.rs:149,237-252`
 
 **BOOT-008 — `GOP BltOnly` returns zeroed `FramebufferInfo` (not fatal):**
 If the framebuffer has no linear address, the bootloader logs a warning and
 returns `FramebufferInfo::zeroed()` so the kernel can fall back to serial-only
-operation. Never panics.
-- Location: `boot/src/main.rs:368-371`
+operation. Never panics. Also returns zeroed on missing GOP handle or failed
+protocol open.
+- Location: `boot/src/main.rs:315-368` (`get_framebuffer_info`), `boot/src/main.rs:319-321,327-330,351-354`
 
 **BOOT-009 — ELF loading rejects PIE executables (`ET_DYN`):**
 Only `ET_EXEC` (type 2) is accepted. Accepting `ET_DYN` would silently jump
@@ -82,7 +87,7 @@ The bootloader executes `CLI` (disable interrupts) before `MOV RSP` to
 prevent firmware IDT from handling an interrupt on the kernel's unprotected
 stack. `CLD` guarantees the SysV ABI direction-flag invariant before any
 `cld`-dependent string operation in the kernel.
-- Location: `boot/src/main.rs:434-438`
+- Location: `boot/src/main.rs:400-434` (`jump_to_kernel`), `cli`/`cld` at 417,421
 
 **BOOT-013 — `FramebufferInfo::zeroed()` provides safe default:**
 When GOP is unavailable (missing handle, open failure, or BltOnly), a
@@ -94,14 +99,15 @@ display subsystem treats a null framebuffer pointer as a safe no-op.
 `parse_bitmask()` checks whether each channel's mask is byte-aligned.
 Non-byte-aligned masks (e.g. 5:6:5) fall back to BGR 32bpp. Byte-offset
 comparison determines RGB vs BGR order.
-- Location: `boot/src/main.rs:277-326`
+- Location: `boot/src/main.rs:260-309`
 
 **BOOT-015 — `cpu_slow` mode configures Intel-only MSRs after EBS:**
 Gated behind `#[cfg(feature = "cpu_slow")]`. Runs just before jumping to
 kernel. Writes to IA32_CLOCK_MODULATION, IA32_ENERGY_PERF_BIAS,
 IA32_PERF_CTL, and IA32_HWP_REQUEST MSRs to force minimum power state.
-Skips on non-Intel or under hypervisors.
-- Location: `boot/src/main.rs:214-218`, `boot/src/limiter.rs`
+Skips on non-Intel or under hypervisors (CPUID detection in
+`limiter::is_hypervisor`, unrelated to memory-map filtering).
+- Location: `boot/src/main.rs:205-209`, `boot/src/limiter.rs:64,106-114`
 
 ## Safety Invariants
 
@@ -114,14 +120,14 @@ physical memory is writable and does not overlap critical regions.
 `entry` must be a valid kernel entry point. `stack_top` must be valid
 writable memory (stack grows downward). `regions_ptr` / `fb_ptr` must point
 to valid, non-dangling data. This function does not return.
-- Location: `boot/src/main.rs:417-425`
+- Location: `boot/src/main.rs:390-408`
 
 **BOOT-S003 — Kernel entry ABI (x86_64):**
 sysv64 calling convention: `rdi=regions_ptr, rsi=regions_len, rdx=fb_ptr,
 rcx=stack_guard, r8=rsdp_addr`. `rsdp_addr` is 0 if RSDP not found.
 For the Multiboot2 path, the `Kernel::new()` call additionally receives
 `rsdp_data: Option<&'static [u8]>` in lieu of `rsdp_addr`.
-- Location: `boot/src/main.rs:442-449`, `kernel/src/arch/x86_64/multiboot2.rs`
+- Location: `boot/src/main.rs:427-431`, `kernel/src/arch/x86_64/multiboot2.rs`
 
 ---
 
@@ -137,7 +143,7 @@ segment data fits within `elf_data` before copying.
 `regions_buf` capacity is over-provisioned as `est_entries * 2 + 256`.
 The bootloader HALTS if capacity is exceeded (post-exit allocation is
 impossible).
-- Location: `boot/src/main.rs:120-123,188-193`
+- Location: `boot/src/main.rs:120-123,179-184`
 
 ---
 
@@ -145,9 +151,11 @@ impossible).
 
 - `OS_DATA` memory type (`0x80000001`) is a custom UEFI type that persists
   after `exit_boot_services(Some(OS_DATA))`.
-- On x86_64, conventional memory ABOVE 4 GiB is only filtered under
-  hypervisors (detected via CPUID hypervisor bit). Real hardware trusts the
-  UEFI memory map and keeps its full RAM.
+- On x86_64, conventional memory at ANY address (including >4 GiB) is
+  trusted and kept as `Usable`. OVMF reports PCI MMIO and other non-RAM as
+  `Reserved`, so no hypervisor filter is needed on the memory map. (The
+  CPUID-based `limiter::is_hypervisor` still exists, but only gates the
+  `cpu_slow` MSR writes — it no longer filters memory regions.)
 - The kernel ELF is stored on the ESP as `\EFI\BEDROCK\KERNEL` and loaded
   from disk at runtime (not embedded at build time).
 - When booting via GRUB/Multiboot2, the kernel is loaded by GRUB directly

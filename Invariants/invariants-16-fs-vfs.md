@@ -129,11 +129,16 @@ Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
 Required operations: `statfs`, `sync_fs`.
 
 **VFS-API-003a — Mount operations:**
-`mount` mounts a filesystem as a new drive letter. `mount_at` mounts
-a filesystem on a subdirectory of an existing drive, setting the
-target dentry's `mount_id` to enable cross-drive path traversal.
-`mount_virtual` creates a bind-mount sharing an existing inode tree.
-`unmount` removes a drive, clearing any covered dentry's `mount_id`.
+`mount(fstype, device, drive)` mounts a filesystem as a new drive letter,
+taking `device: Option<Arc<dyn BlockDevice>>` (wrapped in the
+`DriveMount`, which the FAT32 superblock uses for sector I/O).
+`mount_at(fstype, device, target_path, drive)` mounts a filesystem on a
+subdirectory of an existing drive, setting the target dentry's `mount_id`
+to enable cross-drive path traversal (target must be a directory and not
+already a mount point). `mount_virtual(source, drive)` creates a bind-mount
+sharing an existing inode tree (`device = None`). `unmount` removes a drive,
+clearing any covered dentry's `mount_id`.
+- Location: `kernel/src/filesystems/vfs/mod.rs:130-190`
 
 **VFS-API-004 — Open file operations:**
 `open`, `close`, `read`, `write`, `seek`, `truncate`, `ftruncate`,
@@ -154,7 +159,9 @@ statistics via `statfs()`.
 ## Design Notes
 
 - VFS supports `tmpfs` (always) and `fat32` (x86_64, via the ESP/block device).
-  The ESP is mounted on `B>` during `Kernel::run()`.
+  The ESP is mounted on `B>` during `Kernel::run()` via
+  `partition::mount_first_partition(dev, "fat32", 'B')` (see
+  `invariants-19-fs-partition.md`).
 - `/dev` is not populated; no device special file type exists. Console
   I/O goes through `SerialPort` and `Framebuffer` directly, not through VFS.
 - Standard FDs 0/1/2 are placeholder files in `A>tmp/`. They will be

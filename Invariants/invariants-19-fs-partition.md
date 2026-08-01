@@ -26,10 +26,13 @@ points to the next EBR (entry 1).
 infinite loops from corrupted or malicious partition tables.
 - Location: `kernel/src/filesystems/partition/mod.rs:17`
 
-**PART-004 — GPT header CRC32 is validated:**
+**PART-004 — GPT header CRC32 is validated, with zero-CRC tolerance:**
 The GPT header CRC32 field is verified by zeroing the crc32 field in
-the header buffer and recomputing the CRC over `header_size` bytes.
-- Location: `kernel/src/filesystems/partition/gpt.rs:48-54`
+the header buffer and recomputing the CRC over `header_size` bytes —
+**unless the stored CRC is 0**, in which case validation is skipped.
+This tolerates firmware that writes a zero CRC32 (e.g. certain GRUB/
+image tooling). CRC uses the IEEE 802.3 polynomial (0xEDB88320).
+- Location: `kernel/src/filesystems/partition/gpt.rs:52-57`, `kernel/src/filesystems/partition/mod.rs:188-200`
 
 **PART-005 — Partition numbering follows platform conventions:**
 MBR primary partitions use slots 1–4 (matching their entry index).
@@ -53,7 +56,9 @@ the partition's sector count, not the whole disk's.
 - `rsvd_sec_cnt > 0`, `num_fats > 0`, `root_clus >= 2`
 - `total_sectors > first_data_sec` and `total_sectors <= device.sector_count()`
 Returns `VfsError::InvalidInput` on any violation.
-- Location: `kernel/src/filesystems/fstypes/fat32.rs`
+The BPB parser moved into the FAT32 module's `bpb.rs`; cluster-chain walks
+additionally bound their length at `total_clus + 2` to survive corrupt FATs.
+- Location: `kernel/src/filesystems/fstypes/fat32/bpb.rs`
 
 ---
 

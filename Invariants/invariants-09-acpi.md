@@ -1,6 +1,7 @@
 # ACPI Subsystem — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Source:** `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs`
 **Status:** Stable
 
@@ -13,12 +14,12 @@ The VMM-backed `AcpiHandler` requires live page tables for the physical-
 address path. When `rsdp_data` is provided (e.g. from Multiboot2 tag),
 the RSDP bytes are already in memory and `parse_tables_from_data()` is used
 directly, requiring no VMM mapping for the RSDP itself.
-- Location: `kernel/src/lib.rs:213-227`, `kernel/src/acpi/mod.rs`, `kernel/src/acpi/tables.rs`
+- Location: `kernel/src/lib.rs:183,278-290` (`init_acpi`), `kernel/src/acpi/mod.rs:77` (`AcpiSubsystem::new`)
 
 **ACPI-002 — `AcpiSubsystem` stored as `Option`; ACPI is optional:**
 If RSDP discovery or table parsing fails, the kernel continues without
 ACPI. `reset()` and `shutdown()` are no-ops when `self.acpi` is `None`.
-- Location: `kernel/src/lib.rs:65,214-227`
+- Location: `kernel/src/lib.rs:72,162,279-290`
 
 **ACPI-003 — Table entry signatures are validated:**
 XSDT/RSDT signatures checked (`"XSDT"`/`"RSDT"`). Individual table
@@ -46,17 +47,18 @@ All access serialized behind `Mutex<Option<AcpiVmmState>>`.
 **ACPI-007 — PCI config regions parsed from MCFG, gracefully absent:**
 `PciConfigRegions` is empty if no MCFG table found. PCI init handles
 empty regions.
-- Location: `kernel/src/acpi/mod.rs:110-114`
+- Location: `kernel/src/acpi/mod.rs:122`, `kernel/src/acpi/platform.rs:22`
 
 **ACPI-008 — MADT parsing prefers x2APIC entries over legacy APIC:**
 On x2APIC-capable firmware, legacy type-0 entries (8-bit APIC IDs) are
 stubs. Type-9 x2APIC entries (32-bit IDs) take precedence.
-- Location: `kernel/src/acpi/madt.rs:164-172`
+- Location: `kernel/src/acpi/madt.rs:73-75,104-123,167-169`
 
-**ACPI-009 — Processor list is built from MADT:**
-A flat `Vec<(local_apic_id, enabled)>` is extracted from the MADT,
-bypassing the `ProcessorInfo` struct for direct use by SMP init.
-- Location: `kernel/src/acpi/mod.rs:138-145`
+**ACPI-009 — Processor list is built from MADT into `AcpiSubsystem.cpus`:**
+A flat `Vec<(u32, bool)>` — `(local_apic_id, enabled)` — is extracted from
+the MADT (boot CPU first), bypassing `ProcessorInfo` for direct use by SMP
+init and the `AcpiProvider::cpus()` service.
+- Location: `kernel/src/acpi/mod.rs:66,146-164`
 
 **ACPI-010 — `parse_tables_from_data()` parses RSDP from embedded byte slice:**
 When `rsdp_data: Option<&'static [u8]>` is `Some`, the function operates on
@@ -65,6 +67,14 @@ the already-mapped byte slice directly. This supports Multiboot2 tags 14 and
 checksum, revision, and extracts RSDT/XSDT addresses without needing a VMM
 mapping call.
 - Location: `kernel/src/acpi/tables.rs`
+
+**ACPI-011 — `AcpiProvider` capability trait wraps `AcpiSubsystem`:**
+The `AcpiProvider: Capability` trait (`services/acpi.rs`) exposes
+`interrupt_model`, `pci_config_regions`, `platform_info`, `cpus()`, and
+`map_device_mmio()`. On x86_64, `X86Acpi` wraps a `Box::leak`ed
+`&'static AcpiSubsystem`; on RISC-V, `RiscvAcpi` is a unit struct returning
+empty `cpus()`, `InterruptModel::Unknown`, and a no-op `map_device_mmio`.
+- Location: `kernel/src/services/acpi.rs:7-15`, `kernel/src/services/x86_64/x86_acpi.rs:7-43`, `kernel/src/services/x86_64/mod.rs:19-24`, `kernel/src/services/riscv64/riscv_acpi.rs:8-43`
 
 ---
 
@@ -95,6 +105,7 @@ can carry embedded RSDP bytes (Multiboot2 path). When `Some`, uses
 `parse_tables_from_data()` instead of mapping from physical `rsdp_addr`.
 Returns `Err(AcpiError)` on bad signature, bad checksum, or missing
 required tables.
+- Location: `kernel/src/acpi/mod.rs:77`
 
 **ACPI-API-002 — `AcpiSubsystem::reset()`:**
 Attempts reset via:
@@ -102,6 +113,7 @@ Attempts reset via:
 2. 8042 PS/2 controller (x86_64 only)
 3. SBI cold_reboot (RISC-V only)
 4. Infinite halt (ultimate fallback)
+- Location: `kernel/src/acpi/mod.rs:168`
 
 **ACPI-API-003 — `AcpiSubsystem::shutdown()`:**
 Attempts S5 sleep via:
@@ -109,6 +121,7 @@ Attempts S5 sleep via:
 2. QEMU PM I/O port (x86_64 only)
 3. SBI system_reset (RISC-V only)
 4. Infinite halt (ultimate fallback)
+- Location: `kernel/src/acpi/mod.rs:201`
 
 ---
 

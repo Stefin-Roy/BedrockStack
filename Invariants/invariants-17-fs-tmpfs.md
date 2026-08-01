@@ -1,7 +1,8 @@
 # tmpfs — Invariants
 
-**Version:** 0.3.0
-**Source:** `kernel/src/filesystems/fstypes/{mod,tmpfs}.rs`
+**Version:** 0.4.0
+**Date:** 2026-07-31
+**Source:** `kernel/src/filesystems/fstypes/{mod,tmpfs/mount.rs,tmpfs/inode.rs}`
 **Status:** Stable
 
 ---
@@ -55,12 +56,13 @@ Wraps in `Inode` + `SuperBlock`. Returns `(SuperBlock, InodeOps)`.
 
 **TMPFS-API-002 — `FileSystem` trait:**
 ```rust
-pub trait FileSystem: Sync {
-    fn mount(&self, device: Option<Arc<dyn BlockDevice>>) -> Result<(SuperBlock, Arc<dyn InodeOps>), VfsError>;
+pub trait FileSystem: Send + Sync {
+    fn mount(&self, device: Option<Arc<dyn BlockDevice>>)
+        -> Result<(SuperBlock, Arc<dyn InodeOps>), VfsError>;
     fn name(&self) -> &str;
 }
 ```
-- Location: `kernel/src/filesystems/fstypes/mod.rs`
+- Location: `kernel/src/filesystems/fstypes/mod.rs:13-15`
 
 ---
 

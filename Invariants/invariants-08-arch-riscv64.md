@@ -1,7 +1,8 @@
 # RISC-V64 Architecture — Invariants
 
-**Version:** 0.3.0
-**Source:** `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline}.rs`, `kernel/src/dtb.rs`
+**Version:** 0.4.0
+**Date:** 2026-07-31
+**Source:** `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline,time}.rs`, `kernel/src/dtb.rs`, `kernel/src/services/riscv64/*`
 **Status:** Stable
 
 ---
@@ -18,8 +19,6 @@ Identity mapping + higher-half kernel alias at `KERNEL_VMA_BASE + phys`.
 with NX. Framebuffer area strips EXECUTE.
 - Location: `kernel/src/arch/riscv64/paging.rs:80-90`
 
-
-
 **RISCV-004 — Trap handler saves/restores all 32 GPRs + `sepc` + `sstatus`:**
 `__trap_entry` allocates a `TrapFrame` (256 bytes) on the stack,
 calls `__trap_handler`, then restores and `sret`.
@@ -31,10 +30,13 @@ Reset) extensions. Uses the standard SBI calling convention:
 `a7=extension_id, a6=function_id, a0..a2=args`.
 - Location: `kernel/src/arch/riscv64/sbi.rs:23-40`
 
-**RISCV-006 — CPU discovery via DTB or ACPI MADT:**
-First tries DTB parsing (`crate::dtb::parse_cpus`), falls back to
-ACPI MADT data. BSP hart ID read from PLIC.
-- Location: `kernel/src/arch/riscv64/mod.rs:74-89`
+**RISCV-006 — CPU discovery moved to the `RiscvCpu` service, DTB-first:**
+`CpuManager::discover_cpus()` (implemented by `services::riscv64::riscv_cpu::RiscvCpu`)
+first parses the device tree via `get_dtb_ptr()` + `dtb::parse_cpus`; if empty
+or no DTB, falls back to ACPI MADT (`AcpiSubsystem.cpus`). The BSP's hart ID is
+recorded in `Riscv64::init()` from `plic::HART_ID` via `smp::set_bsp_hardware_id()`
+before PLIC init.
+- Location: `kernel/src/services/riscv64/riscv_cpu.rs:44-57`, `kernel/src/arch/riscv64/mod.rs:20-23`
 
 **RISCV-007 — Identity map covers `[0, max_addr)` without hardcoded 4 GiB ceiling:**
 `max_addr = fb_end.max(allocator.alloc_end())`, rounded to 2 MiB.
@@ -47,10 +49,13 @@ and are covered automatically.
 Same 4 KiB hole-punching as x86_64 in the identity map loop.
 - Location: `kernel/src/arch/riscv64/paging.rs:43-51`
 
-**RISCV-009 — W^X enforced (identical logic to x86_64):**
-`.text` = READ + EXECUTE, `.rodata` = READ, everything else = READ + WRITE
-with NX. Framebuffer area strips EXECUTE.
-- Location: `kernel/src/arch/riscv64/paging.rs:80-90`
+**RISCV-010 — `Riscv64::init()` does NOT wire the UniversalTimer:**
+Unlike x86_64, `Riscv64::init()` never calls `universal_timer::early_init`.
+The legacy periodic SBI 100 Hz trap timer remains active, and the
+`UniversalTimer` service is unwired on riscv64 (would panic if its `Once`
+is accessed). `SbiTimer`/`ApicTimer` (`services/*/sbi_timer.rs`,
+`apic_timer.rs`) are orphaned.
+- Location: `kernel/src/arch/riscv64/mod.rs:16-31`, `kernel/src/services/riscv64/mod.rs`
 
 ---
 
@@ -69,7 +74,7 @@ calls don't access the caller's memory or stack.
 **RISCV-S003 — CSR manipulation safety:**
 `sstatus`, `sie`, `stvec` are written via inline asm. The caller
 must understand the RISC-V privilege specification.
-- Location: `kernel/src/arch/riscv64/mod.rs:30-32,49-61`
+- Location: `kernel/src/arch/riscv64/mod.rs:27-29,37-39,46-58`
 
 ---
 
@@ -90,6 +95,10 @@ Programs the next timer interrupt. The `stime_value` is an absolute
 time in the `mtime` CSR's timebase.
 - Location: `kernel/src/arch/riscv64/sbi.rs:52-56`
 
+**RISCV-API-004 — `smp::set_bsp_hardware_id(plic::HART_ID)`:**
+Called inside `Riscv64::init()` before `plic::init()` so `scontext()`
+can resolve the BSP.
+
 ---
 
 ## Design Notes
@@ -98,4 +107,8 @@ time in the `mtime` CSR's timebase.
   default), not port I/O. The `IoBackend` trait abstracts this.
 - Interrupt sources: PLIC (external), CLINT (timer/software), SBI.
   The `sie` register enables: SEIE (external), SSIE (software), STIE (timer).
+- **CLINT is not compiled** — only PLIC and SBI timer are used.
 - The `tp` register holds the per-CPU pointer (equivalent to x86 GS.base).
+- riscv64's timer story is transitional: the periodic SBI 100 Hz trap timer
+  still drives scheduling; the UniversalTimer path is defined but unwired
+  (see RISCV-010 and `invariants-23-services.md`).

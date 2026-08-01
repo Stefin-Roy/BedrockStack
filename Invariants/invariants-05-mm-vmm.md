@@ -1,6 +1,7 @@
 # Virtual Memory Manager — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Source:** `kernel/src/mm/vmm/mod.rs`, `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/mm/vmm/riscv64.rs`
 **Status:** Stable
 
@@ -104,7 +105,12 @@ Walks the page table without TLB lookups. Returns the physical address or
 `None` if not mapped.
 - Location: `kernel/src/mm/vmm/mod.rs:220-225`
 
-**VMM-API-008 — `PageFlags` encoding:**
+**VMM-API-008 — `Vmm::flush_tlb()`:**
+Flushes the TLB for the whole address space (reloads CR3 on x86_64).
+Called after page-table mutation by the kernel VMM consumer.
+- Location: `kernel/src/mm/vmm/mod.rs:228-230`
+
+**VMM-API-009 — `PageFlags` encoding:**
 `READ=1, WRITE=2, EXECUTE=4, NO_CACHE=8, USER=16, WRITE_COMBINING=32`.
 Translated to native PTE bits inside each arch module.
 On x86_64, `WRITE_COMBINING` sets `PWT=1, PCD=0, PAT=0` (PAT index 1),
@@ -129,3 +135,6 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
   `paging::setup()`, before any identity-map entries are created.
 - `KERNEL_VMA_BASE = 0xFFFFFF8000000000` provides the higher-half view
   of the kernel image.
+- The `VirtualMemoryManager` capability trait (`services/virt_mem.rs`) is
+  intentionally **unimplemented** — `Vmm` is used directly at init. See
+  `invariants-23-services.md` (SVC-D001, orphaned/dead trait).

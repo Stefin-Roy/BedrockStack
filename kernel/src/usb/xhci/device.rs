@@ -113,13 +113,10 @@ fn submit_control(
         2
     };
 
-    // Setup Stage — chain only when followed by a Data Stage (per xHCI §4.11.2.3)
-    let mut setup_control = (memory::TRB_TYPE_SETUP_STAGE as u32) << 10
+    // Setup Stage — single-TRB TD; CH bit is RsvdZ here (spec Table 6-26)
+    let setup_control = (memory::TRB_TYPE_SETUP_STAGE as u32) << 10
         | (trt << 16)
         | memory::TRB_IDT;
-    if data_len > 0 {
-        setup_control |= memory::TRB_CHAIN;
-    }
     slot.ep0_ring.enqueue_raw(param, 8, setup_control);
 
     if data_len > 0 {

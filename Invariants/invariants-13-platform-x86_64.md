@@ -1,6 +1,7 @@
 # x86_64 Platform Devices — Invariants
 
-**Version:** 0.2.0
+**Version:** 0.3.0
+**Date:** 2026-07-31
 **Source:** `kernel/src/platform/x86_64_pc/{apic,ioapic,pit}.rs`
 **Status:** Stable
 
@@ -13,41 +14,58 @@
 **APIC-001 — LAPIC is enabled before timer programming:**
 Bit 11 of `IA32_APIC_BASE` MSR is set. Spurious Vector Register
 (offset `0xF0`) has bit 8 set. TPR is set to 0.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:333-354`
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:406-439`
 
-**APIC-002 — LAPIC timer calibrated via PIT before starting:**
+**APIC-002 — LAPIC timer + TSC calibrated together via PIT:**
 PIT channel 0 programmed in one-shot with count `0xFFFF` (~54.9 ms).
-APIC timer runs simultaneously with `0xFFFF_FFFF` initial count.
-Elapsed APIC ticks during the PIT interval compute the count for
-`TIMER_HZ = 1000` (1 ms period).
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:209-279`
-- Formula: `count = elapsed_ticks * 1193182 / (6553500 * TIMER_HZ factor)`
+APIC timer runs simultaneously with `0xFFFF_FFFF` initial count. From the
+elapsed APIC ticks over the PIT interval both frequencies are derived:
+- `apic_hz = elapsed * PIT_HZ / PIT_RELOAD` (PIT_HZ = 1_193_182)
+- `tsc_hz  = tsc_elapsed * PIT_HZ / PIT_RELOAD`, `TSC_BOOT = tsc_start`
+- The per-interrupt count for `TIMER_HZ = 1000` is `count = apic_hz / TIMER_HZ`.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:285-376`
+- Note: `rdtsc` is used to bracket the PIT interval so TSC is calibrated in the same pass.
 
-**APIC-003 — APIC timer interrupt at vector 32:**
-LVT Timer register (offset `0x320`) configured with periodic mode
-(bit 17) and vector 32. Timer handler writes EOI (offset `0xB0`).
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:23,359-362`
+**APIC-003 — APIC timer is a masked one-shot, armed only on demand:**
+The LVT Timer register (offset `0x320`) is configured with the mask bit
+(bit 16) SET and vector 32. The UniversalTimer's clockevent arms a single
+shot via `oneshot_timer_set(count)` (LVT = vector, no mask) and cancels via
+`timer_stop()` (LVT |= mask, init count = 0). There is **no periodic mode**.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:171-185,406-451`
+- `TIMER_VECTOR: u8 = 32` — `apic.rs:22`
 
-**APIC-004 — x2APIC mode enabled when supported:**
-If CPUID indicates x2APIC support, the enable bit (bit 10) is set in
-`IA32_APIC_BASE`. All register access uses `rdmsr`/`wrmsr` in x2APIC
-mode instead of MMIO.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:340-345,87-103`
+**APIC-004 — x2APIC mode is forced OFF:**
+QEMU TCG sets the CPUID x2APIC bit and MSR `0x1B` bit 10, but the x2APIC
+MSR range causes #GP regardless. Bit 10 is cleared and `X2APIC_MODE` stays
+`false`; all access goes through MMIO (`LAPIC_BASE + reg`).
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:426-433`
 
-**APIC-005 — BSP timer count shared with APs:**
+**APIC-005 — APs leave the timer masked; count shared but not started:**
 The calibrated count is stored in `BSP_TIMER_COUNT` (global `AtomicU32`).
-APs read it during `init_ap()` to program their local timers.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:207,310-313,357`
+`init_ap()` skips PIT calibration, does **not** write `IA32_APIC_BASE` (may
+#GP on many CPUs), and programs its LVT timer as masked one-shot with init
+count 0 — it never fires until the clockevent arms it.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:377-404`
 
-**APIC-006 — PIT calibration has fallback:**
-If PIT times out or yields zero elapsed ticks, a hard-coded fallback
-of 1,000,000 ticks is used (works on QEMU at 100 MHz APIC frequency).
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:235-236,248-249,274-276`
+**APIC-006 — PIT calibration has a 1,000,000-ticks fallback:**
+If PIT times out, yields zero elapsed ticks, or the derived count is 0, the
+calibration returns `1_000_000` (works on QEMU at 100 MHz APIC frequency).
+A TSC-elapsed-zero warning falls back to the APIC-based clocksource.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:305-373`
 
 **APIC-007 — IPI delivery waits for previous IPI to complete (xAPIC):**
 In xAPIC mode, the delivery status bit (bit 12 of ICR low) must be 0
-before a new IPI is sent.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:57-58`
+before a new IPI is sent. Broadcast-to-all-except-self uses ICR
+destination shorthand (bits 18:16 = 11).
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:37-51,238-254`
+
+**APIC-008 — IPI vectors are fixed: 49 (resched), 50 (TLB shootdown), 51 (halt):**
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:256-266`
+
+**APIC-009 — `PollTimeout` is TSC-backed, replacing the old APIC-counter `ApicTimeout`:**
+Works after `apic::init()` calibration completes, with no dependency on a
+running periodic APIC timer. Deadline computed in ns from `tsc_now_ns()`.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:114-130`
 
 ### I/O APIC
 
@@ -75,7 +93,7 @@ GSI not managed by this IOAPIC or if vectors exhausted.
 Count written low-byte then high-byte to data port 0x40.
 - Location: `kernel/src/platform/x86_64_pc/pit.rs:16-20`
 
-**PIT-002 — `has_fired()` reads back status via command 0xE2:`
+**PIT-002 — `has_fired()` reads back status via command 0xE2:**
 Checks bit 7 of the returned status (output pin status = 1 when
 the count reaches zero and the output goes high).
 - Location: `kernel/src/platform/x86_64_pc/pit.rs:22-25`
@@ -86,13 +104,18 @@ the count reaches zero and the output goes high).
 
 **APIC-S001 — MSR read/write safety:**
 `rdmsr`/`wrmsr` use inline asm. Valid MSR indices must be provided.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:66-76`
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:53-63`
 
 **APIC-S002 — LAPIC MMIO access safety (xAPIC mode):**
 `LAPIC_BASE` is read from `IA32_APIC_BASE` MSR. The computed register
 address must be within the LAPIC MMIO frame and must be mapped in the
 page tables.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:91-92,100-101`
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:81-97`
+
+**APIC-S003 — `init_ap` must not write `IA32_APIC_BASE`:**
+Writes from a non-BSP processor may cause a general-protection exception
+(Intel SDM). APs only read the base; mode is forced xAPIC globally by the BSP.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:387-391`
 
 **IOAPIC-S001 — I/O APIC MMIO access safety:**
 `ioapic_write`/`ioapic_read` use volatile pointer operations on the
@@ -109,19 +132,32 @@ ISA ports and safe to access on any x86 PC.
 ## API Contracts
 
 **APIC-API-001 — `apic::init()`:**
-Enables LAPIC, calibrates timer, starts periodic timer at `TIMER_HZ`.
-Panics if CPU has no local APIC.
+Enables LAPIC, forces xAPIC mode, calibrates via PIT, stores
+`BSP_TIMER_COUNT`/`TSC_HZ`/`TSC_BOOT`/`APIC_HZ`, leaves the timer masked
+(one-shot, never fired). Panics if CPU has no local APIC.
 
 **APIC-API-002 — `apic::init_ap()`:**
-AP-only init. Enables LAPIC and starts timer using BSP's calibrated
-count. Does NOT calibrate PIT.
+AP-only init. Enables LAPIC, sets SVR/TPR, leaves the timer masked with
+init count 0. Does NOT calibrate PIT and does NOT write `IA32_APIC_BASE`.
 
 **APIC-API-003 — `apic::apic_eoi()`:**
-Writes 0 to the EOI register. Called by the timer and device IRQ
-handlers.
+Writes 0 to the EOI register. Called by the timer and device IRQ handlers.
 
-**APIC-API-004 — `apic::send_ipi(dest_apic_id, vector)`:**
-Sends fixed IPI. Used for TLB shootdown and reschedule IPIs.
+**APIC-API-004 — `apic::oneshot_timer_set(count)` / `apic::timer_stop()`:**
+Arms/cancels a single one-shot APIC timer interrupt on vector 32. These
+are the clockevent's only entry points.
+
+**APIC-API-005 — `apic::send_ipi(dest_apic_id, vector)` and friends:**
+`send_init_ipi`, `send_init_deassert`, `send_sipi_ipi(page)` implement the
+INIT-INIT-SIPI MP startup sequence; `send_ipi_all_except_self` broadcasts.
+
+**APIC-API-006 — `apic::tsc_hz()`, `tsc_boot()`, `apic_hz()`, `tsc_now_ns()`, `timer_init_count()`:**
+Read accessors for calibration results. `tsc_now_ns()` uses divide-first
+arithmetic to avoid u64 overflow and returns 0 before calibration.
+
+**APIC-API-007 — `PollTimeout::new(ms)` / `.expired()`:**
+TSC-backed deadline for driver polling loops (AHCI, xHCI). Replaces the
+removed APIC-counter-based `ApicTimeout`.
 
 **IOAPIC-API-001 — `ioapic::init(phys_base, gsi_base)`:**
 Initializes I/O APIC from ACPI MADT data. Masks all entries.
@@ -138,3 +174,14 @@ Starts a one-shot countdown on PIT channel 0.
 
 **PIT-API-002 — `pit::has_fired() → bool`:**
 Returns true when the one-shot countdown has completed.
+
+---
+
+## Design Notes
+
+- The LAPIC timer is now **exclusively** the UniversalTimer's clockevent
+  backend (one-shot deadlines), not a periodic tick source. `TIMER_HZ = 1000`
+  is retained only as the calibration target for the count value. See
+  `invariants-23-services.md`.
+- `PollTimeout` (TSC-backed) is the driver polling primitive; the old
+  APIC-counter `ApicTimeout` was removed in commit `8c515c4`.

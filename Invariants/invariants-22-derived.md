@@ -1,8 +1,9 @@
 # Derived Properties — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Description:** Higher-level correctness properties that follow from the
-subsystem invariants in files `invariants-01` through `invariants-21`.
+subsystem invariants in files `invariants-01` through `invariants-23`.
 
 ---
 
@@ -57,7 +58,16 @@ critical sections (VFS-001).
 **DERV-010 — No stale ECAM references follow from PCI-003:**
 Mapped ECAM regions are `Vec<MappedRegion>` stored behind a `Mutex`
 and never modified after init. The `&'static` cast in `find_region()` is
-safe because the data is pinned.
+safe because the data is pinned. The `EcamPciConfig` capability provider
+is itself a `'static` unit struct.
+- Cross-refs: PCI-003, PCI-006
+
+**DERV-010b — No stale service references follow from SVC-002:**
+`KernelServices` is leaked via `Box::leak` (`kernel/src/lib.rs:205`) and
+installed with `set_global`, and the `AcpiSubsystem` is transmuted to
+`'static` (`lib.rs:199`) before being wrapped in the `AcpiProvider`.
+Service references therefore remain valid for the kernel's whole lifetime.
+- Cross-refs: SVC-002, SVC-003, ACPI-011
 
 ---
 
@@ -77,7 +87,7 @@ Fallbacks exist for reset/shutdown.
 Every shutdown path either succeeds or falls through to an infinite
 halt loop. The CPU never executes unknown code after shutdown.
 
-**DERV-014 — PCI config reads never fault follow from PCI-002:**
+**DERV-014 — PCI config reads never fault follow from PCI-003:**
 If no ECAM region matches `(segment, bus)`, `read_*` returns a default
 value and `write_*` is a no-op. No MMIO access occurs.
 

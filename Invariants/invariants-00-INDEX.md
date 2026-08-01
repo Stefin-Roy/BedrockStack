@@ -1,9 +1,9 @@
 # BedrockOS Invariants — Index
 
-**Version:** 0.4.0
-**Date:** 2026-07-29
+**Version:** 0.5.0
+**Date:** 2026-07-31
 **Status:** All subsystems documented — MM, Arch (x86_64, RISC-V), ACPI, Display, PCI, Platform,
-Module, Drivers, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
+Module, Drivers, Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
 
 ---
 
@@ -26,26 +26,27 @@ Rust module hierarchy under `kernel/src/`.
 | 03 | `invariants-03-mm-physalloc.md` | Physical allocator | `kernel/src/mm/phys_alloc.rs` |
 | 04 | `invariants-04-mm-heap.md` | Heap allocator | `kernel/src/mm/heap.rs` |
 | 05 | `invariants-05-mm-vmm.md` | Virtual memory manager | `kernel/src/mm/vmm/mod.rs` + `vmm/{x86_64,riscv64}.rs` |
-| 06 | `invariants-06-arch.md` | Arch trait | `kernel/src/arch/mod.rs` |
+| 06 | `invariants-06-arch.md` | Arch (`CurrentArch`) | `kernel/src/arch/mod.rs`, `kernel/src/services/` |
 | 07 | `invariants-07-arch-x86_64.md` | x86_64 arch | `kernel/src/arch/x86_64/{gdt,idt,paging,trampoline,serial}.rs` |
 | 08 | `invariants-08-arch-riscv64.md` | RISC-V64 arch | `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline}.rs` |
 | 09 | `invariants-09-acpi.md` | ACPI subsystem | `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs` |
 | 10 | `invariants-10-display.md` | Display / framebuffer (legacy) | `kernel/src/display/{mod,framebuffer}.rs` |
 | 10g | `invariants-10-graphics-framebuffer.md` | Graphics framebuffer (active) | `graphics/Framebuffer/src/{display,framebuffer,console,color}.rs` |
-| 11 | `invariants-11-module.md` | Module system | `kernel/src/module/{mod,registry,fat32_test,msix_test,usb_test,vfs_test}.rs` |
-| 12 | `invariants-12-pci.md` | PCI subsystem | `kernel/src/pci/{mod,ecam,enumerate}.rs` |
+| 11 | `invariants-11-module.md` | Module system | `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,vfs_test}.rs` |
+| 12 | `invariants-12-pci.md` | PCI subsystem | `kernel/src/pci/{mod,ecam,enumerate}.rs`, `kernel/src/services/{pci_config,ecam_pci_config,pci_device}.rs` |
 | 13 | `invariants-13-platform-x86_64.md` | x86_64 platform | `kernel/src/platform/x86_64_pc/{apic,ioapic,pit}.rs` |
-| 14 | `invariants-14-platform-riscv64.md` | RISC-V platform | `kernel/src/platform/riscv_virt/{plic,clint,htif}.rs` |
-| 15 | `invariants-15-drivers-serial.md` | Serial driver (+ display_log) | `kernel/src/drivers/serial.rs` |
+| 14 | `invariants-14-platform-riscv64.md` | RISC-V platform | `kernel/src/platform/riscv_virt/{mod,plic,clint,htif}.rs`, `kernel/src/services/riscv64/riscv_interrupts.rs` |
+| 15 | `invariants-15-drivers-serial.md` | Serial driver (+ display_log) | `kernel/src/drivers/serial.rs`, `kernel/src/services/{serial.rs,x86_64/x86_serial.rs}` |
 | 16 | `invariants-16-fs-vfs.md` | VFS core | `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types}.rs` |
-| 17 | `invariants-17-fs-tmpfs.md` | tmpfs | `kernel/src/filesystems/fstypes/{mod,tmpfs}.rs` |
+| 17 | `invariants-17-fs-tmpfs.md` | tmpfs | `kernel/src/filesystems/fstypes/{mod,tmpfs/{mod,mount,inode}}.rs` |
 | 18 | `invariants-18-fs-ahci.md` | AHCI block driver | `kernel/src/filesystems/blockdriver/{mod,traits,ahci}.rs` |
-| 19 | `invariants-19-fs-partition.md` | Partition tables (MBR/GPT) + FAT32 BPB | `kernel/src/filesystems/partition/{mod,mbr,gpt}.rs`, `kernel/src/filesystems/fstypes/fat32.rs` |
+| 19 | `invariants-19-fs-partition.md` | Partition tables (MBR/GPT) + FAT32 BPB | `kernel/src/filesystems/partition/{mod,mbr,gpt}.rs`, `kernel/src/filesystems/fstypes/fat32/` |
 | 19s | `invariants-19-smp.md` | SMP | `kernel/src/smp/mod.rs` |
 | 20 | `invariants-20-kerneldump.md` | Fault dump | `kernel/src/kerneldump/{mod,dump,disasm}.rs` |
 | 21 | `invariants-21-init-sequence.md` | Boot ordering (incl. xHCI, USB, ESP mount) | `kernel/src/lib.rs`, `kernel/src/main.rs` |
 | 22 | `invariants-22-derived.md` | Derived properties | All |
-| 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,dma,xhci/{mod,registers,memory,event,command,device,ports},usb/{mod,descriptors}}.rs` |
+| 23 | `invariants-23-services.md` | Services capability layer | `kernel/src/services/{mod,capability,acpi,cpu,dma,ecam_pci_config,interrupts,pci_config,pci_device,platform,serial,timer,timer_queue,universal_timer,virt_mem,phys_mem,clockevent,clocksource,msi,null_msi,block_device}.rs`, `kernel/src/services/{x86_64,riscv64}/` |
+| 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,dma,xhci/{mod,registers,memory,event,command,device,ports,context},class/mass_storage,usb/{mod,descriptors}}.rs` |
 
 ---
 
@@ -55,7 +56,8 @@ Invariant IDs follow the pattern `AREA-NNN` where:
 
 - `AREA` is a short subsystem code: `ALLOC`, `HEAP`, `VMM`, `PAGING`, `BOOT`,
   `ACPI`, `DISP`, `MOD`, `PCI`, `APIC`, `IOAPIC`, `PIT`, `SMP`, `VFS`, `TMPFS`,
-  `AHCI`, `SERIAL`, `PLAT`, `ARCH`, `DUMP`, `INIT`, `COMMON`, `PART`, `WC`
+  `AHCI`, `SERIAL`, `PLAT`, `ARCH`, `DUMP`, `INIT`, `COMMON`, `PART`, `WC`,
+  `SVC`, `USB`, `XHCI`
 - `NNN` is a three-digit number
 
 Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
@@ -73,6 +75,7 @@ Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
 | Serial driver (`SERIAL`) | All logging output, must not deadlock |
 | VFS (`VFS`) | Module init, tmpfs, AHCI |
 | SMP (`SMP`) | Per-CPU data, serial prefix, AP startup |
+| Services (`SVC`) | All capability providers (ACPI, CPU, timer, PCI, serial, platform, DMA) |
 
 ---
 
@@ -97,6 +100,7 @@ When modifying code, verify that relevant invariants still hold:
 - [ ] **USB/xHCI**: MMIO mapping, event ring/TRB management, IRQ handling, device enumeration
 - [ ] **FAT**: BPB discriminant validation (RootEntCnt, FATSz16, FATSz32), per-field bounds checks
 - [ ] **PCI**: ECAM VMM, read/write alignment, device enumeration
+- [ ] **SVC**: service matrix wiring order, Box::leak lifetime, orphaned/dead traits
 - [ ] **KERNELDUMP**: re-entrancy guard, NMI safety
 - [ ] If boot types changed, update both `boot/src/main.rs` AND `common/src/types.rs`
 - [ ] If Multiboot2 entry changed, update both `multiboot2_header.s` AND `multiboot2.rs`

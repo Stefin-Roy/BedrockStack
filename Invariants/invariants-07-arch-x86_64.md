@@ -1,6 +1,7 @@
 # x86_64 Architecture — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Source:** `kernel/src/arch/x86_64/{gdt,idt,paging,trampoline,mod}.rs`
 **Status:** Stable
 
@@ -59,7 +60,7 @@ APIC and other MMIO regions remain mapped as `NO_CACHE`.
 **PAGING-009 — Local APIC MMIO is identity-mapped as NO_CACHE:**
 The `IA32_APIC_BASE` MSR is read during `paging::setup()` and the local
 APIC 4 KiB page is mapped as `NO_CACHE` in the identity page tables.
-This ensures the APIC registers are accessible before `Arch::init()`.
+This ensures the APIC registers are accessible before `CurrentArch::init()`.
 - Location: `kernel/src/arch/x86_64/paging.rs:52-53,81-83`
 
 **PAGING-010 — `setup()` takes framebuffer `bpp` parameter:**
@@ -101,20 +102,39 @@ encodes their address, so they must not move after init.
 **IDT-001 — IDT is initialized once via `spin::Once`:**
 The BSP builds the IDT in `IDT.call_once(|| ...)`. APs reload it via
 `init_ap()` which panics if the BSP hasn't initialized it.
-- Location: `kernel/src/arch/x86_64/idt.rs:8,36,140-146`
+- Location: `kernel/src/arch/x86_64/idt.rs:16,145-195,322-325`
 
 **IDT-002 — Double-fault handler uses IST stack:**
 `set_stack_index(gdt::DOUBLE_FAULT_IST_INDEX)` marks the double-fault
 descriptor to switch stacks on entry.
-- Location: `kernel/src/arch/x86_64/idt.rs:53-57`
+- Location: `kernel/src/arch/x86_64/idt.rs:160-165`
 
-**IDT-003 — APIC timer at vector 32 with interrupt gate:**
-`.disable_interrupts(true)` — clears IF so no nested interrupts.
-- Location: `kernel/src/arch/x86_64/idt.rs:60`
+**IDT-003 — IDT integrity canary guards the `.idt` page:**
+`IDT_GUARD_MAGIC = 0x1D7_1D7_1D7_1D7` is placed in the `.idt` link section;
+`verify_integrity()` halts the kernel if overwritten, `check_integrity()`
+returns a bool for diagnostics. After init, `protect_idt()` makes the `.idt`
+pages read-only so corruption faults instead of corrupting silently.
+- Location: `kernel/src/arch/x86_64/idt.rs:18-41,305-316`
 
-**IDT-004 — All exception handlers (except breakpoint) log and halt:**
-Delegates to `kerneldump::dump_full_fault()` with vector and error code.
-- Location: `kernel/src/arch/x86_64/idt.rs:87-137`
+**IDT-004 — Device interrupt vectors 33-48 via atomic handler table:**
+`DEVICE_HANDLERS: [AtomicPtr<fn()>; 16]` at `DEVICE_VECTOR_BASE = 33`.
+`register_device_handler()` auto-allocates the first free slot;
+`register_device_handler_at(vector, handler)` (used by the
+`InterruptManager` service provider) writes a specific slot;
+`unregister_device_handler()` clears it. `device_irq_handler` dispatches
+then writes EOI.
+- Location: `kernel/src/arch/x86_64/idt.rs:43-52,57-115`
+
+**IDT-005 — Timer ISR is BSP-only, driven by `TIMER_CALLBACK`:**
+Vector 32's `timer_handler` returns immediately (EOI only) on APs;
+on the BSP it invokes `TIMER_CALLBACK` (set via `set_timer_callback()` by
+`UniversalTimer` for queue processing + clockevent reprogramming) then EOI.
+- Location: `kernel/src/arch/x86_64/idt.rs:95-103,203-216`
+
+**IDT-006 — All exception handlers (including breakpoint) log and halt:**
+Each delegates to `kerneldump::dump_full_fault()` with vector and error
+code. Page-fault has PF-recovery support during kernel dumps.
+- Location: `kernel/src/arch/x86_64/idt.rs:218-300`
 
 ---
 
@@ -149,7 +169,13 @@ single-threaded init before SMP starts.
 **IDT-S001 — IDT `init` safety:**
 Must be called AFTER GDT init (the double-fault IST stack requires a
 valid TSS in the GDT).
-- Location: `kernel/src/arch/x86_64/idt.rs:33-37`
+- Location: `kernel/src/arch/x86_64/idt.rs:140-145`
+
+**IDT-S002 — `.idt` section is write-protected after init:**
+`protect_idt()` makes the IDT pages read-only in page tables and reloads
+CR3; calling it before all IDT registration is complete will fault on
+later writes.
+- Location: `kernel/src/arch/x86_64/idt.rs:305-316`
 
 ---
 
@@ -157,11 +183,25 @@ valid TSS in the GDT).
 
 **GDT-API-001 — `gdt::init()`:**
 Must be called once per CPU (BSP then each AP). Loads segments and TSS.
-Called from `Arch::init()` (BSP) and `Arch::init_ap()` (APs).
+Called from `X86_64::init()` (BSP) and `X86_64::init_ap()` (APs).
 
 **IDT-API-001 — `idt::init()`:**
 Must be called after `gdt::init()`. Loads the IDT via `lidt`.
 Called once on BSP; APs call `idt::init_ap()`.
+
+**IDT-API-002 — `idt::set_timer_callback(cb: fn())`:**
+Wires the UniversalTimer's tick routine into the vector-32 ISR. Called by
+`universal_timer::early_init`.
+
+**IDT-API-003 — `idt::register_device_handler(handler) → Option<u8>` / `register_device_handler_at(vector, handler)` / `unregister_device_handler(vector)`:**
+Driver interrupt registration over vectors 33-48. Slots are atomic; only
+one handler per vector.
+
+**IDT-API-004 — `idt::protect_idt(root, idt_start_phys, idt_end_phys)`:**
+Makes the `.idt` pages read-only. Called after all IDT initialisation.
+
+**IDT-API-005 — `idt::verify_integrity()` / `idt::check_integrity() → bool`:**
+Canary checks; `verify_integrity` halts the kernel on corruption.
 
 ---
 
@@ -176,3 +216,10 @@ Called once on BSP; APs call `idt::init_ap()`.
   32 bits from memory at `[0x8700]`), then again in 64-bit mode with
   the full 64-bit value. This is intentional because the 32-bit `mov eax, [mem]`
   instruction cannot hold a 64-bit address.
+- `X86_64::init()` order: `gdt::init()` → `idt::init()` → `apic::init()` →
+  `smp::set_bsp_hardware_id(apic::read_full_apic_id())` →
+  `universal_timer::early_init(&X86TscClocksource, &ApicOneShotClockevent)`.
+- `X86TscClocksource` (`arch/x86_64/mod.rs:80-92`) delegates `now_ns` to
+  `apic::tsc_now_ns()`. `ApicOneShotClockevent` (`mod.rs:99-138`) converts
+  absolute deadlines to APIC ticks (overflow-safe arithmetic), arming a
+  single-shot; deadline already passed → minimum 1 tick.

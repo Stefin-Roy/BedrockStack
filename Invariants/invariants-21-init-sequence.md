@@ -1,6 +1,7 @@
 # Boot Initialization Sequence — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
+**Date:** 2026-07-31
 **Source:** `kernel/src/lib.rs`, `kernel/src/main.rs`, `boot/src/main.rs`
 **Status:** Stable
 
@@ -35,10 +36,10 @@ The following dependencies MUST be respected:
                     ├── heap::set_phys_allocator()
                     ├── smp::early_init_bsp()
                     ├── switch_to_higher_half()
-                    │   └── Arch::setup_virt_mem()
+                    │   └── CurrentArch::setup_virt_mem()
                     │       (identity + higher-half, NXE+WP, PAT WC)
-                    ├── Vmm::activate()
-                    │   (switches CR3 / SATP; ACPI VMM also initted)
+                    │   └── Vmm::activate()
+                    │       (switches CR3 / SATP; acpi::init_vmm also here)
                     ├── enable_framebuffer_log()
                     │   (Console via set_console() — after page tables
                     │    cover framebuffer physical address)
@@ -51,12 +52,14 @@ The following dependencies MUST be respected:
                     ├── AcpiSubsystem::new()
                     │   (parses RSDP data or mapped RSDP)
                     ├── IOAPIC::init() [x86_64 only]
-                    ├── smp::init()
-                    │   ├── Arch::discover_cpus()
+                    ├── services::init_services(root, alloc, acpi)
+                    │   └── Box::leak → KernelServices global
+                    ├── smp::init(page_table_root, acpi, services)
+                    │   ├── services.cpu.discover_cpus(acpi)
                     │   ├── Allocate AP stacks (alloc_contiguous)
                     │   ├── Configure PerCpu slots
-                    │   └── Arch::wake_aps()
-                    ├── Arch::enable_interrupts()
+                    │   └── services.cpu.wake_aps()
+                    ├── services.platform.enable_interrupts()
                     │
                     ▼
                     Kernel::run()
@@ -75,6 +78,7 @@ The following dependencies MUST be respected:
                     │   ├── Fat32Test (B>)
                     │   ├── MsixTest [x86_64]
                     │   ├── UsbTest [x86_64]
+                    │   ├── Fat32Ls [B>]
                     │   └── VfsTest (A>)
                     └── Halt loop (hlt/wfi)
 ```
@@ -86,11 +90,11 @@ The following dependencies MUST be respected:
 **INIT-001 — GDT must be loaded before IDT:**
 The double-fault handler's IST entry must be valid in the TSS (part of
 GDT) before the IDT can reference it.
-- Location: `kernel/src/arch/x86_64/mod.rs:init()`
+- Location: `kernel/src/arch/x86_64/mod.rs` `X86_64::init()`
 
 **INIT-002 — IDT must be loaded before interrupts are enabled:**
 The IDT must be valid before the CPU can take any interrupt or exception.
-- Location: `kernel/src/arch/x86_64/mod.rs:init()`
+- Location: `kernel/src/arch/x86_64/mod.rs` `X86_64::init()`
 
 **INIT-003 — Physical allocator must exist before page table setup:**
 Page-table intermediate frames are allocated from `BitmapAllocator`.
@@ -114,7 +118,7 @@ All code after `heap::init()` may use `Vec`, `Box`, `Arc`, etc.
 
 **INIT-006 — APIC must be initialized after IDT:**
 Timer handler registered in IDT before APIC timer is programmed.
-- Location: `kernel/src/arch/x86_64/mod.rs:init()`
+- Location: `kernel/src/arch/x86_64/mod.rs` `X86_64::init()`
 
 **INIT-007 — Page tables must be set up before ACPI init:**
 The VMM-backed `AcpiHandler` requires live page tables for MMIO mapping.
@@ -128,6 +132,12 @@ I/O APIC base addresses and GSI mappings come from the MADT table.
 APs may generate interrupts that the I/O APIC must route.
 - Location: `kernel/src/lib.rs:` `init_ioapic()` → `smp::init()`
 
+**INIT-009b — Services must be built after ACPI/IOAPIC, before SMP:**
+`init_services()` wraps the `AcpiSubsystem` (Box::leak) and installs the
+capability providers; `smp::init` and all later subsystems consume
+`KernelServices` via `kernel_services()`.
+- Location: `kernel/src/lib.rs:199-207`, `kernel/src/services/mod.rs:62-72`
+
 **INIT-010 — Page tables must be set up before framebuffer console init:**
 Framebuffer memory must be identity-mapped before `enable_framebuffer_log()`
 calls `set_console()` with a `Console` that draws to the framebuffer.
@@ -136,8 +146,8 @@ Console init moved from `Kernel::new()` to after `switch_to_higher_half()`.
 
 **INIT-011 — Interrupts must be enabled after SMP init:**
 AP startup uses IPIs (x86_64) or SBI ecalls (RISC-V). Interrupts are
-enabled only after all CPUs are running.
-- Location: `kernel/src/lib.rs:` `smp::init()` → `enable_interrupts()`
+enabled only after all CPUs are running, via `services.platform`.
+- Location: `kernel/src/lib.rs:` `smp::init()` → `platform.enable_interrupts()`
 
 **INIT-011b — `acpi_log::init()` runs first in `Kernel::new()`:**
 Before any allocator or heap initialization, the ACPI log subsystem is
@@ -185,7 +195,8 @@ first block device) is mounted as `B>` (fat32) after VFS init.
 **INIT-017 — Module init runs last:**
 Modules may use VFS, display, and all other initialized subsystems.
 The x86_64 module list includes: `HelloModule`, `Fat32Test`, `MsixTest`,
-`UsbTest`, `VfsTest`. Non-x86_64 targets exclude `MsixTest` and `UsbTest`.
+`UsbTest`, `Fat32Ls`, `VfsTest`. Non-x86_64 targets exclude `MsixTest`
+and `UsbTest`.
 - Location: `kernel/src/lib.rs:` `init_all()` at end of `run()`
 
 ---

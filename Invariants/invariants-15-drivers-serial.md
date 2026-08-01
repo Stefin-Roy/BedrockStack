@@ -1,7 +1,8 @@
 # Serial Driver — Invariants
 
-**Version:** 0.3.0
-**Source:** `kernel/src/drivers/serial.rs`
+**Version:** 0.4.0
+**Date:** 2026-07-31
+**Source:** `kernel/src/drivers/serial.rs`, `kernel/src/services/serial.rs`, `kernel/src/services/x86_64/x86_serial.rs`
 **Status:** Stable
 
 ---
@@ -65,6 +66,13 @@ the inner serial port (no recursive locking) and does not affect
 `LAST_WAS_NL` tracking.
 - Location: `kernel/src/drivers/serial.rs:154-163`
 
+**SERIAL-010 — `SerialConsole` capability wraps `SerialPort`:**
+`KernelSerial` (unit struct, capability `"kernel-serial"`) implements the
+`SerialConsole` trait (`putc`/`puts`/`put_hex`/`put_u64`) by delegating to
+`drivers::serial::SerialPort`. It is installed as `KernelServices.serial`
+on both architectures; `x86_serial::init()` is an alias.
+- Location: `kernel/src/services/serial.rs:3-41`, `kernel/src/services/x86_64/x86_serial.rs:1-3`, `kernel/src/services/mod.rs:47`
+
 ---
 
 ## Safety Invariants
@@ -100,7 +108,9 @@ is justified because all access is serialized by the serial locks.
 
 **SERIAL-API-001 — `SerialPort::init()`:**
 Initializes the underlying hardware UART (COM1 on x86, MMIO UART on
-RISC-V). Called once during `Kernel::new()`.
+RISC-V). Called at the top of the kernel entry (`_start`/`rust_entry`,
+`kernel/src/main.rs:34`) BEFORE `Kernel::new()`, and re-initialized in the
+Multiboot2 path (`kernel/src/arch/x86_64/multiboot2.rs:32`).
 
 **SERIAL-API-002 — `SerialPort::puts(s)`:**
 Line-buffered output with per-CPU `[CPU(N)]` prefix. Re-entrant safe

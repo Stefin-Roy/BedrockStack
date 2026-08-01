@@ -42,6 +42,8 @@ impl SerialPort {
 
     /// Write one raw byte without prefix.
     pub fn putc(c: u8) {
+        #[cfg(feature = "forceslowlogging")]
+        slow_down();
         let cpu = acquire_locks();
         Inner::putc(c);
         track_newline(c);
@@ -54,6 +56,8 @@ impl SerialPort {
 
     /// Write a string, prefixing each line with `[CPU(N)] `.
     pub fn puts(s: &str) {
+        #[cfg(feature = "forceslowlogging")]
+        slow_down();
         let cpu = acquire_locks();
 
         let should_prefix = LAST_WAS_NL.load(Ordering::Relaxed);
@@ -88,6 +92,8 @@ impl SerialPort {
 
     /// Write a 64-bit value as hex without prefix.
     pub fn put_hex(val: u64) {
+        #[cfg(feature = "forceslowlogging")]
+        slow_down();
         let cpu = acquire_locks();
         Inner::put_hex(val);
         #[cfg(feature = "display_log")]
@@ -101,6 +107,8 @@ impl SerialPort {
 
     /// Write a 64-bit value in decimal without prefix.
     pub fn put_u64(val: u64) {
+        #[cfg(feature = "forceslowlogging")]
+        slow_down();
         let cpu = acquire_locks();
         Inner::put_u64(val);
         #[cfg(feature = "display_log")]
@@ -160,6 +168,14 @@ fn write_prefix(cpu_id: u32) {
     Inner::putc(b']');
     Inner::putc(b' ');
     // These primitives don't affect LAST_WAS_NL — only the caller's content does.
+}
+
+#[cfg(feature = "forceslowlogging")]
+fn slow_down() {
+    use crate::services::universal_timer;
+    if universal_timer::is_ready() {
+        universal_timer::sleep_ms(50);
+    }
 }
 
 fn track_newline(c: u8) {

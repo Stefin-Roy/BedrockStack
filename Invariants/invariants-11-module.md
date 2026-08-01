@@ -1,7 +1,8 @@
 # Module System — Invariants
 
-**Version:** 0.3.0
-**Source:** `kernel/src/module/{mod,registry,fat32_test,msix_test,usb_test,vfs_test}.rs`
+**Version:** 0.4.0
+**Date:** 2026-07-31
+**Source:** `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,vfs_test}.rs`
 **Status:** Stable
 
 ---
@@ -21,11 +22,13 @@ The loop `break`s after the first `Err(msg)`, logging the failure.
 All module metadata is compile-time constant.
 - Location: `kernel/src/module/registry.rs:13-18`
 
-**MOD-004 — x86_64 modules include MsixTest and UsbTest:**
-On `#[cfg(target_arch = "x86_64")]`, the module list also includes
-`MsixTest` and `UsbTest` in addition to `HelloModule`, `Fat32Test`,
-and `VfsTest`. Non-x86_64 targets skip these.
-- Location: `kernel/src/module/registry.rs:34-48`
+**MOD-004 — Registry lists `Fat32Ls` on both arches, x86_64 adds `MsixTest` and `UsbTest`:**
+- `#[cfg(target_arch = "x86_64")]`: `[HelloModule, Fat32Test, MsixTest, UsbTest, Fat32Ls, VfsTest]`
+- otherwise: `[HelloModule, Fat32Test, Fat32Ls, VfsTest]`
+`Fat32Ls` (lists the FAT32 root directory on `B>`) was added in the block/FS
+registry work; it runs on riscv64 too but is skipped gracefully when no
+ESP is mounted.
+- Location: `kernel/src/module/registry.rs:35-51`
 
 ---
 

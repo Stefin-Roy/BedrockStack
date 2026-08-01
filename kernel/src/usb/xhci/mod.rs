@@ -524,6 +524,14 @@ fn setup_interrupts(
     } as u8;
 
     let caps_list = caps::all(dev);
+    SerialPort::puts("[xhci] caps:");
+    for c in caps_list.iter() {
+        SerialPort::puts(" id=");
+        SerialPort::put_u64(c.id as u64);
+        SerialPort::puts("@0x");
+        SerialPort::put_hex(c.offset as u64);
+    }
+    SerialPort::puts("\n");
     let msix_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSIX);
     let msi_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSI);
 

@@ -222,6 +222,11 @@ pub fn universal_timer() -> &'static dyn UniversalTimer {
     *UNIVERSAL_TIMER.get().expect("UniversalTimer not initialised — call early_init() first")
 }
 
+/// True once `early_init()` has run and the singleton is usable.
+pub fn is_ready() -> bool {
+    UNIVERSAL_TIMER.get().is_some()
+}
+
 /// Convenience: return the raw impl pointer for the ISR tick handler.
 pub fn universal_timer_impl() -> &'static UniversalTimerImpl {
     *UNIVERSAL_TIMER.get().expect("UniversalTimer not initialised")
