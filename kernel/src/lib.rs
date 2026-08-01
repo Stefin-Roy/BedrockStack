@@ -10,6 +10,7 @@ pub mod filesystems;
 #[cfg(target_arch = "riscv64")]
 pub mod dtb;
 pub mod acpi_log;
+pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
 pub mod mm;
@@ -292,9 +293,6 @@ impl Kernel {
     }
 
     pub fn run(&mut self) -> ! {
-        use framebuffer::Display;
-        self.framebuffer.clear();
-        self.framebuffer.flush();
 
         // The physical allocator was moved from the stack of `new()` into
         // `self.allocator`, leaving the raw pointer stashed by `heap::init`
@@ -319,8 +317,13 @@ impl Kernel {
             );
         }
 
-        // PS/2 keyboard driver (8042 controller) — registers IRQ 1 before the
-        // module tests run so the input test can receive keystrokes.
+        // UInputL — the unified input layer.  Must exist before any driver
+        // (PS/2, future USB HID) tries to register a device.
+        crate::input::init();
+
+        // PS/2 keyboard driver (8042 controller) — registers IRQ 1 and the
+        // keyboard device before the module tests run so the input test can
+        // receive keystrokes.
         #[cfg(target_arch = "x86_64")]
         crate::drivers::ps2::init();
 

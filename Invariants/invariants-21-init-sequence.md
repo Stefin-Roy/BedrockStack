@@ -1,7 +1,7 @@
 # Boot Initialization Sequence — Invariants
 
-**Version:** 0.4.0
-**Date:** 2026-07-31
+**Version:** 0.6.0
+**Date:** 2026-08-01
 **Source:** `kernel/src/lib.rs`, `kernel/src/main.rs`, `boot/src/main.rs`
 **Status:** Stable
 
@@ -66,7 +66,9 @@ The following dependencies MUST be respected:
                     ├── heap::set_phys_allocator() (re-point after move)
                     ├── IDT protect (.idt section read-only) [x86_64]
                     ├── PCI::init() (ECAM mapping + bus enumeration)
-                    ├── ps2::init() [x86_64] (8042 keyboard, IRQ 1/GSI 1)
+                    ├── input::init() (UInputL core — static queue)
+                    ├── ps2::init() [x86_64] (8042 keyboard, IRQ 1/GSI 1;
+                    │   registers "PS/2 Keyboard" device with UInputL)
                     ├── blockdriver::driver::init_all() [x86_64]
                     │   ├── AHCI + block_devices returned
                     │   └── DMA via kernel_services().dma (shared KernelDma)
@@ -83,8 +85,9 @@ The following dependencies MUST be respected:
                     │   ├── UsbTest [x86_64]
                     │   ├── Fat32Ls [B>]
                     │   ├── VfsTest (A>)
-                    │   └── Ps2Test (keyboard echo; halts on Esc) [x86_64]
-                    └── Halt loop (reached only when no keyboard / non-x86_64)
+                    │   └── InputTest (UInputL echo, Backspace/Delete,
+                    │       halts on Esc) [x86_64]
+                    └── Halt loop (reached only when no input device / non-x86_64)
 ```
 
 ---
@@ -197,19 +200,27 @@ first block device) is mounted as `B>` (fat32) after VFS init.
 - Location: `kernel/src/lib.rs:` block drivers → VFS → partition mount
 
 **INIT-017 — Module init runs last:**
-Modules may use VFS, display, and all other initialized subsystems.
+Modules may use VFS, display, input, and all other initialized subsystems.
 The x86_64 module list includes: `HelloModule`, `Fat32Test`, `MsixTest`,
-`UsbTest`, `Fat32Ls`, `VfsTest`, `Ps2Test`. Non-x86_64 targets exclude
-`MsixTest`, `UsbTest`, and `Ps2Test`. `Ps2Test` is last and halts forever
-once a keyboard is present, so it is the terminal step of the sequence.
+`UsbTest`, `Fat32Ls`, `VfsTest`, `InputTest`. Non-x86_64 targets exclude
+`MsixTest`, `UsbTest`, and `InputTest`. `InputTest` is last and halts forever
+once an input device is present, so it is the terminal step of the sequence.
 - Location: `kernel/src/lib.rs:` `init_all()` at end of `run()`
 
-**INIT-017b — PS/2 init runs after PCI init, before module tests:**
+**INIT-017a — UInputL core init runs before any input driver:**
+`input::init()` (the core owns the static event queue and registries) must
+precede `ps2::init()`, which registers a device and submits events. The queue
+is a `static const` so no heap ordering is involved, but the call still marks
+the ordering contract for future drivers.
+- Location: `kernel/src/lib.rs:323-325`, `kernel/src/input/mod.rs:96-101`
+
+**INIT-017b — PS/2 init runs after PCI init and UInputL init, before module tests:**
 `ps2::init()` registers the keyboard ISR and programs IOAPIC GSI 1 while
 interrupts are already enabled (post-`init()`). It must complete before
-`module::init_all()` so `Ps2Test` can receive keystrokes. Failure is
-non-fatal — the keyboard simply stays absent and `Ps2Test` skips itself.
-- Location: `kernel/src/lib.rs:322-325`, `kernel/src/drivers/ps2.rs:269-324`
+`module::init_all()` so `InputTest` can receive keystrokes. Failure is
+non-fatal — the keyboard simply stays absent and `InputTest` skips itself
+(no `register_device` call, so `input::device_count()` stays 0).
+- Location: `kernel/src/lib.rs:327-331`, `kernel/src/drivers/ps2.rs:768-784`
 
 ---
 

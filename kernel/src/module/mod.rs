@@ -1,9 +1,9 @@
 pub mod fat32_ls;
 pub mod fat32_test;
 #[cfg(target_arch = "x86_64")]
-pub mod msix_test;
+pub mod input_test;
 #[cfg(target_arch = "x86_64")]
-pub mod ps2_test;
+pub mod msix_test;
 pub mod registry;
 #[cfg(target_arch = "x86_64")]
 pub mod usb_test;

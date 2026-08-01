@@ -164,6 +164,33 @@ impl Console {
         self.display_mut().flush();
     }
 
+    /// Clear the display to the background colour and reset the cursor to the
+    /// top-left corner.  Also clears the scrollback screen buffer.
+    pub fn clear(&mut self) {
+        self.display_mut().clear();
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        #[cfg(feature = "scrollback")]
+        self.screen_chars.fill(b' ');
+        self.display_mut().flush();
+    }
+
+    /// Erase the character before the cursor and move the cursor back one
+    /// column (Backspace key).
+    pub fn backspace(&mut self) {
+        if self.cursor_col > 0 {
+            self.cursor_col -= 1;
+            self.draw_char(b' ');
+            self.display_mut().flush();
+        }
+    }
+
+    /// Erase the character at the cursor position without moving (Delete key).
+    pub fn delete(&mut self) {
+        self.draw_char(b' ');
+        self.display_mut().flush();
+    }
+
     pub fn flush(&mut self) {
         self.display_mut().flush();
     }

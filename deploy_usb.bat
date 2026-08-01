@@ -48,16 +48,16 @@ set DRIVE_LETTER=%WSL_TARGET:~0,1%
 for %%a in (a b c d e f g h i j k l m n o p q r s t u v w x y z) do if /i "%%a"=="%DRIVE_LETTER%" set DRIVE_LETTER=%%a
 set "WSL_TARGET=/mnt/%DRIVE_LETTER%%WSL_TARGET:~2%"
 
-REM Check GRUB cache — only regenerate if the config changed
+REM Check GRUB cache - only regenerate if the config changed
 set GRUB_SKIP=0
 if exist "%GRUB_EFI%" if exist "%GRUB_CFG_CACHED%" (
     > "%TARGET_DIR%\_grub_cmp.cfg" (
-    echo set timeout=1
+    echo set timeout=0
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1024x768x32
+    echo set gfxmode=1920x1080x32
     echo set gfxpayload=keep
     echo.
     echo menuentry "BedrockOS" {
@@ -80,12 +80,12 @@ if %GRUB_SKIP% equ 1 (
 
     REM Write grub.cfg
     (
-    echo set timeout=1
+    echo set timeout=0
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1024x768x32
+    echo set gfxmode=1920x1080x32
     echo set gfxpayload=keep
     echo.
     echo menuentry "BedrockOS" {

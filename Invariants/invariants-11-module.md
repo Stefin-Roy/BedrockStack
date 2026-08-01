@@ -1,8 +1,8 @@
 # Module System — Invariants
 
-**Version:** 0.5.0
+**Version:** 0.6.0
 **Date:** 2026-08-01
-**Source:** `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,ps2_test,vfs_test}.rs`
+**Source:** `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,input_test,vfs_test}.rs`
 **Status:** Stable
 
 ---
@@ -22,14 +22,15 @@ The loop `break`s after the first `Err(msg)`, logging the failure.
 All module metadata is compile-time constant.
 - Location: `kernel/src/module/registry.rs:13-18`
 
-**MOD-004 — Registry lists `Fat32Ls` on both arches, x86_64 adds `MsixTest`, `UsbTest`, and `Ps2Test`:**
-- `#[cfg(target_arch = "x86_64")]`: `[HelloModule, Fat32Test, MsixTest, UsbTest, Fat32Ls, VfsTest, Ps2Test]`
+**MOD-004 — Registry lists `Fat32Ls` on both arches, x86_64 adds `MsixTest`, `UsbTest`, and `InputTest`:**
+- `#[cfg(target_arch = "x86_64")]`: `[HelloModule, Fat32Test, MsixTest, UsbTest, Fat32Ls, VfsTest, InputTest]`
 - otherwise: `[HelloModule, Fat32Test, Fat32Ls, VfsTest]`
 `Fat32Ls` (lists the FAT32 root directory on `B>`) was added in the block/FS
 registry work; it runs on riscv64 too but is skipped gracefully when no
-ESP is mounted. `Ps2Test` (interactive keyboard echo, halts on Esc) is x86_64
-only and is deliberately **last**: its `init()` never returns once a keyboard
-is present, so it is the terminal step of the boot sequence.
+ESP is mounted. `InputTest` (interactive UInputL echo — clears the screen,
+echoes characters, Backspace/Delete edit, halts on Esc) is x86_64
+only and is deliberately **last**: its `init()` never returns once an input
+device is present, so it is the terminal step of the boot sequence.
 - Location: `kernel/src/module/registry.rs:37-47`
 
 ---
@@ -56,4 +57,7 @@ pub trait Module: Sync {
 - Modules are statically defined (not dynamically loaded). The `MODULES`
   slice is built at compile time.
 - The `VfsTest` module exercises the VFS subsystem during kernel init.
+- The `InputTest` module is the first UInputL consumer: it clears the
+  framebuffer (all black) before echoing, so boot logs are not overwritten,
+  and edits via Backspace/Delete through `Console` methods.
 - No module unloading is supported.

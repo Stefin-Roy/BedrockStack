@@ -4,9 +4,9 @@ use super::Module;
 use super::fat32_ls::Fat32Ls;
 use super::fat32_test::Fat32Test;
 #[cfg(target_arch = "x86_64")]
-use super::msix_test::MsixTest;
+use super::input_test::InputTest;
 #[cfg(target_arch = "x86_64")]
-use super::ps2_test::Ps2Test;
+use super::msix_test::MsixTest;
 #[cfg(target_arch = "x86_64")]
 use super::usb_test::UsbTest;
 use super::vfs_test::VfsTest;
@@ -42,7 +42,7 @@ static MODULES: &[&dyn Module] = &[
     &UsbTest,
     &Fat32Ls,
     &VfsTest,
-    &Ps2Test,
+    &InputTest,
 ];
 
 #[cfg(not(target_arch = "x86_64"))]
