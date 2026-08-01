@@ -75,16 +75,6 @@ pub fn xhci_irq_handler() {
     consume_pending_events();
 }
 
-pub fn read_event_completion_at(trb_va: u64) -> (u32, u8, u8, u32) {
-    let param = unsafe { core::ptr::read_volatile(trb_va as *const u64) };
-    let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
-    let control = unsafe { core::ptr::read_volatile((trb_va + 12) as *const u32) };
-    let completion_code = (status >> 24) as u8;
-    let slot_id = ((status >> 8) & 0xFF) as u8;
-    let trb_type = (control >> 10) & 0x3F;
-    (param as u32, completion_code, slot_id, trb_type)
-}
-
 static LAST_CMD_STATE: AtomicU64 = AtomicU64::new(0);
 static LAST_TRANSFER_STATE: AtomicU64 = AtomicU64::new(0);
 

@@ -5,6 +5,7 @@ pub mod enumerate;
 pub mod msi;
 pub mod msix;
 
+use alloc::vec::Vec;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::acpi::PciConfigRegions;
 
@@ -34,16 +35,23 @@ pub struct PciDevice {
 ///
 /// 1. Store VMM state for mapping ECAM regions.
 /// 2. Map all MCFG ECAM regions into the virtual address space.
-/// 3. Enumerate all buses and discover devices.
+/// 3. Enumerate all buses on every segment group and discover devices.
 ///
 /// Must be called once after the page tables are live and ACPI is initialised.
 pub fn init(regions: &PciConfigRegions, root: u64, alloc: *mut BitmapAllocator) {
     ecam::init_vmm(root, alloc);
     ecam::map_all(regions);
 
-    // Scan segment group 0 (the common case; multi-segment support can be
-    // added by iterating `regions.regions` for unique segment groups).
-    enumerate::enumerate(0);
+    // Enumerate every segment group present in the MCFG.  `regions` may
+    // contain multiple entries per segment (one per bus range); dedupe to
+    // unique segment groups before scanning.
+    let mut segments: Vec<u16> = Vec::new();
+    for r in &regions.regions {
+        if !segments.contains(&r.pci_segment_group) {
+            segments.push(r.pci_segment_group);
+        }
+    }
+    enumerate::enumerate_all(&segments);
 
     let count = enumerate::all().len();
     crate::drivers::serial::SerialPort::puts("[pci] init complete: ");

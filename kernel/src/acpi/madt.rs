@@ -224,13 +224,18 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
         local_apic_address,
     });
 
-    // Prefer x2APIC entries when present. On x2APIC-capable firmware the type 0
-    // entries are emitted as legacy compatibility stubs with APIC ID 0, so the
-    // authoritative IDs live in the type 9 entries.
-    let mut processors = if !x2apic_processors.is_empty() {
+    // Driver policy: type-9 x2APIC entries carry the authoritative 32-bit
+    // APIC IDs when present.  Some firmware additionally emits type-0 xAPIC
+    // entries as legacy compatibility stubs with APIC ID 0.  Prefer the
+    // x2APIC list only when it actually carries a nonzero ID; otherwise fall
+    // back to the xAPIC entries rather than discarding valid processors.
+    let x2apic_valid = !x2apic_processors.is_empty()
+        && x2apic_processors.iter().any(|p| p.local_apic_id != 0);
+    let mut processors = if x2apic_valid {
         info!("[madt] using x2APIC (type 9) processor entries");
         x2apic_processors
     } else {
+        info!("[madt] using xAPIC (type 0) processor entries");
         xapic_processors
     };
 

@@ -159,26 +159,6 @@ impl TrbRing {
         phys
     }
 
-    pub fn enqueue_raw(&mut self, parameter: u64, status: u32, control: u32) -> u64 {
-        let idx = self.enqueue_index as usize;
-        let va = self.virt + (idx as u64) * 16;
-        unsafe {
-            core::ptr::write_volatile(va as *mut u64, parameter);
-            core::ptr::write_volatile((va + 8) as *mut u32, status);
-            core::ptr::write_volatile((va + 12) as *mut u32, (control & !1) | self.cycle);
-        }
-        let phys = self.phys + (idx as u64) * 16;
-        let next = self.enqueue_index + 1;
-        if next >= self.trb_count {
-            self.write_link_trb(self.trb_count as usize);
-            self.enqueue_index = 0;
-            self.cycle ^= 1;
-        } else {
-            self.enqueue_index = next;
-        }
-        phys
-    }
-
     fn write_link_trb(&self, idx: usize) {
         let va = self.virt + (idx as u64) * 16;
         let link_phys = self.phys;
@@ -198,27 +178,6 @@ impl TrbRing {
 
     pub fn flush(&self) {
         fence(Ordering::SeqCst);
-    }
-}
-
-#[repr(C)]
-pub struct InputControlContext {
-    pub drop_flags: u32,
-    pub add_flags: u32,
-    _rsvd: [u32; 6],
-    pub slot_context: [u32; 8],
-    pub ep_contexts: [[u32; 8]; 31],
-}
-
-impl InputControlContext {
-    pub fn new_slot() -> Self {
-        InputControlContext {
-            drop_flags: 0,
-            add_flags: 0,
-            _rsvd: [0; 6],
-            slot_context: [0u32; 8],
-            ep_contexts: [[0u32; 8]; 31],
-        }
     }
 }
 
@@ -282,4 +241,10 @@ pub fn make_normal_trb(data_phys: u64, len: u32) -> Trb {
 
 pub fn make_no_op_command_trb() -> Trb {
     Trb::new(0, 0, (TRB_TYPE_NO_OP_COMMAND as u32) << 10 | TRB_IOC)
+}
+
+pub fn make_disable_slot_trb(slot_id: u8) -> Trb {
+    let mut control = (TRB_TYPE_DISABLE_SLOT as u32) << 10;
+    control |= (slot_id as u32) << 24;
+    Trb::new(0, 0, control)
 }

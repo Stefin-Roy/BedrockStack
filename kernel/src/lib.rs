@@ -390,6 +390,17 @@ impl Kernel {
 
         init_all(&mut self.framebuffer);
         loop {
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Hot-plug: poll the retained xHCI controller for port
+                // changes and register any newly attached block devices.
+                let new_devices = crate::usb::xhci::poll();
+                if !new_devices.is_empty() {
+                    crate::filesystems::blockdriver::driver::BLOCK_DEVICES
+                        .lock()
+                        .extend(new_devices);
+                }
+            }
             self.svc().platform.halt();
         }
     }

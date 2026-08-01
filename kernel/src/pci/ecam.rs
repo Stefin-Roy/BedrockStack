@@ -123,15 +123,3 @@ ecam_read!(read_u8, u8, 0xFF);
 ecam_write!(write_u32, u32);
 ecam_write!(write_u16, u16);
 ecam_write!(write_u8, u8);
-
-/// Read entire 256-byte config header into a buffer.
-pub fn read_header(segment: u16, bus: u8, device: u8, function: u8, buf: &mut [u8; 256]) {
-    let r = match find_region(segment, bus) {
-        Some(r) => r,
-        None => return,
-    };
-    let base = r.virt_addr(bus, device, function, 0);
-    unsafe {
-        core::ptr::copy_nonoverlapping(base, buf.as_mut_ptr(), 256);
-    }
-}

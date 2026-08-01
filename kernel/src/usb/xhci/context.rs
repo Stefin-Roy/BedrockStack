@@ -1,14 +1,21 @@
-use super::memory::InputControlContext;
+//! Input Control Context builders.
+//!
+//! xHCI context entries are 32 bytes (CSZ=0) or 64 bytes (CSZ=1, HCCPARAMS1
+//! bit 2).  All builders write through raw virtual addresses at the spec
+//! offsets: the 32-byte Input Control context header at offset 0, the slot
+//! context at offset 32, and each endpoint context at offset
+//! 32 + context_index * ctx_size (context_index == DCI, EP0 == 1).
+
+const SLOT_CTX_OFF: u64 = 0x20;
 
 const SLOT_CTX_ENTRIES_SHIFT: u32 = 27;
 const SLOT_SPEED_SHIFT: u32 = 20;
-const SLOT_PORT_NUM_SHIFT: u32 = 16;
 
 const EP_CERR_SHIFT: u32 = 1;
 const EP_TYPE_SHIFT: u32 = 3;
 const EP_MAX_PACKET_SHIFT: u32 = 16;
-const EP_MAX_BURST_SHIFT: u32 = 8;
 const EP_AVG_TRB_LENGTH_SHIFT: u32 = 0;
+const EP_MAX_BURST_SHIFT: u32 = 16;
 const EP_DCS: u64 = 1;
 
 pub const EP_TYPE_CONTROL: u32 = 4;
@@ -28,89 +35,124 @@ pub struct EndpointConfig {
     pub interval: u8,
 }
 
-fn init_slot_context(ctx: &mut [u32; 8], speed: u8, port_num: u8, context_entries: u8) {
-    ctx[0] = (context_entries as u32) << SLOT_CTX_ENTRIES_SHIFT
-        | (speed as u32) << SLOT_SPEED_SHIFT;
-    ctx[1] = (port_num as u32) << SLOT_PORT_NUM_SHIFT;
-    for i in 2..8 {
-        ctx[i] = 0;
-    }
+fn write32(va: u64, off: u64, val: u32) {
+    unsafe { core::ptr::write_volatile((va + off) as *mut u32, val) }
 }
 
-fn init_ep0_context(ctx: &mut [u32; 8], mps: u16, dequeue_phys: u64, cerr: u8, avg_trb_len: u16) {
-    let ep_type = EP_TYPE_CONTROL;
-    let dw0 = 0;
-    ctx[0] = dw0;
-    let dw1 = ((cerr as u32) & 0x3) << EP_CERR_SHIFT
-        | (ep_type & 0x7) << EP_TYPE_SHIFT
-        | (mps as u32) << EP_MAX_PACKET_SHIFT;
-    ctx[1] = dw1;
+fn ep_ctx_off(ctx_size: u8, context_index: u8) -> u64 {
+    SLOT_CTX_OFF + (context_index as u64) * (ctx_size as u64)
+}
+
+fn init_slot_context(icc_va: u64, speed: u8, port_num: u8, context_entries: u8) {
+    let base = icc_va + SLOT_CTX_OFF;
+    // dw0: Context Entries | Speed; dw1: Root Hub Port Number.
+    write32(
+        base,
+        0x00,
+        ((context_entries as u32) & 0x1F) << SLOT_CTX_ENTRIES_SHIFT
+            | ((speed as u32) & 0xF) << SLOT_SPEED_SHIFT,
+    );
+    write32(base, 0x04, (port_num as u32) << 16);
+}
+
+fn init_ep_context(
+    icc_va: u64,
+    ctx_size: u8,
+    context_index: u8,
+    ep_type: u32,
+    mps: u16,
+    dequeue_phys: u64,
+    cerr: u8,
+    avg_trb_len: u16,
+    max_burst: u8,
+) {
+    let base = icc_va + ep_ctx_off(ctx_size, context_index);
+    // dw1: CErr | EP Type | Max Packet Size.
+    write32(
+        base,
+        0x04,
+        ((cerr as u32) & 0x3) << EP_CERR_SHIFT
+            | (ep_type & 0x7) << EP_TYPE_SHIFT
+            | (mps as u32) << EP_MAX_PACKET_SHIFT,
+    );
+    // dw2/dw3: Dequeue Pointer | DCS; dw4: Average TRB Length | Max Burst.
     let dequeue = dequeue_phys | EP_DCS;
-    ctx[2] = dequeue as u32;
-    ctx[3] = (dequeue >> 32) as u32;
-    ctx[4] = (avg_trb_len as u32) << EP_AVG_TRB_LENGTH_SHIFT;
-    for i in 5..8 {
-        ctx[i] = 0;
-    }
+    write32(base, 0x08, dequeue as u32);
+    write32(base, 0x0C, (dequeue >> 32) as u32);
+    write32(
+        base,
+        0x10,
+        (avg_trb_len as u32) << EP_AVG_TRB_LENGTH_SHIFT
+            | ((max_burst as u32) & 0xFF) << EP_MAX_BURST_SHIFT,
+    );
 }
 
-fn init_ep_context(ctx: &mut [u32; 8], ep_type: u32, mps: u16, dequeue_phys: u64, cerr: u8, avg_trb_len: u16, max_burst: u8, _interval: u8) {
-    ctx[0] = 0;
-    let dw1 = ((cerr as u32) & 0x3) << EP_CERR_SHIFT
-        | (ep_type & 0x7) << EP_TYPE_SHIFT
-        | (mps as u32) << EP_MAX_PACKET_SHIFT
-        | ((max_burst as u32) & 0xFF) << EP_MAX_BURST_SHIFT;
-    ctx[1] = dw1;
-    let dequeue = dequeue_phys | EP_DCS;
-    ctx[2] = dequeue as u32;
-    ctx[3] = (dequeue >> 32) as u32;
-    ctx[4] = (avg_trb_len as u32) << EP_AVG_TRB_LENGTH_SHIFT;
-    for i in 5..8 {
-        ctx[i] = 0;
-    }
-}
-
+/// Build an Input Control Context for an Address Device command: slot +
+/// EP0 with an unknown (speed-default) MaxPacketSize.  EP0 uses DCI 1.
 pub fn init_icc_for_address_device(
-    icc: &mut InputControlContext,
+    icc_va: u64,
+    ctx_size: u8,
     speed: u8,
     port_num: u8,
     mps: u16,
     dequeue_phys: u64,
 ) {
-    icc.drop_flags = 0;
-    icc.add_flags = 0x3;
-    init_slot_context(&mut icc.slot_context, speed, port_num, 1);
-    init_ep0_context(&mut icc.ep_contexts[0], mps, dequeue_phys, 3, 8);
+    // Add Context Flags: slot (bit 0) + EP0 (bit 1).
+    write32(icc_va, 0x00, 0);
+    write32(icc_va, 0x04, 0x3);
+    init_slot_context(icc_va, speed, port_num, 1);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0);
 }
 
+/// Build an Input Control Context for an Evaluate Context command that
+/// updates only EP0's MaxPacketSize once the device descriptor is known.
+pub fn init_icc_for_evaluate_ep0(
+    icc_va: u64,
+    ctx_size: u8,
+    speed: u8,
+    port_num: u8,
+    mps: u16,
+    dequeue_phys: u64,
+) {
+    // Add Context Flags: slot (bit 0) + EP0 (bit 1).
+    write32(icc_va, 0x00, 0);
+    write32(icc_va, 0x04, 0x3);
+    init_slot_context(icc_va, speed, port_num, 1);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0);
+}
+
+/// Build an Input Control Context for a Configure Endpoint command that
+/// configures the given non-default endpoints (EP0 is never included).
 pub fn init_icc_for_configure_endpoint(
-    icc: &mut InputControlContext,
+    icc_va: u64,
+    ctx_size: u8,
     speed: u8,
     port_num: u8,
     endpoints: &[EndpointConfig],
 ) {
-    icc.drop_flags = 0;
-    icc.add_flags = 0x1;
+    let mut add_flags = 0x1u32;
     let mut max_dci = 1u8;
     for ep in endpoints {
         if ep.dci > max_dci {
             max_dci = ep.dci;
         }
-        icc.add_flags |= 1u32 << (ep.dci as u32);
+        add_flags |= 1u32 << (ep.dci as u32);
     }
-    init_slot_context(&mut icc.slot_context, speed, port_num, max_dci);
+    write32(icc_va, 0x00, 0);
+    write32(icc_va, 0x04, add_flags);
+    init_slot_context(icc_va, speed, port_num, max_dci);
     for ep in endpoints {
-        let ep_index = (ep.dci - 1) as usize;
-        if ep_index < 31 {
+        if ep.dci >= 2 && ep.dci <= 31 {
             init_ep_context(
-                &mut icc.ep_contexts[ep_index],
+                icc_va,
+                ctx_size,
+                ep.dci,
                 ep.ep_type,
                 ep.max_packet_size,
                 ep.dequeue_phys,
                 ep.cerr,
                 ep.avg_trb_len,
                 ep.max_burst,
-                ep.interval,
             );
         }
     }

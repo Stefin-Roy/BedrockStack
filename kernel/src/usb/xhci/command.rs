@@ -94,11 +94,12 @@ pub fn submit_evaluate_context(
     Ok(())
 }
 
-pub fn submit_no_op(
+pub fn submit_disable_slot(
     cmd_ring: &mut memory::TrbRing,
     doorbell_va: u64,
+    slot_id: u8,
 ) -> Result<(), &'static str> {
-    let trb = memory::make_no_op_command_trb();
+    let trb = memory::make_disable_slot_trb(slot_id);
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);

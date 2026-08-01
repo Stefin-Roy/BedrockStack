@@ -4,7 +4,7 @@ use framebuffer::Framebuffer;
 use crate::drivers::serial::SerialPort;
 use crate::usb::usb;
 use crate::usb::usb::descriptors;
-use crate::usb::xhci::memory::{self, Trb, InputControlContext};
+use crate::usb::xhci::memory::{self, Trb};
 use crate::usb::xhci::context;
 use super::Module;
 
@@ -338,6 +338,15 @@ fn test_trb_factory_no_op() -> Result<(), &'static str> {
     Ok(())
 }
 
+fn test_trb_factory_disable_slot() -> Result<(), &'static str> {
+    let trb = memory::make_disable_slot_trb(5);
+    let ttype = trb.trb_type();
+    if ttype != memory::TRB_TYPE_DISABLE_SLOT { return Err("wrong TRB type"); }
+    let slot_id = (trb.control >> 24) & 0xFF;
+    if slot_id != 5 { return Err("slot_id not encoded"); }
+    Ok(())
+}
+
 fn test_trb_struct_methods() -> Result<(), &'static str> {
     let trb = Trb::new(0x1234, 0x5678, (9 << 10) | 1);
     if trb.parameter != 0x1234 { return Err("parameter mismatch"); }
@@ -404,69 +413,67 @@ fn test_event_completion_constants() -> Result<(), &'static str> {
     Ok(())
 }
 
-fn test_input_control_context() -> Result<(), &'static str> {
-    let ctx = InputControlContext::new_slot();
-    if ctx.drop_flags != 0 { return Err("drop_flags should be 0"); }
-    if ctx.add_flags != 0 { return Err("add_flags should be 0"); }
-    for v in ctx.slot_context {
-        if v != 0 { return Err("slot_context should be zeroed"); }
-    }
-    for ep in ctx.ep_contexts.iter() {
-        for v in ep {
-            if *v != 0 { return Err("ep_contexts should be zeroed"); }
-        }
-    }
-    Ok(())
+fn read32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
 }
 
 fn test_init_icc_for_address_device() -> Result<(), &'static str> {
-    let mut icc = InputControlContext::new_slot();
-    context::init_icc_for_address_device(&mut icc, 3, 1, 64, 0x10000);
+    // The ICC must be built identically for 32-byte (CSZ=0) and 64-byte
+    // (CSZ=1) contexts, with the slot context at 32 and EP0 at 32+ctx_size.
+    for ctx_size in [32u8, 64u8] {
+        let mut buf = [0u8; 4096];
+        let icc_va = buf.as_mut_ptr() as usize as u64;
+        context::init_icc_for_address_device(icc_va, ctx_size, 3, 1, 64, 0x10000);
 
-    if icc.add_flags != 0x3 {
-        return Err("add_flags should be 0x3");
-    }
-    if icc.drop_flags != 0 {
-        return Err("drop_flags should be 0");
-    }
+        if read32(&buf, 0x00) != 0 {
+            return Err("drop_flags should be 0");
+        }
+        if read32(&buf, 0x04) != 0x3 {
+            return Err("add_flags should be 0x3");
+        }
 
-    let entries = (icc.slot_context[0] >> 27) & 0x1F;
-    let speed = (icc.slot_context[0] >> 20) & 0xF;
-    let dw1 = icc.slot_context[1];
-    let port_num = (dw1 >> 16) & 0xFF;
-    if speed != 3 {
-        return Err("slot speed wrong");
-    }
-    if port_num != 1 {
-        return Err("slot port_num wrong");
-    }
-    if entries != 1 {
-        return Err("slot entries wrong");
-    }
+        let entries = (read32(&buf, 0x20) >> 27) & 0x1F;
+        let speed = (read32(&buf, 0x20) >> 20) & 0xF;
+        let port_num = (read32(&buf, 0x20 + 0x04) >> 16) & 0xFF;
+        if speed != 3 {
+            return Err("slot speed wrong");
+        }
+        if port_num != 1 {
+            return Err("slot port_num wrong");
+        }
+        if entries != 1 {
+            return Err("slot entries wrong");
+        }
 
-    let ep_dw1 = icc.ep_contexts[0][1];
-    let mps = (ep_dw1 >> 16) & 0xFFFF;
-    let ep_type = (ep_dw1 >> 3) & 0x7;
-    let cerr = (ep_dw1 >> 1) & 0x3;
-    if mps != 64 {
-        return Err("EP0 MPS wrong");
-    }
-    if ep_type != 4 {
-        return Err("EP0 type not control (expected 4 per xHCI spec)");
-    }
-    if cerr != 3 {
-        return Err("EP0 CErr wrong");
-    }
+        let ep0_base = 0x20 + ctx_size as usize;
+        let ep_dw1 = read32(&buf, ep0_base + 0x04);
+        let mps = (ep_dw1 >> 16) & 0xFFFF;
+        let ep_type = (ep_dw1 >> 3) & 0x7;
+        let cerr = (ep_dw1 >> 1) & 0x3;
+        if mps != 64 {
+            return Err("EP0 MPS wrong");
+        }
+        if ep_type != 4 {
+            return Err("EP0 type not control (expected 4 per xHCI spec)");
+        }
+        if cerr != 3 {
+            return Err("EP0 CErr wrong");
+        }
 
-    if icc.ep_contexts[0][2] & 1 != 1 {
-        return Err("EP0 DCS not set");
-    }
+        let dequeue = (read32(&buf, ep0_base + 0x08) as u64)
+            | ((read32(&buf, ep0_base + 0x0C) as u64) << 32);
+        if dequeue & 1 != 1 {
+            return Err("EP0 DCS not set");
+        }
+        if dequeue & !1 != 0x10000 {
+            return Err("EP0 dequeue ptr wrong");
+        }
 
-    let dw4 = icc.ep_contexts[0][4];
-    if dw4 & 0xFFFF != 8 {
-        return Err("EP0 avg_trb_len wrong");
+        let dw4 = read32(&buf, ep0_base + 0x10);
+        if dw4 & 0xFFFF != 8 {
+            return Err("EP0 avg_trb_len wrong");
+        }
     }
-
     Ok(())
 }
 
@@ -507,13 +514,13 @@ impl Module for UsbTest {
         t!("trb_status_stage_out", test_trb_factory_status_stage_out());
         t!("trb_eval_context", test_trb_factory_evaluate_context());
         t!("trb_no_op", test_trb_factory_no_op());
+        t!("trb_disable_slot", test_trb_factory_disable_slot());
         t!("trb_struct_methods", test_trb_struct_methods());
         t!("trb_is_event", test_trb_is_event());
         t!("trb_cycle_bit", test_trb_cycle_bit());
         t!("trb_type_constants", test_trb_type_constants());
         t!("trb_flag_constants", test_trb_flag_constants());
         t!("event_completion_codes", test_event_completion_constants());
-        t!("input_control_ctx", test_input_control_context());
         t!("icc_address_device", test_init_icc_for_address_device());
 
         let p = PASS.load(Ordering::Relaxed);

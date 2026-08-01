@@ -24,11 +24,35 @@ struct MsixFallback {
     dest_apic_id: u8,
 }
 
+/// A Supported Protocol capability parsed from the xHC extended capability
+/// list (xHCI §7.6.2).  Retained so hot-plug diagnostics can label a newly
+/// attached device with its protocol name and revision.
+struct ProtocolCap {
+    name: [u8; 20],
+    rev_major: u8,
+    rev_minor: u8,
+    port_offset: u8,
+    port_count: u8,
+}
+
+/// State retained after init so the idle loop can poll for post-boot port
+/// changes and enumerate/detach devices without re-probing the controller.
+struct XhciControllerState {
+    ports: spin::Mutex<ports::UsbPorts>,
+    slots: spin::Mutex<device::DeviceSlotManager>,
+    cmd_ring: spin::Mutex<memory::TrbRing>,
+    doorbell_va: u64,
+    dma: &'static dyn DmaAllocator,
+    protocol_caps: Vec<ProtocolCap>,
+}
+
+static CONTROLLER: spin::Mutex<Option<XhciControllerState>> = spin::Mutex::new(None);
+
 pub fn init_all(
     pci_devices: &[PciDevice],
 ) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
-    let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
+    let dma: &'static dyn DmaAllocator = crate::services::kernel_services().dma;
     let mut usb_block_devices = Vec::new();
     for dev in pci_devices {
         if dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
@@ -56,7 +80,7 @@ pub fn init_all(
     usb_block_devices
 }
 
-fn init_controller(dev: &PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
     let phys_base = match crate::pci::bar::bar(dev, 0) {
@@ -92,10 +116,6 @@ fn init_controller(dev: &PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dy
     SerialPort::puts(" ac64=");
     SerialPort::put_u64(ac64 as u64);
     SerialPort::puts("\n");
-
-    if xecp_off != 0 {
-        parse_ext_caps(mmio_va, xecp_off);
-    }
 
     controller_reset(&regs);
 
@@ -226,7 +246,7 @@ fn init_controller(dev: &PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dy
     }
 
     let mut dev_mgr = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
-        regs.doorbell_va(), er_buf.virt, er_buf.trb_count as u32, max_slots);
+        regs.doorbell_va(), ctx_size, max_slots);
 
     // Verify message-interrupt delivery with a No-Op command.
     verify_message_interrupt_delivery(&mut cmd_ring, regs.doorbell_va(), &regs, dev, msix_fallback);
@@ -240,66 +260,203 @@ fn init_controller(dev: &PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dy
         if slot.interface_class != 0 || slot.config_value != 0 {
             continue; // already configured
         }
-
-        if let Err(e) = device::get_config_descriptor_full(slot, doorbell_va, slot.icc_phys, slot.icc_va) {
-            SerialPort::puts("[xhci]  config desc failed: ");
-            SerialPort::puts(e);
-            SerialPort::puts("\n");
-            continue;
-        }
-
-        if slot.interface_class == 0 {
-            continue;
-        }
-
-        if let Err(e) = device::configure_device(slot, &mut cmd_ring, doorbell_va, dma) {
-            SerialPort::puts("[xhci]  configure failed: ");
-            SerialPort::puts(e);
-            SerialPort::puts("\n");
-            continue;
-        }
-
-        if slot.interface_class == crate::usb::usb::CLASS_MASS_STORAGE && slot.bulk_in_dci != 0 && slot.bulk_out_dci != 0 {
-            SerialPort::puts("[xhci]  found USB mass storage\n");
-
-            let mut bulk_out_ring = None;
-            let mut bulk_in_ring = None;
-            let mut i = 0;
-            while i < slot.ep_rings.len() {
-                let (dci, _) = slot.ep_rings[i];
-                if dci == slot.bulk_out_dci {
-                    bulk_out_ring = Some(slot.ep_rings.remove(i));
-                } else if dci == slot.bulk_in_dci {
-                    bulk_in_ring = Some(slot.ep_rings.remove(i));
-                } else {
-                    i += 1;
-                }
-            }
-            let bulk_out_ring = bulk_out_ring.ok_or("missing bulk OUT ring")?.1;
-            let bulk_in_ring = bulk_in_ring.ok_or("missing bulk IN ring")?.1;
-
-            match crate::usb::class::mass_storage::UsbMassStorageDevice::new(
-                doorbell_va,
-                slot.slot_id,
-                slot.bulk_out_dci,
-                slot.bulk_in_dci,
-                bulk_out_ring,
-                bulk_in_ring,
-                dma,
-            ) {
-                Ok(dev) => {
-                    block_devices.push(dev);
-                }
-                Err(e) => {
-                    SerialPort::puts("[xhci]  mass storage init failed: ");
-                    SerialPort::puts(e);
-                    SerialPort::puts("\n");
-                }
+        match bind_slot(slot, &mut cmd_ring, doorbell_va, dma) {
+            Ok(Some(dev)) => block_devices.push(dev),
+            Ok(None) => {}
+            Err(e) => {
+                SerialPort::puts("[xhci]  bind failed: ");
+                SerialPort::puts(e);
+                SerialPort::puts("\n");
             }
         }
     }
 
+    let protocol_caps = if xecp_off != 0 {
+        parse_ext_caps(mmio_va, xecp_off)
+    } else {
+        Vec::new()
+    };
+
+    *CONTROLLER.lock() = Some(XhciControllerState {
+        ports: spin::Mutex::new(usb_ports),
+        slots: spin::Mutex::new(dev_mgr),
+        cmd_ring: spin::Mutex::new(cmd_ring),
+        doorbell_va,
+        dma,
+        protocol_caps,
+    });
+
     Ok(block_devices)
+}
+
+/// Full configuration + class-driver binding for one enumerated slot.
+/// Returns the bound block device, or None if the slot needs no class driver.
+fn bind_slot(
+    slot: &mut device::DeviceSlot,
+    cmd_ring: &mut memory::TrbRing,
+    doorbell_va: u64,
+    dma: &dyn DmaAllocator,
+) -> Result<Option<Arc<dyn BlockDevice>>, &'static str> {
+    use crate::drivers::serial::SerialPort;
+
+    device::get_config_descriptor_full(slot, doorbell_va, slot.icc_phys, slot.icc_va)?;
+
+    if slot.interface_class == 0 {
+        return Ok(None);
+    }
+
+    device::configure_device(slot, cmd_ring, doorbell_va, dma)?;
+
+    if slot.interface_class == crate::usb::usb::CLASS_MASS_STORAGE
+        && slot.bulk_in_dci != 0
+        && slot.bulk_out_dci != 0
+    {
+        SerialPort::puts("[xhci]  found USB mass storage\n");
+
+        let mut bulk_out_ring = None;
+        let mut bulk_in_ring = None;
+        let mut i = 0;
+        while i < slot.ep_rings.len() {
+            let (dci, _) = slot.ep_rings[i];
+            if dci == slot.bulk_out_dci {
+                bulk_out_ring = Some(slot.ep_rings.remove(i));
+            } else if dci == slot.bulk_in_dci {
+                bulk_in_ring = Some(slot.ep_rings.remove(i));
+            } else {
+                i += 1;
+            }
+        }
+        let bulk_out_ring = bulk_out_ring.ok_or("missing bulk OUT ring")?.1;
+        let bulk_in_ring = bulk_in_ring.ok_or("missing bulk IN ring")?.1;
+
+        let dev = crate::usb::class::mass_storage::UsbMassStorageDevice::new(
+            doorbell_va,
+            slot.slot_id,
+            slot.bulk_out_dci,
+            slot.bulk_in_dci,
+            bulk_out_ring,
+            bulk_in_ring,
+            dma,
+        )?;
+        return Ok(Some(dev));
+    }
+    Ok(None)
+}
+
+/// Poll the retained xHCI controller for queued port-change events and
+/// enumerate or detach devices accordingly.  Returns any newly bound block
+/// devices so the caller can register them with the VFS/block layer.
+/// Called from the idle loop on the BSP.
+pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
+    use crate::drivers::serial::SerialPort;
+
+    let mut new_devices = Vec::new();
+    let guard = CONTROLLER.lock();
+    let ctrl = match guard.as_ref() {
+        Some(c) => c,
+        None => return new_devices,
+    };
+
+    if !event::port_change_pending() {
+        return new_devices;
+    }
+
+    while let Some(port_id) = event::take_port_change() {
+        {
+            let mut ports = ctrl.ports.lock();
+            if let Err(e) = ports.handle_port_status_change(port_id) {
+                SerialPort::puts("[xhci] port change err: ");
+                SerialPort::puts(e);
+                SerialPort::puts("\n");
+            }
+        }
+
+        let port_state = {
+            let ports = ctrl.ports.lock();
+            ports.ports.iter().find(|p| p.port_num == port_id).map(|p| (p.connected, p.enabled, p.speed))
+        };
+
+        match port_state {
+            // Disconnect: tear down the slot if one exists.
+            Some((false, _, _)) => {
+                let mut cmd = ctrl.cmd_ring.lock();
+                let mut slots = ctrl.slots.lock();
+                if let Some(idx) = slots.slots.iter().position(|s| s.port_num == port_id) {
+                    let slot_id = slots.slots[idx].slot_id;
+                    match command::submit_disable_slot(&mut cmd, ctrl.doorbell_va, slot_id) {
+                        Ok(()) => {
+                            SerialPort::puts("[xhci] port ");
+                            SerialPort::put_u64(port_id as u64);
+                            SerialPort::puts(": slot ");
+                            SerialPort::put_u64(slot_id as u64);
+                            SerialPort::puts(" disabled\n");
+                        }
+                        Err(e) => {
+                            SerialPort::puts("[xhci] port ");
+                            SerialPort::put_u64(port_id as u64);
+                            SerialPort::puts(": disable slot failed: ");
+                            SerialPort::puts(e);
+                            SerialPort::puts("\n");
+                        }
+                    }
+                    slots.slots.remove(idx);
+                }
+            }
+            // Connect: enumerate + bind, unless the port already has a slot
+            // (e.g. a link-state change on an already-attached device).
+            Some((true, true, speed)) => {
+                let (name, major, minor) = match protocol_cap_for_port(ctrl, port_id) {
+                    Some(cap) => {
+                        let n = cap.name.iter().position(|&b| b == 0).unwrap_or(cap.name.len());
+                        let name = core::str::from_utf8(&cap.name[..n]).unwrap_or("?");
+                        (name, cap.rev_major, cap.rev_minor)
+                    }
+                    None => ("?", 0, 0),
+                };
+                SerialPort::puts("[xhci] port ");
+                SerialPort::put_u64(port_id as u64);
+                SerialPort::puts(": connect (");
+                SerialPort::puts(name);
+                SerialPort::puts(" v");
+                SerialPort::put_u64(major as u64);
+                SerialPort::puts(".");
+                SerialPort::put_u64(minor as u64);
+                SerialPort::puts(")\n");
+
+                let mut cmd = ctrl.cmd_ring.lock();
+                let mut slots = ctrl.slots.lock();
+                if slots.slots.iter().any(|s| s.port_num == port_id) {
+                    continue;
+                }
+                if let Err(e) = slots.enumerate_port(&mut cmd, ctrl.doorbell_va, ctrl.dma, port_id, speed) {
+                    SerialPort::puts("[xhci]  port ");
+                    SerialPort::put_u64(port_id as u64);
+                    SerialPort::puts(" enum failed: ");
+                    SerialPort::puts(e);
+                    SerialPort::puts("\n");
+                    continue;
+                }
+                let slot = slots.slots.last_mut().expect("enumerated slot missing");
+                match bind_slot(slot, &mut cmd, ctrl.doorbell_va, ctrl.dma) {
+                    Ok(Some(dev)) => new_devices.push(dev),
+                    Ok(None) => {}
+                    Err(e) => {
+                        SerialPort::puts("[xhci]  bind failed: ");
+                        SerialPort::puts(e);
+                        SerialPort::puts("\n");
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    new_devices
+}
+
+fn protocol_cap_for_port<'a>(ctrl: &'a XhciControllerState, port_num: u8) -> Option<&'a ProtocolCap> {
+    ctrl.protocol_caps
+        .iter()
+        .find(|c| port_num >= c.port_offset && port_num < c.port_offset + c.port_count)
 }
 
 fn verify_message_interrupt_delivery(
@@ -347,14 +504,21 @@ fn verify_message_interrupt_delivery(
     let diag_data = crate::pci::msix::diag_read_data();
     let diag_vc = crate::pci::msix::diag_read_vc();
     let diag_pba = crate::pci::msix::diag_read_pba();
-    SerialPort::puts(" tbl_addr=0x");
-    SerialPort::put_hex(diag_addr);
-    SerialPort::puts(" data=0x");
-    SerialPort::put_hex(diag_data as u64);
-    SerialPort::puts(" vc=0x");
-    SerialPort::put_hex(diag_vc as u64);
-    SerialPort::puts(" pba=0x");
-    SerialPort::put_hex(diag_pba as u64);
+    fn print_diag(name: &str, val: Option<u64>) {
+        SerialPort::puts(name);
+        SerialPort::puts("=");
+        match val {
+            Some(v) => {
+                SerialPort::puts("0x");
+                SerialPort::put_hex(v);
+            }
+            None => SerialPort::puts("unset"),
+        }
+    }
+    print_diag(" tbl_addr", diag_addr);
+    print_diag(" data", diag_data.map(|v| v as u64));
+    print_diag(" vc", diag_vc.map(|v| v as u64));
+    print_diag(" pba", diag_pba.map(|v| v as u64));
     SerialPort::puts("\n");
 
     // Fallback: poll the event ring so we don't leave a dangling completion.
@@ -414,8 +578,9 @@ fn verify_message_interrupt_delivery(
     SerialPort::puts("\n");
 }
 
-fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
+fn parse_ext_caps(mmio_va: u64, xecp_off: u64) -> Vec<ProtocolCap> {
     use crate::drivers::serial::SerialPort;
+    let mut caps = Vec::new();
     let mut off = xecp_off;
     loop {
         let cap_id = registers::read_cap_id(mmio_va, off);
@@ -450,6 +615,13 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
                 SerialPort::puts("-");
                 SerialPort::put_u64((comp_port_off + comp_port_cnt - 1) as u64);
                 SerialPort::puts("\n");
+                caps.push(ProtocolCap {
+                    name,
+                    rev_major,
+                    rev_minor,
+                    port_offset: comp_port_off,
+                    port_count: comp_port_cnt,
+                });
             }
             _ => {}
         }
@@ -458,6 +630,7 @@ fn parse_ext_caps(mmio_va: u64, xecp_off: u64) {
         }
         off = cap_next as u64;
     }
+    caps
 }
 
 fn controller_reset(regs: &registers::XhciRegisters) {
@@ -624,12 +797,11 @@ fn enumerate_initial_ports(
     cmd_ring: &mut memory::TrbRing,
     dma: &dyn DmaAllocator,
     doorbell_va: u64,
-    _er_vaddr: u64,
-    _er_trb_count: u32,
-    _max_slots: u8,
+    ctx_size: u8,
+    max_slots: u8,
 ) -> device::DeviceSlotManager {
     use crate::usb::xhci::device::DeviceSlotManager;
-    let mut mgr = DeviceSlotManager::new();
+    let mut mgr = DeviceSlotManager::new(ctx_size, max_slots);
     for port in &usb_ports.ports {
         if port.enabled && port.connected {
             if let Err(e) = mgr.enumerate_port(cmd_ring, doorbell_va, dma, port.port_num, port.speed) {

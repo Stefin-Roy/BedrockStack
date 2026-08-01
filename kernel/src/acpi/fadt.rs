@@ -11,28 +11,28 @@ impl Pm1ControlRegisters {
         Self { pm1a, pm1b }
     }
 
-    pub fn set_sleep_typ(&self, typ: u8) -> Result<(), ()> {
+    pub fn set_sleep_typ(&self, typ: u8) -> Result<(), AcpiError> {
         const SLP_TYP_MASK: u16 = 0x1C00;
-        let val = gas_read16(&self.pm1a);
-        gas_write16(&self.pm1a, (val & !SLP_TYP_MASK) | ((typ as u16) << 10));
+        let val = gas_read16(&self.pm1a)?;
+        gas_write16(&self.pm1a, (val & !SLP_TYP_MASK) | ((typ as u16) << 10))?;
         if let Some(ref pm1b) = self.pm1b {
-            let valb = gas_read16(pm1b);
-            gas_write16(pm1b, (valb & !SLP_TYP_MASK) | ((typ as u16) << 10));
+            let valb = gas_read16(pm1b)?;
+            gas_write16(pm1b, (valb & !SLP_TYP_MASK) | ((typ as u16) << 10))?;
         }
         Ok(())
     }
 
-    pub fn set_bit(&self, bit: Pm1ControlBit, set: bool) -> Result<(), ()> {
+    pub fn set_bit(&self, bit: Pm1ControlBit, set: bool) -> Result<(), AcpiError> {
         let mask = match bit {
             Pm1ControlBit::SleepEnable => 1 << 13,
         };
-        let mut val = gas_read16(&self.pm1a);
+        let mut val = gas_read16(&self.pm1a)?;
         if set { val |= mask; } else { val &= !mask; }
-        gas_write16(&self.pm1a, val);
+        gas_write16(&self.pm1a, val)?;
         if let Some(ref pm1b) = self.pm1b {
-            let mut valb = gas_read16(pm1b);
+            let mut valb = gas_read16(pm1b)?;
             if set { valb |= mask; } else { valb &= !mask; }
-            gas_write16(pm1b, valb);
+            gas_write16(pm1b, valb)?;
         }
         Ok(())
     }
@@ -43,6 +43,8 @@ pub struct FadtFields {
     pub reset_gas: Option<Gas>,
     pub reset_value: u8,
     pub reset_supported: bool,
+    /// Physical address of the DSDT table (FADT offset 140).
+    pub dsdt_addr: u32,
 }
 
 fn r8(buf: &[u8], off: usize) -> u8 { buf[off] }
@@ -151,10 +153,14 @@ pub fn parse_fadt(vaddr: u64, length: u32) -> Result<FadtFields, AcpiError> {
 
     let pm1_control = Pm1ControlRegisters::new(pm1a_gas, pm1b_gas);
 
+    // DSDT at offset 140 (u32 physical address, present in all revisions).
+    let dsdt_addr = if len >= 144 { r32(raw, 140) } else { 0 };
+
     Ok(FadtFields {
         pm1_control,
         reset_gas,
         reset_value,
         reset_supported,
+        dsdt_addr,
     })
 }

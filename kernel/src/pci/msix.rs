@@ -23,47 +23,37 @@ pub fn set_diag_addrs(table_va: u64, pba_va: u64) {
 }
 
 /// Read back entry 0's msg_addr from the diagnosed table.
-pub fn diag_read_addr() -> u64 {
+/// Returns `None` when no MSI-X table has been diagnosed (the caller must
+/// not confuse that with a genuinely programmed address of 0).
+pub fn diag_read_addr() -> Option<u64> {
     let guard = MSIX_DIAG.lock();
-    if let Some(d) = guard.as_ref() {
-        unsafe {
-            let lo = read_volatile(d.table_va as *const u32);
-            let hi = read_volatile((d.table_va + 4) as *const u32);
-            (lo as u64) | ((hi as u64) << 32)
-        }
-    } else {
-        0
+    let d = guard.as_ref()?;
+    unsafe {
+        let lo = read_volatile(d.table_va as *const u32);
+        let hi = read_volatile((d.table_va + 4) as *const u32);
+        Some((lo as u64) | ((hi as u64) << 32))
     }
 }
 
 /// Read back entry 0's msg_data from the diagnosed table.
-pub fn diag_read_data() -> u32 {
+pub fn diag_read_data() -> Option<u32> {
     let guard = MSIX_DIAG.lock();
-    if let Some(d) = guard.as_ref() {
-        unsafe { read_volatile((d.table_va + 8) as *const u32) }
-    } else {
-        0
-    }
+    let d = guard.as_ref()?;
+    unsafe { Some(read_volatile((d.table_va + 8) as *const u32)) }
 }
 
 /// Read back entry 0's vector control from the diagnosed table.
-pub fn diag_read_vc() -> u32 {
+pub fn diag_read_vc() -> Option<u32> {
     let guard = MSIX_DIAG.lock();
-    if let Some(d) = guard.as_ref() {
-        unsafe { read_volatile((d.table_va + 12) as *const u32) }
-    } else {
-        0
-    }
+    let d = guard.as_ref()?;
+    unsafe { Some(read_volatile((d.table_va + 12) as *const u32)) }
 }
 
 /// Read the PBA word for entry 0.
-pub fn diag_read_pba() -> u32 {
+pub fn diag_read_pba() -> Option<u32> {
     let guard = MSIX_DIAG.lock();
-    if let Some(d) = guard.as_ref() {
-        unsafe { read_volatile(d.pba_va as *const u32) }
-    } else {
-        0
-    }
+    let d = guard.as_ref()?;
+    unsafe { Some(read_volatile(d.pba_va as *const u32)) }
 }
 
 /// MSI-X Message Control register bits (capability offset +2).

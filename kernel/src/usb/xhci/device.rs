@@ -7,12 +7,13 @@ use crate::usb::usb::descriptors::{ConfigDescriptor, InterfaceDescriptor, Endpoi
 use crate::usb::xhci::command;
 use crate::usb::xhci::context::{self, EndpointConfig};
 use crate::usb::xhci::event;
-use crate::usb::xhci::memory::{self, TrbRing, InputControlContext};
+use crate::usb::xhci::memory::{self, TrbRing};
 
 pub struct DeviceSlot {
     pub slot_id: u8,
     pub port_num: u8,
     pub speed: u8,
+    pub ctx_size: u8,
     pub mps: u16,
     pub icc_phys: u64,
     pub icc_va: u64,
@@ -36,6 +37,7 @@ impl DeviceSlot {
         slot_id: u8,
         port_num: u8,
         speed: u8,
+        ctx_size: u8,
         mps: u16,
         icc_phys: u64,
         icc_va: u64,
@@ -46,6 +48,7 @@ impl DeviceSlot {
             slot_id,
             port_num,
             speed,
+            ctx_size,
             mps,
             icc_phys,
             icc_va,
@@ -104,7 +107,6 @@ fn submit_control(
         setup.w_length as u8,
         (setup.w_length >> 8) as u8,
     ];
-    let param = u64::from_le_bytes(setup_raw);
     let trt: u32 = if data_len == 0 {
         0
     } else if dir_in {
@@ -113,24 +115,13 @@ fn submit_control(
         2
     };
 
-    // Setup Stage — single-TRB TD; CH bit is RsvdZ here (spec Table 6-26)
-    let setup_control = (memory::TRB_TYPE_SETUP_STAGE as u32) << 10
-        | (trt << 16)
-        | memory::TRB_IDT;
-    slot.ep0_ring.enqueue_raw(param, 8, setup_control);
+    slot.ep0_ring.enqueue(&memory::make_setup_stage_trb(&setup_raw, trt));
 
     if data_len > 0 {
-        let data_control = (memory::TRB_TYPE_DATA_STAGE as u32) << 10
-            | if dir_in { memory::TRB_DIR_IN } else { 0 };
-        slot.ep0_ring.enqueue_raw(data_phys, data_len as u32, data_control);
+        slot.ep0_ring.enqueue(&memory::make_data_stage_trb(data_phys, data_len as u32, dir_in));
     }
 
-    // Status Stage — always present
-    let status_dir = if dir_in { 0 } else { memory::TRB_DIR_IN };
-    let status_control = (memory::TRB_TYPE_STATUS_STAGE as u32) << 10
-        | memory::TRB_IOC
-        | status_dir;
-    slot.ep0_ring.enqueue_raw(0, 0, status_control);
+    slot.ep0_ring.enqueue(&memory::make_status_stage_trb(dir_in));
 
     slot.ep0_ring.flush();
     command::ring_doorbell(doorbell_va, slot.slot_id, 1);
@@ -336,8 +327,9 @@ pub fn configure_device(
         submit_control(slot, doorbell_va, &setup, 0, 0, false)?;
     }
 
-    let icc = unsafe { &mut *(slot.icc_va as *mut InputControlContext) };
-    *icc = InputControlContext::new_slot();
+    let icc_va = slot.icc_va;
+    let ctx_size = slot.ctx_size;
+    unsafe { core::ptr::write_bytes(icc_va as *mut u8, 0, 4096) };
 
     let mut ring_pairs: Vec<(u8, TrbRing)> = Vec::new();
     let mut endpoints: Vec<EndpointConfig> = Vec::new();
@@ -377,7 +369,7 @@ pub fn configure_device(
     // Only push to slot.ep_rings once all allocations succeeded.
     slot.ep_rings.extend(ring_pairs);
 
-    context::init_icc_for_configure_endpoint(icc, slot.speed, slot.port_num, &endpoints);
+    context::init_icc_for_configure_endpoint(icc_va, ctx_size, slot.speed, slot.port_num, &endpoints);
 
     command::submit_configure_endpoint(cmd_ring, doorbell_va, slot.icc_phys, slot.slot_id, false)?;
 
@@ -433,13 +425,17 @@ pub fn find_ep_ring_mut(slot: &mut DeviceSlot, dci: u8) -> Option<&mut TrbRing> 
 
 pub struct DeviceSlotManager {
     pub slots: Vec<DeviceSlot>,
+    ctx_size: u8,
+    max_slots: u8,
     next_address: u8,
 }
 
 impl DeviceSlotManager {
-    pub fn new() -> Self {
+    pub fn new(ctx_size: u8, max_slots: u8) -> Self {
         DeviceSlotManager {
             slots: Vec::new(),
+            ctx_size,
+            max_slots,
             next_address: 1,
         }
     }
@@ -452,6 +448,9 @@ impl DeviceSlotManager {
         port_num: u8,
         speed: u8,
     ) -> Result<(), &'static str> {
+        if self.slots.len() >= self.max_slots as usize {
+            return Err("slot limit reached");
+        }
         SerialPort::puts("[xhci] enumerate port ");
         SerialPort::put_u64(port_num as u64);
         SerialPort::puts(" speed=");
@@ -481,13 +480,12 @@ impl DeviceSlotManager {
             (mps, self.next_address)
         };
 
-        let icc = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
-        *icc = InputControlContext::new_slot();
-        context::init_icc_for_address_device(icc, speed, port_num, mps, ep0_ring.phys);
+        unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
+        context::init_icc_for_address_device(icc_buf.virt, self.ctx_size, speed, port_num, mps, ep0_ring.phys);
         command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, bsr)?;
 
         let mut slot = DeviceSlot::new(
-            slot_id, port_num, speed, mps,
+            slot_id, port_num, speed, self.ctx_size, mps,
             icc_buf.phys, icc_buf.virt, ep0_ring, address,
         );
 
@@ -501,9 +499,8 @@ impl DeviceSlotManager {
             let real_mps = if desc_mps_raw < 8 { 8 } else { desc_mps_raw as u16 };
 
             // Re-address with correct MPS and real device address (BSR=0).
-            let icc2 = unsafe { &mut *(icc_buf.virt as *mut InputControlContext) };
-            *icc2 = InputControlContext::new_slot();
-            context::init_icc_for_address_device(icc2, speed, port_num, real_mps, slot.ep0_ring.phys);
+            unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
+            context::init_icc_for_address_device(icc_buf.virt, self.ctx_size, speed, port_num, real_mps, slot.ep0_ring.phys);
             command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, false)?;
             slot.address = self.next_address;
             slot.mps = real_mps;
@@ -513,6 +510,18 @@ impl DeviceSlotManager {
         } else {
             // Non-BSR path: MPS is known from speed table, read full descriptor.
             get_device_descriptor(&mut slot, doorbell_va, desc_buf.phys, desc_buf.virt)?;
+        }
+
+        // EP0 MaxPacketSize0 from the device descriptor may exceed the
+        // speed-table default (e.g. full-speed bMaxPacketSize0 = 64).
+        // Propagate the real value to the xHC via Evaluate Context.
+        let desc_mps = unsafe { core::ptr::read_volatile((desc_buf.virt + 7) as *const u8) };
+        let real_mps = if desc_mps < 8 { 8 } else { desc_mps as u16 };
+        if real_mps != slot.mps {
+            unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
+            context::init_icc_for_evaluate_ep0(icc_buf.virt, self.ctx_size, speed, port_num, real_mps, slot.ep0_ring.phys);
+            command::submit_evaluate_context(cmd_ring, doorbell_va, icc_buf.phys, slot_id)?;
+            slot.mps = real_mps;
         }
 
         self.next_address += 1;

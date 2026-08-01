@@ -187,15 +187,6 @@ impl UsbPorts {
         Ok(())
     }
 
-    pub fn port_speed(&self, port_num: u8) -> Option<u8> {
-        self.ports.iter().find(|p| p.port_num == port_num).map(|p| p.speed)
-    }
-
-    pub fn reset_port(&mut self, port_num: u8) -> Result<(), &'static str> {
-        let idx = self.find_port_idx(port_num).ok_or("invalid port")?;
-        self.reset_port_by_idx(idx)
-    }
-
     pub fn port_count(&self) -> u8 {
         self.ports.len() as u8
     }

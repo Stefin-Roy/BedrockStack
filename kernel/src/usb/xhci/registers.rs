@@ -68,9 +68,6 @@ impl XhciRegisters {
         let caplength = unsafe { core::ptr::read_volatile(mmio_va as *const u8) };
         let op_base = mmio_va + caplength as u64;
 
-        let hccparams1 = Self::read32_inner(mmio_va, 0x10);
-        let ac64 = hccparams1 & (1 << 0) != 0;
-
         let rts_off_val = Self::read32_inner(mmio_va, 0x18) & !0x1F;
         let runtime_off = if rts_off_val != 0 { rts_off_val } else { 0x8000 };
         let runtime_va = mmio_va + runtime_off as u64;
@@ -138,8 +135,10 @@ pub fn read_cap_data32(base: u64, offset: u64, reg: u16) -> u32 {
 
 pub fn read_protocol_string(base: u64, offset: u64) -> [u8; 20] {
     let mut buf = [0u8; 20];
-    let name = unsafe { core::ptr::read_volatile((base + offset + 4) as *const u32) };
-    buf[0..4].copy_from_slice(&name.to_le_bytes());
+    for (i, chunk) in buf.chunks_exact_mut(4).enumerate() {
+        let word = unsafe { core::ptr::read_volatile((base + offset + 4 + (i as u64) * 4) as *const u32) };
+        chunk.copy_from_slice(&word.to_le_bytes());
+    }
     buf
 }
 
@@ -158,8 +157,10 @@ impl HcsParams2 {
     pub fn from(raw: u32) -> Self { HcsParams2(raw) }
     pub fn erst_max(&self) -> u8 { ((self.0 >> 4) & 0xF) as u8 }
     pub fn scratchpad_bufs(&self) -> u16 {
-        let hi = (self.0 >> 27) & 0x1F;
-        let lo = (self.0 >> 21) & 0x1F;
+        // HCSPARAMS2: bits 31:27 = Max Scratchpad Buffers Lo, bits 26:22 = Hi.
+        // The register value is the Hi field shifted above the Lo field.
+        let lo = (self.0 >> 27) & 0x1F;
+        let hi = (self.0 >> 22) & 0x1F;
         ((hi as u16) << 5) | lo as u16
     }
 }
@@ -195,11 +196,6 @@ impl PortRegisterSet {
     pub fn write_portsc(&self, port_num: u8, val: u32) {
         let off = self.port_off(port_num);
         unsafe { core::ptr::write_volatile((self.mmio_va + off) as *mut u32, val) }
-    }
-
-    pub fn read_portpm(&self, port_num: u8) -> u32 {
-        let off = self.port_off(port_num) + 0x04;
-        unsafe { core::ptr::read_volatile((self.mmio_va + off) as *const u32) }
     }
 }
 

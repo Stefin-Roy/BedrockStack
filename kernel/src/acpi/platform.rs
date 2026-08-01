@@ -95,4 +95,8 @@ pub struct PlatformInfo {
     pub reset_value: u8,
     pub reset_supported: bool,
     pub pm1_control: crate::acpi::fadt::Pm1ControlRegisters,
+    /// SLP_TYP value for the S5 soft-off state, decoded from the `\_S5`
+    /// AML package.  `None` means the value is not known and the PM1
+    /// registers must not be programmed with a guessed value.
+    pub slp_typ_s5: Option<u8>,
 }

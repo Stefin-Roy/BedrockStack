@@ -10,6 +10,7 @@ mod mcfg;
 mod fadt;
 mod gas;
 mod madt;
+mod s5;
 pub mod platform;
 
 pub use platform::{
@@ -51,14 +52,17 @@ const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
 pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
     let mut guard = ACPI_STATE.lock();
     let state = guard.as_mut().expect("ACPI VMM not initialized — call init_vmm first");
-    let vaddr = state.next_vaddr.checked_sub(size).expect("ACPI VMM: address space exhausted (overflow)");
+    // Page-round the reservation so successive small mappings can never
+    // overlap within a shared page.
+    let pages = (size + 0xFFF) & !0xFFF;
+    let vaddr = state.next_vaddr.checked_sub(pages).expect("ACPI VMM: address space exhausted (overflow)");
     if vaddr < ACPI_VADDR_FLOOR {
         panic!("ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", vaddr);
     }
     state.next_vaddr = vaddr;
     let mut vmm = Vmm::from_root(state.root);
     let alloc = unsafe { &mut *state.alloc };
-    vmm.map(alloc, vaddr, paddr, size, flags);
+    vmm.map(alloc, vaddr, paddr, pages, flags);
     vaddr
 }
 
@@ -89,31 +93,34 @@ impl AcpiSubsystem {
             tables::parse_tables(rsdp_addr)?
         };
 
-        // DEBUG: dump all parsed table entries and their signatures
-        for (i, e) in entries.iter().enumerate() {
-            let sig_bytes = [
-                e.signature as u8,
-                (e.signature >> 8) as u8,
-                (e.signature >> 16) as u8,
-                (e.signature >> 24) as u8,
-            ];
-            SerialPort::puts("[acpi] entry ");
-            SerialPort::put_u64(i as u64);
-            SerialPort::puts(": sig=0x");
-            SerialPort::put_hex(e.signature as u64);
-            SerialPort::puts(" \"");
-            for &b in &sig_bytes {
-                if b >= 0x20 && b < 0x7f {
-                    SerialPort::putc(b);
-                } else {
-                    SerialPort::putc(b'.');
+        // Dump all parsed table entries and their signatures (dev-only).
+        #[cfg(feature = "display_log")]
+        {
+            for (i, e) in entries.iter().enumerate() {
+                let sig_bytes = [
+                    e.signature as u8,
+                    (e.signature >> 8) as u8,
+                    (e.signature >> 16) as u8,
+                    (e.signature >> 24) as u8,
+                ];
+                SerialPort::puts("[acpi] entry ");
+                SerialPort::put_u64(i as u64);
+                SerialPort::puts(": sig=0x");
+                SerialPort::put_hex(e.signature as u64);
+                SerialPort::puts(" \"");
+                for &b in &sig_bytes {
+                    if b >= 0x20 && b < 0x7f {
+                        SerialPort::putc(b);
+                    } else {
+                        SerialPort::putc(b'.');
+                    }
                 }
+                SerialPort::puts("\" vaddr=");
+                SerialPort::put_hex(e.vaddr);
+                SerialPort::puts(" len=");
+                SerialPort::put_u64(e.length as u64);
+                SerialPort::puts("\n");
             }
-            SerialPort::puts("\" vaddr=");
-            SerialPort::put_hex(e.vaddr);
-            SerialPort::puts(" len=");
-            SerialPort::put_u64(e.length as u64);
-            SerialPort::puts("\n");
         }
 
         let fadt_fields = entries
@@ -164,6 +171,17 @@ impl AcpiSubsystem {
             reset_value: fadt_fields.reset_value,
             reset_supported: fadt_fields.reset_supported,
             pm1_control: fadt_fields.pm1_control,
+            slp_typ_s5: if fadt_fields.dsdt_addr != 0 {
+                let slp = s5::parse_s5_slp_typa(fadt_fields.dsdt_addr as u64);
+                match slp {
+                    Some(t) => log::info!("ACPI: \\_S5 SLP_TYP = 0x{:02x}", t),
+                    None => log::warn!("ACPI: \\_S5 not decodable — ACPI PM1 shutdown disabled"),
+                }
+                slp
+            } else {
+                log::warn!("ACPI: FADT has no DSDT address — ACPI PM1 shutdown disabled");
+                None
+            },
         };
 
         log::info!("ACPI: platform info parsed (interrupt model: {:?})", interrupt_model);
@@ -178,7 +196,9 @@ impl AcpiSubsystem {
         if self.platform_info.reset_supported {
             if let Some(ref reset_gas) = self.platform_info.reset_gas {
                 log::info!("ACPI: reset via FADT reset register");
-                gas::gas_write(reset_gas, self.platform_info.reset_value as u64);
+                if let Err(e) = gas::gas_write(reset_gas, self.platform_info.reset_value as u64) {
+                    log::error!("ACPI: FADT reset register write failed: {:?}", e);
+                }
             }
         }
 
@@ -204,18 +224,28 @@ impl AcpiSubsystem {
     }
 
     /// Attempt a graceful system shutdown (S5 soft-off) via the PM1 control
-    /// registers. Falls back to QEMU legacy port on x86.
+    /// registers.  The SLP_TYP value comes from the `\_S5` AML package; when
+    /// it is not known the PM1 registers are left alone (writing a guessed
+    /// sleep type can hang real hardware).  Falls back to the QEMU legacy
+    /// port on x86.
     pub fn shutdown(&self) -> ! {
         log::info!("ACPI: system shutdown requested");
 
-        // SLP_TYP for S5 — AML is not available, use default 0x00
-        // (works on QEMU / Bochs / common virtual hardware).
-        let slp_typ_s5: u8 = 0x00;
-        log::info!("ACPI: S5 SLP_TYP = 0x{:02x}", slp_typ_s5);
-
-        let ctrl = &self.platform_info.pm1_control;
-        let _ = ctrl.set_sleep_typ(slp_typ_s5);
-        let _ = ctrl.set_bit(Pm1ControlBit::SleepEnable, true);
+        match self.platform_info.slp_typ_s5 {
+            Some(slp_typ_s5) => {
+                log::info!("ACPI: S5 SLP_TYP = 0x{:02x} (from \\_S5)", slp_typ_s5);
+                let ctrl = &self.platform_info.pm1_control;
+                if let Err(e) = ctrl.set_sleep_typ(slp_typ_s5) {
+                    log::error!("ACPI: PM1 SLP_TYP write failed: {:?}", e);
+                }
+                if let Err(e) = ctrl.set_bit(Pm1ControlBit::SleepEnable, true) {
+                    log::error!("ACPI: PM1 SLP_EN write failed: {:?}", e);
+                }
+            }
+            None => {
+                log::error!("ACPI: \\_S5 unknown — refusing to write a guessed SLP_TYP");
+            }
+        }
 
         #[cfg(target_arch = "x86_64")]
         {

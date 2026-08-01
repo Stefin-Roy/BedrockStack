@@ -7,16 +7,20 @@ fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
     crate::services::kernel_services().pci_cfg
 }
 
-/// Leaked slice of PCI devices — set once by `enumerate()` and never freed.
+/// Leaked slice of PCI devices — set once by `enumerate_all()` and never freed.
 static mut DEVICES: Option<&'static [PciDevice]> = None;
 
 pub fn all() -> &'static [PciDevice] {
     unsafe { DEVICES.expect("PCI not enumerated yet") }
 }
 
-pub fn enumerate(segment: u16) {
+/// Enumerate every segment group in `segments`, merging the results into a
+/// single leaked device list.
+pub fn enumerate_all(segments: &[u16]) {
     let mut devices = Vec::new();
-    scan_bus(segment, 0, &mut devices);
+    for &segment in segments {
+        scan_bus(segment, 0, &mut devices);
+    }
     let leaked: &'static [PciDevice] = Box::leak(devices.into_boxed_slice());
     unsafe { DEVICES = Some(leaked); }
 }
