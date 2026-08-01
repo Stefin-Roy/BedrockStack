@@ -3,7 +3,7 @@
 **Version:** 0.5.0
 **Date:** 2026-07-31
 **Status:** All subsystems documented — MM, Arch (x86_64, RISC-V), ACPI, Display, PCI, Platform,
-Module, Drivers, Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
+Module, Drivers (Serial, PS/2), Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
 
 ---
 
@@ -37,6 +37,7 @@ Rust module hierarchy under `kernel/src/`.
 | 13 | `invariants-13-platform-x86_64.md` | x86_64 platform | `kernel/src/platform/x86_64_pc/{apic,ioapic,pit}.rs` |
 | 14 | `invariants-14-platform-riscv64.md` | RISC-V platform | `kernel/src/platform/riscv_virt/{mod,plic,clint,htif}.rs`, `kernel/src/services/riscv64/riscv_interrupts.rs` |
 | 15 | `invariants-15-drivers-serial.md` | Serial driver (+ display_log) | `kernel/src/drivers/serial.rs`, `kernel/src/services/{serial.rs,x86_64/x86_serial.rs}` |
+| 15p | `invariants-15p-drivers-ps2.md` | PS/2 keyboard driver | `kernel/src/drivers/ps2.rs`, `kernel/src/module/ps2_test.rs` |
 | 16 | `invariants-16-fs-vfs.md` | VFS core | `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types}.rs` |
 | 17 | `invariants-17-fs-tmpfs.md` | tmpfs | `kernel/src/filesystems/fstypes/{mod,tmpfs/{mod,mount,inode}}.rs` |
 | 18 | `invariants-18-fs-ahci.md` | AHCI block driver | `kernel/src/filesystems/blockdriver/{mod,traits,ahci}.rs` |
@@ -57,7 +58,7 @@ Invariant IDs follow the pattern `AREA-NNN` where:
 - `AREA` is a short subsystem code: `ALLOC`, `HEAP`, `VMM`, `PAGING`, `BOOT`,
   `ACPI`, `DISP`, `MOD`, `PCI`, `APIC`, `IOAPIC`, `PIT`, `SMP`, `VFS`, `TMPFS`,
   `AHCI`, `SERIAL`, `PLAT`, `ARCH`, `DUMP`, `INIT`, `COMMON`, `PART`, `WC`,
-  `SVC`, `USB`, `XHCI`
+  `SVC`, `USB`, `XHCI`, `PS2`
 - `NNN` is a three-digit number
 
 Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
@@ -73,6 +74,7 @@ Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
 | WC / Write-Combining (`WC`) | Framebuffer (`DISP`), PAT MSR (`PAGING`), `PageFlags` (`VMM`) |
 | Heap (`HEAP`) | All kernel code running after `heap::init()` |
 | Serial driver (`SERIAL`) | All logging output, must not deadlock |
+| PS/2 keyboard (`PS2`) | IOAPIC GSI 1 routing (`IOAPIC`), IDT device vectors, interrupt-gate IF semantics |
 | VFS (`VFS`) | Module init, tmpfs, AHCI |
 | SMP (`SMP`) | Per-CPU data, serial prefix, AP startup |
 | Services (`SVC`) | All capability providers (ACPI, CPU, timer, PCI, serial, platform, DMA) |
@@ -94,6 +96,7 @@ When modifying code, verify that relevant invariants still hold:
 - [ ] **APIC/IOAPIC/PIT**: interrupt delivery, timer calibration, EOI ordering
 - [ ] **SMP**: PerCpu layout, AP startup sequence, stack-guard unmapping
 - [ ] **SERIAL**: lock ordering, per-CPU re-entrancy, no deadlock
+- [ ] **PS2**: IF masking around queue lock, ISR drops-on-full, IRQ wired only after device ready, bounded port waits
 - [ ] **VFS**: IrqMutex discipline, dentry/inode lifetime, dcache consistency
 - [ ] **TMPFS**: atomic counter, per-inode locking, no deadlock
 - [ ] **AHCI**: DMA safety, MMIO ordering, PRDT bounds, timeout handling, NCQ vs non-NCQ FIS selection

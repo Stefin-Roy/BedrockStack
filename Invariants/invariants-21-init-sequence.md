@@ -66,6 +66,7 @@ The following dependencies MUST be respected:
                     ├── heap::set_phys_allocator() (re-point after move)
                     ├── IDT protect (.idt section read-only) [x86_64]
                     ├── PCI::init() (ECAM mapping + bus enumeration)
+                    ├── ps2::init() [x86_64] (8042 keyboard, IRQ 1/GSI 1)
                     ├── blockdriver::driver::init_all() [x86_64]
                     │   ├── AHCI + block_devices returned
                     │   └── DMA via kernel_services().dma (shared KernelDma)
@@ -81,8 +82,9 @@ The following dependencies MUST be respected:
                     │   ├── MsixTest [x86_64]
                     │   ├── UsbTest [x86_64]
                     │   ├── Fat32Ls [B>]
-                    │   └── VfsTest (A>)
-                    └── Halt loop (hlt/wfi)
+                    │   ├── VfsTest (A>)
+                    │   └── Ps2Test (keyboard echo; halts on Esc) [x86_64]
+                    └── Halt loop (reached only when no keyboard / non-x86_64)
 ```
 
 ---
@@ -197,9 +199,17 @@ first block device) is mounted as `B>` (fat32) after VFS init.
 **INIT-017 — Module init runs last:**
 Modules may use VFS, display, and all other initialized subsystems.
 The x86_64 module list includes: `HelloModule`, `Fat32Test`, `MsixTest`,
-`UsbTest`, `Fat32Ls`, `VfsTest`. Non-x86_64 targets exclude `MsixTest`
-and `UsbTest`.
+`UsbTest`, `Fat32Ls`, `VfsTest`, `Ps2Test`. Non-x86_64 targets exclude
+`MsixTest`, `UsbTest`, and `Ps2Test`. `Ps2Test` is last and halts forever
+once a keyboard is present, so it is the terminal step of the sequence.
 - Location: `kernel/src/lib.rs:` `init_all()` at end of `run()`
+
+**INIT-017b — PS/2 init runs after PCI init, before module tests:**
+`ps2::init()` registers the keyboard ISR and programs IOAPIC GSI 1 while
+interrupts are already enabled (post-`init()`). It must complete before
+`module::init_all()` so `Ps2Test` can receive keystrokes. Failure is
+non-fatal — the keyboard simply stays absent and `Ps2Test` skips itself.
+- Location: `kernel/src/lib.rs:322-325`, `kernel/src/drivers/ps2.rs:269-324`
 
 ---
 

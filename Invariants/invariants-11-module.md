@@ -1,8 +1,8 @@
 # Module System — Invariants
 
-**Version:** 0.4.0
-**Date:** 2026-07-31
-**Source:** `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,vfs_test}.rs`
+**Version:** 0.5.0
+**Date:** 2026-08-01
+**Source:** `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,ps2_test,vfs_test}.rs`
 **Status:** Stable
 
 ---
@@ -22,13 +22,15 @@ The loop `break`s after the first `Err(msg)`, logging the failure.
 All module metadata is compile-time constant.
 - Location: `kernel/src/module/registry.rs:13-18`
 
-**MOD-004 — Registry lists `Fat32Ls` on both arches, x86_64 adds `MsixTest` and `UsbTest`:**
-- `#[cfg(target_arch = "x86_64")]`: `[HelloModule, Fat32Test, MsixTest, UsbTest, Fat32Ls, VfsTest]`
+**MOD-004 — Registry lists `Fat32Ls` on both arches, x86_64 adds `MsixTest`, `UsbTest`, and `Ps2Test`:**
+- `#[cfg(target_arch = "x86_64")]`: `[HelloModule, Fat32Test, MsixTest, UsbTest, Fat32Ls, VfsTest, Ps2Test]`
 - otherwise: `[HelloModule, Fat32Test, Fat32Ls, VfsTest]`
 `Fat32Ls` (lists the FAT32 root directory on `B>`) was added in the block/FS
 registry work; it runs on riscv64 too but is skipped gracefully when no
-ESP is mounted.
-- Location: `kernel/src/module/registry.rs:35-51`
+ESP is mounted. `Ps2Test` (interactive keyboard echo, halts on Esc) is x86_64
+only and is deliberately **last**: its `init()` never returns once a keyboard
+is present, so it is the terminal step of the boot sequence.
+- Location: `kernel/src/module/registry.rs:37-47`
 
 ---
 

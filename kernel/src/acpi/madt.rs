@@ -1,11 +1,42 @@
 use alloc::vec::Vec;
-use crate::acpi::platform::{AcpiError, Apic, InterruptModel, IoApic, Processor, ProcessorInfo, ProcessorState};
+use spin::Mutex;
+use crate::acpi::platform::{
+    AcpiError, Apic, InterruptModel, IoApic, Polarity, Processor, ProcessorInfo,
+    ProcessorState, TriggerMode,
+};
 use crate::drivers::serial::SerialPort;
 use log::info;
 
 fn r8(buf: &[u8], off: usize) -> u8 { buf[off] }
+fn r16(buf: &[u8], off: usize) -> u16 { u16::from_le_bytes([buf[off], buf[off + 1]]) }
 fn r32(buf: &[u8], off: usize) -> u32 { u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) }
 fn r64(buf: &[u8], off: usize) -> u64 { u64::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]) }
+
+/// A MADT Interrupt Source Override (type 2) entry.
+#[derive(Clone, Copy, Debug)]
+pub struct IrqOverride {
+    /// Legacy ISA IRQ number (e.g. 1 for the keyboard).
+    pub irq: u8,
+    /// GSI that the legacy IRQ is actually wired to.
+    pub gsi: u32,
+    pub polarity: Polarity,
+    pub trigger: TriggerMode,
+}
+
+static OVERRIDES: Mutex<Vec<IrqOverride>> = Mutex::new(Vec::new());
+
+/// Look up the MADT interrupt source override for a legacy ISA IRQ.
+///
+/// Returns `Some((gsi, polarity, trigger))` when an override exists, `None`
+/// when the firmware relies on the default ISA wiring (IRQ n → GSI n,
+/// ActiveHigh, Edge).
+pub fn irq_override(irq: u8) -> Option<(u32, Polarity, TriggerMode)> {
+    OVERRIDES
+        .lock()
+        .iter()
+        .find(|o| o.irq == irq)
+        .map(|o| (o.gsi, o.polarity, o.trigger))
+}
 
 pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptModel, Option<ProcessorInfo>), AcpiError> {
     let initial_raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, length as usize) };
@@ -132,6 +163,38 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
                         address: io_apic_address as u64,
                         global_system_interrupt_base: gsi_base,
                     });
+                }
+            }
+            0x2 => {
+                // Interrupt Source Override (10 bytes).  Legacy IRQs are
+                // remapped onto GSIs here (e.g. keyboard IRQ 1 → GSI 9 on
+                // hardware where the ISA interrupt lines are redirected).
+                if entry_len >= 10 {
+                    let bus = r8(raw, offset + 2);
+                    let source = r8(raw, offset + 3);
+                    if bus == 0 {
+                        let gsi = r32(raw, offset + 4);
+                        let flags = r16(raw, offset + 8);
+                        let polarity = match flags & 0x3 {
+                            0 | 1 => Polarity::ActiveHigh,
+                            _ => Polarity::ActiveLow,
+                        };
+                        let trigger = match (flags >> 2) & 0x3 {
+                            0 | 1 => TriggerMode::Edge,
+                            _ => TriggerMode::Level,
+                        };
+                        OVERRIDES.lock().push(IrqOverride {
+                            irq: source,
+                            gsi,
+                            polarity,
+                            trigger,
+                        });
+                        SerialPort::puts("[madt] type 2 (IRQ override): irq=");
+                        SerialPort::put_u64(source as u64);
+                        SerialPort::puts(" gsi=");
+                        SerialPort::put_u64(gsi as u64);
+                        SerialPort::puts("\n");
+                    }
                 }
             }
             0x5 => {

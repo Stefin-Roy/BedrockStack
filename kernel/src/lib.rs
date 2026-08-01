@@ -319,6 +319,11 @@ impl Kernel {
             );
         }
 
+        // PS/2 keyboard driver (8042 controller) — registers IRQ 1 before the
+        // module tests run so the input test can receive keystrokes.
+        #[cfg(target_arch = "x86_64")]
+        crate::drivers::ps2::init();
+
         #[cfg(target_arch = "x86_64")]
         {
             crate::drivers::serial::SerialPort::puts("\n=== vec34=");

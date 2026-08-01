@@ -17,6 +17,13 @@ pub use platform::{
     Pm1ControlBit, Polarity, PlatformInfo, Processor, ProcessorInfo, ProcessorState, TriggerMode,
 };
 
+/// Resolve a legacy ISA IRQ to its GSI plus polarity/trigger via the MADT
+/// interrupt source override table.  Returns `None` when no override exists
+/// (the caller should then assume the default ISA wiring).
+pub fn irq_override(irq: u8) -> Option<(u32, Polarity, TriggerMode)> {
+    madt::irq_override(irq)
+}
+
 /// ACPI VMM state for mapping physical regions.
 const ACPI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x10000000;
 
