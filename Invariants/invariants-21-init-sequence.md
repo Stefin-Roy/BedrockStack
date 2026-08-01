@@ -67,8 +67,10 @@ The following dependencies MUST be respected:
                     ├── IDT protect (.idt section read-only) [x86_64]
                     ├── PCI::init() (ECAM mapping + bus enumeration)
                     ├── blockdriver::driver::init_all() [x86_64]
-                    │   └── AHCI + block_devices returned
+                    │   ├── AHCI + block_devices returned
+                    │   └── DMA via kernel_services().dma (shared KernelDma)
                     ├── USB/xHCI::init_all() [x86_64]
+                    │   └── DMA via kernel_services().dma (shared KernelDma)
                     ├── VFS::init()
                     │   ├── fstypes::register_all()
                     │   ├── Mount tmpfs on A>

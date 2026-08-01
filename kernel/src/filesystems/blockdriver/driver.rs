@@ -2,10 +2,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use super::dma::DmaAllocator;
 use super::traits::BlockDevice;
-use crate::mm::vmm::KERNEL_VMA_BASE;
 use crate::pci::PciDevice;
+use crate::services::dma::DmaAllocator;
 
 pub trait StorageDriver: Send + Sync {
     fn name(&self) -> &str;
@@ -13,7 +12,7 @@ pub trait StorageDriver: Send + Sync {
     fn init_controller(
         &self,
         dev: &PciDevice,
-        dma: &mut DmaAllocator,
+        dma: &dyn DmaAllocator,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str>;
 }
 
@@ -30,19 +29,14 @@ fn register_all() {
     register(&super::ahci::AhciDriver);
 }
 
-const VMM_VADDR: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000 - 0x20000000;
-const VMM_VADDR_FLOOR: u64 = VMM_VADDR - 0x2000_0000;
-
 pub fn init_all(
     pci_devices: &[PciDevice],
-    root: u64,
-    alloc: *mut crate::mm::phys_alloc::BitmapAllocator,
 ) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
 
     register_all();
 
-    let mut dma = DmaAllocator::new(root, alloc, VMM_VADDR, VMM_VADDR_FLOOR);
+    let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
     let mut all_devices = Vec::new();
     let registry = REGISTRY.lock();
 
@@ -58,7 +52,7 @@ pub fn init_all(
                 SerialPort::puts(":");
                 SerialPort::put_u64(dev.function as u64);
                 SerialPort::puts("\n");
-                match driver.init_controller(dev, &mut dma) {
+                match driver.init_controller(dev, dma) {
                     Ok(devices) => {
                         let n = devices.len();
                         SerialPort::puts("[storage] ");

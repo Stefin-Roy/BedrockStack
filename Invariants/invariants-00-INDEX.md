@@ -46,7 +46,7 @@ Rust module hierarchy under `kernel/src/`.
 | 21 | `invariants-21-init-sequence.md` | Boot ordering (incl. xHCI, USB, ESP mount) | `kernel/src/lib.rs`, `kernel/src/main.rs` |
 | 22 | `invariants-22-derived.md` | Derived properties | All |
 | 23 | `invariants-23-services.md` | Services capability layer | `kernel/src/services/{mod,capability,acpi,cpu,dma,ecam_pci_config,interrupts,pci_config,pci_device,platform,serial,timer,timer_queue,universal_timer,virt_mem,phys_mem,clockevent,clocksource,msi,null_msi,block_device}.rs`, `kernel/src/services/{x86_64,riscv64}/` |
-| 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,dma,xhci/{mod,registers,memory,event,command,device,ports,context},class/mass_storage,usb/{mod,descriptors}}.rs` |
+| 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,xhci/{mod,registers,memory,event,command,device,ports,context},class/mass_storage,usb/{mod,descriptors}}.rs` |
 
 ---
 

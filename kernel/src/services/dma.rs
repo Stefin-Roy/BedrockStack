@@ -19,8 +19,10 @@ pub trait DmaAllocator: Capability {
 }
 
 // ── Global DMA allocator singleton ──────────────────────────────────
-
-const DMA_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x3000_0000;
+//
+// Region lives below the PCI ECAM window (KERNEL_VMA_BASE - 0x3000_0000)
+// so the two never collide; this is the former blockdriver/AHCI carve-out.
+const DMA_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x5000_0000;
 const DMA_VADDR_FLOOR: u64 = DMA_VADDR_BASE - 0x2000_0000;
 
 static DMA_ALLOCATOR: Once<KernelDma> = Once::new();

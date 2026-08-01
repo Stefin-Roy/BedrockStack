@@ -25,10 +25,9 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use super::dma;
-use super::dma::DmaAllocator;
 use super::driver::StorageDriver;
 use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
+use crate::services::dma::DmaAllocator;
 
 const AHCI_MAX_SLOTS: usize = 32;
 const MAX_PRDT: usize = 64;
@@ -150,7 +149,6 @@ unsafe impl Sync for PortPtr {}
 static IRQ_PORTS: Mutex<Vec<PortPtr>> = Mutex::new(Vec::new());
 
 struct AhciPort {
-    root: u64,
     hba: Hba,
     port: u8,
     _cl_paddr: u64,
@@ -314,7 +312,9 @@ impl AhciPort {
         let mut n = 0usize;
         while rem > 0 && n < self.max_prdt {
             let va = (buf_vaddr as isize + off) as u64;
-            let pa = dma::translate(self.root, va).ok_or("PRDT translate fail")?;
+            let pa = crate::services::kernel_services().dma
+                .virt_to_phys(va)
+                .ok_or("PRDT translate fail")?;
             let skip = (va & 0xFFF) as usize;
             let chunk = rem.min((4096 - skip) as isize) as usize;
             unsafe {
@@ -420,24 +420,6 @@ impl AhciPort {
         unsafe {
             core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl).write_volatile(5u32 | w | (prdtl as u32) << 16);
             core::ptr::addr_of_mut!((*hdr).prdbc).write_volatile(0);
-        }
-
-        // DEBUG: flush Command Table (FIS + PRDT) and Command List (CmdHeader)
-        // so the HBA reads coherent data from RAM.
-        let ct_end = ct_va + 0x80 + (prdtl as u64) * 16;
-        unsafe {
-            let mut cl = ct_va & !63u64;
-            while cl < ct_end {
-                cache_flush_line(cl as *const u8);
-                cl += 64;
-            }
-            let hdr_vaddr = self.cl_vaddr + (tag as u64) * 32;
-            let hdr_end = hdr_vaddr + 32;
-            let mut cl2 = hdr_vaddr & !63u64;
-            while cl2 < hdr_end {
-                cache_flush_line(cl2 as *const u8);
-                cl2 += 64;
-            }
         }
 
         Ok(())
@@ -740,7 +722,7 @@ impl BlockDevice for AhciPort {
 
 // ── Initialisation ──────────────────────────────────────────────
 
-fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
     let base = match crate::pci::bar::bar(dev, 5) {
         crate::pci::bar::Bar::Memory { addr, .. } => addr,
@@ -844,7 +826,7 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &mut DmaAllocator) -> Resul
 
     Ok(ports)
 }
-fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
+fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
@@ -905,7 +887,6 @@ fn init_one(p: u8, hba: &Hba, dma: &mut DmaAllocator, max_prdt: usize, n_slots_r
     if !wait_ssts_det(hba, p) { return Err("no device"); }
 
     let mut port = AhciPort {
-        root: dma.root(),
         hba: *hba, port: p,
         _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
         _rfis_paddr: rfis_buf.phys, _rfis_vaddr: rfis_buf.virt,
@@ -939,7 +920,7 @@ impl StorageDriver for AhciDriver {
     fn init_controller(
         &self,
         dev: &crate::pci::PciDevice,
-        dma: &mut DmaAllocator,
+        dma: &dyn DmaAllocator,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
         init_controller(dev, dma)
     }

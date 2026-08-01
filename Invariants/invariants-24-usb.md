@@ -1,10 +1,9 @@
 # BedrockOS Invariants — USB/xHCI Host Controller Driver
 
-**Version:** 0.3.0
-**Date:** 2026-07-31
+**Version:** 0.3.1
+**Date:** 2026-08-01
 **Source paths:**
 - `kernel/src/usb/mod.rs` — crate root
-- `kernel/src/usb/dma.rs` — DMA allocator
 - `kernel/src/usb/usb/mod.rs` — USB protocol constants and `SetupPacket`
 - `kernel/src/usb/usb/descriptors.rs` — descriptor structs and parsers
 - `kernel/src/usb/xhci/mod.rs` — controller init, MSI-X/INTx fallback, device enumeration
@@ -20,22 +19,27 @@
 
 ---
 
-## DMA Allocator (`kernel/src/usb/dma.rs`)
+## DMA Allocator (`kernel/src/services/dma.rs`)
 
-**USB-001** The USB DMA VMM region is at `USB_VMM_VADDR = 0xFFFFFF7F70000000`, 512 MiB below the AHCI VMM region (`0xFFFFFF7FB0000000`) and 1280 MiB below `KERNEL_VMA_BASE`. The floor is `USB_VMM_VADDR - 0x2000_0000` (512 MiB of virtual address space).
-- Location: `kernel/src/usb/dma.rs:6-7`
+xHCI uses the kernel-wide DMA allocator, `services::dma::KernelDma`, obtained
+via `kernel_services().dma`. There is no USB-specific allocator.
 
-**USB-002** Allocations grow downward from `USB_VMM_VADDR`: each allocation subtracts its page-aligned size from `next_vaddr` and fails if the result would fall below `vaddr_floor`.
+**USB-001** All DMA (MMIO, rings, contexts, data buffers) is allocated from the single `KernelDma` VMM window: `KERNEL_VMA_BASE - 0x5000_0000` down to `- 0x2000_0000` (512 MiB), directly below the PCI ECAM window. The pool is shared with AHCI; allocations grow downward.
+- Location: `kernel/src/services/dma.rs:23-30`
 
-**USB-003** `map_mmio()` maps physical MMIO regions with `PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE` and returns the virtual address. Failure modes: address space exhausted (overflow below floor).
+**USB-002** Allocations grow downward from the window base: each allocation subtracts its page-aligned size from `next_vaddr` and fails if the result would fall below `vaddr_floor`. The allocator is `&self` with an internal `Mutex`, so drivers share it safely.
+- Location: `kernel/src/services/dma.rs:63-87`
+
+**USB-003** `map_mmio()` maps physical MMIO regions with `PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE` and returns the page-aligned virtual address. Failure modes: address space exhausted (overflow below floor).
+- Location: `kernel/src/services/dma.rs:97-114`
 
 **USB-004** `alloc_page()` allocates one physical frame via `BitmapAllocator::alloc()`, maps it with NO_CACHE, zeroes it, and returns a `DmaBuffer { phys, virt, size: 4096 }`. Returns `None` on OOM.
 
 **USB-005** `alloc_contiguous(count)` allocates `count` contiguous physical frames, maps them, zeroes them, and returns a `DmaBuffer { phys, virt, size: count * 4096 }`. Returns `None` on OOM.
 
-**USB-006** `UsbDmaAllocator` is `unsafe impl Send` because it wraps raw pointers (`root`, `alloc`). The caller must ensure that only one thread uses the allocator at a time (or provides external synchronisation).
+**USB-006** `KernelDma` is `Send + Sync` (methods take `&self` and lock internally), so concurrent drivers share it safely — replacing the old USB-specific `UsbDmaAllocator` (Send-only, `&mut self`).
 
-**USB-007** The allocator's `VMM::map()` uses the caller-supplied `root` page-table root and `BitmapAllocator` for page-table frame allocation, ensuring all mappings are visible in the address space used by the xHCI DMA.
+**USB-007** `virt_to_phys()` translates arbitrary kernel virtual addresses via the shared 64-entry translation cache; xHCI carries `phys` in each `DmaBuffer`, so it only needs this for indirect translations.
 
 ---
 
@@ -74,7 +78,7 @@ If any check fails, `None` is returned.
 
 ## xHCI Registers (`kernel/src/usb/xhci/registers.rs`)
 
-**XHCI-001** `XhciRegisters` maps the first 64 KiB (`MMIO_SIZE = 0x10000`) of the xHCI BAR0 via `UsbDmaAllocator::map_mmio()` with NO_CACHE. All register accesses use `read_volatile`/`write_volatile`.
+**XHCI-001** `XhciRegisters` maps the first 64 KiB (`MMIO_SIZE = 0x10000`) of the xHCI BAR0 via `kernel_services().dma.map_mmio()` with NO_CACHE. All register accesses use `read_volatile`/`write_volatile`.
 
 **XHCI-002** The `caplength` register (at MMIO base + 0) determines the offset to the Operational registers. The `op_base = mmio_va + caplength` and all OP register offsets are relative to `op_base`.
 
@@ -275,7 +279,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 ## Controller Init (`kernel/src/usb/xhci/mod.rs`)
 
-**XHCI-056** `init_all(pci_devices, root, alloc)` iterates all PCI devices, filtering for class=0x0C, subclass=0x03, prog_if=0x30 (xHCI USB controller). For each match it creates a `UsbDmaAllocator` and calls `init_controller()`, **collecting `Vec<Arc<dyn BlockDevice>>`** for mass-storage devices. A failed controller is logged and skipped; others still initialize.
+**XHCI-056** `init_all(pci_devices)` iterates all PCI devices, filtering for class=0x0C, subclass=0x03, prog_if=0x30 (xHCI USB controller). For each match it calls `init_controller()` using the shared `kernel_services().dma` allocator, **collecting `Vec<Arc<dyn BlockDevice>>`** for mass-storage devices. A failed controller is logged and skipped; others still initialize.
 
 **XHCI-057** `init_controller()` init sequence:
 1. Read BAR0, validate it is memory-mapped
@@ -375,10 +379,10 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 ## API Contracts
 
-### `UsbDmaAllocator` (caller must ensure)
-- The `alloc: *mut BitmapAllocator` pointer must remain valid for the allocator's lifetime
-- `UsbDmaAllocator` is `Send` but not `Sync` — concurrent use from multiple threads requires external synchronisation
+### `DmaAllocator` (`kernel_services().dma`)
+- The allocator is a kernel-wide singleton (`services::dma::KernelDma`), `Send + Sync`, with an internal `Mutex`; no per-driver instance exists
 - `map_mmio()` consumes virtual address space; overflow is checked and returns `Err`
+- All mappings are `NO_CACHE`; `DmaBuffer` carries `phys`/`virt`/`size`
 
 ### `TrbRing` (caller must ensure)
 - The ring is writable with NO_CACHE semantics (no caching, writes reach the controller)

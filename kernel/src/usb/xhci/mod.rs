@@ -10,7 +10,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::pci::PciDevice;
-use crate::usb::dma::{DmaBuffer, UsbDmaAllocator};
+use crate::services::dma::{DmaAllocator, DmaBuffer};
 
 /// Information retained only while xHCI validates a newly enabled MSI-X
 /// route.  If the device raises an event but no LAPIC vector arrives, we can
@@ -26,10 +26,9 @@ struct MsixFallback {
 
 pub fn init_all(
     pci_devices: &[PciDevice],
-    root: u64,
-    alloc: *mut crate::mm::phys_alloc::BitmapAllocator,
 ) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
+    let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
     let mut usb_block_devices = Vec::new();
     for dev in pci_devices {
         if dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
@@ -41,8 +40,7 @@ pub fn init_all(
             SerialPort::put_u64(dev.function as u64);
             SerialPort::puts("\n");
 
-            let mut dma = UsbDmaAllocator::new(root, alloc);
-            match init_controller(dev, &mut dma) {
+            match init_controller(dev, dma) {
                 Ok(block_devs) => {
                     SerialPort::puts("[xhci] controller ready\n");
                     usb_block_devices.extend(block_devs);
@@ -58,7 +56,7 @@ pub fn init_all(
     usb_block_devices
 }
 
-fn init_controller(dev: &PciDevice, dma: &mut UsbDmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
     let phys_base = match crate::pci::bar::bar(dev, 0) {
@@ -477,7 +475,7 @@ fn controller_reset(regs: &registers::XhciRegisters) {
     }
 }
 
-fn alloc_dcbaa(dma: &mut UsbDmaAllocator, max_slots: u8) -> Result<DmaBuffer, &'static str> {
+fn alloc_dcbaa(dma: &dyn DmaAllocator, max_slots: u8) -> Result<DmaBuffer, &'static str> {
     let bytes = (max_slots as usize + 1) * 8;
     let pages = (bytes + 4095) / 4096;
     let buf = dma.alloc_contiguous(pages).ok_or("OOM for DCBAA")?;
@@ -486,7 +484,7 @@ fn alloc_dcbaa(dma: &mut UsbDmaAllocator, max_slots: u8) -> Result<DmaBuffer, &'
 }
 
 fn alloc_scratchpad_array(
-    dma: &mut UsbDmaAllocator,
+    dma: &dyn DmaAllocator,
     spbuf_cnt: u16,
     ac64: bool,
 ) -> Result<DmaBuffer, &'static str> {
@@ -511,7 +509,7 @@ fn setup_interrupts(
     dev: &PciDevice,
     rt_va: u64,
     mmio_va: u64,
-    dma: &mut UsbDmaAllocator,
+    dma: &dyn DmaAllocator,
     _ac64: bool,
 ) -> Option<MsixFallback> {
     use crate::arch::x86_64::idt;
@@ -624,7 +622,7 @@ fn setup_interrupts(
 fn enumerate_initial_ports(
     usb_ports: &mut ports::UsbPorts,
     cmd_ring: &mut memory::TrbRing,
-    dma: &mut UsbDmaAllocator,
+    dma: &dyn DmaAllocator,
     doorbell_va: u64,
     _er_vaddr: u64,
     _er_trb_count: u32,

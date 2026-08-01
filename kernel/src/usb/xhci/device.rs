@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use crate::drivers::serial::SerialPort;
-use crate::usb::dma::UsbDmaAllocator;
+use crate::services::dma::DmaAllocator;
 use crate::usb::usb;
 use crate::usb::usb::SetupPacket;
 use crate::usb::usb::descriptors::{ConfigDescriptor, InterfaceDescriptor, EndpointDescriptor};
@@ -327,7 +327,7 @@ pub fn configure_device(
     slot: &mut DeviceSlot,
     cmd_ring: &mut TrbRing,
     doorbell_va: u64,
-    dma: &mut UsbDmaAllocator,
+    dma: &dyn DmaAllocator,
 ) -> Result<(), &'static str> {
     // Per xHCI §4.8.1, SET_CONFIGURATION to the USB device MUST precede
     // the Configure Endpoint command to the xHC.
@@ -448,7 +448,7 @@ impl DeviceSlotManager {
         &mut self,
         cmd_ring: &mut TrbRing,
         doorbell_va: u64,
-        dma: &mut UsbDmaAllocator,
+        dma: &dyn DmaAllocator,
         port_num: u8,
         speed: u8,
     ) -> Result<(), &'static str> {

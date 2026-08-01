@@ -1,7 +1,7 @@
 # Kernel Services (Capability Layer) — Invariants
 
-**Version:** 0.1.0
-**Date:** 2026-07-31
+**Version:** 0.1.1
+**Date:** 2026-08-01
 **Source:** `kernel/src/services/{mod,capability,cpu,dma,interrupts,msi,null_msi,pci_config,ecam_pci_config,pci_device,phys_mem,platform,serial,timer,virt_mem,block_device,acpi,clocksource,clockevent,timer_queue,universal_timer}.rs`, `kernel/src/services/x86_64/*`, `kernel/src/services/riscv64/*`
 **Status:** Stable
 
@@ -41,18 +41,20 @@ The `Capability` supertrait guarantees all providers are thread-safe and
 immutable, so the container can be shared across CPUs via a `'static` leak.
 - Location: `kernel/src/services/capability.rs:1-3`
 
-**SVC-006 — Only `platform`, `cpu`, and `pci_cfg` are consumed today:**
+**SVC-006 — `platform`, `cpu`, `pci_cfg`, and `dma` are consumed today:**
 `lib.rs` uses `svc().platform.halt()/enable_interrupts()`;
 `smp::init()` uses `services.cpu.discover_cpus()/wake_aps()`;
 `pci/{caps,enumerate,msi,msix}.rs` route config access through
-`kernel_services().pci_cfg`. The remaining fields are populated but not yet
-consumed by hot paths.
-- Location: `kernel/src/lib.rs:217,389`, `kernel/src/smp/mod.rs:178,219`, `kernel/src/pci/msix.rs`
+`kernel_services().pci_cfg`; the AHCI (blockdriver) and xHCI (USB)
+storage inits allocate all DMA through `kernel_services().dma`. The
+remaining fields are populated but not yet consumed by hot paths.
+- Location: `kernel/src/lib.rs:217,389`, `kernel/src/smp/mod.rs:178,219`, `kernel/src/pci/msix.rs`, `kernel/src/filesystems/blockdriver/driver.rs:32-72`, `kernel/src/usb/xhci/mod.rs:27-60`
 
-**SVC-007 — DMA is a global singleton (`Once<KernelDma>`), not per-instance:**
+**SVC-007 — DMA is a global singleton (`Once<KernelDma>`), the only DMA allocator:**
 `init_dma_allocator(root, alloc)` populates `DMA_ALLOCATOR` once. `KernelDma`
-owns a 512 MiB VMM region below `KERNEL_VMA_BASE - 0x3000_0000`, grows
+owns a 512 MiB VMM region below `KERNEL_VMA_BASE - 0x5000_0000`, grows
 allocations downward, and maps everything `NO_CACHE | READ | WRITE`.
+AHCI and xHCI both share this allocator via `kernel_services().dma`.
 - Location: `kernel/src/services/dma.rs:23-30,97-159`
 
 **SVC-008 — The shared translation cache is mutex-protected and sized 64:**
@@ -154,6 +156,10 @@ code routes through `kernel_services().pci_cfg`.
   `universal_timer()` which `expect`s the `Once`. The riscv64 path is
   currently unwired and would panic if reached; riscv64 still runs the legacy
   periodic SBI 100 Hz trap timer.
-- The three DMA allocators are separate: `services::dma::KernelDma`
-  (KernelServices), `filesystems::blockdriver::dma::DmaAllocator` (AHCI), and
-  `usb::dma::UsbDmaAllocator` (xHCI). They do not share address space.
+- DMA is a single allocator: `services::dma::KernelDma` (exposed as
+  `KernelServices.dma`), shared by AHCI (`blockdriver`) and xHCI (`usb`).
+  All three formerly-separate allocators (`services::dma::KernelDma`,
+  `filesystems::blockdriver::dma::DmaAllocator`, `usb::dma::UsbDmaAllocator`)
+  were unified into it. It lives in the former AHCI carve-out
+  (`KERNEL_VMA_BASE - 0x5000_0000`, 512 MiB), directly below the PCI ECAM
+  window (`KERNEL_VMA_BASE - 0x3000_0000`) so the two never overlap.

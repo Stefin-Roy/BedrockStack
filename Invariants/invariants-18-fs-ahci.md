@@ -1,8 +1,8 @@
 # AHCI Block Driver — Invariants
 
-**Version:** 0.4.0
-**Date:** 2026-07-31
-**Source:** `kernel/src/filesystems/blockdriver/{mod,driver,dma,traits,ahci}.rs`
+**Version:** 0.4.1
+**Date:** 2026-08-01
+**Source:** `kernel/src/filesystems/blockdriver/{mod,driver,traits,ahci}.rs`
 **Status:** Stable (x86_64 only)
 
 ---
@@ -17,7 +17,7 @@ initializes ports. Returns `Vec<Arc<dyn BlockDevice>>` which is merged with
 USB devices and published into the global `BLOCK_DEVICES` registry. The
 first block device's first partition is then mounted as `B>` (FAT32) via
 `partition::mount_first_partition`.
-- Location: `kernel/src/filesystems/blockdriver/driver.rs:20-31,36-79`, `kernel/src/filesystems/blockdriver/ahci.rs:928-946`, `kernel/src/lib.rs:334-385`
+- Location: `kernel/src/filesystems/blockdriver/driver.rs:20-31,32-72`, `kernel/src/filesystems/blockdriver/ahci.rs:910-928`, `kernel/src/lib.rs:334-348`
 
 **AHCI-002 — MMIO registers are accessed via volatile pointers:**
 All MMIO read/write uses `read_volatile`/`write_volatile` to prevent
@@ -39,9 +39,10 @@ Per-port `ncq` flag selects the path.
 
 **AHCI-005 — Translation cache avoids repeated 4-level page walks:**
 `TRANS_CACHE_SIZE = 64` entries cache virtual-to-physical translations
-for DMA buffer pages. The cache lives in `blockdriver/dma.rs` (used by
-`build_prdt` via `dma::translate`), not in the AHCI module.
-- Location: `kernel/src/filesystems/blockdriver/dma.rs:5-42,119-121`
+for DMA buffer pages. The cache lives in `services/dma.rs` (the shared
+`KernelDma` allocator); `build_prdt` resolves caller buffers through
+`kernel_services().dma.virt_to_phys()`.
+- Location: `kernel/src/services/dma.rs:32-59`, `kernel/src/filesystems/blockdriver/ahci.rs:314-318`
 
 **AHCI-006 — Timeout detection uses HLT-based waits via the universal timer:**
 `wait_slots()`, `wait_ssts_det()`, and `port_reset()` all wait with
@@ -89,10 +90,12 @@ command outstanding until the timeout.
 
 **AHCI-013 — CPU cache is explicitly managed around DMA (`cache_flush_line`):**
 `CLFLUSHOPT` (detected once via CPUID.7.EBX bit 23) is used when
-available, else `CLFLUSH`. Command tables + command lists are flushed
-after preparation; write buffers are flushed before submission; read
-buffers are invalidated after completion.
-- Location: `kernel/src/filesystems/blockdriver/ahci.rs:37-50,425-441,644-677`
+available, else `CLFLUSH`. DMA structures (command list, command tables,
+received-FIS, scratch) are mapped NO_CACHE by the shared DMA allocator,
+so no flush is needed for them; only the caller's data buffers are
+managed: write buffers are flushed before submission; read buffers are
+invalidated after completion.
+- Location: `kernel/src/filesystems/blockdriver/ahci.rs:36-50,627-658`
 
 **AHCI-014 — COMRESET saves and restores port registers:**
 `port_reset()` snapshots `CLB/CLBU/FB/FBU/IE` before issuing COMRESET
@@ -133,18 +136,19 @@ and the list is only mutated during single-threaded init.
 
 ## API Contracts
 
-**AHCI-API-001 — `blockdriver::driver::init_all(devices, page_table_root, phys_allocator)` → `Vec<Arc<dyn BlockDevice>>`:**
+**AHCI-API-001 — `blockdriver::driver::init_all(devices)` → `Vec<Arc<dyn BlockDevice>>`:**
 Scans the PCI device list, runs the `StorageDriver` registry, resets AHCI
-controllers, probes ports, and returns the block devices. Must be called
-after PCI init and VMM activation. On x86_64 only. Caller is responsible
-for merging the result into `BLOCK_DEVICES`.
+controllers, probes ports, and returns the block devices. DMA comes from
+`kernel_services().dma` (the shared `services::dma::KernelDma` allocator).
+Must be called after PCI init and VMM activation. On x86_64 only. Caller is
+responsible for merging the result into `BLOCK_DEVICES`.
 
 **AHCI-API-002 — `StorageDriver` trait:**
 ```rust
 pub trait StorageDriver: Send + Sync {
     fn name(&self) -> &str;
     fn probe(&self, dev: &PciDevice) -> bool;
-    fn init_controller(&self, dev: &PciDevice, dma: &mut DmaAllocator)
+    fn init_controller(&self, dev: &PciDevice, dma: &dyn DmaAllocator)
         -> Result<Vec<Arc<dyn BlockDevice>>, &'static str>;
 }
 ```

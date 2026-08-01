@@ -204,7 +204,7 @@ impl UsbMassStorageDevice {
         bulk_in_dci: u8,
         bulk_out_ring: TrbRing,
         bulk_in_ring: TrbRing,
-        dma: &mut crate::usb::dma::UsbDmaAllocator,
+        dma: &dyn crate::services::dma::DmaAllocator,
     ) -> Result<Arc<Self>, &'static str> {
         let data_page = dma.alloc_page().ok_or("OOM for USB MSD data page")?;
         let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;

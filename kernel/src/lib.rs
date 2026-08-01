@@ -333,8 +333,6 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         let mut block_devices = crate::filesystems::blockdriver::driver::init_all(
             crate::pci::devices(),
-            self.page_table_root,
-            &mut self.allocator as *mut _,
         );
 
         #[cfg(target_arch = "x86_64")]
@@ -351,8 +349,6 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         let usb_block_devices = crate::usb::xhci::init_all(
             crate::pci::devices(),
-            self.page_table_root,
-            &mut self.allocator as *mut _,
         );
 
         #[cfg(target_arch = "x86_64")]
