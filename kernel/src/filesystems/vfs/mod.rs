@@ -106,14 +106,6 @@ pub fn init() -> Result<(), VfsError> {
     mount("tmpfs", None, 'A')?;
     mkdir("A>tmp")?;
 
-    // Standard FDs 0/1/2 (placeholder files — replaced by real console later)
-    {
-        let _fd0 = open("A>tmp/stdin", OpenFlags::CREATE | OpenFlags::READ)?;
-        let _fd1 = open("A>tmp/stdout", OpenFlags::CREATE | OpenFlags::WRITE)?;
-        let _fd2 = open("A>tmp/stderr", OpenFlags::CREATE | OpenFlags::WRITE)?;
-        debug_assert!(_fd0 == 0 && _fd1 == 1 && _fd2 == 2);
-    }
-
     // Set CWD to A> root
     let root = DRIVE_MAP.lookup('A')?.root.clone();
     *CWD.lock() = Some(CurrentWorkingDirectory { drive: 'A', dentry: root });
@@ -212,6 +204,10 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
     }
     // Flush FS data (FAT cache, FSInfo, dirty bit) before unmount
     sync_drive(drive)?;
+    {
+        let mount = DRIVE_MAP.lookup(drive)?;
+        mount.sb.ops.shutdown()?;
+    }
 
     // Check no open FDs reference this drive
     let mount = DRIVE_MAP.lookup(drive)?;

@@ -17,6 +17,7 @@ pub mod dma;
 pub mod block_device;
 pub mod pci_device;
 pub mod acpi;
+pub mod wallclock;
 
 #[cfg(target_arch = "x86_64")]
 pub mod x86_64;

@@ -74,15 +74,6 @@ impl Fat32SuperBlock {
         Ok(())
     }
 
-    pub fn chain_cluster_at(&self, start: u32, index: u32) -> Result<u32, VfsError> {
-        let mut current = start;
-        for _ in 0..index {
-            current = self.read_fat_entry(current)?;
-            if current >= EOC_MARKER { return Err(VfsError::IOError); }
-        }
-        Ok(current)
-    }
-
     pub fn truncate_chain(&self, start: u32, keep: u32) -> Result<(), VfsError> {
         if start == 0 || keep == 0 {
             self.free_chain(start)?;

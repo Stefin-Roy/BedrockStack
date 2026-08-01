@@ -131,6 +131,23 @@ impl BlockDevice for CachedDevice {
         let mut completed = 0u32;
         let mut errors = 0u32;
         for r in reqs {
+            // Physical-address buffers bypass the sector cache: the caller
+            // owns a DMA-visible buffer at a fixed address, so forward the
+            // request straight to the backing device (correct and avoids
+            // aliasing cached sectors).
+            if let IoBuffer::Phys(pa, sz) = &r.buffer {
+                let phys_req = IoRequest {
+                    lba: r.lba,
+                    count: r.count,
+                    buffer: IoBuffer::Phys(*pa, *sz),
+                    is_write: r.is_write,
+                };
+                match self.inner.submit(core::slice::from_ref(&phys_req)) {
+                    Ok(c) if c.all_ok() => completed += 1,
+                    _ => errors += 1,
+                }
+                continue;
+            }
             let result = if r.is_write {
                 self.write_io(&mut cache, r)
             } else {

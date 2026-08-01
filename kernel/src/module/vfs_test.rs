@@ -368,6 +368,9 @@ fn test_stat() -> Result<(), &'static str> {
     if st.size != 5 {
         return Err("stat size wrong");
     }
+    if st.mtime == 0 {
+        return Err("stat mtime is 0");
+    }
     try_unlink("A>test_stat_file.txt")
 }
 

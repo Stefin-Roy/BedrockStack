@@ -118,15 +118,19 @@ implementation passes `Arc::as_ptr()` which is valid for the
 
 **VFS-API-001 — `vfs::init()`:**
 Registers all filesystems, mounts `tmpfs` on `A>`, creates `A>tmp`,
-allocates placeholder FDs 0/1/2 pointing to empty files in `A>tmp`,
-sets CWD to `A>`. Returns `Err(VfsError)` on failure.
+sets CWD to `A>`. Returns `Err(VfsError)` on failure. No standard FDs are
+allocated — the first `open()` returns fd 0. Console I/O goes through
+`SerialPort`/`framebuffer::Console` directly until a devfs exists.
 
 **VFS-API-002 — `InodeOps` trait:**
 Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
 `unlink`, `rmdir`, `readdir`, `rename`, `truncate`, `getattr`, `file_type`, `size`.
 
 **VFS-API-003 — `SuperOps` trait:**
-Required operations: `statfs`, `sync_fs`.
+Required operations: `statfs`, `sync_fs`. Optional `shutdown()`
+(defaults to `sync_fs()`); it is called by `unmount()` after the final
+`sync_fs` to let a filesystem release mount-time state (e.g. clear the
+FAT volume-dirty flag).
 
 **VFS-API-003a — Mount operations:**
 `mount(fstype, device, drive)` mounts a filesystem as a new drive letter,
@@ -152,7 +156,8 @@ clearing any covered dentry's `mount_id`.
 **VFS-API-006 — Superblock operations:**
 `sync_all` iterates all mounted drives and calls `sync_fs()` on each.
 `statfs(path)` resolves the drive for a path and returns filesystem
-statistics via `statfs()`.
+statistics via `statfs()`. `unmount()` calls `sync_fs()` then the
+superblock's `shutdown()` before dropping the drive.
 
 ---
 
@@ -164,8 +169,8 @@ statistics via `statfs()`.
   `invariants-19-fs-partition.md`).
 - `/dev` is not populated; no device special file type exists. Console
   I/O goes through `SerialPort` and `Framebuffer` directly, not through VFS.
-- Standard FDs 0/1/2 are placeholder files in `A>tmp/`. They will be
-  replaced by console device nodes when a devfs is implemented.
+- Standard FDs 0/1/2 are not allocated; console device nodes are a
+  devfs feature that has not been implemented yet.
 - `rename()` across different drives (cross-device) copies data through
   a userspace-style buffer. Directories cannot be renamed across devices
   (`CrossDeviceLink` error).

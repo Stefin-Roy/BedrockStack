@@ -232,7 +232,7 @@ pub(super) fn update_entry_cluster_and_size(sb: &Fat32SuperBlock, dir_clus: u32,
     find_and_update_entry(sb, dir_clus, name, |entry| {
         if let Some(c) = new_clus { set_first_clus_in_entry(entry, c); }
         if let Some(s) = new_size { set_file_size_in_entry(entry, s); }
-        set_timestamps(entry);
+        let _ = set_timestamps(entry);
     })
 }
 

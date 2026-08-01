@@ -50,13 +50,11 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
     }
 
     let stored_crc = u32::from_le(hdr.header_crc32);
-    if stored_crc != 0 {
-        let mut crc_buf = [0u8; 512];
-        crc_buf[..header_size].copy_from_slice(&buf[..header_size]);
-        crc_buf[16..20].copy_from_slice(&[0, 0, 0, 0]);
-        if crc32(&crc_buf[..header_size]) != stored_crc {
-            return Err("GPT header CRC mismatch");
-        }
+    let mut crc_buf = [0u8; 512];
+    crc_buf[..header_size].copy_from_slice(&buf[..header_size]);
+    crc_buf[16..20].copy_from_slice(&[0, 0, 0, 0]);
+    if crc32(&crc_buf[..header_size]) != stored_crc {
+        return Err("GPT header CRC mismatch");
     }
 
     let entry_lba = u64::from_le(hdr.partition_entry_lba);
@@ -96,7 +94,7 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
             start_lba,
             end_lba,
             size_sectors,
-            partition_type: 0xEE,
+            partition_type: None,
             guid_type: Some(entry.partition_type_guid),
             guid_unique: Some(entry.unique_guid),
             name: if name_str.is_empty() { None } else { Some(name_str) },

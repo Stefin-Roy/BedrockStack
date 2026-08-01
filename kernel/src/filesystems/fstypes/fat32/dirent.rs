@@ -18,13 +18,56 @@ pub(crate) struct DirEntrySlot {
     pub sfn_entry: [u8; DIR_ENTRY_SIZE],
 }
 
-pub fn set_timestamps(entry: &mut [u8; DIR_ENTRY_SIZE]) {
+pub fn set_timestamps(entry: &mut [u8; DIR_ENTRY_SIZE]) -> Option<u64> {
+    let epoch = crate::services::wallclock::now_epoch_secs()?;
+    let (time, date) = epoch_to_dos_datetime(epoch);
+    let t = time.to_le_bytes();
+    let d = date.to_le_bytes();
     entry[0x0D] = 0;
-    entry[0x0E..0x10].copy_from_slice(&[0, 0]);
-    entry[0x10..0x12].copy_from_slice(&[0, 0]);
-    entry[0x12..0x14].copy_from_slice(&[0, 0]);
-    entry[0x16..0x18].copy_from_slice(&[0, 0]);
-    entry[0x18..0x1A].copy_from_slice(&[0, 0]);
+    entry[0x0E..0x10].copy_from_slice(&t);
+    entry[0x10..0x12].copy_from_slice(&d);
+    entry[0x12..0x14].copy_from_slice(&d);
+    entry[0x16..0x18].copy_from_slice(&t);
+    entry[0x18..0x1A].copy_from_slice(&d);
+    Some(epoch)
+}
+
+/// Epoch-seconds modification time from a directory entry's DOS write
+/// date/time. Returns 0 if the entry carries no valid timestamp.
+pub fn mtime_from_entry(entry: &[u8; DIR_ENTRY_SIZE]) -> u64 {
+    let time = u16::from_le_bytes([entry[0x16], entry[0x17]]);
+    let date = u16::from_le_bytes([entry[0x18], entry[0x19]]);
+    dos_datetime_to_epoch(time, date).unwrap_or(0)
+}
+
+/// DOS (time, date) pair for an epoch-seconds timestamp.
+fn epoch_to_dos_datetime(epoch: u64) -> (u16, u16) {
+    let days = epoch.div_euclid(86400);
+    let rem = epoch.rem_euclid(86400);
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let (year, month, day) = crate::services::wallclock::civil_from_days(days);
+    if !(1980..=2107).contains(&year) {
+        return (0, 0);
+    }
+    let date = (((year - 1980) as u16) << 9) | ((month as u16) << 5) | (day as u16);
+    let time = ((hour as u16) << 11) | ((min as u16) << 5) | ((sec / 2) as u16);
+    (time, date)
+}
+
+fn dos_datetime_to_epoch(time: u16, date: u16) -> Option<u64> {
+    let year = 1980u64 + ((date >> 9) & 0x7F) as u64;
+    let month = ((date >> 5) & 0x0F) as u64;
+    let day = (date & 0x1F) as u64;
+    let hour = ((time >> 11) & 0x1F) as u64;
+    let min = ((time >> 5) & 0x3F) as u64;
+    let sec = ((time & 0x1F) as u64) * 2;
+    if month == 0 || month > 12 || day == 0 || day > 31 || hour > 23 || min > 59 || sec > 59 {
+        return None;
+    }
+    let days = crate::services::wallclock::days_from_civil(year, month, day);
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
 }
 
 pub fn decode_sfn(sfn: &[u8; MAX_SFN_LEN]) -> String {

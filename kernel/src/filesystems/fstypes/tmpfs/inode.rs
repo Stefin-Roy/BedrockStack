@@ -24,10 +24,12 @@ pub(super) struct TmpfsInode {
     pub entry: TmpfsEntry,
     pub mtime: Mutex<u64>,
     pub size: AtomicU64,
+    /// Shared superblock usage counter (bytes), kept in sync on write/truncate.
+    pub used: Arc<AtomicU64>,
 }
 
 impl TmpfsInode {
-    pub fn new_root() -> Self {
+    pub fn new_root(used: Arc<AtomicU64>) -> Self {
         TmpfsInode {
             ino: ROOT_INO,
             file_type: FileType::Directory,
@@ -36,6 +38,7 @@ impl TmpfsInode {
             },
             mtime: Mutex::new(0),
             size: AtomicU64::new(0),
+            used,
         }
     }
 }
@@ -61,13 +64,18 @@ impl InodeOps for TmpfsInode {
         match &self.entry {
             TmpfsEntry::File { data } => {
                 let mut data = data.lock();
+                let old_len = data.len() as u64;
                 let end = offset as usize + buf.len();
                 if end > data.len() {
                     data.resize(end, 0);
                 }
                 data[offset as usize..end].copy_from_slice(buf);
-                self.size.store(data.len() as u64, Ordering::Relaxed);
-                *self.mtime.lock() = 0;
+                let new_len = data.len() as u64;
+                self.size.store(new_len, Ordering::Relaxed);
+                if new_len > old_len {
+                    self.used.fetch_add(new_len - old_len, Ordering::Relaxed);
+                }
+                *self.mtime.lock() = crate::services::wallclock::now_secs();
                 Ok(buf.len())
             }
             _ => Err(VfsError::IsADirectory),
@@ -103,6 +111,7 @@ impl InodeOps for TmpfsInode {
                     },
                     mtime: Mutex::new(0),
                     size: AtomicU64::new(0),
+                    used: self.used.clone(),
                 });
                 children.insert(String::from(name), child.clone());
                 Ok(child as Arc<dyn InodeOps>)
@@ -138,6 +147,7 @@ impl InodeOps for TmpfsInode {
                     },
                     mtime: Mutex::new(0),
                     size: AtomicU64::new(0),
+                    used: self.used.clone(),
                 });
                 children.insert(String::from(name), child.clone());
                 Ok(child as Arc<dyn InodeOps>)
@@ -197,9 +207,16 @@ impl InodeOps for TmpfsInode {
         match &self.entry {
             TmpfsEntry::File { data } => {
                 let mut data = data.lock();
+                let old_len = data.len() as u64;
                 data.resize(len as usize, 0);
+                let new_len = data.len() as u64;
                 self.size.store(len, Ordering::Relaxed);
-                *self.mtime.lock() = 0;
+                if new_len > old_len {
+                    self.used.fetch_add(new_len - old_len, Ordering::Relaxed);
+                } else if new_len < old_len {
+                    self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
+                }
+                *self.mtime.lock() = crate::services::wallclock::now_secs();
                 Ok(())
             }
             _ => Err(VfsError::IsADirectory),

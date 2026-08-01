@@ -19,7 +19,9 @@ pub struct PartitionInfo {
     pub start_lba: u64,
     pub end_lba: u64,
     pub size_sectors: u64,
-    pub partition_type: u8,
+    /// MBR partition type (byte 4 of a partition record).  `None` for GPT
+    /// entries, whose type lives in [`Self::guid_type`].
+    pub partition_type: Option<u8>,
     pub guid_type: Option<[u8; 16]>,
     pub guid_unique: Option<[u8; 16]>,
     pub name: Option<String>,

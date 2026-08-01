@@ -52,7 +52,7 @@ impl FatCache {
     }
 
     pub fn flush(&mut self, device: &dyn BlockDevice, bpb: &Bpb) -> Result<(), VfsError> {
-        let is_mirrored = bpb.active_fat & 0x80 == 0;
+        let is_mirrored = bpb.ext_flags & 0x80 == 0;
         for &lba in self.dirty.iter() {
             let data = self.sectors.get(&lba).unwrap();
             write_sectors(device, lba, 1, data)?;

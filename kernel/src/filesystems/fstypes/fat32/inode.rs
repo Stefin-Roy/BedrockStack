@@ -16,7 +16,8 @@ use super::dirent::{
     DirEntrySlot, ATTR_DIRECTORY,
     first_clus_from_entry, file_size_from_entry,
     sfn_from_name, vfat_checksum, needs_vfat, encode_vfat_entries,
-    set_first_clus_in_entry, set_file_size_in_entry, set_timestamps, ATTR_ARCHIVE,
+    set_first_clus_in_entry, set_file_size_in_entry, set_timestamps, mtime_from_entry,
+    ATTR_ARCHIVE,
 };
 use super::cluster::{read_cluster, write_cluster, zero_cluster};
 use super::dir::{
@@ -39,6 +40,9 @@ pub struct Fat32Inode {
     pub(crate) size: AtomicU32,
     pub(crate) file_type: FileType,
     pub(crate) ino: u64,
+    /// Epoch-seconds modification time, mirrored from the directory entry's
+    /// DOS write date/time (0 for the root, or before any timestamp is known).
+    pub(crate) mtime: AtomicU64,
     pub(crate) parent_clus: u32,
     pub(crate) entry_name: String,
     pub(crate) unlinked: AtomicBool,
@@ -253,6 +257,11 @@ impl InodeOps for Fat32Inode {
             )?;
         }
 
+        self.mtime.store(
+            crate::services::wallclock::now_epoch_secs().unwrap_or(0),
+            Ordering::Relaxed,
+        );
+
         Ok(buf.len())
     }
 
@@ -275,7 +284,8 @@ impl InodeOps for Fat32Inode {
                     first_clus: AtomicU32::new(actual_clus),
                     size: AtomicU32::new(sz),
                     file_type: ft,
-                    ino: self.sb.next_ino.fetch_add(1, Ordering::Relaxed),
+                    ino: self.sb.ino_for(self.first_clus.load(Ordering::Relaxed), name),
+                    mtime: AtomicU64::new(mtime_from_entry(&slot.sfn_entry)),
                     parent_clus: self.first_clus.load(Ordering::Relaxed),
                     entry_name: String::from(name),
                     unlinked: AtomicBool::new(false),
@@ -319,7 +329,7 @@ impl InodeOps for Fat32Inode {
         sfn_entry[0x0B] = ATTR_ARCHIVE;
         set_first_clus_in_entry(&mut sfn_entry, 0);
         set_file_size_in_entry(&mut sfn_entry, 0);
-        set_timestamps(&mut sfn_entry);
+        let mtime = set_timestamps(&mut sfn_entry).unwrap_or(0);
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
@@ -329,13 +339,14 @@ impl InodeOps for Fat32Inode {
         self.invalidate_dir_cache();
         drop(_lock);
 
-        let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
+        let ino = self.sb.ino_for(parent, name);
         Ok(Arc::new(Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(0),
             size: AtomicU32::new(0),
             file_type: FileType::Regular,
             ino,
+            mtime: AtomicU64::new(mtime),
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
             unlinked: AtomicBool::new(false),
@@ -401,13 +412,13 @@ impl InodeOps for Fat32Inode {
         dot_entry[..MAX_SFN_LEN].copy_from_slice(&dot_sfn);
         dot_entry[0x0B] = ATTR_DIRECTORY;
         set_first_clus_in_entry(&mut dot_entry, new_clus);
-        set_timestamps(&mut dot_entry);
+        let _ = set_timestamps(&mut dot_entry);
 
         let mut dotdot_entry = [0u8; DIR_ENTRY_SIZE];
         dotdot_entry[..MAX_SFN_LEN].copy_from_slice(&dotdot_sfn);
         dotdot_entry[0x0B] = ATTR_DIRECTORY;
         set_first_clus_in_entry(&mut dotdot_entry, self.first_clus.load(Ordering::Relaxed));
-        set_timestamps(&mut dotdot_entry);
+        let _ = set_timestamps(&mut dotdot_entry);
 
         let clus_bytes = self.sb.bpb.byts_per_clus as usize;
         let mut clus_buf = alloc::vec![0u8; clus_bytes];
@@ -434,7 +445,7 @@ impl InodeOps for Fat32Inode {
         sfn_entry[..MAX_SFN_LEN].copy_from_slice(&sfn);
         sfn_entry[0x0B] = ATTR_DIRECTORY;
         set_first_clus_in_entry(&mut sfn_entry, new_clus);
-        set_timestamps(&mut sfn_entry);
+        let mtime = set_timestamps(&mut sfn_entry).unwrap_or(0);
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
@@ -444,13 +455,14 @@ impl InodeOps for Fat32Inode {
         self.invalidate_dir_cache();
         drop(_lock);
 
-        let ino = self.sb.next_ino.fetch_add(1, Ordering::Relaxed);
+        let ino = self.sb.ino_for(parent, name);
         Ok(Arc::new(Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(new_clus),
             size: AtomicU32::new(0),
             file_type: FileType::Directory,
             ino,
+            mtime: AtomicU64::new(mtime),
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
             unlinked: AtomicBool::new(false),
@@ -498,13 +510,13 @@ impl InodeOps for Fat32Inode {
         let slots = self.get_dir_slots()?;
         fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] readdir got slots\n"));
         let mut entries = Vec::with_capacity(slots.len());
+        let dir_clus = self.first_clus.load(Ordering::Relaxed);
         for slot in &*slots {
             let name = decode_entry_name(slot);
             if name.is_empty() || name == "." || name == ".." { continue; }
-            let fc = first_clus_from_entry(&slot.sfn_entry);
             let attr = slot.sfn_entry[0x0B];
             let ft = if attr & ATTR_DIRECTORY != 0 { FileType::Directory } else { FileType::Regular };
-            entries.push(DirEntry { ino: fc as u64, name, file_type: ft });
+            entries.push(DirEntry { ino: self.sb.ino_for(dir_clus, &name), name, file_type: ft });
         }
         Ok(entries)
     }
@@ -514,7 +526,7 @@ impl InodeOps for Fat32Inode {
             ino: self.ino,
             size: if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 },
             file_type: self.file_type,
-            mtime: 0,
+            mtime: self.mtime.load(Ordering::Relaxed),
         })
     }
 
@@ -570,7 +582,7 @@ impl InodeOps for Fat32Inode {
         sfn_entry[0x0B] = attr;
         set_first_clus_in_entry(&mut sfn_entry, fc);
         set_file_size_in_entry(&mut sfn_entry, sz);
-        set_timestamps(&mut sfn_entry);
+        let _ = set_timestamps(&mut sfn_entry);
         new_entries.push(sfn_entry);
 
         let parent = self.first_clus.load(Ordering::Relaxed);
@@ -630,6 +642,10 @@ impl InodeOps for Fat32Inode {
                 self.size.store(new_size, Ordering::Relaxed);
                 update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name,
                                                Some(new_clus), Some(new_size))?;
+                self.mtime.store(
+                    crate::services::wallclock::now_epoch_secs().unwrap_or(0),
+                    Ordering::Relaxed,
+                );
                 return Ok(());
             }
             self.sb.extend_chain(current_first, needed - have)?;
@@ -641,6 +657,11 @@ impl InodeOps for Fat32Inode {
         } else {
             self.size.store(new_size, Ordering::Relaxed);
         }
+
+        self.mtime.store(
+            crate::services::wallclock::now_epoch_secs().unwrap_or(0),
+            Ordering::Relaxed,
+        );
 
         Ok(())
     }

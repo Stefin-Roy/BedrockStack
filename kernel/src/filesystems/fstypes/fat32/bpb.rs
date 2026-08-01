@@ -20,7 +20,7 @@ pub(crate) struct Bpb {
     pub byts_per_clus: u32,
     pub first_data_sec: u64,
     pub total_clus: u32,
-    pub active_fat: u8,
+    pub ext_flags: u16,
 }
 
 fn dump_bpb_failure(sector: &[u8; SECTOR_SIZE], reason: &str) {
@@ -112,12 +112,16 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let total_clus = (total_data_sectors / sec_per_clus as u64) as u32;
     let byts_per_clus = (bytes_per_sec as u32) * (sec_per_clus as u32);
 
-    let active_fat = sector[0x42];
+    // BPB_ExtFlags (offset 0x28): bits 0-3 = active FAT (only meaningful when
+    // bit 7 is set), bit 7 set = FAT mirroring disabled, bits 8-15 reserved.
+    // Note offset 0x42 is the extended boot signature (0x29), NOT a FAT
+    // mirroring field — reading it there was wrong.
+    let ext_flags = u16::from_le_bytes([sector[0x28], sector[0x29]]);
 
     Ok(Bpb {
         bytes_per_sec, sec_per_clus, rsvd_sec_cnt, num_fats,
         fat_sz32, root_clus, fsinfo_sec,
-        byts_per_clus, first_data_sec, total_clus, active_fat,
+        byts_per_clus, first_data_sec, total_clus, ext_flags,
     })
 }
 
@@ -128,7 +132,7 @@ impl Bpb {
     }
 
     pub fn active_fat_idx(&self) -> u8 {
-        if self.active_fat & 0x80 != 0 { self.active_fat & 0x0F } else { 0 }
+        if self.ext_flags & 0x80 != 0 { (self.ext_flags & 0x0F) as u8 } else { 0 }
     }
 
     pub fn fat_sector_lba(&self, fat_num: u8, sector_idx: u32) -> u64 {
@@ -139,10 +143,6 @@ impl Bpb {
 
     pub fn fat_entry_position(&self, cluster: u32) -> (u32, u32) {
         let byte_off = cluster as u32 * 4;
-        if self.bytes_per_sec == 0 {
-            crate::drivers::serial::dump_puts("[BPB] CORRUPT: bytes_per_sec=0 in fat_entry_position!\n");
-            return (0, 0);
-        }
         let sector_idx = byte_off / self.bytes_per_sec as u32;
         let offset = byte_off % self.bytes_per_sec as u32;
         (sector_idx, offset)

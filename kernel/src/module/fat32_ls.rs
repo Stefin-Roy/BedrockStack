@@ -167,8 +167,13 @@ fn probe_device(device: Arc<dyn BlockDevice>, stats: &mut WalkStats) {
         SerialPort::put_hex(part.end_lba);
         SerialPort::puts(" size=");
         SerialPort::put_u64(part.size_sectors);
-        SerialPort::puts(" type=0x");
-        SerialPort::put_hex(part.partition_type as u64);
+        match part.partition_type {
+            Some(t) => {
+                SerialPort::puts(" type=0x");
+                SerialPort::put_hex(t as u64);
+            }
+            None => SerialPort::puts(" type=GPT"),
+        }
         SerialPort::puts(" -> ");
         SerialPort::putc(letter as u8);
         SerialPort::puts("> ... ");

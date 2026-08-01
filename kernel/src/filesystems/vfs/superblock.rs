@@ -6,6 +6,14 @@ use super::inode::Inode;
 pub trait SuperOps: Send + Sync {
     fn statfs(&self) -> Result<StatFs, VfsError>;
     fn sync_fs(&self) -> Result<(), VfsError>;
+
+    /// Called by `vfs::unmount` after `sync_fs()`.  A filesystem can use this
+    /// to perform teardown that must only happen on a clean unmount (e.g.
+    /// clearing the FAT volume-dirty flag), as opposed to a plain runtime
+    /// flush.  Defaults to `sync_fs` so existing superblocks keep working.
+    fn shutdown(&self) -> Result<(), VfsError> {
+        self.sync_fs()
+    }
 }
 
 pub struct SuperBlock {

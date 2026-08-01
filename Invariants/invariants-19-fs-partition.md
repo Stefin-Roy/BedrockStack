@@ -26,12 +26,12 @@ points to the next EBR (entry 1).
 infinite loops from corrupted or malicious partition tables.
 - Location: `kernel/src/filesystems/partition/mod.rs:17`
 
-**PART-004 — GPT header CRC32 is validated, with zero-CRC tolerance:**
+**PART-004 — GPT header CRC32 is always validated:**
 The GPT header CRC32 field is verified by zeroing the crc32 field in
-the header buffer and recomputing the CRC over `header_size` bytes —
-**unless the stored CRC is 0**, in which case validation is skipped.
-This tolerates firmware that writes a zero CRC32 (e.g. certain GRUB/
-image tooling). CRC uses the IEEE 802.3 polynomial (0xEDB88320).
+the header buffer and recomputing the CRC over `header_size` bytes.
+The header is rejected on mismatch; there is no zero-CRC tolerance
+(a header with a stale/zero CRC is treated as corrupt). CRC uses the
+IEEE 802.3 polynomial (0xEDB88320).
 - Location: `kernel/src/filesystems/partition/gpt.rs:52-57`, `kernel/src/filesystems/partition/mod.rs:188-200`
 
 **PART-005 — Partition numbering follows platform conventions:**
@@ -58,6 +58,11 @@ the partition's sector count, not the whole disk's.
 Returns `VfsError::InvalidInput` on any violation.
 The BPB parser moved into the FAT32 module's `bpb.rs`; cluster-chain walks
 additionally bound their length at `total_clus + 2` to survive corrupt FATs.
+The active-FAT field is derived from the FAT32 extended flags (offset
+0x28): bit 0x80 selects the active FAT, bits 0x0F hold its index; FATs
+are mirrored when bit 0x80 is clear. `fat_entry_position()` computes the
+sector of a FAT entry by plain division (no special-casing of a zero
+`bytes_per_sec`).
 - Location: `kernel/src/filesystems/fstypes/fat32/bpb.rs`
 
 ---
@@ -122,13 +127,15 @@ pub struct PartitionInfo {
     pub start_lba: u64,
     pub end_lba: u64,
     pub size_sectors: u64,
-    pub partition_type: u8,
+    pub partition_type: Option<u8>,
     pub guid_type: Option<[u8; 16]>,
     pub guid_unique: Option<[u8; 16]>,
     pub name: Option<String>,
     pub is_extended: bool,
 }
 ```
+- `partition_type` is `Some` for MBR partitions and `None` for GPT entries
+  (a GPT partition's type is carried in `guid_type`).
 
 ---
 

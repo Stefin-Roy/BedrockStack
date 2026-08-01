@@ -2,6 +2,7 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use hashbrown::HashMap;
 use spin::Mutex;
 
 use crate::filesystems::blockdriver::block_cache::CachedDevice;
@@ -21,12 +22,27 @@ pub struct Fat32SuperBlock {
     pub(crate) bpb: Bpb,
     pub(crate) fat_cache: Mutex<FatCache>,
     pub(crate) next_ino: AtomicU64,
+    /// Stable inode numbers keyed by (parent directory cluster, entry name).
+    /// FAT has no inode table, so the identity is the namespace location.
+    pub(crate) ino_map: Mutex<HashMap<(u32, String), u64>>,
     pub(crate) next_alloc_hint: Mutex<u32>,
     pub(crate) free_clus_count: AtomicU32,
     pub(crate) volume_dirty: AtomicBool,
 }
 
 impl Fat32SuperBlock {
+    /// Stable inode number for an entry.  Allocates on first sight so the same
+    /// (parent, name) always maps to the same number, whichever VFS API asks.
+    pub fn ino_for(&self, parent_clus: u32, name: &str) -> u64 {
+        let mut map = self.ino_map.lock();
+        if let Some(&ino) = map.get(&(parent_clus, String::from(name))) {
+            return ino;
+        }
+        let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
+        map.insert((parent_clus, String::from(name)), ino);
+        ino
+    }
+
     pub fn set_volume_dirty_flag(&self) -> Result<(), VfsError> {
         if self.volume_dirty.load(Ordering::Relaxed) { return Ok(()); }
         let mut sector = [0u8; SECTOR_SIZE];
@@ -47,12 +63,18 @@ impl Fat32SuperBlock {
         Ok(())
     }
 
+    /// Runtime flush: push dirty FAT sectors and FSInfo.  Does not touch the
+    /// volume-dirty flag — the volume stays marked dirty while it is in use.
     pub fn sync_all(&self) -> Result<(), VfsError> {
-        self.set_volume_dirty_flag()?;
         let mut cache = self.fat_cache.lock();
         cache.flush(&*self.device, &self.bpb)?;
         drop(cache);
-        self.write_fsinfo()?;
+        self.write_fsinfo()
+    }
+
+    /// Clean-unmount teardown: flush, then clear the volume-dirty flag.
+    pub fn shutdown(&self) -> Result<(), VfsError> {
+        self.sync_all()?;
         self.clear_volume_dirty_flag()
     }
 }
@@ -67,6 +89,9 @@ impl SuperOps for Fat32SuperBlock {
     }
     fn sync_fs(&self) -> Result<(), VfsError> {
         self.sync_all()
+    }
+    fn shutdown(&self) -> Result<(), VfsError> {
+        Fat32SuperBlock::shutdown(self)
     }
 }
 
@@ -99,10 +124,15 @@ impl FileSystem for Fat32FileSystem {
             bpb: bpb.clone(),
             fat_cache: Mutex::new(FatCache::new()),
             next_ino: AtomicU64::new(2),
+            ino_map: Mutex::new(HashMap::new()),
             next_alloc_hint: Mutex::new(2),
             free_clus_count: AtomicU32::new(0),
             volume_dirty: AtomicBool::new(false),
         });
+
+        // Mark the volume dirty for the whole session so an unclean shutdown
+        // (crash/power loss) leaves the flag set for detection at next mount.
+        sb.set_volume_dirty_flag()?;
 
         if bpb.fsinfo_is_valid() {
             let mut sector = [0u8; SECTOR_SIZE];
@@ -129,6 +159,7 @@ impl FileSystem for Fat32FileSystem {
             size: AtomicU32::new(0),
             file_type: FileType::Directory,
             ino: 1,
+            mtime: AtomicU64::new(0),
             parent_clus: root_clus,
             entry_name: String::new(),
             unlinked: AtomicBool::new(false),

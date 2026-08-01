@@ -30,7 +30,16 @@ lock-free unique allocation.
 Updated via `store(Relaxed)` on write, read via `load(Relaxed)`.
 May be stale if read concurrent with a write on another CPU (but
 writes are serialized by the data mutex).
-- Location: `kernel/src/filesystems/fstypes/tmpfs.rs:72`
+- Location: `kernel/src/filesystems/fstypes/tmpfs/inode.rs:73`
+
+**TMPFS-008 — Superblock usage counter and statfs budget:**
+`TmpfsSuperOps.used` is an `Arc<AtomicU64>` shared with every inode.
+`write_at`/`truncate` adjust it by the size delta (`fetch_add`, never
+below 0 via `saturating_sub` on truncate). `statfs` reports
+`total_blocks = TMPFS_BUDGET / 4096` and
+`free_blocks = TMPFS_BUDGET.saturating_sub(used) / 4096`, where
+`TMPFS_BUDGET = 64 MiB` (a documented in-memory budget, not a hard limit).
+- Location: `kernel/src/filesystems/fstypes/tmpfs/mount.rs:14,40-44`
 
 **TMPFS-005 — `create()` checks for duplicates:`
 Returns `AlreadyExists` error if a child with the given name already
@@ -69,7 +78,11 @@ pub trait FileSystem: Send + Sync {
 ## Design Notes
 
 - tmpfs is a pure memory-backed filesystem. No block device needed.
-- `mtime` is tracked per-inode via a `Mutex<u64>` (coarse but simple).
+- `mtime` is tracked per-inode via a `Mutex<u64>`, set to
+  `services::wallclock::now_secs()` on `write_at`/`truncate`. On x86_64
+  that is the CMOS RTC wall-clock epoch; without an RTC (riscv64) it
+  falls back to monotonic seconds since boot. Inode creation leaves it
+  at 0 until the first write.
 - Files and directories are both `TmpfsInode` with different `TmpfsEntry`
   variants, discriminated by `file_type`.
 - No hard link support (each dentry owns its inode reference).

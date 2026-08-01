@@ -7,7 +7,7 @@
 //!   - NCQ (Native Command Queuing) via FPDMA QUEUED (0x60/0x61)
 //!   - Pre-allocated per-slot Command Table pages
 //!   - Translation cache to avoid repeated 4-level page walks
-//!   - Proper timeout via APIC timer count
+//!   - Proper timeout via the universal timer (now_ns / wait_until_cond)
 //!   - TFD error checking + SERR diagnostics
 //!   - Port reset recovery on command failure
 //!   - Zero-copy DMA: PRDT points directly to caller buffer pages
@@ -589,26 +589,27 @@ impl BlockDevice for AhciPort {
         let mut tag_of = [0u8; AHCI_MAX_SLOTS];
         let mut idx = 0usize;
         let mut err_mask = 0u32;
-        // DEBUG: store buffer ranges for cache maintenance
+        // Buffer virtual ranges for cache maintenance after DMA (allocation
+        // and cache handling are unconditional — this is not debug-only).
         let mut buf_ranges: [(u64, u64); AHCI_MAX_SLOTS] = [(0, 0); AHCI_MAX_SLOTS];
         for tag in 0..self.n_slots as u8 {
             if tag_mask & (1 << tag) != 0 {
-                        if idx < n {
-                            tag_of[idx] = tag;
-                            let req = &reqs[idx];
-                            let bytes = (req.count as usize) * 512;
-                            // SAFETY: The buffer virtual address is extracted for
-                            // DMA translation. The caller guarantees the buffer
-                            // lives until submit() returns (synchronous submit).
-                            let (buf_vaddr, buf_size) = match &req.buffer {
-                                IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
-                                IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
-                                IoBuffer::Phys(pa, sz) => (*pa, *sz),
-                            };
-                            if buf_size < bytes {
-                                err_mask |= 1 << tag;
-                            } else if let Err(_) = self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write) {
-                                err_mask |= 1 << tag;
+                if idx < n {
+                    tag_of[idx] = tag;
+                    let req = &reqs[idx];
+                    let bytes = (req.count as usize) * 512;
+                    // SAFETY: The buffer virtual address is extracted for
+                    // DMA translation. The caller guarantees the buffer
+                    // lives until submit() returns (synchronous submit).
+                    let (buf_vaddr, buf_size) = match &req.buffer {
+                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
+                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
+                        IoBuffer::Phys(pa, sz) => (*pa, *sz),
+                    };
+                    if buf_size < bytes {
+                        err_mask |= 1 << tag;
+                    } else if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
+                        err_mask |= 1 << tag;
                     }
                     buf_ranges[idx] = (buf_vaddr, bytes as u64);
                     idx += 1;
@@ -623,7 +624,7 @@ impl BlockDevice for AhciPort {
             return Ok(IoCompletions { completed: 0, errors: tag_mask });
         }
 
-        // DEBUG: Flush CPU cache for write buffers before DMA submission.
+        // Flush the CPU cache for write buffers before DMA submission.
         // Without this the HBA may read stale data from RAM.
         if reqs[0].is_write {
             for i in 0..n {
@@ -641,9 +642,9 @@ impl BlockDevice for AhciPort {
         let result = self.submit_batch(ok_mask);
         match result {
             Ok(()) => {
-                // DEBUG: Invalidate CPU cache for read buffers after DMA completes.
-                // Without this the CPU may read stale cache lines instead of
-                // the data the HBA wrote to RAM.
+                // Invalidate the CPU cache for read buffers after DMA
+                // completes.  Without this the CPU may read stale cache
+                // lines instead of the data the HBA wrote to RAM.
                 if !reqs[0].is_write {
                     for i in 0..n {
                         let (va, sz) = buf_ranges[i];
@@ -728,7 +729,7 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
         crate::pci::bar::Bar::Memory { addr, .. } => addr,
         _ => {
             SerialPort::puts("[ahci] BAR5 is not memory-mapped\n");
-            return Ok(Vec::new());
+            return Err("AHCI BAR5 is not memory-mapped");
         }
     };
 
@@ -772,7 +773,8 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
         core::hint::spin_loop();
     }
     if mmio.r32(ghc::GHC) & GHC_HR != 0 {
-        SerialPort::puts("[ahci] HBA reset timeout\n"); return Ok(Vec::new());
+        SerialPort::puts("[ahci] HBA reset timeout\n");
+        return Err("AHCI HBA reset timeout");
     }
     mmio.w32(ghc::GHC, mmio.r32(ghc::GHC) | GHC_AE);
     SerialPort::puts("[ahci] HBA reset complete\n");
