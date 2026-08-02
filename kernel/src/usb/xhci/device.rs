@@ -126,9 +126,20 @@ fn wait_for_transfer_timeout(slot_id: u8, ep_id: u8, timeout_ns: u64) -> Result<
     }
 }
 
-fn submit_control(
-    slot: &mut DeviceSlot,
+/// Submit a full control transfer (Setup + optional Data + Status) on an
+/// endpoint-0 transfer ring and wait for its completion.  Ringing the
+/// doorbell, flushing, and the TRB sequence follow xHCI §4.11.2.2:
+/// - a Setup Stage TRB carrying the 8-byte setup data (immediate, IDT),
+/// - a Data Stage TRB only when `data_len > 0` (DIR_IN if `dir_in`),
+/// - a Status Stage TRB whose direction is flipped relative to the data stage.
+///
+/// `submit_control` is the `DeviceSlot`-based wrapper; class drivers with
+/// only the ring (e.g. HID issuing `SET_PROTOCOL` from `init_interface`)
+/// call this directly.
+pub fn submit_control_transfer(
+    ep0_ring: &mut TrbRing,
     doorbell_va: u64,
+    slot_id: u8,
     setup: &SetupPacket,
     data_phys: u64,
     data_len: u16,
@@ -152,19 +163,38 @@ fn submit_control(
         2
     };
 
-    slot.ep0_ring.enqueue(&memory::make_setup_stage_trb(&setup_raw, trt));
+    ep0_ring.enqueue(&memory::make_setup_stage_trb(&setup_raw, trt));
 
     if data_len > 0 {
-        slot.ep0_ring.enqueue(&memory::make_data_stage_trb(data_phys, data_len as u32, dir_in));
+        ep0_ring.enqueue(&memory::make_data_stage_trb(data_phys, data_len as u32, dir_in));
     }
 
-    slot.ep0_ring.enqueue(&memory::make_status_stage_trb(dir_in));
+    ep0_ring.enqueue(&memory::make_status_stage_trb(dir_in));
 
-    slot.ep0_ring.flush();
-    command::ring_doorbell(doorbell_va, slot.slot_id, 1);
+    ep0_ring.flush();
+    command::ring_doorbell(doorbell_va, slot_id, 1);
 
-    let cc = wait_for_transfer(slot.slot_id, 1)?;
+    let cc = wait_for_transfer(slot_id, 1)?;
     Ok(cc as u32)
+}
+
+fn submit_control(
+    slot: &mut DeviceSlot,
+    doorbell_va: u64,
+    setup: &SetupPacket,
+    data_phys: u64,
+    data_len: u16,
+    dir_in: bool,
+) -> Result<u32, &'static str> {
+    submit_control_transfer(
+        &mut slot.ep0_ring,
+        doorbell_va,
+        slot.slot_id,
+        setup,
+        data_phys,
+        data_len,
+        dir_in,
+    )
 }
 
 pub fn get_device_descriptor(

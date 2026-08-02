@@ -390,6 +390,7 @@ fn bind_slot(
         let res = InterfaceResources {
             slot_id: slot.slot_id,
             doorbell_va,
+            iface_num: iface.iface_num,
             iface_class: iface.class,
             iface_subclass: iface.subclass,
             iface_protocol: iface.protocol,
@@ -407,8 +408,9 @@ fn bind_slot(
         SerialPort::puts("\n");
 
         // One driver's failure must not prevent the other interfaces of the
-        // same slot from binding.
-        match driver.init_interface(res, dma) {
+        // same slot from binding.  The EP0 ring is shared across interfaces
+        // and only used while the interface configures itself.
+        match driver.init_interface(res, dma, &mut slot.ep0_ring) {
             Ok(dev) => bound.push(dev),
             Err(e) => {
                 SerialPort::puts("[usbdrv] ");

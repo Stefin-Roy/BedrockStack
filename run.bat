@@ -46,6 +46,9 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
     -device qemu-xhci,msi=on,msix=on ^
     -device usb-storage,drive=usb_disk ^
+    -device usb-kbd ^
+    -device usb-mouse ^
+    -device usb-tablet ^
     -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
     -device virtio-net,netdev=net0 ^
     -m 7120M ^

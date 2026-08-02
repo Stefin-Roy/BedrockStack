@@ -23,6 +23,8 @@ pub const REQ_GET_INTERFACE: u8 = 10;
 pub const REQ_SET_INTERFACE: u8 = 11;
 pub const REQ_CLEAR_FEATURE: u8 = 1;
 pub const REQ_SET_FEATURE: u8 = 3;
+pub const REQ_GET_PROTOCOL: u8 = 3;
+pub const REQ_SET_PROTOCOL: u8 = 0x0B;
 
 pub const DESC_DEVICE: u8 = 1;
 pub const DESC_CONFIG: u8 = 2;
@@ -35,10 +37,21 @@ pub const DESC_INTERFACE_POWER: u8 = 8;
 pub const DESC_BOS: u8 = 15;
 pub const DESC_SS_EP_COMPANION: u8 = 48;
 pub const DESC_SS_ISOCH_EP_COMPANION: u8 = 49;
+/// HID class descriptor types (HID spec §7.1).  Both are retrieved with the
+/// standard `GET_DESCRIPTOR` request but with `wIndex` = interface number.
+pub const DESC_HID: u8 = 0x21;
+pub const DESC_REPORT: u8 = 0x22;
 
 pub const CLASS_HUB: u8 = 9;
 pub const CLASS_MASS_STORAGE: u8 = 8;
 pub const CLASS_HID: u8 = 3;
+
+/// HID interface subclass 1 = boot-interface device (HID spec §4.3).
+pub const HID_SUBCLASS_BOOT: u8 = 1;
+/// Boot protocol values used with `SET_PROTOCOL`/`GET_PROTOCOL`.
+pub const HID_PROTOCOL_NONE: u8 = 0;
+pub const HID_PROTOCOL_KEYBOARD: u8 = 1;
+pub const HID_PROTOCOL_MOUSE: u8 = 2;
 
 pub const SPEED_LS: u8 = 1;
 pub const SPEED_FS: u8 = 2;
@@ -87,6 +100,32 @@ impl SetupPacket {
             w_value: ((desc_type as u16) << 8) | desc_index as u16,
             w_index: lang_id,
             w_length: len,
+        }
+    }
+
+    /// `GET_DESCRIPTOR` addressed to an interface instead of the device.
+    /// HID report/HID descriptors must be fetched with `wIndex` = interface
+    /// number (HID spec §7.1), unlike the device-level descriptors.
+    pub fn get_descriptor_interface(desc_type: u8, desc_index: u8, iface: u16, len: u16) -> Self {
+        SetupPacket {
+            bm_request_type: BMREQ_DEVICE_TO_HOST | USB_TYPE_STANDARD | USB_RECIP_INTERFACE,
+            b_request: REQ_GET_DESCRIPTOR,
+            w_value: ((desc_type as u16) << 8) | desc_index as u16,
+            w_index: iface,
+            w_length: len,
+        }
+    }
+
+    /// HID class `SET_PROTOCOL` (HID spec §7.2.6): a no-data control
+    /// transfer selecting the report protocol.  `protocol` is the boot
+    /// protocol value (keyboard 1, mouse 2) or 0 for the generic protocol.
+    pub fn set_protocol(protocol: u16, iface: u16) -> Self {
+        SetupPacket {
+            bm_request_type: BMREQ_HOST_TO_DEVICE | USB_TYPE_CLASS | USB_RECIP_INTERFACE,
+            b_request: REQ_SET_PROTOCOL,
+            w_value: protocol,
+            w_index: iface,
+            w_length: 0,
         }
     }
 

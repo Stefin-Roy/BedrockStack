@@ -16,7 +16,9 @@
 - `kernel/src/usb/xhci/ports.rs` — port state machine, reset, status change handling
 - `kernel/src/usb/class/driver.rs` — USB class-driver registry (`UsbClassDriver`, `InterfaceResources`, `EndpointResource`, `find_driver`)
 - `kernel/src/usb/class/mass_storage.rs` — USB Bulk-Only Transport mass-storage driver + `MassStorageDriver`
-- `kernel/src/usb/class/hid.rs` — USB HID boot-keyboard driver (`HidDriver`)
+- `kernel/src/usb/class/hid.rs` — USB HID driver (`HidDriver`): boot keyboard + boot mouse, generic-protocol fallback
+- `kernel/src/usb/class/hid_report.rs` — minimal HID report-descriptor parser for the generic-protocol fallback
+- `kernel/src/input/mouse.rs` — evdev-consistent mouse codes (`REL_*`, `BTN_*`) for `InputType::Mouse`
 - `make_demo_drive.py` — script to build a QEMU demo USB drive image
 
 ---
@@ -56,6 +58,12 @@ via `kernel_services().dma`. There is no USB-specific allocator.
 **USB-011** `SetupPacket::clear_feature()` and `set_feature()` accept a `recip` parameter to target device, interface, or endpoint as appropriate; the caller selects the correct recipient.
 
 **USB-012** Speed constants (`SPEED_LS=1`, `SPEED_FS=2`, `SPEED_HS=3`, `SPEED_SS=4`) map to xHCI PORTSC speed field values.
+
+**USB-013** HID protocol constants: `REQ_GET_PROTOCOL` (0x03) and `REQ_SET_PROTOCOL` (0x0B) are HID class requests; `DESC_HID` (0x21) and `DESC_REPORT` (0x22) are the HID class descriptor types — unlike device-level descriptors they are retrieved with `wIndex` = interface number; `HID_SUBCLASS_BOOT` (1) is the boot-interface subclass; `HID_PROTOCOL_NONE/KEYBOARD/MOUSE` (0/1/2) are the protocol values used with `SET_PROTOCOL`/`GET_PROTOCOL`.
+
+**USB-014** `SetupPacket::set_protocol(protocol, iface)` builds the HID class `SET_PROTOCOL` request: `bmRequestType` = host-to-device | class | interface (0x21), `wValue` = protocol, `wIndex` = interface, `wLength` = 0 — a no-data control transfer (Setup + Status stages only, `TRT` = 0 per xHCI §4.11.2.2).
+
+**USB-015** `SetupPacket::get_descriptor_interface(desc_type, desc_index, iface, len)` is `get_descriptor()` with `wIndex` = interface instead of langid — the addressing HID report/HID descriptors require (HID spec §7.1).
 
 ---
 
@@ -255,11 +263,13 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **XHCI-050** **The ICC page is reused across phases**: the same `icc_phys`/`icc_va` page is re-zeroed and re-filled for Address Device (BSR and non-BSR) and later for Configure Endpoint. One DMA page per slot, never leaked.
 
-**XHCI-051** `submit_control()` builds a 3-stage control transfer on `ep0_ring`:
+**XHCI-051** `submit_control_transfer(ep0_ring, doorbell_va, slot_id, setup, data_phys, data_len, dir_in)` builds a 3-stage control transfer on an endpoint-0 ring:
 - Setup Stage: `TRT` encodes the data stage (0 = no data, 2 = OUT, 3 = IN); `CHAIN` set **only when a data stage follows** (per xHCI §4.11.2.3)
 - Data Stage (optional): DIR_IN if IN
 - Status Stage: always present, direction **flipped**, IOC=1
 - Then `flush()` + doorbell on the default control endpoint (target 1) + `wait_for_transfer`
+
+`submit_control()` is a thin `DeviceSlot` wrapper forwarding `&mut slot.ep0_ring`/`slot.slot_id`; class drivers that own only a ring (HID `SET_PROTOCOL`, descriptor fetches) call `submit_control_transfer` directly.
 
 **XHCI-052** `wait_for_transfer(slot_id, ep_id)` waits with a 5-second deadline via `wait_until_cond`, consuming events and peeking `LAST_TRANSFER_STATE` for a matching slot/ep. Completion codes 1 (success) and 13 (short packet) are accepted.
 
@@ -305,7 +315,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 18. `drain_pending_and_clear_intr()`, diagnostic dump (USBSTS, IMAN, PORTSC1, ERDP)
 19. `enumerate_initial_ports()` — real slot enumeration into a `DeviceSlotManager`
 20. `verify_message_interrupt_delivery()` — No-Op command IRQ verification
-21. **Class binding**: for each slot, `bind_slot()` runs `get_config_descriptor_full()` → per-interface driver match → `configure_device()` (one Configure Endpoint command covering every matched interface) → `init_interface` for **each** matched interface; matched mass-storage interfaces get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section), HID interfaces get an interrupt-IN boot keyboard (see USB-HID section). A composite device yields one bound device per matched interface
+21. **Class binding**: for each slot, `bind_slot()` runs `get_config_descriptor_full()` → per-interface driver match → `configure_device()` (one Configure Endpoint command covering every matched interface) → `init_interface` for **each** matched interface; matched mass-storage interfaces get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section), HID interfaces get an interrupt-IN device (boot keyboard/mouse, or a generic-protocol device via report-descriptor parse — see USB-HID section). A composite device yields one bound device per matched interface
 
 **XHCI-058** `controller_reset()` sets USBCMD_HCRST and waits until it self-clears (500 ms, HLT wait). During reset the xHCI does not respond to operational register writes.
 
@@ -372,23 +382,33 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) matches **each interface** of the slot against the registry in one pass, collecting `Vec<(usize, &'static dyn UsbClassDriver)>`, hands every matched index to `configure_device`, then binds **every** matched interface by building its `InterfaceResources` and calling `init_interface`. If no interface matches, `bind_slot` returns `Ok(vec![])`, leaving the slot unconfigured (no SET_CONFIGURATION, no endpoint rings).
 
-**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings` for each matched interface and hands them to that interface's driver. A driver must not keep its own copy of a ring it does not consume. A failed `init_interface` is logged but does **not** abort the loop — the other matched interfaces of the same slot still bind.
+**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings` for each matched interface and hands them to that interface's driver. A driver must not keep its own copy of a ring it does not consume. `InterfaceResources` also carries `iface_num` — the `wIndex` target for interface-scoped control requests. `UsbClassDriver::init_interface` takes an additional `ep0_ring: &mut TrbRing` (the slot's shared default control-endpoint ring) so drivers can run control traffic while they bind; `bind_slot` passes `&mut slot.ep0_ring` and each driver's use of the ring completes before the next interface binds. A failed `init_interface` is logged but does **not** abort the loop — the other matched interfaces of the same slot still bind.
 
 **USB-CDR-005** `BoundUsbDevice::Block(Arc<dyn BlockDevice>)` devices are returned to `init_all`/`poll` and flow into the block layer; `BoundUsbDevice::Input(u32)` carries the UInputL-owned device id. Input devices are registered with UInputL *inside* `init_interface`, which is safe because `input::init()` runs before USB init in `Kernel::run()`. Because input devices self-register, `init_controller`/`poll` collect the full `Vec<BoundUsbDevice>` internally but return only the `Block` variants (the public `Vec<Arc<dyn BlockDevice>>` API is unchanged) — a composite device's input device is therefore visible to UInputL while only its storage device reaches the block layer.
 
 **USB-CDR-006** `MassStorageDriver::init_interface` requires both bulk endpoints and wraps the existing `UsbMassStorageDevice::new(...)` — it is a thin adapter and performs blocking SCSI I/O, so it must run on the init path, never interrupt context.
 
-## USB HID Boot Keyboard (`kernel/src/usb/class/hid.rs`)
+## USB HID (`kernel/src/usb/class/hid.rs`, `kernel/src/usb/class/hid_report.rs`)
 
-**USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only. The boot keyboard protocol (subclass 1, protocol 1) needs no report descriptor and no `SET_PROTOCOL`/`SET_IDLE` control transfers, so the class alone is sufficient. This phase binds exactly **one** keyboard; a second HID interface is rejected by `init_interface` with an error (the error is logged and the remaining matched interfaces of that slot still bind).
+**USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only; the boot-vs-generic decision is deferred to `init_interface`. Two report-format paths are supported:
+- **Boot path** (subclass `HID_SUBCLASS_BOOT` = 1, protocol 1 = keyboard / 2 = mouse): `init_interface` issues the class `SET_PROTOCOL(protocol, iface_num)` request on EP0, then decodes the fixed boot reports — 8-byte keyboard (modifier + reserved + 6 key usages), 4-byte mouse (buttons + X delta + Y delta + wheel delta). No report descriptor is needed.
+- **Generic path** (subclass 0, or boot subclass with protocol 0): the driver fetches the HID descriptor (0x21, 9 bytes, report-descriptor length from bytes 7-8) and the report descriptor (0x22) over EP0, parses them with `hid_report::parse_report_descriptor` for the device kind and report byte length, and interprets the report boot-style.
 
-**USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll **non-blockingly** consumes the interrupt-IN completion target's ready flag (XHCI-067); when a report is pending it diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s, then re-arms the next read. No key is emitted for usages with no `KeyCode` mapping.
+Exactly **one keyboard and one mouse** bind in this phase; a second device of the same kind is rejected by `init_interface` with an error (logged; the remaining matched interfaces of that slot still bind).
 
-**USB-HID-003** The interrupt-IN endpoint is configured by `configure_device` with the xHCI context type mapped from `(EP_TYPE_INTERRUPT, dci parity)` = `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `UsbEndpoint::interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
+**USB-HID-002** Devices are driven by UInputL `poll` hooks registered with `CAP_KEYS` (`hid_keyboard_poll`) / `CAP_MOUSE` (`hid_mouse_poll`). Each poll **non-blockingly** consumes the interrupt-IN completion target's ready flag (XHCI-067); when a report is pending it diffs against the previous state and emits press (1) / release (0) `InputEvent`s, then re-arms the next read. The keyboard diffs the modifier byte (via `modifier_keycode`) and the six key usages (via `usage_to_keycode`); no key is emitted for usages with no `KeyCode` mapping. The modifier decode keeps the Super/GUI bits (3, 7) mapped to `SuperLeft`/`SuperRight` alongside Ctrl/Shift/Alt — the keymap already tracks `super_`.
 
-**USB-HID-004** The interrupt-IN endpoint does **not** share `LAST_TRANSFER_STATE` with control/bulk. At bind time `init_interface` registers `(slot_id, dci)` in the interrupt-IN target table (`event::register_interrupt_target`) and arms the first read (one Normal TRB + `ring_doorbell`); **exactly one TRB is ever in flight**. The UInputL `poll` hook consumes the target's ready flag (`event::take_interrupt_completion`), diffs the report, and only then re-arms. While the device idles it NAKs, the TRB stays pending, and no Transfer Event is generated — so the hook is non-blocking and the ring never grows. Because a target consumes its completion directly, the HID keyboard and bulk I/O are fully decoupled and may run concurrently.
+**USB-HID-003** The mouse emits `InputType::Mouse` events with the evdev-numbered codes from `input/mouse.rs`: `REL_X`/`REL_Y`/`REL_WHEEL` (signed deltas, only when non-zero) and `BTN_LEFT`/`BTN_RIGHT`/`BTN_MIDDLE` (diff-based press/release over the low three button bits). Boot mice report `(buttons, dx, dy, wheel)`; generic absolute pointers (QEMU `usb-tablet`) report `(x, y, wheel, buttons)` and are diffed against the previous report to recover deltas (`absolute_pointer` flag).
 
-**USB-HID-005** The report buffer is single-buffered: a new read is armed only *after* the previous report has been diffed and emitted. There is a small window between the consume and the re-arm with no TRB in flight; the worst case is one ESIT of extra latency for the next report (the device holds the report until the next poll). Re-arming before consuming would let a new DMA overwrite an unprocessed report, so the order is fixed: consume → diff/emit → re-arm.
+**USB-HID-004** The interrupt-IN endpoint is configured by `configure_device` with the xHCI context type mapped from `(EP_TYPE_INTERRUPT, dci parity)` = `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `UsbEndpoint::interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
+
+**USB-HID-005** The interrupt-IN endpoint does **not** share `LAST_TRANSFER_STATE` with control/bulk. At bind time `init_interface` registers `(slot_id, dci)` in the interrupt-IN target table (`event::register_interrupt_target`) and arms the first read (one Normal TRB + `ring_doorbell`); **exactly one TRB is ever in flight**. The UInputL `poll` hook consumes the target's ready flag (`event::take_interrupt_completion`), diffs the report, and only then re-arms. While the device idles it NAKs, the TRB stays pending, and no Transfer Event is generated — so the hook is non-blocking and the ring never grows. Because a target consumes its completion directly, the HID devices and bulk I/O are fully decoupled and may run concurrently.
+
+**USB-HID-006** The report buffer is single-buffered: a new read is armed only *after* the previous report has been diffed and emitted. There is a small window between the consume and the re-arm with no TRB in flight; the worst case is one ESIT of extra latency for the next report (the device holds the report until the next poll). Re-arming before consuming would let a new DMA overwrite an unprocessed report, so the order is fixed: consume → diff/emit → re-arm.
+
+**USB-HID-007** `HidDeviceInner` is shared by both kinds (doorbell VA, slot id, DCI, ring, report phys/VA, device id, report length, `absolute_pointer`, and previous modifier/key/button/X/Y state) in two statics `KEYBOARD`/`MOUSE`. Both paths allocate the DMA report page up front; the generic path additionally allocates a scratch page for the descriptor fetches.
+
+**USB-HID-008** `hid_report::parse_report_descriptor` is a minimal HID short-item walker covering only the fallback needs: global Usage Page / Report Size / Report Count / Report ID, local Usage, and main Input/Output/Feature/Collection items (long items 0xFE skipped). The kind comes from the top-level Application collection's local usage on the Generic Desktop page (1): 0x06 = keyboard, 0x02/0x01 = mouse. The report byte length sums `Report Size × Report Count` over **Input items only** (output/feature items are not part of the input report), rounds up to a byte boundary, and adds one byte when a Report ID item is present. Unrecognized descriptors, a bad HID descriptor header, or a report length outside 1..=4096 make the generic path fail with an error.
 
 ---
 
@@ -447,6 +467,8 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 - `device::submit_interrupt()` (the blocking interrupt-IN helper) is retained in `device.rs` for the bulk-path style but is **no longer used** by HID; the HID driver registers an interrupt-IN target (XHCI-067) and keeps exactly one TRB in flight, re-arming only after consuming a completion
 - The HID `poll` hook must stay non-blocking: it runs while UInputL holds its `DEVICES` lock, must not call `register_device` or otherwise re-enter UInputL core state, and must never block on a transfer (the in-flight TRB may be pending indefinitely while the device idles)
 - `register_interrupt_target()` must be called before the first read is armed, and must not be called again for the same `(slot_id, dci)`
+- `init_interface` may issue blocking control transfers on the shared `ep0_ring` (HID `SET_PROTOCOL`, descriptor fetches) — this runs on the init path only, never in a poll hook or ISR
+- The generic-protocol path's blocking descriptor fetches must complete before the interrupt-IN read is armed (the scratch page is only valid during `init_interface`)
 
 ---
 

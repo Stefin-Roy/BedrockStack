@@ -33,6 +33,9 @@ pub struct EndpointResource {
 pub struct InterfaceResources {
     pub slot_id: u8,
     pub doorbell_va: u64,
+    /// The interface number (`wIndex` target for interface-scoped control
+    /// requests such as HID `SET_PROTOCOL`).
+    pub iface_num: u8,
     pub iface_class: u8,
     pub iface_subclass: u8,
     pub iface_protocol: u8,
@@ -55,10 +58,15 @@ pub enum BoundUsbDevice {
 pub trait UsbClassDriver: Send + Sync {
     fn name(&self) -> &str;
     fn probe(&self, iface_class: u8, subclass: u8, protocol: u8) -> bool;
+    /// Bind one configured interface.  `ep0_ring` is the slot's default
+    /// control-endpoint ring, shared while the interface configures itself
+    /// (HID uses it for `SET_PROTOCOL` and descriptor fetches); drivers that
+    /// need no control traffic ignore it.
     fn init_interface(
         &self,
         res: InterfaceResources,
         dma: &dyn DmaAllocator,
+        ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str>;
 }
 

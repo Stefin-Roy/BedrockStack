@@ -36,6 +36,7 @@
 pub mod event;
 pub mod keycode;
 pub mod keymap;
+pub mod mouse;
 mod queue;
 
 use alloc::vec::Vec;

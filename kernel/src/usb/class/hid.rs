@@ -1,17 +1,26 @@
-//! HID class driver (boot-keyboard only).
+//! HID class driver — boot keyboard + boot mouse, with a report-descriptor
+//! fallback for generic-protocol (non-boot) devices.
 //!
 //! Binds the interrupt-IN endpoint of a HID interface, registering it as an
 //! xHCI interrupt-IN completion target at bind time and arming one read.  The
 //! UInputL `poll` hook then *consumes* completed reports: when the target's
-//! ready flag is armed it diffs the 8-byte boot keyboard report against the
-//! previous state to emit normalized `InputEvent`s and re-arms the next read.
-//! Exactly one TRB is ever in flight; an idle device simply NAKs and leaves
-//! the TRB pending, so the poll hook stays non-blocking.  The boot protocol
-//! (subclass 1, protocol 1) needs no report descriptor and no SET_PROTOCOL,
-//! so interface class alone is enough to probe.
+//! ready flag is armed it diffs the report against the previous state to emit
+//! normalized `InputEvent`s and re-arms the next read.  Exactly one TRB is
+//! ever in flight; an idle device simply NAKs and leaves the TRB pending, so
+//! the poll hook stays non-blocking.
 //!
-//! Only one keyboard is supported in this phase; a second HID keyboard is
-//! rejected by `init_interface`.
+//! Two paths select the report format:
+//! - **Boot protocol** (subclass 1, protocol 1 = keyboard / 2 = mouse): the
+//!   driver issues the class `SET_PROTOCOL` request on EP0, then decodes the
+//!   fixed boot report (8-byte keyboard, 4-byte mouse) with no report
+//!   descriptor.
+//! - **Generic protocol** (subclass 0, or boot subclass with protocol 0): the
+//!   driver fetches the HID descriptor (0x21) and report descriptor (0x22)
+//!   over EP0, parses them (see [`crate::usb::class::hid_report`]) for the
+//!   device kind and report length, and decodes the report boot-style.
+//!
+//! One keyboard and one mouse are supported in this phase; a second device of
+//! the same kind is rejected by `init_interface`.
 
 use spin::Mutex;
 
@@ -19,18 +28,30 @@ use crate::drivers::serial::SerialPort;
 use crate::input;
 use crate::input::event::{InputEvent, InputType};
 use crate::input::keycode::KeyCode;
+use crate::input::mouse::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, REL_WHEEL, REL_X, REL_Y};
 use crate::services::dma::DmaAllocator;
 use crate::usb::class::driver::{BoundUsbDevice, InterfaceResources, UsbClassDriver};
+use crate::usb::class::hid_report;
 use crate::usb::xhci::command;
+use crate::usb::xhci::device;
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing};
-use crate::usb::usb::CLASS_HID;
+use crate::usb::usb::{CLASS_HID, DESC_HID, DESC_REPORT, HID_PROTOCOL_MOUSE, HID_SUBCLASS_BOOT, SetupPacket};
 
 /// Boot keyboard report: modifier byte, reserved byte, 6 key usages.
-const HID_BOOT_REPORT_LEN: u32 = 8;
+const HID_BOOT_KBD_REPORT_LEN: u32 = 8;
+/// Boot mouse report: buttons, X delta, Y delta, wheel delta.
+const HID_BOOT_MOUSE_REPORT_LEN: u32 = 4;
 const HID_MAX_KEYS: usize = 6;
 
-struct HidKeyboardInner {
+/// The device kind of a bound HID interface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HidKind {
+    Keyboard,
+    Mouse,
+}
+
+struct HidDeviceInner {
     doorbell_va: u64,
     slot_id: u8,
     dci: u8,
@@ -38,11 +59,20 @@ struct HidKeyboardInner {
     report_phys: u64,
     report_va: u64,
     device_id: u32,
+    report_len: u32,
+    /// Generic-protocol pointer (QEMU `usb-tablet`) reports absolute X/Y and
+    /// a button byte; boot-protocol mice report buttons first.  Drives the
+    /// mouse decode below.
+    absolute_pointer: bool,
     prev_mods: u8,
     prev_keys: [u8; HID_MAX_KEYS],
+    prev_buttons: u8,
+    prev_x: u8,
+    prev_y: u8,
 }
 
-static KEYBOARD: Mutex<Option<HidKeyboardInner>> = Mutex::new(None);
+static KEYBOARD: Mutex<Option<HidDeviceInner>> = Mutex::new(None);
+static MOUSE: Mutex<Option<HidDeviceInner>> = Mutex::new(None);
 
 pub struct HidDriver;
 
@@ -59,56 +89,152 @@ impl UsbClassDriver for HidDriver {
         &self,
         res: InterfaceResources,
         dma: &dyn DmaAllocator,
+        ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str> {
-        if KEYBOARD.lock().is_some() {
+        let report_page = dma.alloc_page().ok_or("OOM for HID report page")?;
+
+        // Decide the report format before moving `res.interrupt_in` (the
+        // generic path borrows `res` for the EP0 descriptor fetches).
+        let (kind, report_len, absolute_pointer) = if res.iface_subclass == HID_SUBCLASS_BOOT
+            && res.iface_protocol != crate::usb::usb::HID_PROTOCOL_NONE
+        {
+            // Boot path: select the protocol on EP0, then decode the fixed
+            // boot report.  `SET_PROTOCOL` is a no-data control transfer.
+            let (kind, len) = match res.iface_protocol {
+                crate::usb::usb::HID_PROTOCOL_KEYBOARD => (HidKind::Keyboard, HID_BOOT_KBD_REPORT_LEN),
+                HID_PROTOCOL_MOUSE => (HidKind::Mouse, HID_BOOT_MOUSE_REPORT_LEN),
+                _ => return Err("unsupported HID boot protocol"),
+            };
+            let setup = SetupPacket::set_protocol(res.iface_protocol as u16, res.iface_num as u16);
+            device::submit_control_transfer(
+                ep0_ring,
+                res.doorbell_va,
+                res.slot_id,
+                &setup,
+                0,
+                0,
+                false,
+            )?;
+            (kind, len, false)
+        } else {
+            // Generic path: fetch and parse the report descriptor to learn
+            // the kind and report length; the report is interpreted
+            // boot-style, so a pointer decodes absolute coordinates.
+            let scratch = dma.alloc_page().ok_or("OOM for HID descriptor page")?;
+            let (kind, len) = fetch_report_info(ep0_ring, &res, scratch.phys, scratch.virt)?;
+            (kind, len, kind == HidKind::Mouse)
+        };
+
+        let ep = res.interrupt_in.ok_or("HID needs interrupt IN endpoint")?;
+
+        if kind == HidKind::Keyboard && KEYBOARD.lock().is_some() {
             return Err("one USB HID keyboard already bound");
         }
+        if kind == HidKind::Mouse && MOUSE.lock().is_some() {
+            return Err("one USB HID mouse already bound");
+        }
 
-        let ep = res.interrupt_in.ok_or("HID keyboard needs interrupt IN endpoint")?;
-        let page = dma.alloc_page().ok_or("OOM for HID report page")?;
-
-        if !event::register_interrupt_target(res.slot_id, ep.dci, page.virt, HID_BOOT_REPORT_LEN) {
+        if !event::register_interrupt_target(res.slot_id, ep.dci, report_page.virt, report_len) {
             return Err("interrupt-IN target table full");
         }
 
-        let device_id = input::register_device("usb-hid-keyboard", input::CAP_KEYS, Some(hid_keyboard_poll));
+        let device_id = match kind {
+            HidKind::Keyboard => {
+                input::register_device("usb-hid-keyboard", input::CAP_KEYS, Some(hid_keyboard_poll))
+            }
+            HidKind::Mouse => {
+                input::register_device("usb-hid-mouse", input::CAP_MOUSE, Some(hid_mouse_poll))
+            }
+        };
 
-        let mut inner = HidKeyboardInner {
+        let mut inner = HidDeviceInner {
             doorbell_va: res.doorbell_va,
             slot_id: res.slot_id,
             dci: ep.dci,
             ring: ep.ring,
-            report_phys: page.phys,
-            report_va: page.virt,
+            report_phys: report_page.phys,
+            report_va: report_page.virt,
             device_id,
+            report_len,
+            absolute_pointer,
             prev_mods: 0,
             prev_keys: [0; HID_MAX_KEYS],
+            prev_buttons: 0,
+            prev_x: 0,
+            prev_y: 0,
         };
 
         // Arm the first interrupt-IN read.  Exactly one TRB stays in flight;
-        // the driver re-arms only after consuming a completion.  `make_normal_trb`
-        // sets IOC, so a Short Packet report still generates a Transfer Event.
-        inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, HID_BOOT_REPORT_LEN));
-        inner.ring.flush();
-        command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
+        // the driver re-arms only after consuming a completion.
+        arm_read(&mut inner);
 
-        *KEYBOARD.lock() = Some(inner);
+        match kind {
+            HidKind::Keyboard => *KEYBOARD.lock() = Some(inner),
+            HidKind::Mouse => *MOUSE.lock() = Some(inner),
+        }
 
-        SerialPort::puts("[usb-hid] keyboard bound slot=");
+        SerialPort::puts("[usb-hid] ");
+        SerialPort::puts(match kind {
+            HidKind::Keyboard => "keyboard",
+            HidKind::Mouse => "mouse",
+        });
+        SerialPort::puts(" bound slot=");
         SerialPort::put_u64(res.slot_id as u64);
         SerialPort::puts(" dci=");
         SerialPort::put_u64(ep.dci as u64);
-        SerialPort::puts("\n");
+        SerialPort::puts(" report=");
+        SerialPort::put_u64(report_len as u64);
+        SerialPort::puts(" bytes\n");
 
         Ok(BoundUsbDevice::Input(device_id))
     }
 }
 
+/// Fetch the HID descriptor (0x21) for the report-descriptor length, then the
+/// report descriptor (0x22), and parse both.  Returns the device kind and
+/// report byte length, or an error for unrecognized devices.
+fn fetch_report_info(
+    ep0_ring: &mut TrbRing,
+    res: &InterfaceResources,
+    buf_phys: u64,
+    buf_va: u64,
+) -> Result<(HidKind, u32), &'static str> {
+    let setup = SetupPacket::get_descriptor_interface(DESC_HID, 0, res.iface_num as u16, 9);
+    device::submit_control_transfer(ep0_ring, res.doorbell_va, res.slot_id, &setup, buf_phys, 9, true)?;
+    let hid = unsafe { core::slice::from_raw_parts(buf_va as *const u8, 9) };
+    if hid[0] < 9 || hid[1] != DESC_HID {
+        return Err("bad HID descriptor");
+    }
+    let report_len = u16::from_le_bytes([hid[7], hid[8]]);
+    if report_len == 0 || report_len > 4096 {
+        return Err("bad HID report descriptor length");
+    }
+
+    let setup = SetupPacket::get_descriptor_interface(DESC_REPORT, 0, res.iface_num as u16, report_len);
+    device::submit_control_transfer(
+        ep0_ring,
+        res.doorbell_va,
+        res.slot_id,
+        &setup,
+        buf_phys,
+        report_len,
+        true,
+    )?;
+    let rd = unsafe { core::slice::from_raw_parts(buf_va as *const u8, report_len as usize) };
+    let info = hid_report::parse_report_descriptor(rd).ok_or("unrecognized HID report descriptor")?;
+    Ok((info.kind, info.report_len as u32))
+}
+
+fn arm_read(inner: &mut HidDeviceInner) {
+    inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, inner.report_len));
+    inner.ring.flush();
+    command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
+}
+
 /// UInputL poll hook: non-blockingly consume one completed interrupt-IN read
-/// and emit the diff against the previous report.  Returns immediately when
-/// no completion has armed the ready flag (the single in-flight TRB is still
-/// pending while the device idles), and re-arms the next read after a
-/// consumed report is fully processed.
+/// on the keyboard and emit the diff against the previous report.  Returns
+/// immediately when no completion has armed the ready flag, and re-arms the
+/// next read only after a consumed report is fully processed.
 fn hid_keyboard_poll() {
     let mut kb = KEYBOARD.lock();
     let inner = match kb.as_mut() {
@@ -120,12 +246,19 @@ fn hid_keyboard_poll() {
         return;
     }
 
-    let report =
-        unsafe { core::slice::from_raw_parts(inner.report_va as *const u8, HID_BOOT_REPORT_LEN as usize) };
+    let len = inner.report_len as usize;
+    let report = unsafe { core::slice::from_raw_parts(inner.report_va as *const u8, len) };
     let mods = report[0];
-    let keys: [u8; HID_MAX_KEYS] = match report[2..8].try_into() {
-        Ok(k) => k,
-        Err(_) => return,
+    let keys: [u8; HID_MAX_KEYS] = if len >= 8 {
+        match report[2..8].try_into() {
+            Ok(k) => k,
+            Err(_) => return,
+        }
+    } else {
+        let mut k = [0u8; HID_MAX_KEYS];
+        let n = (len.saturating_sub(2)).min(HID_MAX_KEYS);
+        k[..n].copy_from_slice(&report[2..2 + n]);
+        k
     };
 
     for bit in 0..8u8 {
@@ -157,19 +290,85 @@ fn hid_keyboard_poll() {
     inner.prev_mods = mods;
     inner.prev_keys = keys;
 
-    // The report has been fully consumed; re-arm the next read.  No TRB is
-    // in flight during this window, so the buffer cannot be overwritten by a
-    // new DMA before we are done with it.
-    inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, HID_BOOT_REPORT_LEN));
-    inner.ring.flush();
-    command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
+    arm_read(inner);
+}
+
+/// UInputL poll hook for the mouse: button diffs plus signed axis deltas.
+/// Boot mice report `(buttons, dx, dy, wheel)`; generic absolute pointers
+/// (QEMU `usb-tablet`) report `(x, y, wheel, buttons)`, which are diffed
+/// against the previous report to recover deltas.
+fn hid_mouse_poll() {
+    let mut mouse = MOUSE.lock();
+    let inner = match mouse.as_mut() {
+        Some(i) => i,
+        None => return,
+    };
+
+    if event::take_interrupt_completion(inner.slot_id, inner.dci).is_none() {
+        return;
+    }
+
+    let report = unsafe { core::slice::from_raw_parts(inner.report_va as *const u8, inner.report_len as usize) };
+
+    let (buttons, dx, dy, wheel) = if inner.absolute_pointer {
+        let x = report.get(0).copied().unwrap_or(0);
+        let y = report.get(1).copied().unwrap_or(0);
+        let dx = x.wrapping_sub(inner.prev_x) as i8;
+        let dy = y.wrapping_sub(inner.prev_y) as i8;
+        inner.prev_x = x;
+        inner.prev_y = y;
+        (
+            report.get(3).copied().unwrap_or(0) & 0x07,
+            dx,
+            dy,
+            report.get(2).copied().unwrap_or(0) as i8,
+        )
+    } else {
+        (
+            report.get(0).copied().unwrap_or(0) & 0x07,
+            report.get(1).copied().unwrap_or(0) as i8,
+            report.get(2).copied().unwrap_or(0) as i8,
+            report.get(3).copied().unwrap_or(0) as i8,
+        )
+    };
+
+    for bit in 0..3u8 {
+        let pressed = buttons & (1 << bit) != 0;
+        let was_pressed = inner.prev_buttons & (1 << bit) != 0;
+        if pressed != was_pressed {
+            let code = match bit {
+                0 => BTN_LEFT,
+                1 => BTN_RIGHT,
+                _ => BTN_MIDDLE,
+            };
+            submit_mouse(inner.device_id, code, pressed as i32);
+        }
+    }
+    inner.prev_buttons = buttons;
+
+    if dx != 0 {
+        submit_mouse(inner.device_id, REL_X, dx as i32);
+    }
+    if dy != 0 {
+        submit_mouse(inner.device_id, REL_Y, dy as i32);
+    }
+    if wheel != 0 {
+        submit_mouse(inner.device_id, REL_WHEEL, wheel as i32);
+    }
+
+    arm_read(inner);
 }
 
 fn submit_key(device_id: u32, kc: KeyCode, value: i32) {
     input::submit_event(InputEvent::new(device_id, InputType::Key, kc.code(), value));
 }
 
-/// Boot-report modifier bit -> physical key code.
+fn submit_mouse(device_id: u32, code: u32, value: i32) {
+    input::submit_event(InputEvent::new(device_id, InputType::Mouse, code, value));
+}
+
+/// Boot-report modifier bit -> physical key code.  GUI bits (3, 7) are kept so
+/// the OS can see the Super keys (the keymap already tracks `super_`).
 fn modifier_keycode(bit: u8) -> Option<KeyCode> {
     match bit {
         0 => Some(KeyCode::ControlLeft),

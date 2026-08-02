@@ -285,6 +285,7 @@ impl UsbClassDriver for MassStorageDriver {
         &self,
         res: InterfaceResources,
         dma: &dyn crate::services::dma::DmaAllocator,
+        _ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str> {
         let bulk_in = res.bulk_in.ok_or("MSD needs bulk IN endpoint")?;
         let bulk_out = res.bulk_out.ok_or("MSD needs bulk OUT endpoint")?;
