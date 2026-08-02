@@ -305,7 +305,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 18. `drain_pending_and_clear_intr()`, diagnostic dump (USBSTS, IMAN, PORTSC1, ERDP)
 19. `enumerate_initial_ports()` — real slot enumeration into a `DeviceSlotManager`
 20. `verify_message_interrupt_delivery()` — No-Op command IRQ verification
-21. **Class binding**: for each slot, `bind_slot()` runs `get_config_descriptor_full()` → per-interface driver match → `configure_device()` → `init_interface`; matched mass-storage slots get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section), HID slots get an interrupt-IN boot keyboard (see USB-HID section)
+21. **Class binding**: for each slot, `bind_slot()` runs `get_config_descriptor_full()` → per-interface driver match → `configure_device()` (one Configure Endpoint command covering every matched interface) → `init_interface` for **each** matched interface; matched mass-storage interfaces get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section), HID interfaces get an interrupt-IN boot keyboard (see USB-HID section). A composite device yields one bound device per matched interface
 
 **XHCI-058** `controller_reset()` sets USBCMD_HCRST and waits until it self-clears (500 ms, HLT wait). During reset the xHCI does not respond to operational register writes.
 
@@ -370,17 +370,17 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **USB-CDR-002** `register_all()` is idempotent, guarded by a `REGISTERED: AtomicBool`. It is invoked lazily from `find_driver()` (not from the boot sequence), so the registry is self-contained.
 
-**USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) matches **each interface** of the slot against the registry, hands every matched index to `configure_device`, then binds the **first** matched interface by building its `InterfaceResources`. If no interface matches, the slot is left unbound (`Ok(None)`) and no endpoint rings are allocated.
+**USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) matches **each interface** of the slot against the registry in one pass, collecting `Vec<(usize, &'static dyn UsbClassDriver)>`, hands every matched index to `configure_device`, then binds **every** matched interface by building its `InterfaceResources` and calling `init_interface`. If no interface matches, `bind_slot` returns `Ok(vec![])`, leaving the slot unconfigured (no SET_CONFIGURATION, no endpoint rings).
 
-**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings` **for the bound interface only**. A driver must not keep its own copy of a ring it does not consume. Rings of matched-but-unbound interfaces stay in `slot.ep_rings` (retained for a future multi-driver binding pass).
+**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings` for each matched interface and hands them to that interface's driver. A driver must not keep its own copy of a ring it does not consume. A failed `init_interface` is logged but does **not** abort the loop — the other matched interfaces of the same slot still bind.
 
-**USB-CDR-005** `BoundUsbDevice::Block(Arc<dyn BlockDevice>)` devices are returned to `init_all`/`poll` and flow into the block layer; `BoundUsbDevice::Input(u32)` carries the UInputL-owned device id. Input devices are registered with UInputL *inside* `init_interface`, which is safe because `input::init()` runs before USB init in `Kernel::run()`.
+**USB-CDR-005** `BoundUsbDevice::Block(Arc<dyn BlockDevice>)` devices are returned to `init_all`/`poll` and flow into the block layer; `BoundUsbDevice::Input(u32)` carries the UInputL-owned device id. Input devices are registered with UInputL *inside* `init_interface`, which is safe because `input::init()` runs before USB init in `Kernel::run()`. Because input devices self-register, `init_controller`/`poll` collect the full `Vec<BoundUsbDevice>` internally but return only the `Block` variants (the public `Vec<Arc<dyn BlockDevice>>` API is unchanged) — a composite device's input device is therefore visible to UInputL while only its storage device reaches the block layer.
 
 **USB-CDR-006** `MassStorageDriver::init_interface` requires both bulk endpoints and wraps the existing `UsbMassStorageDevice::new(...)` — it is a thin adapter and performs blocking SCSI I/O, so it must run on the init path, never interrupt context.
 
 ## USB HID Boot Keyboard (`kernel/src/usb/class/hid.rs`)
 
-**USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only. The boot keyboard protocol (subclass 1, protocol 1) needs no report descriptor and no `SET_PROTOCOL`/`SET_IDLE` control transfers, so the class alone is sufficient. This phase binds exactly **one** keyboard; a second HID device is rejected by `init_interface` with an error.
+**USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only. The boot keyboard protocol (subclass 1, protocol 1) needs no report descriptor and no `SET_PROTOCOL`/`SET_IDLE` control transfers, so the class alone is sufficient. This phase binds exactly **one** keyboard; a second HID interface is rejected by `init_interface` with an error (the error is logged and the remaining matched interfaces of that slot still bind).
 
 **USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll submits one interrupt-IN read (`device::submit_interrupt`) with a **250 ms** timeout, then diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s. No key is emitted for usages with no `KeyCode` mapping.
 
