@@ -63,3 +63,20 @@ pub fn init(regions: &PciConfigRegions, root: u64, alloc: *mut BitmapAllocator) 
 pub fn devices() -> &'static [PciDevice] {
     enumerate::all()
 }
+
+/// Enable the device's memory space and bus master in the PCI Command
+/// register (offset 0x04, bits 1 and 2).
+///
+/// Firmware (OVMF, most BIOSes) configures boot-critical devices, but a
+/// real machine frequently hands the HDA/audio function over with memory
+/// decode still disabled — BAR reads then return 0xFF (all ones) until this
+/// is set.  QEMU hides the problem because OVMF enables every device during
+/// POST.  Mirrors Linux `pci_enable_device()`.
+pub fn enable_device(dev: &PciDevice) {
+    let pci_cfg = crate::services::kernel_services().pci_cfg;
+    let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
+    pci_cfg.write16(
+        dev.segment, dev.bus, dev.device, dev.function, 0x04,
+        cmd | (1 << 1) | (1 << 2),
+    );
+}

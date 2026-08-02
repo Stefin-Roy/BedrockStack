@@ -725,6 +725,7 @@ impl BlockDevice for AhciPort {
 
 fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
+    crate::pci::enable_device(dev);
     let base = match crate::pci::bar::bar(dev, 5) {
         crate::pci::bar::Bar::Memory { addr, .. } => addr,
         _ => {

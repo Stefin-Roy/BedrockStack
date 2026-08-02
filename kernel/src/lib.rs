@@ -4,6 +4,8 @@ extern crate alloc;
 
 pub mod acpi;
 pub mod arch;
+#[cfg(target_arch = "x86_64")]
+pub mod audio;
 pub mod boot;
 pub mod drivers;
 pub mod filesystems;
@@ -358,6 +360,10 @@ impl Kernel {
         let usb_block_devices = crate::usb::xhci::init_all(
             crate::pci::devices(),
         );
+
+        // Audio subsystem — probes PCI for an Intel HD Audio controller.
+        #[cfg(target_arch = "x86_64")]
+        crate::audio::init();
 
         #[cfg(target_arch = "x86_64")]
         {

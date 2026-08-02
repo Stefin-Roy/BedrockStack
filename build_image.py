@@ -103,6 +103,12 @@ def create_fat32_with_mtools(efi_binary_path, profile):
         print(f"  Kernel copied: {kernel_path}")
     else:
         print("  WARNING: Kernel binary not found")
+    wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
+    if os.path.exists(wav_path):
+        run(["mcopy", "-i", OUTPUT_IMG, wav_path, "::/EFI/BEDROCK/STARTUP.WAV"])
+        print(f"  Startup chime copied: {wav_path}")
+    else:
+        print("  WARNING: Sounds/startup.wav not found - no startup chime on image")
     print(f"  Image created: {OUTPUT_IMG}")
     return OUTPUT_IMG
 
@@ -124,6 +130,13 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
     if kernel_path:
         shutil.copy2(kernel_path, os.path.join(efi_bedrock_dir, "KERNEL"))
         print(f"  Kernel copied: {kernel_path}")
+
+    wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
+    if os.path.exists(wav_path):
+        shutil.copy2(wav_path, os.path.join(efi_bedrock_dir, "STARTUP.WAV"))
+        print(f"  Startup chime copied: {wav_path}")
+    else:
+        print("  WARNING: Sounds/startup.wav not found - no startup chime on image")
 
     # Create a blank image
     run(["qemu-img", "create", "-f", "raw", OUTPUT_IMG, "64M"])
@@ -253,6 +266,14 @@ def create_gpt_image(boot_path, kernel_path):
     kernel_wsl = to_wsl(kernel_path)
     esp_img_wsl = to_wsl(os.path.join(TARGET_DIR, "esp_part.img"))
 
+    wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
+    if os.path.exists(wav_path):
+        wav_wsl = to_wsl(wav_path)
+        wav_copy = f"mcopy -i '{esp_img_wsl}' '{wav_wsl}' ::/EFI/BEDROCK/STARTUP.WAV; "
+    else:
+        print("  WARNING: Sounds/startup.wav not found - no startup chime on ESP")
+        wav_copy = ""
+
     run_wsl(
         "set -euo pipefail; "
         f"dd if=/dev/zero of='{esp_img_wsl}' bs=1M count={ESP_MB}; "
@@ -262,8 +283,9 @@ def create_gpt_image(boot_path, kernel_path):
         f"mmd -i '{esp_img_wsl}' ::/EFI/BEDROCK; "
         f"mcopy -i '{esp_img_wsl}' '{boot_wsl}' ::/EFI/BOOT/BOOTX64.EFI; "
         f"mcopy -i '{esp_img_wsl}' '{kernel_wsl}' ::/EFI/BEDROCK/KERNEL; "
-        f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "
-        f"mdir -i '{esp_img_wsl}' ::/EFI/BEDROCK"
+        + wav_copy
+        + f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "
+        + f"mdir -i '{esp_img_wsl}' ::/EFI/BEDROCK"
     )
 
     print("  Splicing ESP into disk image...")

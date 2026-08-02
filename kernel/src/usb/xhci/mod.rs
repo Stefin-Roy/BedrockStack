@@ -84,6 +84,8 @@ pub fn init_all(
 fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
+    crate::pci::enable_device(dev);
+
     let phys_base = match crate::pci::bar::bar(dev, 0) {
         crate::pci::bar::Bar::Memory { addr, .. } => addr,
         _ => return Err("BAR0 not memory-mapped"),

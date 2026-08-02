@@ -49,6 +49,10 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -device usb-kbd ^
     -device usb-mouse ^
     -device usb-tablet ^
+    -audiodev dsound,id=au ^
+    -device ich9-intel-hda ^
+    -device hda-output,audiodev=au ^
+    -device hda-duplex,audiodev=au ^
     -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
     -device virtio-net,netdev=net0 ^
     -m 7120M ^

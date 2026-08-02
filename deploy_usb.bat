@@ -28,6 +28,7 @@ mkdir "%USB_DIR%\EFI\BOOT"
 mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%TARGET_DIR%\x86_64-unknown-uefi\release\boot.efi" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
+call :copy_chime
 echo Done. Copy contents of USB\ to your ESP.
 goto :done
 
@@ -111,7 +112,16 @@ mkdir "%USB_DIR%\EFI\BOOT"
 mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%GRUB_EFI%" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
+call :copy_chime
 echo Done. Copy contents of USB\ to your ESP (boot via UEFI GRUB which loads kernel via multiboot2).
 goto :done
+
+:copy_chime
+if exist "%SCRIPT_DIR%\Sounds\startup.wav" (
+    copy /Y "%SCRIPT_DIR%\Sounds\startup.wav" "%USB_DIR%\EFI\BEDROCK\STARTUP.WAV"
+) else (
+    echo [deploy] WARNING: Sounds\startup.wav not found - no startup chime
+)
+goto :eof
 
 :done

@@ -317,10 +317,25 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
                 inode.ops.truncate(0)?;
                 inode.size.store(0, Ordering::Relaxed);
             }
-            // Update cached dentry
-            if let Some(cd) = parent.children.lock().get(&leaf_name) {
-                *cd.inode.lock() = Some(inode.clone());
+            // Ensure the leaf is present in the parent's children map: opening
+            // an existing file whose exact path was never dentry-resolved (it
+            // may have been seen only via readdir, or the walk used different
+            // letter-case than this path) must not fail on the fd dentry.
+            let mut children = parent.children.lock();
+            match children.get(&leaf_name).cloned() {
+                Some(cd) => {
+                    *cd.inode.lock() = Some(inode.clone());
+                }
+                None => {
+                    let cd = Dentry::new(&leaf_name, Some(inode.clone()));
+                    *cd.parent.lock() = Arc::downgrade(&parent);
+                    let parent_ino = parent.inode.lock()
+                        .as_ref().map(|i| i.ino).unwrap_or(0);
+                    dcache().insert(parent_ino, leaf_name.clone(), Arc::downgrade(&cd));
+                    children.insert(leaf_name.clone(), cd);
+                }
             }
+            drop(children);
             inode
         }
         None => {
