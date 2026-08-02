@@ -117,8 +117,9 @@ impl SetupPacket {
     }
 
     /// HID class `SET_PROTOCOL` (HID spec §7.2.6): a no-data control
-    /// transfer selecting the report protocol.  `protocol` is the boot
-    /// protocol value (keyboard 1, mouse 2) or 0 for the generic protocol.
+    /// transfer selecting the device's report protocol.  `protocol` is the
+    /// HID protocol selector: 0 = boot protocol, 1 = report protocol.  It is
+    /// NOT the interface's `bInterfaceProtocol` (keyboard 1 / mouse 2).
     pub fn set_protocol(protocol: u16, iface: u16) -> Self {
         SetupPacket {
             bm_request_type: BMREQ_HOST_TO_DEVICE | USB_TYPE_CLASS | USB_RECIP_INTERFACE,

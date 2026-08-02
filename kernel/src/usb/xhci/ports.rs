@@ -60,7 +60,7 @@ impl UsbPorts {
                 self.ports[i].speed = speed as u8;
 
                 let speed_str = match speed {
-                    1 => "LS", 2 => "FS", 3 => "HS", 4 => "SS", _ => "?",
+                    1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
                 };
                 SerialPort::puts("[xhci] port ");
                 SerialPort::put_u64(port_num as u64);
@@ -119,7 +119,7 @@ impl UsbPorts {
             self.ports[idx].speed = speed as u8;
 
             let speed_str = match speed {
-                1 => "LS", 2 => "FS", 3 => "HS", 4 => "SS", _ => "?",
+                1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
             };
             SerialPort::puts("[xhci] port ");
             SerialPort::put_u64(port_num as u64);
@@ -147,7 +147,7 @@ impl UsbPorts {
                 let speed = (portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
                 self.ports[idx].speed = speed as u8;
                 let speed_str = match speed {
-                    1 => "LS", 2 => "FS", 3 => "HS", 4 => "SS", _ => "?",
+                    1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
                 };
                 SerialPort::puts("[xhci] port ");
                 SerialPort::put_u64(port_num as u64);

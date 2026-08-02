@@ -105,7 +105,7 @@ impl UsbClassDriver for HidDriver {
                 HID_PROTOCOL_MOUSE => (HidKind::Mouse, HID_BOOT_MOUSE_REPORT_LEN),
                 _ => return Err("unsupported HID boot protocol"),
             };
-            let setup = SetupPacket::set_protocol(res.iface_protocol as u16, res.iface_num as u16);
+            let setup = SetupPacket::set_protocol(crate::usb::usb::HID_PROTOCOL_NONE as u16, res.iface_num as u16);
             device::submit_control_transfer(
                 ep0_ring,
                 res.doorbell_va,
