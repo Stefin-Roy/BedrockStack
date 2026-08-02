@@ -1,9 +1,12 @@
 //! HID class driver (boot-keyboard only).
 //!
-//! Binds the interrupt-IN endpoint of a HID interface, then polls it through
-//! the UInputL `poll` hook: each poll submits one interrupt-IN read, waits for
-//! the transfer, and diffs the 8-byte boot keyboard report against the
-//! previous state to emit normalized `InputEvent`s.  The boot protocol
+//! Binds the interrupt-IN endpoint of a HID interface, registering it as an
+//! xHCI interrupt-IN completion target at bind time and arming one read.  The
+//! UInputL `poll` hook then *consumes* completed reports: when the target's
+//! ready flag is armed it diffs the 8-byte boot keyboard report against the
+//! previous state to emit normalized `InputEvent`s and re-arms the next read.
+//! Exactly one TRB is ever in flight; an idle device simply NAKs and leaves
+//! the TRB pending, so the poll hook stays non-blocking.  The boot protocol
 //! (subclass 1, protocol 1) needs no report descriptor and no SET_PROTOCOL,
 //! so interface class alone is enough to probe.
 //!
@@ -18,17 +21,14 @@ use crate::input::event::{InputEvent, InputType};
 use crate::input::keycode::KeyCode;
 use crate::services::dma::DmaAllocator;
 use crate::usb::class::driver::{BoundUsbDevice, InterfaceResources, UsbClassDriver};
-use crate::usb::xhci::device;
-use crate::usb::xhci::memory::TrbRing;
+use crate::usb::xhci::command;
+use crate::usb::xhci::event;
+use crate::usb::xhci::memory::{self, TrbRing};
 use crate::usb::usb::CLASS_HID;
 
 /// Boot keyboard report: modifier byte, reserved byte, 6 key usages.
 const HID_BOOT_REPORT_LEN: u32 = 8;
 const HID_MAX_KEYS: usize = 6;
-
-/// How long an idle poll waits for an interrupt-IN transfer.  Kept short so a
-/// read on an empty queue returns quickly when no key is held.
-const HID_POLL_TIMEOUT_NS: u64 = 250_000_000;
 
 struct HidKeyboardInner {
     doorbell_va: u64,
@@ -66,9 +66,14 @@ impl UsbClassDriver for HidDriver {
 
         let ep = res.interrupt_in.ok_or("HID keyboard needs interrupt IN endpoint")?;
         let page = dma.alloc_page().ok_or("OOM for HID report page")?;
+
+        if !event::register_interrupt_target(res.slot_id, ep.dci, page.virt, HID_BOOT_REPORT_LEN) {
+            return Err("interrupt-IN target table full");
+        }
+
         let device_id = input::register_device("usb-hid-keyboard", input::CAP_KEYS, Some(hid_keyboard_poll));
 
-        *KEYBOARD.lock() = Some(HidKeyboardInner {
+        let mut inner = HidKeyboardInner {
             doorbell_va: res.doorbell_va,
             slot_id: res.slot_id,
             dci: ep.dci,
@@ -78,7 +83,16 @@ impl UsbClassDriver for HidDriver {
             device_id,
             prev_mods: 0,
             prev_keys: [0; HID_MAX_KEYS],
-        });
+        };
+
+        // Arm the first interrupt-IN read.  Exactly one TRB stays in flight;
+        // the driver re-arms only after consuming a completion.  `make_normal_trb`
+        // sets IOC, so a Short Packet report still generates a Transfer Event.
+        inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, HID_BOOT_REPORT_LEN));
+        inner.ring.flush();
+        command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
+
+        *KEYBOARD.lock() = Some(inner);
 
         SerialPort::puts("[usb-hid] keyboard bound slot=");
         SerialPort::put_u64(res.slot_id as u64);
@@ -90,8 +104,11 @@ impl UsbClassDriver for HidDriver {
     }
 }
 
-/// UInputL poll hook: perform one interrupt-IN read and emit the diff against
-/// the previous report.
+/// UInputL poll hook: non-blockingly consume one completed interrupt-IN read
+/// and emit the diff against the previous report.  Returns immediately when
+/// no completion has armed the ready flag (the single in-flight TRB is still
+/// pending while the device idles), and re-arms the next read after a
+/// consumed report is fully processed.
 fn hid_keyboard_poll() {
     let mut kb = KEYBOARD.lock();
     let inner = match kb.as_mut() {
@@ -99,17 +116,7 @@ fn hid_keyboard_poll() {
         None => return,
     };
 
-    if device::submit_interrupt(
-        &mut inner.ring,
-        inner.doorbell_va,
-        inner.slot_id,
-        inner.dci,
-        inner.report_phys,
-        HID_BOOT_REPORT_LEN,
-        HID_POLL_TIMEOUT_NS,
-    )
-    .is_err()
-    {
+    if event::take_interrupt_completion(inner.slot_id, inner.dci).is_none() {
         return;
     }
 
@@ -149,6 +156,13 @@ fn hid_keyboard_poll() {
 
     inner.prev_mods = mods;
     inner.prev_keys = keys;
+
+    // The report has been fully consumed; re-arm the next read.  No TRB is
+    // in flight during this window, so the buffer cannot be overwritten by a
+    // new DMA before we are done with it.
+    inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, HID_BOOT_REPORT_LEN));
+    inner.ring.flush();
+    command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
 }
 
 fn submit_key(device_id: u32, kc: KeyCode, value: i32) {

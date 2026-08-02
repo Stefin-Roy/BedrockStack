@@ -382,11 +382,13 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only. The boot keyboard protocol (subclass 1, protocol 1) needs no report descriptor and no `SET_PROTOCOL`/`SET_IDLE` control transfers, so the class alone is sufficient. This phase binds exactly **one** keyboard; a second HID interface is rejected by `init_interface` with an error (the error is logged and the remaining matched interfaces of that slot still bind).
 
-**USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll submits one interrupt-IN read (`device::submit_interrupt`) with a **250 ms** timeout, then diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s. No key is emitted for usages with no `KeyCode` mapping.
+**USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll **non-blockingly** consumes the interrupt-IN completion target's ready flag (XHCI-067); when a report is pending it diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s, then re-arms the next read. No key is emitted for usages with no `KeyCode` mapping.
 
 **USB-HID-003** The interrupt-IN endpoint is configured by `configure_device` with the xHCI context type mapped from `(EP_TYPE_INTERRUPT, dci parity)` = `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `UsbEndpoint::interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
 
-**USB-HID-004** Interrupt-IN completions reuse the same single-slot `LAST_TRANSFER_STATE` atomic as control/bulk (see XHCI-065). `submit_interrupt` waits with the caller-chosen timeout and consumes its own completion. The HID poll and bulk I/O must not run concurrently on the same endpoint pair — today they are serialised because the module run and the input-test loop run on the BSP and never perform concurrent block I/O.
+**USB-HID-004** The interrupt-IN endpoint does **not** share `LAST_TRANSFER_STATE` with control/bulk. At bind time `init_interface` registers `(slot_id, dci)` in the interrupt-IN target table (`event::register_interrupt_target`) and arms the first read (one Normal TRB + `ring_doorbell`); **exactly one TRB is ever in flight**. The UInputL `poll` hook consumes the target's ready flag (`event::take_interrupt_completion`), diffs the report, and only then re-arms. While the device idles it NAKs, the TRB stays pending, and no Transfer Event is generated — so the hook is non-blocking and the ring never grows. Because a target consumes its completion directly, the HID keyboard and bulk I/O are fully decoupled and may run concurrently.
+
+**USB-HID-005** The report buffer is single-buffered: a new read is armed only *after* the previous report has been diffed and emitted. There is a small window between the consume and the re-arm with no TRB in flight; the worst case is one ESIT of extra latency for the next report (the device holds the report until the next poll). Re-arming before consuming would let a new DMA overwrite an unprocessed report, so the order is fixed: consume → diff/emit → re-arm.
 
 ---
 
@@ -400,10 +402,18 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 - `XHCI_RT_VA` (AtomicU64) — set once during init, read by IRQ handler for IMAN/ERDP writes
 - `XHCI_OP_VA` (AtomicU64) — set once during init, read by IRQ handler for USBSTS EINT clear
 - `LAST_CMD_STATE` (AtomicU64) — written by `consume_pending_events` (IRQ or poll), read-and-clear by `last_command_completion` (init or command submit path). The seen flag (bit 63) prevents stale reads
-- `LAST_TRANSFER_STATE` (AtomicU64) — same protocol for bulk/control/interrupt transfer completions; read-and-clear by `last_transfer_completion`, peeked by `peek_last_transfer_completion`. Shared by the MSD bulk path and the HID interrupt-IN poll hook (USB-HID-004): exactly one transfer may be awaited at a time
+- `LAST_TRANSFER_STATE` (AtomicU64) — same protocol for bulk/control transfer completions; read-and-clear by `last_transfer_completion`, peeked by `peek_last_transfer_completion`. Owned by the control/bulk wait path (`wait_for_transfer`); interrupt-IN completions for registered targets are routed away from it (see XHCI-067)
 - `PORT_EVENTS` + `PORT_EVENTS_HEAD`/`PORT_EVENTS_TAIL` — SPSC port-change ring (see XHCI-029)
+- `INTERRUPT_TARGETS` + per-target `slot_id`/`dci`/`buf_va`/`cap`/`remaining`/`ready` — SPSC interrupt-IN completion table (see XHCI-067)
 
-**XHCI-066** All atomic accesses use `Ordering::Relaxed` except `LAST_CMD_STATE`/`LAST_TRANSFER_STATE` (Release store in consumer, AcqRel swap in reader) and the `PORT_EVENTS` ring (Acquire/Release on head/tail with release/acquire fences on the payload).
+**XHCI-066** All atomic accesses use `Ordering::Relaxed` except `LAST_CMD_STATE`/`LAST_TRANSFER_STATE` (Release store in consumer, AcqRel swap in reader), the `PORT_EVENTS` ring (Acquire/Release on head/tail with release/acquire fences on the payload), and the `INTERRUPT_TARGETS` table (Release publish of `slot_id` in `register_interrupt_target`, Acquire load of `slot_id` on the producer side, Release store of `ready` in the ISR, AcqRel swap of `ready` in `take_interrupt_completion`).
+
+**XHCI-067** Interrupt-IN completions for registered endpoints are routed to a per-target ready flag by `route_to_interrupt_target`, which runs inside `consume_pending_events` (ISR or poll). The ISR is the only producer, the class driver's poll hook the only consumer (SPSC). Routing rules:
+- A completion for a registered `(slot_id, dci)` with completion code **Success (1) or Short Packet (13)** stores the residual transfer length in `remaining` (Relaxed) then sets `ready` (Release), and is **not** published to `LAST_TRANSFER_STATE`.
+- Every other completion — unregistered endpoints, and error codes on registered endpoints — is published to `LAST_TRANSFER_STATE` exactly as before, so `wait_for_transfer`'s slot+ep peek predicate is unaffected.
+- `register_interrupt_target` writes all fields then publishes `slot_id` last with Release (an Acquire load on the producer side guarantees the ISR never sees a half-formed target); `take_interrupt_completion` finds the target, AcqRel-swaps `ready` to false (synchronising the `remaining` store), and returns the received length.
+- Table capacity is `INTERRUPT_TARGET_CAP = 4`; registration rejects `slot_id == 0`, duplicate pairs, and a full table.
+- **Known limitation**: an error completion (code not 1/13) on a registered endpoint falls through to `LAST_TRANSFER_STATE` and is dropped, so the poll cannot distinguish "TRB errored" from "still pending" — a rare endpoint error (e.g. a stall) leaves the keyboard silent until the device is reset or replugged. The xHC also halts the endpoint on most transfer errors, so the subsequent doorbell would be ignored until a Reset Endpoint + Set TR Dequeue Pointer recovery (out of scope for this phase).
 
 ---
 
@@ -434,8 +444,9 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 ### Class drivers / HID (caller must ensure)
 - `find_driver()` may call `register_all()` on first use; it is not a re-entrancy hazard (guarded by `AtomicBool`)
-- `submit_interrupt()` blocks up to the caller-chosen timeout and consumes its transfer completion — do not call it while another transfer on the same `LAST_TRANSFER_STATE` slot is outstanding
-- The HID `poll` hook runs while UInputL holds its `DEVICES` lock; the hook must not call `register_device` or otherwise re-enter UInputL core state
+- `device::submit_interrupt()` (the blocking interrupt-IN helper) is retained in `device.rs` for the bulk-path style but is **no longer used** by HID; the HID driver registers an interrupt-IN target (XHCI-067) and keeps exactly one TRB in flight, re-arming only after consuming a completion
+- The HID `poll` hook must stay non-blocking: it runs while UInputL holds its `DEVICES` lock, must not call `register_device` or otherwise re-enter UInputL core state, and must never block on a transfer (the in-flight TRB may be pending indefinitely while the device idles)
+- `register_interrupt_target()` must be called before the first read is armed, and must not be called again for the same `(slot_id, dci)`
 
 ---
 

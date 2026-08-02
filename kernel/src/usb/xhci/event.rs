@@ -1,4 +1,4 @@
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
 use crate::drivers::serial::SerialPort;
 
@@ -121,6 +121,112 @@ pub fn port_change_pending() -> bool {
     PORT_EVENTS_HEAD.load(Ordering::Acquire) != PORT_EVENTS_TAIL.load(Ordering::Acquire)
 }
 
+// ── Interrupt-IN completion targets ───────────────────────────────
+//
+// A small lock-free table routing transfer events for registered
+// interrupt-IN endpoints straight to a per-target `ready` flag, so class
+// drivers can poll for input without disturbing the shared
+// LAST_TRANSFER_STATE slot (which the blocking control/bulk wait path
+// owns).  The ISR (via `consume_pending_events`) is the only producer;
+// the class driver's poll hook is the only consumer.  A target is armed
+// only by a Success (1) or Short Packet (13) completion, exactly the
+// codes `wait_for_transfer` accepts — everything else falls through to
+// LAST_TRANSFER_STATE unchanged.
+
+const INTERRUPT_TARGET_CAP: usize = 4;
+
+struct InterruptTarget {
+    /// 0 = free; device slot ids are 1-based.  Released/published last so
+    /// the ISR only ever observes a fully-formed target.
+    slot_id: AtomicU8,
+    dci: AtomicU8,
+    buf_va: AtomicU64,
+    cap: AtomicU32,
+    /// Received transfer length, valid while `ready` is set.
+    remaining: AtomicU32,
+    ready: AtomicBool,
+}
+
+const fn new_interrupt_target() -> InterruptTarget {
+    InterruptTarget {
+        slot_id: AtomicU8::new(0),
+        dci: AtomicU8::new(0),
+        buf_va: AtomicU64::new(0),
+        cap: AtomicU32::new(0),
+        remaining: AtomicU32::new(0),
+        ready: AtomicBool::new(false),
+    }
+}
+
+static INTERRUPT_TARGETS: [InterruptTarget; INTERRUPT_TARGET_CAP] =
+    [const { new_interrupt_target() }; INTERRUPT_TARGET_CAP];
+
+/// Register `(slot_id, dci)` as an interrupt-IN completion target so a
+/// Success/Short-Packet transfer event for that endpoint arms `ready`.
+/// The caller is responsible for keeping exactly one TRB in flight and
+/// calling [`take_interrupt_completion`] before re-arming.
+///
+/// Returns `false` if the slot is invalid, the pair is already registered,
+/// or the table is full.
+pub fn register_interrupt_target(slot_id: u8, dci: u8, buf_va: u64, cap: u32) -> bool {
+    if slot_id == 0 || dci == 0 {
+        return false;
+    }
+    for t in INTERRUPT_TARGETS.iter() {
+        if t.slot_id.load(Ordering::Acquire) == slot_id && t.dci.load(Ordering::Relaxed) == dci {
+            return false;
+        }
+    }
+    for t in INTERRUPT_TARGETS.iter() {
+        if t.slot_id.load(Ordering::Relaxed) != 0 {
+            continue;
+        }
+        // Publish the identity fields first; the Release store of `slot_id`
+        // publishes them to the ISR's Acquire load on the same entry.
+        t.ready.store(false, Ordering::Relaxed);
+        t.remaining.store(0, Ordering::Relaxed);
+        t.buf_va.store(buf_va, Ordering::Relaxed);
+        t.cap.store(cap, Ordering::Relaxed);
+        t.dci.store(dci, Ordering::Relaxed);
+        t.slot_id.store(slot_id, Ordering::Release);
+        return true;
+    }
+    false
+}
+
+/// Poll-consumes a pending completion for `(slot_id, dci)`, returning the
+/// received transfer length (the Transfer Event's residual `remaining`) if
+/// the target's ready flag was armed, or `None` if no completion is pending.
+pub fn take_interrupt_completion(slot_id: u8, dci: u8) -> Option<u32> {
+    for t in INTERRUPT_TARGETS.iter() {
+        if t.slot_id.load(Ordering::Acquire) == slot_id && t.dci.load(Ordering::Relaxed) == dci {
+            if t.ready.swap(false, Ordering::AcqRel) {
+                return Some(t.remaining.load(Ordering::Relaxed));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// Route a transfer completion to the interrupt-IN target for `(slot_id,
+/// ep_id)`, if one is registered and the completion code is Success (1) or
+/// Short Packet (13).  Returns `true` when the completion was consumed by a
+/// target and must NOT be published to LAST_TRANSFER_STATE.
+fn route_to_interrupt_target(slot_id: u8, ep_id: u8, cc: u8, remaining: u32) -> bool {
+    if cc != 1 && cc != 13 {
+        return false;
+    }
+    for t in INTERRUPT_TARGETS.iter() {
+        if t.slot_id.load(Ordering::Acquire) == slot_id && t.dci.load(Ordering::Relaxed) == ep_id {
+            t.remaining.store(remaining, Ordering::Relaxed);
+            t.ready.store(true, Ordering::Release);
+            return true;
+        }
+    }
+    false
+}
+
 pub fn consume_pending_events() {
     let er_vaddr = XHCI_ER_VADDR.load(Ordering::Relaxed);
     if er_vaddr == 0 {
@@ -187,12 +293,18 @@ pub fn consume_pending_events() {
                     SerialPort::put_u64(remaining as u64);
                     SerialPort::puts("\n");
                 });
-                let state = (slot_id as u64) << 48
-                    | (ep_id as u64) << 40
-                    | (cc as u64) << 32
-                    | (remaining as u64)
-                    | (1u64 << 63);
-                LAST_TRANSFER_STATE.store(state, Ordering::Release);
+                if route_to_interrupt_target(slot_id, ep_id, cc, remaining) {
+                    // Consumed by an interrupt-IN target; leave
+                    // LAST_TRANSFER_STATE untouched so wait_for_transfer
+                    // never observes a foreign completion.
+                } else {
+                    let state = (slot_id as u64) << 48
+                        | (ep_id as u64) << 40
+                        | (cc as u64) << 32
+                        | (remaining as u64)
+                        | (1u64 << 63);
+                    LAST_TRANSFER_STATE.store(state, Ordering::Release);
+                }
             }
             37 => {
                 usb_trace!({
