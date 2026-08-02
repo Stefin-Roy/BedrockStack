@@ -9,6 +9,30 @@ use crate::usb::xhci::context::{self, EndpointConfig};
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing};
 
+/// A USB interface (alternate setting 0) parsed from the configuration
+/// descriptor.  Endpoints carry the xHCI endpoint-context fields so the
+/// Configure Endpoint command can be built directly from them.
+#[derive(Clone)]
+pub struct UsbInterface {
+    pub iface_num: u8,
+    pub class: u8,
+    pub subclass: u8,
+    pub protocol: u8,
+    pub endpoints: Vec<UsbEndpoint>,
+}
+
+/// One non-default endpoint of an interface.
+/// `ep_type` is the USB transfer type (`usb::EP_TYPE_BULK`/`EP_TYPE_INTERRUPT`);
+/// `interval` is the pre-converted xHCI endpoint-context Interval value
+/// (spec Table 6-12), 0 for bulk.
+#[derive(Clone, Copy)]
+pub struct UsbEndpoint {
+    pub dci: u8,
+    pub ep_type: u8,
+    pub mps: u16,
+    pub interval: u8,
+}
+
 pub struct DeviceSlot {
     pub slot_id: u8,
     pub port_num: u8,
@@ -23,17 +47,7 @@ pub struct DeviceSlot {
     pub product_id: u16,
     pub ep_rings: Vec<(u8, TrbRing)>,
     pub config_value: u8,
-    pub interface_class: u8,
-    pub interface_subclass: u8,
-    pub interface_protocol: u8,
-    pub bulk_in_dci: u8,
-    pub bulk_out_dci: u8,
-    pub bulk_in_mps: u16,
-    pub bulk_out_mps: u16,
-    pub interrupt_in_dci: u8,
-    pub interrupt_in_mps: u16,
-    /// xHCI endpoint-context Interval value (spec Table 6-12), 0 if none.
-    pub interrupt_in_interval: u8,
+    pub interfaces: Vec<UsbInterface>,
 }
 
 impl DeviceSlot {
@@ -62,16 +76,7 @@ impl DeviceSlot {
             product_id: 0,
             ep_rings: Vec::new(),
             config_value: 0,
-            interface_class: 0,
-            interface_subclass: 0,
-            interface_protocol: 0,
-            bulk_in_dci: 0,
-            bulk_out_dci: 0,
-            bulk_in_mps: 0,
-            bulk_out_mps: 0,
-            interrupt_in_dci: 0,
-            interrupt_in_mps: 0,
-            interrupt_in_interval: 0,
+            interfaces: Vec::new(),
         }
     }
 }
@@ -209,28 +214,10 @@ pub fn get_config_descriptor_full(
         SerialPort::puts(" bytes)\n");
     }
 
-    #[derive(Clone, Copy)]
-    struct IfaceInfo {
-        num: u8,
-        class: u8,
-        subclass: u8,
-        protocol: u8,
-        bulk_in_dci: u8,
-        bulk_out_dci: u8,
-        bulk_in_mps: u16,
-        bulk_out_mps: u16,
-        interrupt_in_dci: u8,
-        interrupt_in_mps: u16,
-        interrupt_in_interval: u8,
-    }
-    let zero = IfaceInfo {
-        num: 0, class: 0, subclass: 0, protocol: 0,
-        bulk_in_dci: 0, bulk_out_dci: 0,
-        bulk_in_mps: 0, bulk_out_mps: 0,
-        interrupt_in_dci: 0, interrupt_in_mps: 0, interrupt_in_interval: 0,
-    };
-    let mut ifaces = [zero; 8];
-    let mut iface_count: u8 = 0;
+    // Rebuild the interface table from scratch so this function is
+    // idempotent even if called twice on the same slot.
+    slot.interfaces.clear();
+
     let mut cur_iface_num: u8 = 0;
     let mut cur_alt_setting: u8 = 0;
 
@@ -254,13 +241,16 @@ pub fn get_config_descriptor_full(
                 if let Some(iface) = InterfaceDescriptor::parse(&cfg_buf[offset..]) {
                     cur_iface_num = iface.interface_number();
                     cur_alt_setting = iface.alternate_setting();
-                    if cur_alt_setting == 0 && (iface_count as usize) < ifaces.len() {
-                        let idx = iface_count as usize;
-                        ifaces[idx].num = cur_iface_num;
-                        ifaces[idx].class = iface.class();
-                        ifaces[idx].subclass = iface.subclass();
-                        ifaces[idx].protocol = iface.protocol();
-                        iface_count += 1;
+                    // Record only alternate setting 0; higher settings of the
+                    // same interface share the same class/subclass/protocol.
+                    if cur_alt_setting == 0 {
+                        slot.interfaces.push(UsbInterface {
+                            iface_num: cur_iface_num,
+                            class: iface.class(),
+                            subclass: iface.subclass(),
+                            protocol: iface.protocol(),
+                            endpoints: Vec::new(),
+                        });
                         if cfg!(feature = "usb_trace") {
                             SerialPort::puts("[xhci]    iface ");
                             SerialPort::put_u64(iface.interface_number() as u64);
@@ -282,45 +272,39 @@ pub fn get_config_descriptor_full(
                         let is_in = ep.is_in();
                         let dci: u8 = (ep_num * 2) + if is_in { 1 } else { 0 };
                         let ep_type = ep.transfer_type();
-                        if ep_type == usb::EP_TYPE_BULK {
-                            for i in 0..(iface_count as usize) {
-                                if ifaces[i].num == cur_iface_num {
-                                    if is_in {
-                                        ifaces[i].bulk_in_dci = dci;
-                                        ifaces[i].bulk_in_mps = ep.max_packet_size();
+                        // Record bulk endpoints (either direction) and
+                        // interrupt-IN endpoints.  Interrupt-OUT and isochronous
+                        // endpoints are not used by the current class drivers.
+                        let record = ep_type == usb::EP_TYPE_BULK
+                            || (ep_type == usb::EP_TYPE_INTERRUPT && is_in);
+                        if record {
+                            if let Some(iface) = slot
+                                .interfaces
+                                .iter_mut()
+                                .find(|i| i.iface_num == cur_iface_num)
+                            {
+                                iface.endpoints.push(UsbEndpoint {
+                                    dci,
+                                    ep_type,
+                                    mps: ep.max_packet_size(),
+                                    interval: if ep_type == usb::EP_TYPE_BULK {
+                                        0
                                     } else {
-                                        ifaces[i].bulk_out_dci = dci;
-                                        ifaces[i].bulk_out_mps = ep.max_packet_size();
-                                    }
-                                    if cfg!(feature = "usb_trace") {
-                                        SerialPort::puts("[xhci]      bulk ");
-                                        SerialPort::puts(if is_in { "IN " } else { "OUT" });
-                                        SerialPort::puts(" dci=");
-                                        SerialPort::put_u64(dci as u64);
-                                        SerialPort::puts(" mps=");
-                                        SerialPort::put_u64(ep.max_packet_size() as u64);
-                                        SerialPort::puts("\n");
-                                    }
-                                    break;
-                                }
-                            }
-                        } else if ep_type == usb::EP_TYPE_INTERRUPT && is_in {
-                            for i in 0..(iface_count as usize) {
-                                if ifaces[i].num == cur_iface_num {
-                                    ifaces[i].interrupt_in_dci = dci;
-                                    ifaces[i].interrupt_in_mps = ep.max_packet_size();
-                                    ifaces[i].interrupt_in_interval =
-                                        usb_interval_to_context(slot.speed, ep.interval());
-                                    if cfg!(feature = "usb_trace") {
-                                        SerialPort::puts("[xhci]      intr IN dci=");
-                                        SerialPort::put_u64(dci as u64);
-                                        SerialPort::puts(" mps=");
-                                        SerialPort::put_u64(ep.max_packet_size() as u64);
-                                        SerialPort::puts(" interval=");
-                                        SerialPort::put_u64(ifaces[i].interrupt_in_interval as u64);
-                                        SerialPort::puts("\n");
-                                    }
-                                    break;
+                                        usb_interval_to_context(slot.speed, ep.interval())
+                                    },
+                                });
+                                if cfg!(feature = "usb_trace") {
+                                    SerialPort::puts("[xhci]      ");
+                                    SerialPort::puts(match ep_type {
+                                        usb::EP_TYPE_BULK if is_in => "bulk IN ",
+                                        usb::EP_TYPE_BULK => "bulk OUT",
+                                        _ => "intr IN ",
+                                    });
+                                    SerialPort::puts(" dci=");
+                                    SerialPort::put_u64(dci as u64);
+                                    SerialPort::puts(" mps=");
+                                    SerialPort::put_u64(ep.max_packet_size() as u64);
+                                    SerialPort::puts("\n");
                                 }
                             }
                         }
@@ -332,55 +316,42 @@ pub fn get_config_descriptor_full(
         offset += len;
     }
 
-    // Prefer mass storage interface; fall back to first non-zero class,
-    // or interface 0 if all interfaces report class=0 (device-level class).
-    let mut chosen: Option<usize> = None;
-    for i in 0..(iface_count as usize) {
-        if ifaces[i].class == usb::CLASS_MASS_STORAGE {
-            chosen = Some(i);
-            break;
-        }
-    }
-    let chosen = chosen.or_else(|| {
-        let idx = (0..(iface_count as usize)).position(|i| ifaces[i].class != 0);
-        idx.or(if iface_count > 0 { Some(0) } else { None })
-    });
-
-    if let Some(idx) = chosen {
-        slot.interface_class = ifaces[idx].class;
-        slot.interface_subclass = ifaces[idx].subclass;
-        slot.interface_protocol = ifaces[idx].protocol;
-        slot.bulk_in_dci = ifaces[idx].bulk_in_dci;
-        slot.bulk_out_dci = ifaces[idx].bulk_out_dci;
-        slot.bulk_in_mps = ifaces[idx].bulk_in_mps;
-        slot.bulk_out_mps = ifaces[idx].bulk_out_mps;
-        slot.interrupt_in_dci = ifaces[idx].interrupt_in_dci;
-        slot.interrupt_in_mps = ifaces[idx].interrupt_in_mps;
-        slot.interrupt_in_interval = ifaces[idx].interrupt_in_interval;
-        if cfg!(feature = "usb_trace") {
-            SerialPort::puts("[xhci]  selected iface ");
-            SerialPort::put_u64(ifaces[idx].num as u64);
-            if ifaces[idx].class == usb::CLASS_MASS_STORAGE {
-                SerialPort::puts(" (mass storage)\n");
-            } else {
-                SerialPort::puts(" (fallback)\n");
-            }
-        }
-    } else if cfg!(feature = "usb_trace") {
-        SerialPort::puts("[xhci]  no usable interface found\n");
+    if cfg!(feature = "usb_trace") {
+        SerialPort::puts("[xhci]  ");
+        SerialPort::put_u64(slot.interfaces.len() as u64);
+        SerialPort::puts(" interface(s) recorded\n");
     }
 
     Ok(())
 }
 
+/// Map a USB transfer type + direction to the xHCI endpoint-context type
+/// (spec §6.2.3 Table 6-4: types are per-direction; DCI parity encodes it,
+/// even = OUT, odd = IN).
+fn context_ep_type(ep_type: u8, dci: u8) -> u32 {
+    match (ep_type, dci & 1) {
+        (usb::EP_TYPE_BULK, 0) => context::EP_TYPE_BULK_OUT,
+        (usb::EP_TYPE_BULK, _) => context::EP_TYPE_BULK_IN,
+        (usb::EP_TYPE_INTERRUPT, 0) => context::EP_TYPE_INTERRUPT_OUT,
+        (usb::EP_TYPE_INTERRUPT, _) => context::EP_TYPE_INTERRUPT_IN,
+        _ => context::EP_TYPE_CONTROL,
+    }
+}
+
+/// Configure the given interfaces' endpoints on the xHC.
+///
+/// `iface_indices` indexes into `slot.interfaces`; every endpoint of every
+/// listed interface gets a transfer ring and an endpoint-context entry, all
+/// applied by a single Configure Endpoint command (spec §4.3.5).  Per the
+/// xHCI spec, SET_CONFIGURATION to the USB device MUST precede the Configure
+/// Endpoint command to the xHC.
 pub fn configure_device(
     slot: &mut DeviceSlot,
     cmd_ring: &mut TrbRing,
     doorbell_va: u64,
     dma: &dyn DmaAllocator,
+    iface_indices: &[usize],
 ) -> Result<(), &'static str> {
-    // Per xHCI §4.8.1, SET_CONFIGURATION to the USB device MUST precede
-    // the Configure Endpoint command to the xHC.
     if slot.config_value != 0 {
         let setup = SetupPacket::set_configuration(slot.config_value);
         submit_control(slot, doorbell_va, &setup, 0, 0, false)?;
@@ -393,52 +364,32 @@ pub fn configure_device(
     let mut ring_pairs: Vec<(u8, TrbRing)> = Vec::new();
     let mut endpoints: Vec<EndpointConfig> = Vec::new();
 
-    if slot.bulk_out_dci != 0 {
-        let ring = TrbRing::new(dma, 4096)?;
-        let dci = slot.bulk_out_dci;
-        endpoints.push(EndpointConfig {
-            dci,
-            ep_type: context::EP_TYPE_BULK_OUT,
-            max_packet_size: slot.bulk_out_mps,
-            dequeue_phys: ring.phys,
-            cerr: 3,
-            avg_trb_len: 3072,
-            max_burst: 0,
-            interval: 0,
-        });
-        ring_pairs.push((dci, ring));
-    }
-
-    if slot.bulk_in_dci != 0 {
-        let ring = TrbRing::new(dma, 4096)?;
-        let dci = slot.bulk_in_dci;
-        endpoints.push(EndpointConfig {
-            dci,
-            ep_type: context::EP_TYPE_BULK_IN,
-            max_packet_size: slot.bulk_in_mps,
-            dequeue_phys: ring.phys,
-            cerr: 3,
-            avg_trb_len: 3072,
-            max_burst: 0,
-            interval: 0,
-        });
-        ring_pairs.push((dci, ring));
-    }
-
-    if slot.interrupt_in_dci != 0 {
-        let ring = TrbRing::new(dma, 4096)?;
-        let dci = slot.interrupt_in_dci;
-        endpoints.push(EndpointConfig {
-            dci,
-            ep_type: context::EP_TYPE_INTERRUPT_IN,
-            max_packet_size: slot.interrupt_in_mps,
-            dequeue_phys: ring.phys,
-            cerr: 3,
-            avg_trb_len: slot.interrupt_in_mps.max(8) as u16,
-            max_burst: 0,
-            interval: slot.interrupt_in_interval,
-        });
-        ring_pairs.push((dci, ring));
+    // One transfer ring + endpoint context per endpoint DCI across the
+    // matched interfaces.  Deduplicate by DCI in case two matched interfaces
+    // share an endpoint (malformed but harmless).
+    for &idx in iface_indices {
+        let iface = &slot.interfaces[idx];
+        for ep in &iface.endpoints {
+            if ring_pairs.iter().any(|(d, _)| *d == ep.dci) {
+                continue;
+            }
+            let ring = TrbRing::new(dma, 4096)?;
+            endpoints.push(EndpointConfig {
+                dci: ep.dci,
+                ep_type: context_ep_type(ep.ep_type, ep.dci),
+                max_packet_size: ep.mps,
+                dequeue_phys: ring.phys,
+                cerr: 3,
+                avg_trb_len: if ep.ep_type == usb::EP_TYPE_BULK {
+                    3072
+                } else {
+                    ep.mps.max(8)
+                },
+                max_burst: 0,
+                interval: ep.interval,
+            });
+            ring_pairs.push((ep.dci, ring));
+        }
     }
 
     // Only push to slot.ep_rings once all allocations succeeded.
@@ -450,19 +401,13 @@ pub fn configure_device(
 
     SerialPort::puts("[xhci]  configured slot=");
     SerialPort::put_u64(slot.slot_id as u64);
-    SerialPort::puts(" class=");
-    SerialPort::put_u64(slot.interface_class as u64);
-    if slot.bulk_out_dci != 0 {
-        SerialPort::puts(" bulk_out_dci=");
-        SerialPort::put_u64(slot.bulk_out_dci as u64);
-    }
-    if slot.bulk_in_dci != 0 {
-        SerialPort::puts(" bulk_in_dci=");
-        SerialPort::put_u64(slot.bulk_in_dci as u64);
-    }
-    if slot.interrupt_in_dci != 0 {
-        SerialPort::puts(" intr_in_dci=");
-        SerialPort::put_u64(slot.interrupt_in_dci as u64);
+    SerialPort::puts(" ifaces=");
+    SerialPort::put_u64(iface_indices.len() as u64);
+    SerialPort::puts(" eps=");
+    SerialPort::put_u64(endpoints.len() as u64);
+    for (dci, _) in &slot.ep_rings {
+        SerialPort::puts(" dci=");
+        SerialPort::put_u64(*dci as u64);
     }
     SerialPort::puts("\n");
 

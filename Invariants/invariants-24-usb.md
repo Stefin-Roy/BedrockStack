@@ -240,7 +240,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 ## xHCI Device Management (`kernel/src/usb/xhci/device.rs`)
 
-**XHCI-047** `DeviceSlot` replaces the old `UsbDevice`: `slot_id`, `port_num`, `speed`, `mps`, `icc_phys`/`icc_va` (one shared `InputControlContext` page), `ep0_ring`, `address`, `vendor_id`/`product_id`, `ep_rings: Vec<(dci, TrbRing)>`, `config_value`, `interface_class`/`subclass`/`protocol`, `bulk_in_dci`/`bulk_out_dci` and their MPS values.
+**XHCI-047** `DeviceSlot` replaces the old `UsbDevice`: `slot_id`, `port_num`, `speed`, `mps`, `icc_phys`/`icc_va` (one shared `InputControlContext` page), `ep0_ring`, `address`, `vendor_id`/`product_id`, `ep_rings: Vec<(dci, TrbRing)>`, `config_value`, and `interfaces: Vec<UsbInterface>`. Each `UsbInterface` (alternate setting 0) carries `iface_num`/`class`/`subclass`/`protocol` plus `endpoints: Vec<UsbEndpoint>`; each `UsbEndpoint` carries `dci`, the USB transfer `ep_type` (`EP_TYPE_BULK`/`EP_TYPE_INTERRUPT`), `mps`, and the **pre-converted** xHCI endpoint-context `interval` (spec Table 6-12, 0 for bulk).
 
 **XHCI-048** `DeviceSlotManager` maintains `slots: Vec<DeviceSlot>` and a `next_address` counter starting at 1. The slot id comes from the controller via `submit_enable_slot()`.
 
@@ -265,15 +265,16 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **XHCI-053** `get_config_descriptor_full()`:
 1. Fetch the 9-byte config header, parse `total_length` (reject > 4096)
-2. Fetch the full blob, walk `(length, type)` pairs recording interfaces (alt-setting 0 only) and bulk endpoints (DCI = `ep_num*2 + (is_in?1:0)`)
-3. **Interface selection**: prefer mass storage class; else first non-zero class; else interface 0
-4. Records `config_value`, chosen interface class/subclass/protocol, and bulk IN/OUT DCI + MPS
+2. Fetch the full blob, walk `(length, type)` pairs, rebuilding `slot.interfaces` from scratch (`clear()` at entry makes the function idempotent)
+3. Record every interface at **alternate setting 0** as a `UsbInterface` (higher alt-settings share class/subclass/protocol and are skipped)
+4. Record bulk endpoints (either direction) and interrupt-IN endpoints into the current interface as `UsbEndpoint { dci = ep_num*2 + (is_in?1:0), ep_type, mps, interval }`; `interval` = `usb_interval_to_context()` for interrupt-IN, 0 for bulk
+5. Record `config_value` from the config descriptor. No interface is singled out at parse time — selection happens later in `bind_slot` via the driver registry
 
-**XHCI-054** `configure_device()`:
+**XHCI-054** `configure_device(slot, cmd_ring, doorbell_va, dma, iface_indices)`:
 - Sends the USB `SET_CONFIGURATION` control transfer **before** the xHC Configure Endpoint command (xHCI §4.8.1)
-- Builds bulk IN/OUT endpoint contexts (type, MPS, dequeue phys, `cerr=3`, `avg_trb_len=3072`)
-- Allocates one `TrbRing` per bulk endpoint; **only pushes to `slot.ep_rings` after all allocations succeed** (no partial state)
-- `init_icc_for_configure_endpoint()` fills the shared ICC, then `submit_configure_endpoint`
+- For every endpoint DCI of the interfaces named by `iface_indices` (deduplicated by DCI), allocates one `TrbRing` and one `EndpointConfig` (context type mapped from `(ep_type, dci parity)`, MPS, dequeue phys, `cerr=3`, `avg_trb_len` 3072 for bulk / `mps.max(8)` for interrupt, converted `interval`)
+- **Only pushes to `slot.ep_rings` after all allocations succeed** (no partial state)
+- One `init_icc_for_configure_endpoint()` fills the shared ICC for **all** endpoints, then a single `submit_configure_endpoint` — all matched interfaces are configured by one command
 
 **XHCI-055** `submit_bulk()` enqueues a Normal TRB (IOC) for `data_len` bytes (rejecting > 64 KiB per TRB), flushes, rings the endpoint doorbell, and waits for the matching transfer completion.
 
@@ -304,7 +305,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 18. `drain_pending_and_clear_intr()`, diagnostic dump (USBSTS, IMAN, PORTSC1, ERDP)
 19. `enumerate_initial_ports()` — real slot enumeration into a `DeviceSlotManager`
 20. `verify_message_interrupt_delivery()` — No-Op command IRQ verification
-21. **Class binding**: for each unconfigured slot, `get_config_descriptor_full()` → `configure_device()`; mass-storage slots get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section)
+21. **Class binding**: for each slot, `bind_slot()` runs `get_config_descriptor_full()` → per-interface driver match → `configure_device()` → `init_interface`; matched mass-storage slots get bulk rings and a `UsbMassStorageDevice` (see USB-MSD section), HID slots get an interrupt-IN boot keyboard (see USB-HID section)
 
 **XHCI-058** `controller_reset()` sets USBCMD_HCRST and waits until it self-clears (500 ms, HLT wait). During reset the xHCI does not respond to operational register writes.
 
@@ -369,9 +370,9 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **USB-CDR-002** `register_all()` is idempotent, guarded by a `REGISTERED: AtomicBool`. It is invoked lazily from `find_driver()` (not from the boot sequence), so the registry is self-contained.
 
-**USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) calls it after `configure_device` and hands the winner an `InterfaceResources`; if no driver matches, the slot is left unbound (`Ok(None)`) and the extracted endpoint rings drop (DMA memory is not freed by `TrbRing`'s drop — rings are deliberately leaked to the driver/registry lifetime).
+**USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) matches **each interface** of the slot against the registry, hands every matched index to `configure_device`, then binds the **first** matched interface by building its `InterfaceResources`. If no interface matches, the slot is left unbound (`Ok(None)`) and no endpoint rings are allocated.
 
-**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings`. A driver must not keep its own copy of a ring it does not consume.
+**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings` **for the bound interface only**. A driver must not keep its own copy of a ring it does not consume. Rings of matched-but-unbound interfaces stay in `slot.ep_rings` (retained for a future multi-driver binding pass).
 
 **USB-CDR-005** `BoundUsbDevice::Block(Arc<dyn BlockDevice>)` devices are returned to `init_all`/`poll` and flow into the block layer; `BoundUsbDevice::Input(u32)` carries the UInputL-owned device id. Input devices are registered with UInputL *inside* `init_interface`, which is safe because `input::init()` runs before USB init in `Kernel::run()`.
 
@@ -383,7 +384,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 **USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll submits one interrupt-IN read (`device::submit_interrupt`) with a **250 ms** timeout, then diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s. No key is emitted for usages with no `KeyCode` mapping.
 
-**USB-HID-003** The interrupt-IN endpoint is configured by `configure_device` with `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `DeviceSlot::interrupt_in_interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
+**USB-HID-003** The interrupt-IN endpoint is configured by `configure_device` with the xHCI context type mapped from `(EP_TYPE_INTERRUPT, dci parity)` = `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `UsbEndpoint::interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
 
 **USB-HID-004** Interrupt-IN completions reuse the same single-slot `LAST_TRANSFER_STATE` atomic as control/bulk (see XHCI-065). `submit_interrupt` waits with the caller-chosen timeout and consumes its own completion. The HID poll and bulk I/O must not run concurrently on the same endpoint pair — today they are serialised because the module run and the input-test loop run on the BSP and never perform concurrent block I/O.
 

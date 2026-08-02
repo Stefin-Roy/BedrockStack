@@ -257,9 +257,6 @@ fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Ve
     let mut block_devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
     for i in 0..dev_mgr.slots.len() {
         let slot = &mut dev_mgr.slots[i];
-        if slot.interface_class != 0 || slot.config_value != 0 {
-            continue; // already configured
-        }
         match bind_slot(slot, &mut cmd_ring, doorbell_va, dma) {
             Ok(Some(dev)) => block_devices.push(dev),
             Ok(None) => {}
@@ -291,6 +288,10 @@ fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Ve
 
 /// Full configuration + class-driver binding for one enumerated slot.
 /// Returns the bound block device, or None if the slot needs no class driver.
+///
+/// Every interface whose class/subclass/protocol matches a registered driver
+/// is configured on the xHC (all its endpoints get transfer rings); the first
+/// matched interface is then bound to its driver.
 fn bind_slot(
     slot: &mut device::DeviceSlot,
     cmd_ring: &mut memory::TrbRing,
@@ -298,31 +299,46 @@ fn bind_slot(
     dma: &dyn DmaAllocator,
 ) -> Result<Option<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
+    use crate::usb::usb::{EP_TYPE_BULK, EP_TYPE_INTERRUPT};
 
     device::get_config_descriptor_full(slot, doorbell_va, slot.icc_phys, slot.icc_va)?;
 
-    if slot.interface_class == 0 {
+    if slot.interfaces.is_empty() {
         return Ok(None);
     }
 
-    device::configure_device(slot, cmd_ring, doorbell_va, dma)?;
+    // Match each interface against the class-driver registry.
+    let mut matched: Vec<usize> = Vec::new();
+    for (idx, iface) in slot.interfaces.iter().enumerate() {
+        if crate::usb::class::driver::find_driver(iface.class, iface.subclass, iface.protocol).is_some() {
+            matched.push(idx);
+        }
+    }
+    if matched.is_empty() {
+        return Ok(None);
+    }
 
-    // Extract the endpoint rings the class driver needs.  Ring ownership
-    // moves into the driver via `InterfaceResources`.
+    // Configure every matched interface's endpoints on the xHC.
+    device::configure_device(slot, cmd_ring, doorbell_va, dma, &matched)?;
+
+    // Bind the first matched interface.  Copy its metadata out first so we
+    // can mutate slot.ep_rings (extracting the rings the driver owns).
+    let bound = slot.interfaces[matched[0]].clone();
+    let take_ring = |slot: &mut device::DeviceSlot, dci: u8| -> Option<(u8, memory::TrbRing)> {
+        let pos = slot.ep_rings.iter().position(|(d, _)| *d == dci)?;
+        Some(slot.ep_rings.remove(pos))
+    };
+
     let mut bulk_out = None;
     let mut bulk_in = None;
     let mut interrupt_in = None;
-    let mut i = 0;
-    while i < slot.ep_rings.len() {
-        let (dci, _) = slot.ep_rings[i];
-        if dci == slot.bulk_out_dci && bulk_out.is_none() {
-            bulk_out = Some(slot.ep_rings.remove(i));
-        } else if dci == slot.bulk_in_dci && bulk_in.is_none() {
-            bulk_in = Some(slot.ep_rings.remove(i));
-        } else if dci == slot.interrupt_in_dci && interrupt_in.is_none() {
-            interrupt_in = Some(slot.ep_rings.remove(i));
-        } else {
-            i += 1;
+    for ep in &bound.endpoints {
+        let ring = take_ring(slot, ep.dci);
+        match (ep.ep_type, ep.dci & 1) {
+            (EP_TYPE_BULK, 0) => bulk_out = ring,
+            (EP_TYPE_BULK, _) => bulk_in = ring,
+            (EP_TYPE_INTERRUPT, _) => interrupt_in = ring,
+            _ => {}
         }
     }
 
@@ -331,22 +347,41 @@ fn bind_slot(
         |pair: Option<(u8, memory::TrbRing)>, mps: u16, interval: u8| -> Option<EndpointResource> {
             pair.map(|(dci, ring)| EndpointResource { dci, mps, interval, ring })
         };
+    let ep_meta = |ep: &device::UsbEndpoint| (ep.mps, ep.interval);
+    let (bulk_out_mps, _) = bound
+        .endpoints
+        .iter()
+        .find(|e| e.ep_type == EP_TYPE_BULK && e.dci & 1 == 0)
+        .map(ep_meta)
+        .unwrap_or((0, 0));
+    let (bulk_in_mps, _) = bound
+        .endpoints
+        .iter()
+        .find(|e| e.ep_type == EP_TYPE_BULK && e.dci & 1 == 1)
+        .map(ep_meta)
+        .unwrap_or((0, 0));
+    let (intr_mps, intr_interval) = bound
+        .endpoints
+        .iter()
+        .find(|e| e.ep_type == EP_TYPE_INTERRUPT && e.dci & 1 == 1)
+        .map(ep_meta)
+        .unwrap_or((0, 0));
 
     let res = InterfaceResources {
         slot_id: slot.slot_id,
         doorbell_va,
-        iface_class: slot.interface_class,
-        iface_subclass: slot.interface_subclass,
-        iface_protocol: slot.interface_protocol,
-        bulk_in: to_resource(bulk_in, slot.bulk_in_mps, 0),
-        bulk_out: to_resource(bulk_out, slot.bulk_out_mps, 0),
-        interrupt_in: to_resource(interrupt_in, slot.interrupt_in_mps, slot.interrupt_in_interval),
+        iface_class: bound.class,
+        iface_subclass: bound.subclass,
+        iface_protocol: bound.protocol,
+        bulk_in: to_resource(bulk_in, bulk_in_mps, 0),
+        bulk_out: to_resource(bulk_out, bulk_out_mps, 0),
+        interrupt_in: to_resource(interrupt_in, intr_mps, intr_interval),
     };
 
     let driver = match crate::usb::class::driver::find_driver(
-        slot.interface_class,
-        slot.interface_subclass,
-        slot.interface_protocol,
+        bound.class,
+        bound.subclass,
+        bound.protocol,
     ) {
         Some(d) => d,
         None => return Ok(None),
@@ -356,6 +391,8 @@ fn bind_slot(
     SerialPort::puts(driver.name());
     SerialPort::puts(" bind slot=");
     SerialPort::put_u64(slot.slot_id as u64);
+    SerialPort::puts(" iface=");
+    SerialPort::put_u64(bound.iface_num as u64);
     SerialPort::puts("\n");
 
     match driver.init_interface(res, dma)? {
