@@ -307,40 +307,61 @@ fn bind_slot(
 
     device::configure_device(slot, cmd_ring, doorbell_va, dma)?;
 
-    if slot.interface_class == crate::usb::usb::CLASS_MASS_STORAGE
-        && slot.bulk_in_dci != 0
-        && slot.bulk_out_dci != 0
-    {
-        SerialPort::puts("[xhci]  found USB mass storage\n");
-
-        let mut bulk_out_ring = None;
-        let mut bulk_in_ring = None;
-        let mut i = 0;
-        while i < slot.ep_rings.len() {
-            let (dci, _) = slot.ep_rings[i];
-            if dci == slot.bulk_out_dci {
-                bulk_out_ring = Some(slot.ep_rings.remove(i));
-            } else if dci == slot.bulk_in_dci {
-                bulk_in_ring = Some(slot.ep_rings.remove(i));
-            } else {
-                i += 1;
-            }
+    // Extract the endpoint rings the class driver needs.  Ring ownership
+    // moves into the driver via `InterfaceResources`.
+    let mut bulk_out = None;
+    let mut bulk_in = None;
+    let mut interrupt_in = None;
+    let mut i = 0;
+    while i < slot.ep_rings.len() {
+        let (dci, _) = slot.ep_rings[i];
+        if dci == slot.bulk_out_dci && bulk_out.is_none() {
+            bulk_out = Some(slot.ep_rings.remove(i));
+        } else if dci == slot.bulk_in_dci && bulk_in.is_none() {
+            bulk_in = Some(slot.ep_rings.remove(i));
+        } else if dci == slot.interrupt_in_dci && interrupt_in.is_none() {
+            interrupt_in = Some(slot.ep_rings.remove(i));
+        } else {
+            i += 1;
         }
-        let bulk_out_ring = bulk_out_ring.ok_or("missing bulk OUT ring")?.1;
-        let bulk_in_ring = bulk_in_ring.ok_or("missing bulk IN ring")?.1;
-
-        let dev = crate::usb::class::mass_storage::UsbMassStorageDevice::new(
-            doorbell_va,
-            slot.slot_id,
-            slot.bulk_out_dci,
-            slot.bulk_in_dci,
-            bulk_out_ring,
-            bulk_in_ring,
-            dma,
-        )?;
-        return Ok(Some(dev));
     }
-    Ok(None)
+
+    use crate::usb::class::driver::{BoundUsbDevice, EndpointResource, InterfaceResources};
+    let to_resource =
+        |pair: Option<(u8, memory::TrbRing)>, mps: u16, interval: u8| -> Option<EndpointResource> {
+            pair.map(|(dci, ring)| EndpointResource { dci, mps, interval, ring })
+        };
+
+    let res = InterfaceResources {
+        slot_id: slot.slot_id,
+        doorbell_va,
+        iface_class: slot.interface_class,
+        iface_subclass: slot.interface_subclass,
+        iface_protocol: slot.interface_protocol,
+        bulk_in: to_resource(bulk_in, slot.bulk_in_mps, 0),
+        bulk_out: to_resource(bulk_out, slot.bulk_out_mps, 0),
+        interrupt_in: to_resource(interrupt_in, slot.interrupt_in_mps, slot.interrupt_in_interval),
+    };
+
+    let driver = match crate::usb::class::driver::find_driver(
+        slot.interface_class,
+        slot.interface_subclass,
+        slot.interface_protocol,
+    ) {
+        Some(d) => d,
+        None => return Ok(None),
+    };
+
+    SerialPort::puts("[usbdrv] ");
+    SerialPort::puts(driver.name());
+    SerialPort::puts(" bind slot=");
+    SerialPort::put_u64(slot.slot_id as u64);
+    SerialPort::puts("\n");
+
+    match driver.init_interface(res, dma)? {
+        BoundUsbDevice::Block(dev) => Ok(Some(dev)),
+        BoundUsbDevice::Input(_id) => Ok(None),
+    }
 }
 
 /// Poll the retained xHCI controller for queued port-change events and

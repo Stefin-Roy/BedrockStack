@@ -16,6 +16,7 @@ const EP_TYPE_SHIFT: u32 = 3;
 const EP_MAX_PACKET_SHIFT: u32 = 16;
 const EP_AVG_TRB_LENGTH_SHIFT: u32 = 0;
 const EP_MAX_BURST_SHIFT: u32 = 16;
+const EP_INTERVAL_SHIFT: u32 = 16;
 const EP_DCS: u64 = 1;
 
 pub const EP_TYPE_CONTROL: u32 = 4;
@@ -65,8 +66,12 @@ fn init_ep_context(
     cerr: u8,
     avg_trb_len: u16,
     max_burst: u8,
+    interval: u8,
 ) {
     let base = icc_va + ep_ctx_off(ctx_size, context_index);
+    // dw0 bits 23:16: Interval — the polling period as `125us * 2^Interval`
+    // (spec Table 6-8).  Zero for bulk/control (never NAK).
+    write32(base, 0x00, ((interval as u32) & 0xFF) << EP_INTERVAL_SHIFT);
     // dw1: CErr | EP Type | Max Packet Size.
     write32(
         base,
@@ -101,7 +106,7 @@ pub fn init_icc_for_address_device(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0);
 }
 
 /// Build an Input Control Context for an Evaluate Context command that
@@ -118,7 +123,7 @@ pub fn init_icc_for_evaluate_ep0(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0);
 }
 
 /// Build an Input Control Context for a Configure Endpoint command that
@@ -153,6 +158,7 @@ pub fn init_icc_for_configure_endpoint(
                 ep.cerr,
                 ep.avg_trb_len,
                 ep.max_burst,
+                ep.interval,
             );
         }
     }

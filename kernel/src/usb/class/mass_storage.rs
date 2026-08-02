@@ -266,6 +266,41 @@ impl UsbMassStorageDevice {
     }
 }
 
+use crate::usb::class::driver::{BoundUsbDevice, InterfaceResources, UsbClassDriver};
+use crate::usb::usb::CLASS_MASS_STORAGE;
+
+/// Class driver for the Mass Storage Class (Bulk-Only Transport).
+pub struct MassStorageDriver;
+
+impl UsbClassDriver for MassStorageDriver {
+    fn name(&self) -> &str {
+        "usb-mass-storage"
+    }
+
+    fn probe(&self, iface_class: u8, _subclass: u8, _protocol: u8) -> bool {
+        iface_class == CLASS_MASS_STORAGE
+    }
+
+    fn init_interface(
+        &self,
+        res: InterfaceResources,
+        dma: &dyn crate::services::dma::DmaAllocator,
+    ) -> Result<BoundUsbDevice, &'static str> {
+        let bulk_in = res.bulk_in.ok_or("MSD needs bulk IN endpoint")?;
+        let bulk_out = res.bulk_out.ok_or("MSD needs bulk OUT endpoint")?;
+        let dev = UsbMassStorageDevice::new(
+            res.doorbell_va,
+            res.slot_id,
+            bulk_out.dci,
+            bulk_in.dci,
+            bulk_out.ring,
+            bulk_in.ring,
+            dma,
+        )?;
+        Ok(BoundUsbDevice::Block(dev))
+    }
+}
+
 impl BlockDevice for UsbMassStorageDevice {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
         let mut inner = self.inner.lock();

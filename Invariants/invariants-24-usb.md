@@ -1,7 +1,7 @@
 # BedrockOS Invariants — USB/xHCI Host Controller Driver
 
-**Version:** 0.3.1
-**Date:** 2026-08-01
+**Version:** 0.4.0
+**Date:** 2026-08-02
 **Source paths:**
 - `kernel/src/usb/mod.rs` — crate root
 - `kernel/src/usb/usb/mod.rs` — USB protocol constants and `SetupPacket`
@@ -12,9 +12,11 @@
 - `kernel/src/usb/xhci/context.rs` — `InputControlContext` / endpoint context builders
 - `kernel/src/usb/xhci/event.rs` — event ring consumption, IRQ handler, command/transfer completion atomics, SPSC port-change ring
 - `kernel/src/usb/xhci/command.rs` — doorbell ring, command submission, timeout wait
-- `kernel/src/usb/xhci/device.rs` — `DeviceSlot`, `DeviceSlotManager`, control/bulk transfers, enumeration
+- `kernel/src/usb/xhci/device.rs` — `DeviceSlot`, `DeviceSlotManager`, control/bulk/interrupt transfers, enumeration
 - `kernel/src/usb/xhci/ports.rs` — port state machine, reset, status change handling
-- `kernel/src/usb/class/mass_storage.rs` — USB Bulk-Only Transport mass-storage driver
+- `kernel/src/usb/class/driver.rs` — USB class-driver registry (`UsbClassDriver`, `InterfaceResources`, `EndpointResource`, `find_driver`)
+- `kernel/src/usb/class/mass_storage.rs` — USB Bulk-Only Transport mass-storage driver + `MassStorageDriver`
+- `kernel/src/usb/class/hid.rs` — USB HID boot-keyboard driver (`HidDriver`)
 - `make_demo_drive.py` — script to build a QEMU demo USB drive image
 
 ---
@@ -360,6 +362,33 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 
 ---
 
+## USB Class Driver Registry (`kernel/src/usb/class/driver.rs`)
+
+**USB-CDR-001** The registry is a static `Mutex<Vec<&'static dyn UsbClassDriver>>`. Drivers are `Send + Sync` unit structs; there is no dynamic loading — `register_all()` statically registers `MassStorageDriver` and `HidDriver` (both x86_64; the whole `usb` crate is already x86_64-gated in `lib.rs`).
+- Location: `kernel/src/usb/class/driver.rs`
+
+**USB-CDR-002** `register_all()` is idempotent, guarded by a `REGISTERED: AtomicBool`. It is invoked lazily from `find_driver()` (not from the boot sequence), so the registry is self-contained.
+
+**USB-CDR-003** `find_driver(iface_class, subclass, protocol)` returns the first driver whose `probe()` matches, or `None`. `bind_slot` (`usb/xhci/mod.rs`) calls it after `configure_device` and hands the winner an `InterfaceResources`; if no driver matches, the slot is left unbound (`Ok(None)`) and the extracted endpoint rings drop (DMA memory is not freed by `TrbRing`'s drop — rings are deliberately leaked to the driver/registry lifetime).
+
+**USB-CDR-004** `InterfaceResources` transfers **ownership** of the endpoint `TrbRing`s from the `DeviceSlot` to the class driver: `bind_slot` removes the bulk-IN/bulk-OUT/interrupt-IN rings by DCI from `slot.ep_rings`. A driver must not keep its own copy of a ring it does not consume.
+
+**USB-CDR-005** `BoundUsbDevice::Block(Arc<dyn BlockDevice>)` devices are returned to `init_all`/`poll` and flow into the block layer; `BoundUsbDevice::Input(u32)` carries the UInputL-owned device id. Input devices are registered with UInputL *inside* `init_interface`, which is safe because `input::init()` runs before USB init in `Kernel::run()`.
+
+**USB-CDR-006** `MassStorageDriver::init_interface` requires both bulk endpoints and wraps the existing `UsbMassStorageDevice::new(...)` — it is a thin adapter and performs blocking SCSI I/O, so it must run on the init path, never interrupt context.
+
+## USB HID Boot Keyboard (`kernel/src/usb/class/hid.rs`)
+
+**USB-HID-001** `HidDriver` probes on `iface_class == CLASS_HID` (3) only. The boot keyboard protocol (subclass 1, protocol 1) needs no report descriptor and no `SET_PROTOCOL`/`SET_IDLE` control transfers, so the class alone is sufficient. This phase binds exactly **one** keyboard; a second HID device is rejected by `init_interface` with an error.
+
+**USB-HID-002** The keyboard is driven by a UInputL `poll` hook (`hid_keyboard_poll`), registered with `CAP_KEYS`. Each poll submits one interrupt-IN read (`device::submit_interrupt`) with a **250 ms** timeout, then diffs the 8-byte boot report (modifier byte + reserved + 6 key usages) against the previous report to emit press (1) / release (0) `InputEvent`s. No key is emitted for usages with no `KeyCode` mapping.
+
+**USB-HID-003** The interrupt-IN endpoint is configured by `configure_device` with `EP_TYPE_INTERRUPT_IN` (7), and the endpoint-context Interval field is written from `DeviceSlot::interrupt_in_interval`, which `usb_interval_to_context()` computes per spec Table 6-12: FS/LS `round_up(bInterval*8)` microframes then `log2` (clamped 3-10); HS/SS `bInterval - 1` (clamped 0-15).
+
+**USB-HID-004** Interrupt-IN completions reuse the same single-slot `LAST_TRANSFER_STATE` atomic as control/bulk (see XHCI-065). `submit_interrupt` waits with the caller-chosen timeout and consumes its own completion. The HID poll and bulk I/O must not run concurrently on the same endpoint pair — today they are serialised because the module run and the input-test loop run on the BSP and never perform concurrent block I/O.
+
+---
+
 ## Interrupt State Atomics
 
 **XHCI-065** The following global atomics coordinate between the init path (BSP, no interrupts) and the IRQ handler (interrupt context):
@@ -370,7 +399,7 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 - `XHCI_RT_VA` (AtomicU64) — set once during init, read by IRQ handler for IMAN/ERDP writes
 - `XHCI_OP_VA` (AtomicU64) — set once during init, read by IRQ handler for USBSTS EINT clear
 - `LAST_CMD_STATE` (AtomicU64) — written by `consume_pending_events` (IRQ or poll), read-and-clear by `last_command_completion` (init or command submit path). The seen flag (bit 63) prevents stale reads
-- `LAST_TRANSFER_STATE` (AtomicU64) — same protocol for bulk/control transfer completions; read-and-clear by `last_transfer_completion`, peeked by `peek_last_transfer_completion`
+- `LAST_TRANSFER_STATE` (AtomicU64) — same protocol for bulk/control/interrupt transfer completions; read-and-clear by `last_transfer_completion`, peeked by `peek_last_transfer_completion`. Shared by the MSD bulk path and the HID interrupt-IN poll hook (USB-HID-004): exactly one transfer may be awaited at a time
 - `PORT_EVENTS` + `PORT_EVENTS_HEAD`/`PORT_EVENTS_TAIL` — SPSC port-change ring (see XHCI-029)
 
 **XHCI-066** All atomic accesses use `Ordering::Relaxed` except `LAST_CMD_STATE`/`LAST_TRANSFER_STATE` (Release store in consumer, AcqRel swap in reader) and the `PORT_EVENTS` ring (Acquire/Release on head/tail with release/acquire fences on the payload).
@@ -401,6 +430,11 @@ Functions: `submit_enable_slot`, `submit_address_device`, `submit_configure_endp
 ### Mass storage (caller must ensure)
 - `UsbMassStorageDevice::new()` performs blocking SCSI I/O and must be called on the init path, not from interrupt context
 - The shared data page is not safe for concurrent `submit()` calls without the `inner` mutex (the `BlockDevice::submit` impl locks it)
+
+### Class drivers / HID (caller must ensure)
+- `find_driver()` may call `register_all()` on first use; it is not a re-entrancy hazard (guarded by `AtomicBool`)
+- `submit_interrupt()` blocks up to the caller-chosen timeout and consumes its transfer completion — do not call it while another transfer on the same `LAST_TRANSFER_STATE` slot is outstanding
+- The HID `poll` hook runs while UInputL holds its `DEVICES` lock; the hook must not call `register_device` or otherwise re-enter UInputL core state
 
 ---
 

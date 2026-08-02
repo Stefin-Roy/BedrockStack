@@ -30,6 +30,10 @@ pub struct DeviceSlot {
     pub bulk_out_dci: u8,
     pub bulk_in_mps: u16,
     pub bulk_out_mps: u16,
+    pub interrupt_in_dci: u8,
+    pub interrupt_in_mps: u16,
+    /// xHCI endpoint-context Interval value (spec Table 6-12), 0 if none.
+    pub interrupt_in_interval: u8,
 }
 
 impl DeviceSlot {
@@ -65,13 +69,41 @@ impl DeviceSlot {
             bulk_out_dci: 0,
             bulk_in_mps: 0,
             bulk_out_mps: 0,
+            interrupt_in_dci: 0,
+            interrupt_in_mps: 0,
+            interrupt_in_interval: 0,
         }
     }
 }
 
+/// Translate a USB `bInterval` into the xHCI endpoint-context Interval value
+/// (spec Table 6-12).  The context value is an exponent: service period is
+/// `125us * 2^n`.
+fn usb_interval_to_context(speed: u8, binterval: u8) -> u8 {
+    if binterval == 0 {
+        return 0;
+    }
+    match speed {
+        // FS/LS interrupt bInterval is in 1 ms frames.  The service interval
+        // (in 125us microframes) must be a power of two; round the frame
+        // count up and take log2.  Valid context range is 3-10.
+        usb::SPEED_FS | usb::SPEED_LS => {
+            let microframes = binterval as u32 * 8;
+            let pow2 = microframes.next_power_of_two();
+            (pow2.trailing_zeros() as u8).clamp(3, 10)
+        }
+        // HS/SS bInterval is already `2^(b-1) * 125us`.  Valid range 0-15.
+        _ => (binterval.saturating_sub(1)).min(15),
+    }
+}
+
 fn wait_for_transfer(slot_id: u8, ep_id: u8) -> Result<u8, &'static str> {
+    wait_for_transfer_timeout(slot_id, ep_id, 5_000_000_000)
+}
+
+fn wait_for_transfer_timeout(slot_id: u8, ep_id: u8, timeout_ns: u64) -> Result<u8, &'static str> {
     use crate::services::universal_timer::{now_ns, wait_until_cond};
-    let deadline = now_ns() + 5_000_000_000;
+    let deadline = now_ns() + timeout_ns;
     let completed = wait_until_cond(deadline, &|| {
         event::consume_pending_events();
         event::peek_last_transfer_completion()
@@ -187,11 +219,15 @@ pub fn get_config_descriptor_full(
         bulk_out_dci: u8,
         bulk_in_mps: u16,
         bulk_out_mps: u16,
+        interrupt_in_dci: u8,
+        interrupt_in_mps: u16,
+        interrupt_in_interval: u8,
     }
     let zero = IfaceInfo {
         num: 0, class: 0, subclass: 0, protocol: 0,
         bulk_in_dci: 0, bulk_out_dci: 0,
         bulk_in_mps: 0, bulk_out_mps: 0,
+        interrupt_in_dci: 0, interrupt_in_mps: 0, interrupt_in_interval: 0,
     };
     let mut ifaces = [zero; 8];
     let mut iface_count: u8 = 0;
@@ -242,10 +278,11 @@ pub fn get_config_descriptor_full(
             usb::DESC_ENDPOINT => {
                 if cur_alt_setting == 0 {
                     if let Some(ep) = EndpointDescriptor::parse(&cfg_buf[offset..]) {
-                        if ep.transfer_type() == usb::EP_TYPE_BULK {
-                            let ep_num = ep.endpoint_number();
-                            let is_in = ep.is_in();
-                            let dci: u8 = (ep_num * 2) + if is_in { 1 } else { 0 };
+                        let ep_num = ep.endpoint_number();
+                        let is_in = ep.is_in();
+                        let dci: u8 = (ep_num * 2) + if is_in { 1 } else { 0 };
+                        let ep_type = ep.transfer_type();
+                        if ep_type == usb::EP_TYPE_BULK {
                             for i in 0..(iface_count as usize) {
                                 if ifaces[i].num == cur_iface_num {
                                     if is_in {
@@ -262,6 +299,25 @@ pub fn get_config_descriptor_full(
                                         SerialPort::put_u64(dci as u64);
                                         SerialPort::puts(" mps=");
                                         SerialPort::put_u64(ep.max_packet_size() as u64);
+                                        SerialPort::puts("\n");
+                                    }
+                                    break;
+                                }
+                            }
+                        } else if ep_type == usb::EP_TYPE_INTERRUPT && is_in {
+                            for i in 0..(iface_count as usize) {
+                                if ifaces[i].num == cur_iface_num {
+                                    ifaces[i].interrupt_in_dci = dci;
+                                    ifaces[i].interrupt_in_mps = ep.max_packet_size();
+                                    ifaces[i].interrupt_in_interval =
+                                        usb_interval_to_context(slot.speed, ep.interval());
+                                    if cfg!(feature = "usb_trace") {
+                                        SerialPort::puts("[xhci]      intr IN dci=");
+                                        SerialPort::put_u64(dci as u64);
+                                        SerialPort::puts(" mps=");
+                                        SerialPort::put_u64(ep.max_packet_size() as u64);
+                                        SerialPort::puts(" interval=");
+                                        SerialPort::put_u64(ifaces[i].interrupt_in_interval as u64);
                                         SerialPort::puts("\n");
                                     }
                                     break;
@@ -298,6 +354,9 @@ pub fn get_config_descriptor_full(
         slot.bulk_out_dci = ifaces[idx].bulk_out_dci;
         slot.bulk_in_mps = ifaces[idx].bulk_in_mps;
         slot.bulk_out_mps = ifaces[idx].bulk_out_mps;
+        slot.interrupt_in_dci = ifaces[idx].interrupt_in_dci;
+        slot.interrupt_in_mps = ifaces[idx].interrupt_in_mps;
+        slot.interrupt_in_interval = ifaces[idx].interrupt_in_interval;
         if cfg!(feature = "usb_trace") {
             SerialPort::puts("[xhci]  selected iface ");
             SerialPort::put_u64(ifaces[idx].num as u64);
@@ -366,6 +425,22 @@ pub fn configure_device(
         ring_pairs.push((dci, ring));
     }
 
+    if slot.interrupt_in_dci != 0 {
+        let ring = TrbRing::new(dma, 4096)?;
+        let dci = slot.interrupt_in_dci;
+        endpoints.push(EndpointConfig {
+            dci,
+            ep_type: context::EP_TYPE_INTERRUPT_IN,
+            max_packet_size: slot.interrupt_in_mps,
+            dequeue_phys: ring.phys,
+            cerr: 3,
+            avg_trb_len: slot.interrupt_in_mps.max(8) as u16,
+            max_burst: 0,
+            interval: slot.interrupt_in_interval,
+        });
+        ring_pairs.push((dci, ring));
+    }
+
     // Only push to slot.ep_rings once all allocations succeeded.
     slot.ep_rings.extend(ring_pairs);
 
@@ -384,6 +459,10 @@ pub fn configure_device(
     if slot.bulk_in_dci != 0 {
         SerialPort::puts(" bulk_in_dci=");
         SerialPort::put_u64(slot.bulk_in_dci as u64);
+    }
+    if slot.interrupt_in_dci != 0 {
+        SerialPort::puts(" intr_in_dci=");
+        SerialPort::put_u64(slot.interrupt_in_dci as u64);
     }
     SerialPort::puts("\n");
 
@@ -406,6 +485,25 @@ pub fn submit_bulk(
     ring.flush();
     command::ring_doorbell(doorbell_va, slot_id, dci);
     wait_for_transfer(slot_id, dci)?;
+    Ok(())
+}
+
+/// Submit one interrupt-IN read and wait for its completion.  The caller
+/// chooses the timeout; periodic polling paths use a short one.
+pub fn submit_interrupt(
+    ring: &mut TrbRing,
+    doorbell_va: u64,
+    slot_id: u8,
+    dci: u8,
+    data_phys: u64,
+    data_len: u32,
+    timeout_ns: u64,
+) -> Result<(), &'static str> {
+    let trb = memory::make_normal_trb(data_phys, data_len);
+    ring.enqueue(&trb);
+    ring.flush();
+    command::ring_doorbell(doorbell_va, slot_id, dci);
+    wait_for_transfer_timeout(slot_id, dci, timeout_ns)?;
     Ok(())
 }
 
