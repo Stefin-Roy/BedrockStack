@@ -1,6 +1,7 @@
 use x86_64::registers::control::{Cr0, Cr0Flags};
 use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
 
+use crate::mm::layout::PHYS_MAP_BASE;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE, init_pat_wc};
 use crate::KernelLayout;
@@ -131,6 +132,33 @@ pub fn setup(
         let flags = leaf_flags(addr, layout, fb_start, fb_end);
         vmm.map_4k(allocator, KERNEL_VMA_BASE + addr, addr, flags);
         addr += PAGE_4K;
+    }
+
+    // ── DIRECT_MAP (private physmap) ───────────────────────────────
+    // Map physical `[0, ram_end)` once at PHYS_MAP_BASE with READ|WRITE so the
+    // VMM walkers can deref page-table frames through the physmap instead of
+    // the identity map once `init_physmap` is called after activation.
+    // Built here (still using the firmware identity map) because it must be
+    // present in the *live* kernel root before any runtime walk.
+    let dm_end = (allocator.alloc_end() + PAGE_2M - 1) & !(PAGE_2M - 1);
+    let mut frame = 0u64;
+    while frame + PAGE_2M <= dm_end {
+        vmm.map_2m(
+            allocator,
+            PHYS_MAP_BASE + frame,
+            frame,
+            PageFlags::READ | PageFlags::WRITE,
+        );
+        frame += PAGE_2M;
+    }
+    while frame < dm_end {
+        vmm.map_4k(
+            allocator,
+            PHYS_MAP_BASE + frame,
+            frame,
+            PageFlags::READ | PageFlags::WRITE,
+        );
+        frame += PAGE_4K;
     }
 
     vmm

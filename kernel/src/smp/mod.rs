@@ -40,6 +40,7 @@ pub struct PerCpu {
     pub started: AtomicU64,
     pub stack_top: u64,
     pub serial_locked: AtomicU64,
+    pub current_domain: *const crate::obj::domain::Domain,
 }
 
 /// Max supported CPUs.
@@ -48,22 +49,22 @@ pub const MAX_CPUS: usize = 16;
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
 static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 3, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 4, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 5, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 6, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 7, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 8, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 9, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 10, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 11, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 12, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0) },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 3, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 4, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 5, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 6, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 7, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 8, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 9, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 10, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 11, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 12, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -227,8 +228,16 @@ pub unsafe fn init(
 
 fn allocate_ap_stack(_cpu_id: u32) -> u64 {
     const AP_STACK_PAGES: usize = 17;
-    let base = crate::mm::heap::get_phys_allocator_mut()
-        .alloc_contiguous(AP_STACK_PAGES)
-        .expect("SMP: OOM for AP stack");
-    base + AP_STACK_PAGES as u64 * 4096
+    // Phase D: AP stacks are heap/guard-mapped VM-backed allocations (NX,
+    // mapped in the shared kernel root), not raw contiguous physical frames.
+    // Both trampolines treat `stack_top` as an opaque address:
+    //   x86   — loaded into RSP in long mode after the CR3 switch;
+    //   riscv — loaded into `sp` before the MMU is enabled, but not dereferenced
+    //          until `ap_entry_riscv` has written satp (heap VAs then resolve).
+    // Allocate a page-aligned block (leaked: AP stacks live for kernel lifetime).
+    let size = AP_STACK_PAGES * 4096;
+    let layout = alloc::alloc::Layout::from_size_align(size, 4096).expect("SMP: AP stack layout");
+    let ptr = unsafe { alloc::alloc::alloc(layout) };
+    assert!(!ptr.is_null(), "SMP: OOM for AP stack");
+    ptr as u64 + size as u64
 }

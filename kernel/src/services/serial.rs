@@ -39,3 +39,8 @@ static KERNEL_SERIAL: KernelSerial = KernelSerial;
 pub fn init() -> &'static dyn SerialConsole {
     &KERNEL_SERIAL as &'static dyn SerialConsole
 }
+
+/// C5: return the concrete serial node as a `'static` object for obj-endowment.
+pub fn kernel_serial_static() -> &'static KernelSerial {
+    &KERNEL_SERIAL
+}

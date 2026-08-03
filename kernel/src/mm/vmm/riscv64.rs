@@ -67,16 +67,25 @@ fn vpn_index(vaddr: u64, level: usize) -> usize {
     ((vaddr >> (12 + level * 9)) & 0x1FF) as usize
 }
 fn pt_at_mut<'a>(ppn: u64) -> &'a mut PageTable {
-    unsafe { &mut *(ppn_to_paddr(ppn) as *mut PageTable) }
+    let phys = ppn_to_paddr(ppn);
+    unsafe { &mut *(crate::mm::layout::to_physmap(phys) as *mut PageTable) }
 }
 fn pt_at<'a>(ppn: u64) -> &'a PageTable {
-    unsafe { &*(ppn_to_paddr(ppn) as *const PageTable) }
+    let phys = ppn_to_paddr(ppn);
+    unsafe { &*(crate::mm::layout::to_physmap(phys) as *const PageTable) }
 }
 fn alloc_pt(alloc: &mut BitmapAllocator) -> (u64, &'static mut PageTable) {
     let phys = alloc.alloc().expect("riscv64 VMM: OOM for page table");
-    let pt = unsafe { &mut *(phys as *mut PageTable) };
+    let pt = unsafe { &mut *(crate::mm::layout::to_physmap(phys) as *mut PageTable) };
     pt.entries.fill(PageTableEntry(0));
     (phys, pt)
+}
+/// Root table deref — `root` is a physical address, decoded via the physmap.
+fn root_pt_mut<'a>(root: u64) -> &'a mut PageTable {
+    unsafe { &mut *(crate::mm::layout::to_physmap(root) as *mut PageTable) }
+}
+fn root_pt<'a>(root: u64) -> &'a PageTable {
+    unsafe { &*(crate::mm::layout::to_physmap(root) as *const PageTable) }
 }
 
 // ── Flag conversion ──────────────────────────────────────────────────
@@ -107,7 +116,7 @@ pub fn map_4k(
     paddr: u64,
     flags: PageFlags,
 ) {
-    let root_pt = unsafe { &mut *(root as *mut PageTable) };
+    let root_pt = root_pt_mut(root);
     let rf = page_flags_to_riscv(flags);
 
     let idx2 = vpn_index(vaddr, 2);
@@ -145,7 +154,7 @@ pub fn map_2m(
     paddr: u64,
     flags: PageFlags,
 ) {
-    let root_pt = unsafe { &mut *(root as *mut PageTable) };
+    let root_pt = root_pt_mut(root);
     let rf = page_flags_to_riscv(flags);
 
     let idx2 = vpn_index(vaddr, 2);
@@ -164,7 +173,7 @@ pub fn map_2m(
 }
 
 pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
-    let root_pt = unsafe { &mut *(root as *mut PageTable) };
+    let root_pt = root_pt_mut(root);
     let idx2 = vpn_index(vaddr, 2);
     let idx1 = vpn_index(vaddr, 1);
     let idx0 = vpn_index(vaddr, 0);
@@ -187,7 +196,7 @@ pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
 }
 
 pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
-    let root_pt = unsafe { &*(root as *const PageTable) };
+    let root_pt = root_pt(root);
     let idx2 = vpn_index(vaddr, 2);
     let idx1 = vpn_index(vaddr, 1);
     let idx0 = vpn_index(vaddr, 0);

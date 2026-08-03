@@ -13,7 +13,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
-use crate::services::dma::DmaAllocator;
+use crate::obj::clients::DmaClient;
 use crate::usb::xhci::memory::TrbRing;
 
 /// A single transfer endpoint of a configured interface, as handed to a
@@ -65,7 +65,7 @@ pub trait UsbClassDriver: Send + Sync {
     fn init_interface(
         &self,
         res: InterfaceResources,
-        dma: &dyn DmaAllocator,
+        dma: DmaClient,
         ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str>;
 }

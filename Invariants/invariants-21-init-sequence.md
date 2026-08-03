@@ -28,7 +28,7 @@ The following dependencies MUST be respected:
                     ├── KernelLayout (sections from linker symbols)
                     ├── BitmapAllocator::new()
                     ├── Reserve kernel image region
-                    ├── Framebuffer::new() (with shadow buffer)
+                    ├── Framebuffer::new() (physical fb addr; no shadow yet)
                     ├── heap::init()
                     │
                     ▼
@@ -40,11 +40,15 @@ The following dependencies MUST be respected:
                     │       (identity + higher-half, NXE+WP, PAT WC)
                     │   └── Vmm::activate()
                     │       (switches CR3 / SATP; acpi::init_vmm also here)
+                    ├── heap::init() (heap on guard-mapped arena)
+                    ├── init_framebuffer_shadow()
+                    │   (shadow bound to heap VM-backed allocation)
                     ├── CurrentArch::init()
                     │   ├── GDT::init()
                     │   ├── IDT::init()
                     │   └── APIC::init()
                     │       └── PIT calibration
+                    │       └── LAPIC MMIO mapped via ACPI VMM (Phase D)
                     ├── ACPI::init_vmm()
                     ├── AcpiSubsystem::new()
                     │   (parses RSDP data or mapped RSDP)
@@ -53,7 +57,7 @@ The following dependencies MUST be respected:
                     │   └── Box::leak → KernelServices global
                     ├── smp::init(page_table_root, acpi, services)
                     │   ├── services.cpu.discover_cpus(acpi)
-                    │   ├── Allocate AP stacks (alloc_contiguous)
+                    │   ├── Allocate AP stacks (heap/guard-mapped VM, NX)
                     │   ├── Configure PerCpu slots
                     │   └── services.cpu.wake_aps()
                     ├── services.platform.enable_interrupts()

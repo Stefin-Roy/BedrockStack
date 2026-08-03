@@ -71,21 +71,3 @@ pub fn init_services(
     #[cfg(target_arch = "riscv64")]
     return riscv64::riscv_services(root, alloc, acpi);
 }
-
-// ── Global accessor for hot-path driver use ─────────────────────────
-
-use spin::Once;
-
-static GLOBAL_SERVICES: Once<&'static KernelServices> = Once::new();
-
-/// Set the global services reference (called once after construction).
-pub fn set_global(svc: &'static KernelServices) {
-    GLOBAL_SERVICES.call_once(|| svc);
-}
-
-/// Returns the global `KernelServices` reference.
-///
-/// Panics if called before `set_global`.
-pub fn kernel_services() -> &'static KernelServices {
-    *GLOBAL_SERVICES.get().expect("KernelServices global not set")
-}

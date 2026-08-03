@@ -2,8 +2,9 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
+use crate::mm::layout::region_next_down;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
+use crate::mm::vmm::{Vmm, PageFlags};
 
 mod tables;
 mod mcfg;
@@ -26,12 +27,9 @@ pub fn irq_override(irq: u8) -> Option<(u32, Polarity, TriggerMode)> {
 }
 
 /// ACPI VMM state for mapping physical regions.
-const ACPI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x10000000;
-
 struct AcpiVmmState {
     root: u64,
     alloc: *mut BitmapAllocator,
-    next_vaddr: u64,
 }
 
 unsafe impl Send for AcpiVmmState {}
@@ -42,27 +40,18 @@ static ACPI_STATE: Mutex<Option<AcpiVmmState>> = Mutex::new(None);
 /// Initialise the ACPI VMM state. Must be called once after higher-half page
 /// tables are activated and before any `AcpiSubsystem::new()` call.
 pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
-    *ACPI_STATE.lock() = Some(AcpiVmmState { root, alloc, next_vaddr: ACPI_VADDR_BASE });
+    *ACPI_STATE.lock() = Some(AcpiVmmState { root, alloc });
 }
-
-/// ACPI VMM floor — 512 MB of virtual space for ACPI tables (generous).
-const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
 
 /// Map a physical MMIO region through the ACPI VMM.
 pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
-    let mut guard = ACPI_STATE.lock();
-    let state = guard.as_mut().expect("ACPI VMM not initialized — call init_vmm first");
-    // Page-round the reservation so successive small mappings can never
-    // overlap within a shared page.
-    let pages = (size + 0xFFF) & !0xFFF;
-    let vaddr = state.next_vaddr.checked_sub(pages).expect("ACPI VMM: address space exhausted (overflow)");
-    if vaddr < ACPI_VADDR_FLOOR {
-        panic!("ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", vaddr);
-    }
-    state.next_vaddr = vaddr;
+    let vaddr = region_next_down("acpi", size)
+        .expect("ACPI VMM: address space exhausted");
+    let guard = ACPI_STATE.lock();
+    let state = guard.as_ref().expect("ACPI VMM not initialized — call init_vmm first");
     let mut vmm = Vmm::from_root(state.root);
     let alloc = unsafe { &mut *state.alloc };
-    vmm.map(alloc, vaddr, paddr, pages, flags);
+    vmm.map(alloc, vaddr, paddr, (size + 0xFFF) & !0xFFF, flags);
     vaddr
 }
 

@@ -16,6 +16,7 @@ pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
 pub mod mm;
+pub mod obj;
 pub mod pci;
 pub mod platform;
 #[cfg(target_arch = "x86_64")]
@@ -65,6 +66,10 @@ pub struct KernelLayout {
 
 pub struct Kernel {
     framebuffer: Framebuffer,
+    /// Physical address of the boot framebuffer, kept here for paging setup
+    /// (which maps it identity).  Drivers access the framebuffer through the
+    /// `Framebuffer` VA, never through this raw address.
+    fb_phys: u64,
     allocator: BitmapAllocator,
     layout: KernelLayout,
     stack_guard: u64,
@@ -131,11 +136,11 @@ impl Kernel {
         // Belt-and-suspenders: reserve the framebuffer's physical range in the
         // allocator so we never hand out the GPU's own memory as system RAM.
         allocator.reserve_range(framebuffer.address, fb_size as u64);
-        let fb_pages = (fb_size + 4095) / 4096;
-        let shadow_phys = allocator
-            .alloc_contiguous(fb_pages)
-            .expect("OOM for framebuffer shadow buffer");
-        unsafe { core::ptr::write_bytes(shadow_phys as *mut u8, 0, fb_size) };
+        // Phase D: no physical shadow buffer here.  The shadow is a heap/
+        // guard-mapped VM-backed allocation that is created in `init()` once
+        // the heap is live, and bound via `set_shadow_va()`.  Until then the
+        // framebuffer's shadow pointer is null (every accessor already treats a
+        // null shadow as inert).
         let display = unsafe {
             Framebuffer::new(
                 framebuffer.address,
@@ -144,17 +149,15 @@ impl Kernel {
                 framebuffer.stride,
                 framebuffer.pixel_format,
                 framebuffer.bpp,
-                shadow_phys,
+                0,
             )
         };
-
-        SerialPort::puts("[kernel] Kernel::new: heap::init\n");
-        unsafe { heap::init(&mut allocator) };
 
         SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {
             framebuffer: display,
+            fb_phys: framebuffer.address,
             allocator,
             layout,
             stack_guard,
@@ -177,6 +180,21 @@ impl Kernel {
         heap::set_phys_allocator(&mut self.allocator);
         unsafe { crate::smp::early_init_bsp(); }
         self.switch_to_higher_half();
+        crate::mm::layout::verify_layout();
+
+        // The heap lives in a mapped arena above KERNEL_VMA_BASE, so it can be
+        // initialised only once the kernel page tables are live. Nothing
+        // between `new()` and here allocates from the heap, so moving it after
+        // `switch_to_higher_half` is safe.
+        unsafe {
+            heap::init(self.page_table_root, &mut self.allocator);
+        }
+
+        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
+        // NX) VM-backed allocation.  The boot-time physical shadow was removed
+        // from `Kernel::new`; nothing dereferences the display until `run()`.
+        self.init_framebuffer_shadow();
+
         CurrentArch::init();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
@@ -203,8 +221,17 @@ impl Kernel {
             acpi_static,
         ));
         let svc_static: &'static crate::services::KernelServices = alloc::boxed::Box::leak(svc);
-        crate::services::set_global(svc_static);
         self.services = Some(svc_static);
+
+        // C5 — RootGraph bootstrap: create the Boot domain, mint the primitive
+        // family roots, and endow the real service providers as capabilities
+        // reachable only through the boot table (§5.4).
+        crate::obj::bootstrap::bootstrap();
+        crate::drivers::serial::SerialPort::puts("[obj] bootstrap: boot domain endowed\n");
+
+        // C6 — boot-time separation proof: the endowed DMA capability works,
+        // unendowed ids and foreign contracts are refused. Runs once, before SMP.
+        crate::obj::separation::run();
 
         // Initialise SMP — discover and start Application Processors.
         let ncpus = unsafe {
@@ -215,6 +242,25 @@ impl Kernel {
 
         // Enable interrupts after arch init, page tables, and SMP are live.
         self.svc().platform.enable_interrupts();
+
+        // C5 — bootstrapper self-revoke (last statement of init; §5.5, §8.2).
+        // Mint authority returns to the Principal; the boot domain stays.
+        crate::obj::mint::finalize_mint();
+        crate::drivers::serial::SerialPort::puts("[obj] bootstrap self-revoke: mint authority returned to Principal\n");
+    }
+
+    /// Phase D: allocate the framebuffer shadow buffer on the heap and bind it.
+    ///
+    /// The shadow lives in the guard-mapped, NX heap arena rather than as raw
+    /// contiguous physical frames, so the display path never dereferences a
+    /// physical address.  The allocation is deliberately leaked: it is needed
+    /// for the lifetime of the kernel and `Framebuffer` keeps no ownership.
+    fn init_framebuffer_shadow(&mut self) {
+        let size = self.framebuffer.total_bytes();
+        let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
+        let va = shadow.as_mut_ptr() as u64;
+        core::mem::forget(shadow);
+        self.framebuffer.set_shadow_va(va);
     }
 
     /// Parse the ACPI interrupt model and initialise I/O APIC(s).
@@ -241,7 +287,7 @@ impl Kernel {
             &mut self.allocator,
             &self.layout,
             self.stack_guard,
-            self.framebuffer.phys_addr(),
+            self.fb_phys,
             self.framebuffer.height(),
             self.framebuffer.stride(),
             self.framebuffer.bpp(),
@@ -249,6 +295,10 @@ impl Kernel {
         let root = vmm.root();
         unsafe {
             vmm::activate(root);
+            // DIRECT_MAP was built into these tables by paging::setup; from
+            // here on the VMM walkers deref page-table frames through the
+            // kernel-internal physmap instead of the identity map.
+            crate::mm::init_physmap(self.allocator.alloc_end());
             crate::acpi::init_vmm(root, &mut self.allocator as *mut _);
         }
         self.page_table_root = root;
@@ -291,6 +341,13 @@ impl Kernel {
             self.layout.idt_end,
         );
 
+        // C8 — the device sweep runs as the first driver domain (§6.2): switch
+        // the BSP's current-domain slot to the driver domain before PCI
+        // enumeration. All device-path clients (driver_dma / driver_pci) are
+        // bound to the driver domain's disjoint table, so the sweep genuinely
+        // runs under its endowed caps only (§8.14).
+        crate::obj::domain::set_current_domain(crate::obj::driver::driver_domain());
+
         // Initialise PCI subsystem (ECAM mapping + bus enumeration).
         if let Some(ref acpi) = self.acpi {
             crate::pci::init(
@@ -301,6 +358,7 @@ impl Kernel {
         }
 
         // UInputL — the unified input layer.  Must exist before any driver
+        // (PS/2, future USB HID) tries to register a device.
         // (PS/2, future USB HID) tries to register a device.
         crate::input::init();
 
@@ -372,6 +430,20 @@ impl Kernel {
                 Ok(()) => log::info!("Mounted ESP as B> (fat32)"),
                 Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
             }
+        }
+
+        // C8 — the device sweep is done; return to the boot domain before the
+        // idle loop, which runs platform halt and xHCI hot-plug poll as the
+        // boot domain again (§6.2).
+        crate::obj::domain::set_current_domain(crate::obj::bootstrap::boot_domain());
+
+        // P1 gate — emit the `kerneldump graph` node census once (read-only
+        // projection; §7.13, §2.8). x86_64-only: `kerneldump` is not built on
+        // riscv64.
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut w = crate::drivers::serial::SerialPort;
+            crate::kerneldump::graph_census(&mut w);
         }
 
         loop {

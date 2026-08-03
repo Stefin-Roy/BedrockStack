@@ -27,7 +27,7 @@ use spin::Mutex;
 
 use super::driver::StorageDriver;
 use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
-use crate::services::dma::DmaAllocator;
+use crate::obj::clients::DmaClient;
 
 const AHCI_MAX_SLOTS: usize = 32;
 const MAX_PRDT: usize = 64;
@@ -157,6 +157,7 @@ struct AhciPort {
     _rfis_vaddr: u64,
     scratch_paddr: u64,
     scratch_vaddr: u64,
+    dma: DmaClient,
     max_prdt: usize,
     n_slots: u8,
     sector_count: u64,
@@ -312,7 +313,7 @@ impl AhciPort {
         let mut n = 0usize;
         while rem > 0 && n < self.max_prdt {
             let va = (buf_vaddr as isize + off) as u64;
-            let pa = crate::services::kernel_services().dma
+            let pa = self.dma
                 .virt_to_phys(va)
                 .ok_or("PRDT translate fail")?;
             let skip = (va & 0xFFF) as usize;
@@ -723,7 +724,7 @@ impl BlockDevice for AhciPort {
 
 // ── Initialisation ──────────────────────────────────────────────
 
-fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &crate::pci::PciDevice, dma: DmaClient) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
     crate::pci::enable_device(dev);
     let base = match crate::pci::bar::bar(dev, 5) {
@@ -829,7 +830,7 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
 
     Ok(ports)
 }
-fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
+fn init_one(p: u8, hba: &Hba, dma: DmaClient, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
@@ -894,6 +895,7 @@ fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_r
         _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
         _rfis_paddr: rfis_buf.phys, _rfis_vaddr: rfis_buf.virt,
         scratch_paddr: sc_buf.phys, scratch_vaddr: sc_buf.virt,
+        dma,
         max_prdt, n_slots,
         sector_count: 0, lba48: false, ncq: false, model: [0u8; 40],
         slots,
@@ -923,7 +925,7 @@ impl StorageDriver for AhciDriver {
     fn init_controller(
         &self,
         dev: &crate::pci::PciDevice,
-        dma: &dyn DmaAllocator,
+        dma: DmaClient,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
         init_controller(dev, dma)
     }

@@ -1,3 +1,4 @@
+use crate::mm::layout::PHYS_MAP_BASE;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
 use crate::KernelLayout;
@@ -71,6 +72,30 @@ pub fn setup(
         let flags = leaf_flags(addr, layout, fb_start, fb_end);
         vmm.map_4k(allocator, KERNEL_VMA_BASE + addr, addr, flags);
         addr += PAGE_SIZE;
+    }
+
+    // ── DIRECT_MAP (private physmap) ───────────────────────────────
+    // Map physical `[0, dm_end)` at PHYS_MAP_BASE so Sv39 walkers deref
+    // page-table frames through the physmap once `init_physmap` runs.
+    let dm_end = (allocator.alloc_end() + PAGE_2M - 1) & !(PAGE_2M - 1);
+    let mut frame = 0u64;
+    while frame + PAGE_2M <= dm_end {
+        vmm.map_2m(
+            allocator,
+            PHYS_MAP_BASE + frame,
+            frame,
+            PageFlags::READ | PageFlags::WRITE,
+        );
+        frame += PAGE_2M;
+    }
+    while frame < dm_end {
+        vmm.map_4k(
+            allocator,
+            PHYS_MAP_BASE + frame,
+            frame,
+            PageFlags::READ | PageFlags::WRITE,
+        );
+        frame += PAGE_SIZE;
     }
 
     vmm

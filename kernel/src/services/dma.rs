@@ -1,7 +1,8 @@
 use spin::{Mutex, Once};
 
+use crate::mm::layout::region_next_down;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
+use crate::mm::vmm::{PageFlags, Vmm};
 
 use super::capability::Capability;
 
@@ -20,15 +21,18 @@ pub trait DmaAllocator: Capability {
 
 // ── Global DMA allocator singleton ──────────────────────────────────
 //
-// Region lives below the PCI ECAM window (KERNEL_VMA_BASE - 0x3000_0000)
-// so the two never collide; this is the former blockdriver/AHCI carve-out.
-const DMA_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x5000_0000;
-const DMA_VADDR_FLOOR: u64 = DMA_VADDR_BASE - 0x2000_0000;
-
+// VA cursor lives in the `dma` window of mm::layout; the two other windows
+// (acpi, ecam) never collide because region_next_down is the single source.
 static DMA_ALLOCATOR: Once<KernelDma> = Once::new();
 
 pub fn init_dma_allocator(root: u64, alloc: *mut BitmapAllocator) -> &'static dyn DmaAllocator {
     DMA_ALLOCATOR.call_once(|| KernelDma::new(root, alloc))
+}
+
+/// C5: return the concrete DMA node for obj-endowment. Call only after
+/// `init_dma_allocator` has run (i.e. once the service container exists).
+pub fn dma_allocator_static() -> &'static KernelDma {
+    DMA_ALLOCATOR.get().expect("dma allocator not initialised")
 }
 
 /// Translation cache shared across the kernel.
@@ -64,12 +68,10 @@ static TRANS_CACHE: Mutex<TransCacheInner> = Mutex::new(TransCacheInner::new());
 
 struct DmaInner {
     alloc: *mut BitmapAllocator,
-    next_vaddr: u64,
 }
 
 pub struct KernelDma {
     root: u64,
-    vaddr_floor: u64,
     inner: Mutex<DmaInner>,
 }
 
@@ -80,11 +82,7 @@ impl KernelDma {
     fn new(root: u64, alloc: *mut BitmapAllocator) -> Self {
         KernelDma {
             root,
-            vaddr_floor: DMA_VADDR_FLOOR,
-            inner: Mutex::new(DmaInner {
-                alloc,
-                next_vaddr: DMA_VADDR_BASE,
-            }),
+            inner: Mutex::new(DmaInner { alloc }),
         }
     }
 }
@@ -98,12 +96,8 @@ impl Capability for KernelDma {
 impl DmaAllocator for KernelDma {
     fn map_mmio(&self, paddr: u64, size: u64) -> Result<u64, &'static str> {
         let page_aligned = (size + 4095) & !4095;
+        let va = region_next_down("dma", page_aligned).ok_or("DMA: address space exhausted")?;
         let mut inner = self.inner.lock();
-        let va = inner.next_vaddr.checked_sub(page_aligned).ok_or("DMA: address space exhausted (overflow)")?;
-        if va < self.vaddr_floor {
-            return Err("DMA: address space exhausted");
-        }
-        inner.next_vaddr = va;
         let alloc = unsafe { &mut *inner.alloc };
         Vmm::from_root(self.root).map(
             alloc,
@@ -120,12 +114,8 @@ impl DmaAllocator for KernelDma {
     }
 
     fn alloc_page(&self) -> Option<DmaBuffer> {
+        let va = region_next_down("dma", 4096)?;
         let mut inner = self.inner.lock();
-        let va = inner.next_vaddr.checked_sub(4096)?;
-        if va < self.vaddr_floor {
-            return None;
-        }
-        inner.next_vaddr = va;
         let alloc = unsafe { &mut *inner.alloc };
         let phys = alloc.alloc()?;
         Vmm::from_root(self.root).map(
@@ -141,12 +131,8 @@ impl DmaAllocator for KernelDma {
 
     fn alloc_contiguous(&self, count: usize) -> Option<DmaBuffer> {
         let size = (count as u64) * 4096;
+        let va = region_next_down("dma", size)?;
         let mut inner = self.inner.lock();
-        let va = inner.next_vaddr.checked_sub(size)?;
-        if va < self.vaddr_floor {
-            return None;
-        }
-        inner.next_vaddr = va;
         let alloc = unsafe { &mut *inner.alloc };
         let phys = alloc.alloc_contiguous(count)?;
         Vmm::from_root(self.root).map(

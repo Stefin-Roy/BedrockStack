@@ -33,9 +33,21 @@ without changing the linker script.
 
 **VMM-005 — VMM manages intermediate page-table frames:**
 When creating page-table entries, the arch-specific code allocates frames
-from `BitmapAllocator` for intermediate tables. These frames are never freed
-(mappings are permanent).
+from `BitmapAllocator` for intermediate tables. On x86_64, `unmap_4k` now
+reclaims any intermediate table whose 512 entries are all non-present after a
+leaf is unmapped, returning those frames to the allocator (bottom-up: L1 →
+L2 → L3; the PML4 root is never freed). The caller-owned leaf frame is never
+freed by the VMM. RISC-V `unmap_4k` currently keeps the leaf-clear-only
+behaviour.
 - Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/mm/vmm/riscv64.rs`
+
+**VMM-006 — `flush_tlb` is a free function:**
+TLB flush is exposed both as `Vmm::flush_tlb()` and as the arch-agnostic
+free function `vmm::flush_tlb()` (reloads CR3 on x86_64, `sfence.vma` on
+RISC-V). `unmap_4k` performs a full flush after reclaiming intermediate
+tables, since freeing them can drop more than the single unmapped page's
+translation.
+- Location: `kernel/src/mm/vmm/mod.rs:245-268`, `kernel/src/mm/vmm/x86_64.rs`
 
 **VMM-006 — Identity map covers `[0, ram_end)`, framebuffer extension beyond:**
 `ram_end = alloc_end().max(apic_base + PAGE_4K)` (x86_64) or
@@ -95,10 +107,11 @@ Maps a single 2 MiB huge page. Panics on alignment violation or OOM.
 - Location: `kernel/src/mm/vmm/mod.rs:135-148`
 
 **VMM-API-006 — `Vmm::unmap(alloc, vaddr, size)`:**
-Unmaps 4 KiB pages. Intermediate tables are NOT freed (leaked intentionally
-for simplicity). `unmap_4k()` unmaps a single page, returning `false` if
-not mapped.
-- Location: `kernel/src/mm/vmm/mod.rs:197-214`
+Unmaps 4 KiB pages. On x86_64, intermediate tables that become empty are
+reclaimed (their frames returned to `alloc`); the mapped page's own frame is
+left to the caller. `unmap_4k()` unmaps a single page, returning `false` if
+not mapped. `unmap()` performs a full TLB flush after any reclamation.
+- Location: `kernel/src/mm/vmm/mod.rs:197-232`
 
 **VMM-API-007 — `Vmm::translate(vaddr)` → `Option<u64>`:**
 Walks the page table without TLB lookups. Returns the physical address or
@@ -124,8 +137,13 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 
 - The VMM is a pure page-table manipulator — it does not manage virtual
   address space allocation. Callers choose virtual addresses.
-- Intermediate page-table frames are never freed (no reference counting).
-  This is acceptable because mappings are generally permanent.
+- On x86_64, empty intermediate page-table frames are returned to the
+  allocator on `unmap` (bottom-up reclamation). RISC-V retains the older
+  leaf-clear-only behaviour; parity is intended as a follow-up.
+- The TLB flush performed after unmap/reclaim is local-core only. The page
+  table root is shared across APs, so a full cross-core flush (IPI-based) is
+  not yet implemented; this matches the pre-existing local-only `flush_tlb`.
+  In practice the default boot runs without APs.
 - ACPI and PCI subsystems maintain their own VMM states (`ACPI_STATE`,
   `PCI_VMM`) that share the same root frame and use a bump-allocated
   virtual address range below `KERNEL_VMA_BASE`.

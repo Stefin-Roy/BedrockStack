@@ -3,6 +3,7 @@ use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
+use crate::obj::clients::DmaClient;
 use crate::usb::xhci::memory::TrbRing;
 use crate::usb::xhci::device;
 
@@ -204,7 +205,7 @@ impl UsbMassStorageDevice {
         bulk_in_dci: u8,
         bulk_out_ring: TrbRing,
         bulk_in_ring: TrbRing,
-        dma: &dyn crate::services::dma::DmaAllocator,
+        dma: DmaClient,
     ) -> Result<Arc<Self>, &'static str> {
         let data_page = dma.alloc_page().ok_or("OOM for USB MSD data page")?;
         let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;
@@ -284,7 +285,7 @@ impl UsbClassDriver for MassStorageDriver {
     fn init_interface(
         &self,
         res: InterfaceResources,
-        dma: &dyn crate::services::dma::DmaAllocator,
+        dma: DmaClient,
         _ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str> {
         let bulk_in = res.bulk_in.ok_or("MSD needs bulk IN endpoint")?;

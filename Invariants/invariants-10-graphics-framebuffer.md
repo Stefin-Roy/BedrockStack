@@ -48,11 +48,13 @@ vacated rows at the bottom. If `rows >= height`, clears the entire buffer.
 - Location: `common/src/types.rs:38`, `boot/src/main.rs:254`
 
 **DISP-010 — Shadow buffer for cached drawing:**
-`Framebuffer` allocates a cacheable RAM shadow buffer (`shadow: *mut u8`)
-from the kernel page allocator as contiguous physical pages. All drawing
-primitives (`put_pixel`, `fill_rect`, `clear`, `draw_glyph_raw`) write to
-the shadow buffer via regular cached stores sized to `bpp`, never directly
-to the real scanout framebuffer.
+`Framebuffer` draws into a cacheable RAM shadow buffer (`shadow: *mut u8`).
+Phase D: the shadow is a heap/guard-mapped VM-backed allocation created by
+the kernel after higher-half switch and bound via `Framebuffer::set_shadow_va()`
+(see `kernel::lib::init_framebuffer_shadow`). All drawing primitives
+(`put_pixel`, `fill_rect`, `clear`, `draw_glyph_raw`) write to the shadow
+buffer via regular cached stores sized to `bpp`, never directly to the real
+scanout framebuffer.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
 **DISP-011 — Dirty rectangle tracking:**
@@ -69,10 +71,12 @@ dirty scanlines from shadow to real fb via `core::ptr::copy_nonoverlapping`
 `clear()` mark the full screen dirty and call `flush()` inline.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
-**DISP-013 — `Framebuffer::new()` requires shadow address:**
-`shadow_addr: u64` parameter provides the physical address of the shadow
-buffer. `shadow_ptr()` and `shadow_slice()`/`shadow_slice_mut()` expose the
-shadow for direct access.
+**DISP-013 — `Framebuffer::new()` takes a shadow address:**
+`shadow_addr: u64` is the *virtual* address of the shadow buffer (0 = none,
+rendering is inert until `set_shadow_va()` binds one). `set_fb_va()` and
+`set_shadow_va()` re-point the framebuffer / shadow to mapped VAs once live
+page tables exist. `shadow_ptr()` and `shadow_slice()`/`shadow_slice_mut()`
+expose the shadow for direct access.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
 ---
@@ -81,8 +85,10 @@ shadow for direct access.
 
 **DISP-S001 — `Framebuffer::new()` safety:**
 Both `addr` (real framebuffer) and `shadow_addr` (shadow buffer) must be
-valid for `stride * height * bpp` bytes of writable memory each.
-- Location: `graphics/Framebuffer/src/framebuffer.rs:17-19`
+valid for `stride * height * bpp` bytes of writable memory each. Addresses
+are virtual — the caller must ensure the corresponding page-table mappings
+exist before any rendering/flush occurs.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
 
 **DISP-S002 — `draw_glyph_raw()` safety:**
 Writes `bpp` bytes per pixel to `buf` (the shadow buffer, not the real fb).
@@ -100,10 +106,13 @@ Access is single-threaded (only BSP writes to the display). No `Sync`
 impl is provided, preventing data races.
 - Location: `graphics/Framebuffer/src/framebuffer.rs` (implicit)
 
-**DISP-S005 — `phys_addr()` / `shadow_phys_addr()` return raw addresses:**
-Return the framebuffer and shadow buffer physical addresses for page-table
-mapping. The caller must ensure the addresses are still valid when used.
-- Location: `graphics/Framebuffer/src/framebuffer.rs:39-41`
+**DISP-S005 — No physical addresses exposed:**
+`phys_addr()` / `shadow_phys_addr()` were removed in Phase D — drivers access
+the framebuffer and shadow only through mapped virtual addresses
+(`ptr()`, `shadow_ptr()`). The framebuffer's physical address is kept in
+`Kernel::fb_phys` exclusively for paging setup. Page-table setup runs before
+higher-half switch, when the identity map still covers the fb.
+- Location: `graphics/Framebuffer/src/framebuffer.rs`
 
 ---
 
@@ -148,9 +157,10 @@ copies the entire buffer. Both reset the dirty flag.
   `flush()` uses `copy_nonoverlapping` to transfer the dirty region to the
   real scanout buffer. This is safe because the shadow buffer is in
   cacheable RAM, not device MMIO.
-- The shadow buffer is allocated from the kernel page allocator as
-  contiguous physical pages. Its physical address is passed to
-  `Framebuffer::new()` as `shadow_addr`.
+- The shadow buffer is allocated from the kernel heap as a guard-mapped,
+  NX VM-backed allocation, bound via `set_shadow_va()` after the higher-half
+  switch. Its virtual address is passed to `Framebuffer` and never exposes a
+  physical address to drivers.
 - On x86_64, the real framebuffer pages are mapped with `WRITE_COMBINING`
   (PAT entry 1 = 01h) instead of `NO_CACHE`, enabling the CPU to coalesce
   flush stores into burst writes over the PCIe bus. APIC and other MMIO

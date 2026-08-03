@@ -3,8 +3,8 @@ use alloc::vec::Vec;
 
 use crate::pci::PciDevice;
 
-fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
-    crate::services::kernel_services().pci_cfg
+fn cfg() -> crate::obj::clients::PciCfgClient {
+    crate::obj::clients::PciCfgClient::driver_pci()
 }
 
 /// Leaked slice of PCI devices — set once by `enumerate_all()` and never freed.

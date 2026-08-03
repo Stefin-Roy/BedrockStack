@@ -1,6 +1,6 @@
 # Kernel Heap Allocator — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 **Source:** `kernel/src/mm/heap.rs`
 **Status:** Stable
 
@@ -67,6 +67,54 @@ list, it calculates the minimum pages needed for the requested allocation
 `HEAP_GROW_PAGES`. This prevents single large resizes from looping.
 - Location: `kernel/src/mm/heap.rs:239-249`
 
+**HEAP-011 — Each growth region is tracked as a `ChunkMeta`:**
+Every `allocate_pages()` call records `{ vaddr, phys, size, live }` in a
+fixed-capacity chunk table (`MAX_CHUNKS = 8192`). `live` counts outstanding
+allocations served from that chunk. Exhausting the table panics rather than
+overflowing a static array.
+- Location: `kernel/src/mm/heap.rs:30-58,439-453`
+
+**HEAP-012 — `live` is incremented/decremented on alloc/free (incl. cache):**
+`mark_live`/`unmark_live` are called for every served/freed payload, whether
+it came from the shared arena or a per-CPU cache, so chunk accounting stays
+balanced regardless of where a block is parked.
+- Location: `kernel/src/mm/heap.rs:214-240`, `GlobalAlloc::alloc/dealloc`
+
+**HEAP-013 — Fully-idle chunks are reclaimed opportunistically on `free`:**
+`try_reclaim()` frees a chunk's contiguous physical frames and unmaps its VA
+range (body + guard) when (a) `live == 0` and (b) the whole body has coalesced
+into a single free block occupying exactly the chunk. The lowest (base) chunk
+is always reserved. Before scanning, the free list is fully coalesced
+(`coalesce_all`), so idle chunks collapse into a single block regardless of
+the order the blocks were freed. Blocks parked in per-CPU caches are not part
+of the global free list, so chunks with cached blocks are left alone.
+- Location: `kernel/src/mm/heap.rs:275-420`
+
+**HEAP-014 — Per-CPU free-list caches over the shared arena:**
+Each CPU keeps a private LIFO cache (`PER_CPU_CACHE`, indexed by
+`current_cpu_id()`). `alloc` pops a suitably-sized/aligned cached block
+first; `dealloc` parks the block in the current CPU's cache. Blocks that
+exceed `CPU_CACHE_CAP` fall back to the shared arena. Blocks are
+interchangeable — there is no owner-CPU tag — so a block may be freed on any
+CPU safely.
+- Location: `kernel/src/mm/heap.rs:453-540`
+
+**HEAP-015 — Cache-hits validate size and alignment:**
+A cached block is only served if `(header.size + header_addr) - payload >=
+layout.size()` and the payload satisfies `layout.align()`. Otherwise the block
+is pushed back and the shared arena is used. This prevents handing a caller a
+block too small/misaligned for its `Layout`.
+- Location: `kernel/src/mm/heap.rs:504-530`
+
+**HEAP-016 — Full-list coalescing on the reclaim path only:**
+`coalesce_all()` (selection-sorts the free list by address, then merges
+adjacent blocks) runs only inside `try_reclaim()` and only when some non-base
+chunk has `live == 0`. It is allocation-free — block headers are re-linked
+in place via their `next` pointers — and never runs on the hot alloc/free
+path. This makes reclamation independent of free order (unlike the O(1)
+head-only coalescing in `push_free`).
+- Location: `kernel/src/mm/heap.rs:214-285`
+
 ---
 
 ## Safety Invariants
@@ -95,6 +143,18 @@ The raw pointer to `BitmapAllocator` is stashed in `init()` and is valid
 for the kernel's lifetime because the allocator lives in `Kernel` (pinned
 on the stack). Re-pointed via `set_phys_allocator()` after moves.
 - Location: `kernel/src/mm/heap.rs:179,187-189,207`
+
+**HEAP-S006 — `try_reclaim` runs with the heap lock held, non-reentrant:**
+It unmaps the chunk (which itself may reclaim empty page tables) and calls
+`allocator.free()`. No path re-enters `HEAP`, so no deadlock occurs.
+- Location: `kernel/src/mm/heap.rs:300-330`
+
+**HEAP-S007 — Per-CPU cache uses payload bytes as link storage:**
+While a block is cached, its first 8 bytes (the unused payload region) hold
+the next-cache pointer. This is safe only because payloads are ≥ `MIN_ALLOC`
+(8) bytes and 8-aligned. The back-pointer at `payload - 8` is never touched
+while cached.
+- Location: `kernel/src/mm/heap.rs:480-495,504-530`
 
 ---
 
@@ -127,8 +187,14 @@ grows by `max(pages_needed, HEAP_GROW_PAGES)` and retries.
 - `alloc_inner` splits free blocks from the START of the block, placing
   any remainder after the allocation. This ensures `BlockHeader` alignment
   of the remainder is preserved.
-- Adjacent coalescing only checks the free list head (not the entire list).
-  Non-head coalescing requires a full walk, which is not implemented.
+- Adjacent coalescing on `push_free` checks only the free-list head (O(1)).
+  A full coalesce (sort + merge) exists as `coalesce_all()` but runs only on
+  the reclaim path, keeping the hot path free of O(n) walks.
+- Fully-idle chunks are returned to the physical allocator and their virtual
+  ranges unmapped (guard page included); their VAs are not reused (the arena
+  grows monotonically downward), but the physical frames are recycled.
+- Per-CPU caches are a contention-reduction layer, not an ownership model:
+  blocks are interchangeable, so cross-CPU frees are always safe.
 - The `PHYS_ALLOCATOR` static raw pointer is set during `init()` and
   re-pointed after any move of the `BitmapAllocator` via `set_phys_allocator()`.
   This is done at the start of both `Kernel::init()` and `Kernel::run()`.

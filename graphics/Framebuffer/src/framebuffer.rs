@@ -32,6 +32,10 @@ impl Framebuffer {
         assert!(bpp > 0, "framebuffer bytes per pixel must be nonzero");
         assert!(width <= stride, "width must be <= stride (pixels per scanline)");
 
+        // NOTE (Phase D): `addr` and `shadow_addr` are mapped VIRTUAL
+        // addresses (never physical).  The framebuffer is reachable through
+        // the VMM/UEFI mapping the kernel sets up, and the shadow lives on
+        // the heap/guard-mapped arena — neither is an identity/physical deref.
         Framebuffer {
             fb_ptr: addr as *mut u8,
             shadow: shadow_addr as *mut u8,
@@ -48,20 +52,25 @@ impl Framebuffer {
         }
     }
 
+    /// Re-point the framebuffer base to `va` (e.g. a freshly mapped VMM
+    /// window).  Used once the kernel page tables are live and the fb MMIO
+    /// has a real mapping.
+    pub fn set_fb_va(&mut self, va: u64) {
+        self.fb_ptr = va as *mut u8;
+    }
+
+    /// Bind a new shadow buffer (a heap/VM-backed allocation) in place of the
+    /// boot-time one.  The caller keeps ownership and lifetime.
+    pub fn set_shadow_va(&mut self, va: u64) {
+        self.shadow = va as *mut u8;
+    }
+
     pub fn ptr(&self) -> *mut u8 {
         self.fb_ptr
     }
 
     pub fn shadow_ptr(&self) -> *mut u8 {
         self.shadow
-    }
-
-    pub fn phys_addr(&self) -> u64 {
-        self.fb_ptr as u64
-    }
-
-    pub fn shadow_phys_addr(&self) -> u64 {
-        self.shadow as u64
     }
 
     pub fn as_bytes(&self) -> &[u8] {

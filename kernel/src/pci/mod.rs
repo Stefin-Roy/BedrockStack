@@ -73,7 +73,7 @@ pub fn devices() -> &'static [PciDevice] {
 /// is set.  QEMU hides the problem because OVMF enables every device during
 /// POST.  Mirrors Linux `pci_enable_device()`.
 pub fn enable_device(dev: &PciDevice) {
-    let pci_cfg = crate::services::kernel_services().pci_cfg;
+    let pci_cfg = crate::obj::clients::PciCfgClient::driver_pci();
     let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
     pci_cfg.write16(
         dev.segment, dev.bus, dev.device, dev.function, 0x04,

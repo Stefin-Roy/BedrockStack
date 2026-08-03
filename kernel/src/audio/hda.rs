@@ -36,7 +36,7 @@ use spin::Mutex;
 
 use super::codec::{self, VerbSender};
 use super::AudioDevice;
-use crate::services::dma::DmaAllocator;
+use crate::obj::clients::DmaClient;
 use crate::drivers::serial::SerialPort;
 
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -593,7 +593,7 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         _ => return Err("HDA BAR0 is not memory-mapped"),
     };
 
-    let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
+    let dma = DmaClient::driver_dma();
 
     // BAR0 covers 0x4000 on QEMU (a 0x2000 register window mirrored above).
     let mmio = dma.map_mmio(base, 0x4000)?;

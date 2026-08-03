@@ -1,4 +1,5 @@
 use crate::drivers::serial::SerialPort;
+use crate::mm::vmm::PageFlags;
 use crate::platform::x86_64_pc::pit;
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -70,6 +71,29 @@ fn rdtsc() -> u64 {
 }
 
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
+static LAPIC_MAPPED: AtomicBool = AtomicBool::new(false);
+
+/// Return the virtual address of the local APIC MMIO window, mapping it on
+/// first use through the ACPI VMM.
+///
+/// Phase D: the LAPIC is reached through a real page-table mapping (the same
+/// table APs use), never through a raw physical deref.  The identity mapping
+/// of the APIC page in paging.rs is retained only as a boot fallback and can
+/// be dropped once every path goes through this window.
+fn lapic_va() -> u64 {
+    if LAPIC_MAPPED.load(Ordering::Relaxed) {
+        return LAPIC_BASE.load(Ordering::Relaxed);
+    }
+    let phys = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFF_FFFF_FFFF_F000;
+    let va = crate::acpi::map_device_mmio(
+        phys,
+        0x1000,
+        PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
+    );
+    LAPIC_BASE.store(va, Ordering::Relaxed);
+    LAPIC_MAPPED.store(true, Ordering::Relaxed);
+    va
+}
 
 /// Map an xAPIC MMIO register offset to its x2APIC MSR index.
 ///
@@ -82,7 +106,7 @@ fn lapic_write(reg: u32, val: u32) {
     if X2APIC_MODE.load(Ordering::Relaxed) {
         wrmsr(x2apic_msr(reg), val as u64);
     } else {
-        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
+        let addr = lapic_va() + reg as u64;
         unsafe { (addr as *mut u32).write_volatile(val); }
     }
 }
@@ -91,7 +115,7 @@ fn lapic_read(reg: u32) -> u32 {
     if X2APIC_MODE.load(Ordering::Relaxed) {
         rdmsr(x2apic_msr(reg)) as u32
     } else {
-        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
+        let addr = lapic_va() + reg as u64;
         unsafe { (addr as *const u32).read_volatile() }
     }
 }
@@ -380,9 +404,10 @@ fn calibrate_via_pit() -> u32 {
 /// already running from BSP init).
 pub fn init_ap() {
     SerialPort::puts("[apic] AP init\n");
-    let base = rdmsr(IA32_APIC_BASE_MSR);
-    let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
-    LAPIC_BASE.store(base_addr, Ordering::Relaxed);
+    // Map the LAPIC MMIO (shared VA window mapped by the BSP via `lapic_va`);
+    // the physical base is never stored or dereferenced directly.
+    let _base_addr = rdmsr(IA32_APIC_BASE_MSR) & 0xFFFF_FFFF_FFFF_F000;
+    let _ = lapic_va();
 
     // Don't write IA32_APIC_BASE MSR on APs — it may cause #GP on many CPUs
     // (Intel SDM: "Writes from a logical processor other than the BSP ... may
@@ -412,10 +437,14 @@ pub fn init() {
 
     let base = rdmsr(IA32_APIC_BASE_MSR);
     let base_addr = base & 0xFFFF_FFFF_FFFF_F000;
-    LAPIC_BASE.store(base_addr, Ordering::Relaxed);
+    // Map the LAPIC MMIO window up front so xAPIC MMIO accesses go through a
+    // real page-table mapping (Phase D: no physical derefs).
+    let va = lapic_va();
 
     SerialPort::puts("[apic] base=0x");
     SerialPort::put_hex(base_addr);
+    SerialPort::puts(" va=0x");
+    SerialPort::put_hex(va);
     SerialPort::puts("\n");
 
     if base & (1 << 11) == 0 {

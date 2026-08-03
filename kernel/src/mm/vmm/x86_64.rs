@@ -1,7 +1,9 @@
 //! x86_64 4-level page table operations.
 //!
-//! Wraps the `x86_64` crate's `OffsetPageTable` with identity offset
-//! (virtual == physical) so we can reuse its robust page-table walker.
+//! Wraps the `x86_64` crate's `OffsetPageTable`.  Before the DIRECT_MAP
+//! physmap is enabled the offset is 0 (identity); once `init_physmap` runs the
+//! offset becomes `PHYS_MAP_BASE`, so page-table frames are dereferenced
+//! through the kernel-internal physmap rather than the identity map.
 
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
@@ -31,8 +33,9 @@ unsafe impl<'a> FrameAllocator<Size4KiB> for BitmapFrameAllocator<'a> {
 
 #[inline]
 fn mapper_at<'a>(root: u64) -> OffsetPageTable<'a> {
-    let root_ptr = root as *mut PageTable;
-    unsafe { OffsetPageTable::new(&mut *root_ptr, VirtAddr::new(0)) }
+    let off = crate::mm::layout::phys_offset();
+    let root_ptr = root.wrapping_add(off) as *mut PageTable;
+    unsafe { OffsetPageTable::new(&mut *root_ptr, VirtAddr::new(off)) }
 }
 
 #[inline]
@@ -124,21 +127,123 @@ pub fn map_2m(
     }
 }
 
-pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
+pub fn unmap_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
     let mut mapper = mapper_at(root);
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-    match mapper.unmap(page) {
-        Ok((_ref_frame, flush)) => {
+    let removed = match mapper.unmap(page) {
+        Ok((_mapped_frame, flush)) => {
             flush.flush();
-            // NB: `_ref_frame` is the page frame that was mapped at this VA,
-            // NOT an intermediate page-table frame.  Freeing it here would
-            // release memory that another component may still be using.
-            // A future enhancement should track empty intermediate page tables
-            // and free them back to the physical allocator.
+            // NB: `_mapped_frame` is the frame that was mapped at this VA and
+            // is owned by the *caller* — freeing it here would release memory
+            // another component may still be using.  We reclaim only the
+            // intermediate (L1/L2/L3) tables, once they become empty.
             true
         }
         Err(_) => false,
+    };
+    if !removed {
+        return false;
+    }
+    reclaim_empty_tables(root, alloc, vaddr);
+    // Freeing intermediate tables drops valid working-set entries for the
+    // whole address space, not just the single unmapped page.  Full flush.
+    crate::mm::vmm::flush_tlb();
+    true
+}
+
+/// The low 12 flag bits of an x86_64 PTE; bit 0 is PRESENT.
+const PTE_PRESENT: u64 = 1 << 0;
+
+/// Physical-frame bits of a page-table entry (bits 12..=51).
+fn pte_frame(entry: u64) -> u64 {
+    entry & 0x000F_FFFF_FFFF_F000
+}
+
+/// Virtual deref address for a page-table frame (through the private physmap).
+fn pte_deref(frame: u64) -> *mut u64 {
+    (crate::mm::layout::to_physmap(frame)) as *mut u64
+}
+
+#[inline]
+unsafe fn read_pte(table: *mut u64, index: usize) -> u64 {
+    unsafe { *table.add(index & 0x1FF) }
+}
+
+#[inline]
+unsafe fn write_pte(table: *mut u64, index: usize, value: u64) {
+    unsafe { *table.add(index & 0x1FF) = value; }
+}
+
+/// True if every one of the 512 entries in the table at physical `frame` is
+/// non-present (i.e. the table holds no leaf and points to no deeper level).
+unsafe fn table_is_empty(frame: u64) -> bool {
+    let table = pte_deref(frame);
+    for i in 0..512 {
+        if unsafe { read_pte(table, i) } & PTE_PRESENT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Free 4-level intermediate page tables that became empty after the leaf at
+/// `vaddr` was unmapped, returning their frames to `alloc`.
+///
+/// Walks from the PML4 down to the deepest (Level-1) table holding the leaf.
+/// After the leaf is cleared (already done by the caller), each table is freed
+/// and its parent entry cleared only when it has no remaining present entries.
+/// The root (PML4) itself is never freed — it is owned by the kernel.
+fn reclaim_empty_tables(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) {
+    // Level-0 (leaf) table index, Level-1 (PD), Level-2 (PDPT), Level-3 (PML4).
+    #[rustfmt::skip]
+    let (i_pt, i_pd, i_pdpt, i_pml4) = (
+        ((vaddr >> 12) & 0x1FF) as usize,
+        ((vaddr >> 21) & 0x1FF) as usize,
+        ((vaddr >> 30) & 0x1FF) as usize,
+        ((vaddr >> 39) & 0x1FF) as usize,
+    );
+
+    unsafe {
+        let pml4 = pte_deref(root);
+        let pml4e = read_pte(pml4, i_pml4);
+        if pml4e & PTE_PRESENT == 0 {
+            return;
+        }
+        let pdpt = pte_deref(pte_frame(pml4e));
+        let pdpte = read_pte(pdpt, i_pdpt);
+        if pdpte & PTE_PRESENT == 0 {
+            return;
+        }
+        let pd = pte_deref(pte_frame(pdpte));
+        let pde = read_pte(pd, i_pd);
+        if pde & PTE_PRESENT == 0 {
+            return;
+        }
+        // This must be a non-leaf entry pointing at the Level-1 table if the
+        // map was created with 2M huge pages this entry is a leaf — nothing to
+        // reclaim (the unmapped page was a 4K leaf deeper down).
+        let pt_frame = pte_frame(pde);
+        let pt = pte_deref(pt_frame);
+        if read_pte(pt, i_pt) & PTE_PRESENT != 0 {
+            return; // line already re-mapped; leave as-is
+        }
+
+        if table_is_empty(pt_frame) {
+            alloc.free(pt_frame);
+            write_pte(pd, i_pd, 0);
+            // PD may now be empty → free it and clear PDPT entry.
+            let pd_frame = pte_frame(pdpte);
+            if table_is_empty(pd_frame) {
+                alloc.free(pd_frame);
+                write_pte(pdpt, i_pdpt, 0);
+                let pdpt_frame = pte_frame(pml4e);
+                if table_is_empty(pdpt_frame) {
+                    alloc.free(pdpt_frame);
+                    write_pte(pml4, i_pml4, 0);
+                }
+            }
+        }
     }
 }
 

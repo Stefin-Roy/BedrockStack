@@ -29,7 +29,7 @@ use crate::input;
 use crate::input::event::{InputEvent, InputType};
 use crate::input::keycode::KeyCode;
 use crate::input::mouse::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, REL_WHEEL, REL_X, REL_Y};
-use crate::services::dma::DmaAllocator;
+use crate::obj::clients::DmaClient;
 use crate::usb::class::driver::{BoundUsbDevice, InterfaceResources, UsbClassDriver};
 use crate::usb::class::hid_report;
 use crate::usb::xhci::command;
@@ -88,7 +88,7 @@ impl UsbClassDriver for HidDriver {
     fn init_interface(
         &self,
         res: InterfaceResources,
-        dma: &dyn DmaAllocator,
+        dma: DmaClient,
         ep0_ring: &mut TrbRing,
     ) -> Result<BoundUsbDevice, &'static str> {
         let report_page = dma.alloc_page().ok_or("OOM for HID report page")?;

@@ -41,3 +41,8 @@ static ECAM_PCI_CONFIG: EcamPciConfig = EcamPciConfig;
 pub fn init() -> &'static dyn PciConfigSpace {
     &ECAM_PCI_CONFIG as &'static dyn PciConfigSpace
 }
+
+/// C5: return the concrete ECAM node as a `'static` object for obj-endowment.
+pub fn ecam_static() -> &'static EcamPciConfig {
+    &ECAM_PCI_CONFIG
+}

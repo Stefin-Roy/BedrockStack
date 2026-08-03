@@ -15,8 +15,8 @@ pub struct PciCapability {
 
 /// Walk the capabilities list for a given device.
 /// Returns all capabilities found, in list order.
-fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
-    crate::services::kernel_services().pci_cfg
+fn cfg() -> crate::obj::clients::PciCfgClient {
+    crate::obj::clients::PciCfgClient::driver_pci()
 }
 
 pub fn all(dev: &PciDevice) -> alloc::vec::Vec<PciCapability> {

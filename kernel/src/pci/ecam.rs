@@ -1,18 +1,14 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 
+use crate::mm::layout::region_next_down;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
+use crate::mm::vmm::{PageFlags, Vmm};
 use crate::acpi::PciConfigRegions;
-
-const PCI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x10000000 - 0x20000000;
-/// PCI ECAM VMM floor — 512 MB of virtual space for PCI config (generous).
-const PCI_VADDR_FLOOR: u64 = PCI_VADDR_BASE - 0x2000_0000;
 
 struct PciVmmState {
     root: u64,
     alloc: *mut BitmapAllocator,
-    next_vaddr: u64,
 }
 
 unsafe impl Send for PciVmmState {}
@@ -21,21 +17,13 @@ unsafe impl Sync for PciVmmState {}
 static PCI_VMM: Mutex<Option<PciVmmState>> = Mutex::new(None);
 
 pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
-    *PCI_VMM.lock() = Some(PciVmmState {
-        root,
-        alloc,
-        next_vaddr: PCI_VADDR_BASE,
-    });
+    *PCI_VMM.lock() = Some(PciVmmState { root, alloc });
 }
 
 fn map_ecam(paddr: u64, size: u64) -> u64 {
-    let mut guard = PCI_VMM.lock();
-    let state = guard.as_mut().expect("PCI VMM not initialized");
-    let vaddr = state.next_vaddr.checked_sub(size).expect("PCI VMM: address space exhausted (overflow)");
-    if vaddr < PCI_VADDR_FLOOR {
-        panic!("PCI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", vaddr);
-    }
-    state.next_vaddr = vaddr;
+    let vaddr = region_next_down("ecam", size).expect("PCI VMM: address space exhausted");
+    let guard = PCI_VMM.lock();
+    let state = guard.as_ref().expect("PCI VMM not initialized");
     let mut vmm = Vmm::from_root(state.root);
     let alloc = unsafe { &mut *state.alloc };
     vmm.map(alloc, vaddr, paddr, size, PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE);

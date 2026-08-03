@@ -1,4 +1,4 @@
-use crate::services::dma::DmaAllocator;
+use crate::obj::clients::DmaClient;
 
 pub const USBCMD_RUN: u32 = 1 << 0;
 pub const USBCMD_HCRST: u32 = 1 << 1;
@@ -62,7 +62,7 @@ pub struct XhciRegisters {
 }
 
 impl XhciRegisters {
-    pub fn new(phys_base: u64, dma: &dyn DmaAllocator) -> Result<Self, &'static str> {
+    pub fn new(phys_base: u64, dma: DmaClient) -> Result<Self, &'static str> {
         let mmio_va = dma.map_mmio(phys_base, MMIO_SIZE)?;
 
         let caplength = unsafe { core::ptr::read_volatile(mmio_va as *const u8) };
@@ -205,7 +205,7 @@ pub struct Erst {
 }
 
 impl Erst {
-    pub fn new(dma: &dyn DmaAllocator) -> Result<Self, &'static str> {
+    pub fn new(dma: DmaClient) -> Result<Self, &'static str> {
         let buf = dma.alloc_page().ok_or("OOM for ERST")?;
         unsafe { core::ptr::write_bytes(buf.virt as *mut u8, 0, 16) }
         Ok(Erst { seg_phys: buf.phys, seg_va: buf.virt })
@@ -220,7 +220,7 @@ pub struct EventRing {
 }
 
 impl EventRing {
-    pub fn new(dma: &dyn DmaAllocator, erst_seg_va: u64) -> Result<Self, &'static str> {
+    pub fn new(dma: DmaClient, erst_seg_va: u64) -> Result<Self, &'static str> {
         let trb_count = 256;
         let bytes = (trb_count as usize) * 16;
         let pages = (bytes + 4095) / 4096;

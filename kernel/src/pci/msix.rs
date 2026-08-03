@@ -6,8 +6,8 @@ use super::caps::{self, PciCapability};
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
 
-fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
-    crate::services::kernel_services().pci_cfg
+fn cfg() -> crate::obj::clients::PciCfgClient {
+    crate::obj::clients::PciCfgClient::driver_pci()
 }
 
 /// Diagnostic snapshot of the last programmed MSI-X entry.

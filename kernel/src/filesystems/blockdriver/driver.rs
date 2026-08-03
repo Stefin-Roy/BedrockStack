@@ -3,8 +3,8 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::traits::BlockDevice;
+use crate::obj::clients::DmaClient;
 use crate::pci::PciDevice;
-use crate::services::dma::DmaAllocator;
 
 pub trait StorageDriver: Send + Sync {
     fn name(&self) -> &str;
@@ -12,7 +12,7 @@ pub trait StorageDriver: Send + Sync {
     fn init_controller(
         &self,
         dev: &PciDevice,
-        dma: &dyn DmaAllocator,
+        dma: DmaClient,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str>;
 }
 
@@ -36,7 +36,7 @@ pub fn init_all(
 
     register_all();
 
-    let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
+    let dma = DmaClient::driver_dma();
     let mut all_devices = Vec::new();
     let registry = REGISTRY.lock();
 
