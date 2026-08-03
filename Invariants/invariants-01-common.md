@@ -23,12 +23,6 @@ to distinguish. Unknown UEFI types are classified as `Reserved`.
 `Bytes per row = stride * bpp`. This matches UEFI GOP semantics.
 - Location: `common/src/types.rs:35`
 
-**COMMON-004 — `FramebufferInfo.draw_rect()` is safe on any `FramebufferInfo`:**
-Returns immediately if `address == 0` or `bpp < 3`. Uses volatile stores
-to prevent compiler reordering of pixel writes, respecting `Rgb` vs `Bgr`
-format. Writes `0xFF` to the alpha byte for bpp>=4.
-- Location: `common/src/types.rs:57-91`
-
 ---
 
 ## Safety Invariants
@@ -54,11 +48,6 @@ ensure the underlying hardware is initialized first.
 **COMMON-API-002 — `SerialPort::init()`:**
 Must be called before any other `SerialPort` method. Configures 115200 8N1
 with FIFO enabled.
-
-**COMMON-API-003 — `FramebufferInfo::draw_rect(x, y, w, h, r, g, b)`:**
-Safe to call with any `FramebufferInfo`. No-op if address/bpp are invalid.
-Caller must ensure the framebuffer memory is identity-mapped. Uses volatile
-stores to avoid optimization of display writes.
 
 ---
 

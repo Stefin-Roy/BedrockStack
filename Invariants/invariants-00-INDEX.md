@@ -1,9 +1,9 @@
 # BedrockOS Invariants — Index
 
-**Version:** 0.6.0
-**Date:** 2026-08-01
+**Version:** 0.7.0
+**Date:** 2026-08-03
 **Status:** All subsystems documented — MM, Arch (x86_64, RISC-V), ACPI, Display, PCI, Platform,
-Module, Drivers (Serial, PS/2), Input (UInputL), Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
+Drivers (Serial, PS/2), Input (UInputL), Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
 
 ---
 
@@ -31,14 +31,13 @@ Rust module hierarchy under `kernel/src/`.
 | 08 | `invariants-08-arch-riscv64.md` | RISC-V64 arch | `kernel/src/arch/riscv64/{mod,paging,trap,sbi,trampoline}.rs` |
 | 09 | `invariants-09-acpi.md` | ACPI subsystem | `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs` |
 | 10 | `invariants-10-display.md` | Display / framebuffer (legacy) | `kernel/src/display/{mod,framebuffer}.rs` |
-| 10g | `invariants-10-graphics-framebuffer.md` | Graphics framebuffer (active) | `graphics/Framebuffer/src/{display,framebuffer,console,color}.rs` |
-| 11 | `invariants-11-module.md` | Module system | `kernel/src/module/{mod,registry,fat32_test,fat32_ls,msix_test,usb_test,vfs_test}.rs` |
+| 10g | `invariants-10-graphics-framebuffer.md` | Graphics framebuffer (active) | `graphics/Framebuffer/src/{display,framebuffer,color}.rs` |
 | 12 | `invariants-12-pci.md` | PCI subsystem | `kernel/src/pci/{mod,ecam,enumerate}.rs`, `kernel/src/services/{pci_config,ecam_pci_config,pci_device}.rs` |
 | 13 | `invariants-13-platform-x86_64.md` | x86_64 platform | `kernel/src/platform/x86_64_pc/{apic,ioapic,pit}.rs` |
 | 14 | `invariants-14-platform-riscv64.md` | RISC-V platform | `kernel/src/platform/riscv_virt/{mod,plic,clint,htif}.rs`, `kernel/src/services/riscv64/riscv_interrupts.rs` |
-| 15 | `invariants-15-drivers-serial.md` | Serial driver (+ display_log) | `kernel/src/drivers/serial.rs`, `kernel/src/services/{serial.rs,x86_64/x86_serial.rs}` |
+| 15 | `invariants-15-drivers-serial.md` | Serial driver | `kernel/src/drivers/serial.rs`, `kernel/src/services/{serial.rs,x86_64/x86_serial.rs}` |
 | 15p | `invariants-15p-drivers-ps2.md` | PS/2 keyboard driver | `kernel/src/drivers/ps2.rs`, `kernel/src/input/{keycode,event}.rs`, `kernel/src/acpi/madt.rs` |
-| 15q | `invariants-15q-drivers-input.md` | UInputL unified input layer | `kernel/src/input/{mod,event,keycode,queue,keymap}.rs`, `kernel/src/module/input_test.rs` |
+| 15q | `invariants-15q-drivers-input.md` | UInputL unified input layer | `kernel/src/input/{mod,event,keycode,queue,keymap}.rs` |
 | 16 | `invariants-16-fs-vfs.md` | VFS core | `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types}.rs` |
 | 17 | `invariants-17-fs-tmpfs.md` | tmpfs | `kernel/src/filesystems/fstypes/{mod,tmpfs/{mod,mount,inode}}.rs` |
 | 18 | `invariants-18-fs-ahci.md` | AHCI block driver | `kernel/src/filesystems/blockdriver/{mod,traits,ahci}.rs` |
@@ -57,7 +56,7 @@ Rust module hierarchy under `kernel/src/`.
 Invariant IDs follow the pattern `AREA-NNN` where:
 
 - `AREA` is a short subsystem code: `ALLOC`, `HEAP`, `VMM`, `PAGING`, `BOOT`,
-  `ACPI`, `DISP`, `MOD`, `PCI`, `APIC`, `IOAPIC`, `PIT`, `SMP`, `VFS`, `TMPFS`,
+  `ACPI`, `DISP`, `PCI`, `APIC`, `IOAPIC`, `PIT`, `SMP`, `VFS`, `TMPFS`,
   `AHCI`, `SERIAL`, `PLAT`, `ARCH`, `DUMP`, `INIT`, `COMMON`, `PART`, `WC`,
   `SVC`, `USB`, `XHCI`, `PS2`, `INPUT`
 - `NNN` is a three-digit number
@@ -77,7 +76,7 @@ Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
 | Serial driver (`SERIAL`) | All logging output, must not deadlock |
 | PS/2 keyboard (`PS2`) | IOAPIC GSI 1 routing (`IOAPIC`), IDT device vectors, interrupt-gate IF semantics |
 | Input layer (`INPUT`) | All producers (PS/2, future USB HID), keymap layout, lock-free queue |
-| VFS (`VFS`) | Module init, tmpfs, AHCI |
+| VFS (`VFS`) | tmpfs, AHCI |
 | SMP (`SMP`) | Per-CPU data, serial prefix, AP startup |
 | Services (`SVC`) | All capability providers (ACPI, CPU, timer, PCI, serial, platform, DMA) |
 

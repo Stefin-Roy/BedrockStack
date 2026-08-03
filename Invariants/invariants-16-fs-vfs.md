@@ -120,7 +120,7 @@ implementation passes `Arc::as_ptr()` which is valid for the
 Registers all filesystems, mounts `tmpfs` on `A>`, creates `A>tmp`,
 sets CWD to `A>`. Returns `Err(VfsError)` on failure. No standard FDs are
 allocated — the first `open()` returns fd 0. Console I/O goes through
-`SerialPort`/`framebuffer::Console` directly until a devfs exists.
+`SerialPort` directly until a devfs exists.
 
 **VFS-API-002 — `InodeOps` trait:**
 Required operations: `read_at`, `write_at`, `lookup`, `create`, `mkdir`,
@@ -168,7 +168,7 @@ superblock's `shutdown()` before dropping the drive.
   `partition::mount_first_partition(dev, "fat32", 'B')` (see
   `invariants-19-fs-partition.md`).
 - `/dev` is not populated; no device special file type exists. Console
-  I/O goes through `SerialPort` and `Framebuffer` directly, not through VFS.
+  I/O goes through `SerialPort` directly, not through VFS.
 - Standard FDs 0/1/2 are not allocated; console device nodes are a
   devfs feature that has not been implemented yet.
 - `rename()` across different drives (cross-device) copies data through

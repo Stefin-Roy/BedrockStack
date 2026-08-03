@@ -16,7 +16,6 @@ pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
 pub mod mm;
-pub mod module;
 pub mod pci;
 pub mod platform;
 #[cfg(target_arch = "x86_64")]
@@ -32,7 +31,6 @@ use framebuffer::Framebuffer;
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use mm::vmm;
-use module::registry::init_all;
 
 unsafe extern "C" {
     static __kernel_start: u8;
@@ -179,7 +177,6 @@ impl Kernel {
         heap::set_phys_allocator(&mut self.allocator);
         unsafe { crate::smp::early_init_bsp(); }
         self.switch_to_higher_half();
-        self.enable_framebuffer_log();
         CurrentArch::init();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
@@ -258,22 +255,6 @@ impl Kernel {
         log::info!("Higher-half page tables activated");
     }
 
-    /// Enable display logging only after the active page tables map the
-    /// Multiboot framebuffer.  The bootstrap tables cover only low memory.
-    #[cfg(feature = "display_log")]
-    fn enable_framebuffer_log(&mut self) {
-        use framebuffer::Console;
-
-        let console = unsafe {
-            let display: &mut dyn framebuffer::Display = &mut self.framebuffer;
-            Console::new(display)
-        };
-        crate::drivers::serial::set_console(console);
-    }
-
-    #[cfg(not(feature = "display_log"))]
-    fn enable_framebuffer_log(&mut self) {}
-
     /// Parse ACPI tables from the RSDP.
     ///
     /// Runs after page tables are live so the VMM-backed `AcpiHandler` can
@@ -324,8 +305,7 @@ impl Kernel {
         crate::input::init();
 
         // PS/2 keyboard driver (8042 controller) — registers IRQ 1 and the
-        // keyboard device before the module tests run so the input test can
-        // receive keystrokes.
+        // keyboard device for the unified input layer.
         #[cfg(target_arch = "x86_64")]
         crate::drivers::ps2::init();
 
@@ -394,7 +374,6 @@ impl Kernel {
             }
         }
 
-        init_all(&mut self.framebuffer);
         loop {
             #[cfg(target_arch = "x86_64")]
             {

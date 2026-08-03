@@ -1,7 +1,7 @@
 # Serial Driver — Invariants
 
-**Version:** 0.4.0
-**Date:** 2026-07-31
+**Version:** 0.5.0
+**Date:** 2026-08-03
 **Source:** `kernel/src/drivers/serial.rs`, `kernel/src/services/serial.rs`, `kernel/src/services/x86_64/x86_serial.rs`
 **Status:** Stable
 
@@ -33,10 +33,9 @@ when a `PerCpu` struct is available (i.e. after `early_init_bsp()`).
 - Location: `kernel/src/drivers/serial.rs:25,56-87,165-167`
 
 **SERIAL-005 — Raw output functions (`putc`, `put_hex`, `put_u64`) do NOT
-add a CPU prefix, but DO acquire locks and mirror to framebuffer:**
+add a CPU prefix, but DO acquire locks:**
 Only `puts()` manages prefix insertion. The primitives are used as building
-blocks inside `puts()` itself. When `feature = "display_log"` is enabled,
-they also write to the framebuffer `Console` via `putc_and_flush()`/`puts()`.
+blocks inside `puts()` itself.
 - Location: `kernel/src/drivers/serial.rs:44-53,90-100,103-113`
 
 **SERIAL-006 — Lock-free `dump_*` functions bypass all locks:**
@@ -46,27 +45,13 @@ lock. Safe ONLY during a fault dump (single CPU, interrupts disabled, no
 concurrent access). Used by `kerneldump` to report crash state.
 - Location: `kernel/src/drivers/serial.rs:123-147`
 
-**SERIAL-007 — Framebuffer console is set via `set_console()`:**
-Behind `#[cfg(feature = "display_log")]`, a global `Console` instance is
-stored in a `ConsoleCell(UnsafeCell<Option<Console>>)`. `set_console()` is
-called during `Kernel::init()` after page tables are live. All `putc`,
-`puts`, `put_hex`, `put_u64` mirror output to the console while holding
-locks, ensuring serial and display output are synchronized.
-- Location: `kernel/src/drivers/serial.rs:13-22,149-152`
-
-**SERIAL-008 — `format_hex`/`format_dec` helpers for display mirroring:**
-Behind `#[cfg(feature = "display_log")]`, `put_hex`/`put_u64` use
-`format_hex()`/`format_dec()` to produce string slices for the console,
-avoiding allocation in the locked context.
-- Location: `kernel/src/drivers/serial.rs:170-198`
-
-**SERIAL-009 — `write_prefix()` outputs `[CPU(N)] ` directly to Inner:**
+**SERIAL-007 — `write_prefix()` outputs `[CPU(N)] ` directly to Inner:**
 Called from `puts()` when a new line starts. Writes the raw prefix via
 the inner serial port (no recursive locking) and does not affect
 `LAST_WAS_NL` tracking.
 - Location: `kernel/src/drivers/serial.rs:154-163`
 
-**SERIAL-010 — `SerialConsole` capability wraps `SerialPort`:**
+**SERIAL-008 — `SerialConsole` capability wraps `SerialPort`:**
 `KernelSerial` (unit struct, capability `"kernel-serial"`) implements the
 `SerialConsole` trait (`putc`/`puts`/`put_hex`/`put_u64`) by delegating to
 `drivers::serial::SerialPort`. It is installed as `KernelServices.serial`
@@ -96,12 +81,6 @@ Must only be called when the calling CPU holds both locks implicitly
 mechanism during a fault dump is safe because the fault handler runs
 on a single CPU with interrupts masked.
 
-**SERIAL-S004 — `ConsoleCell` / `set_console` safety:**
-`ConsoleCell` wraps `UnsafeCell<Option<Console>>` and is `Sync`.
-It is written exactly once during `Kernel::init()` (from the BSP, before
-SMP starts) and only read under the serial lock thereafter. The `UnsafeCell`
-is justified because all access is serialized by the serial locks.
-
 ---
 
 ## API Contracts
@@ -114,20 +93,14 @@ Multiboot2 path (`kernel/src/arch/x86_64/multiboot2.rs:32`).
 
 **SERIAL-API-002 — `SerialPort::puts(s)`:**
 Line-buffered output with per-CPU `[CPU(N)]` prefix. Re-entrant safe
-(with the two-level lock). When `feature = "display_log"` is enabled,
-mirrors output to the framebuffer console after writing to serial.
+(with the two-level lock).
 
 **SERIAL-API-003 — `SerialPort::putc(c)` / `put_hex(val)` / `put_u64(val)`:**
-Raw output without CPU prefix. Acquires both locks. Mirrors to framebuffer
-console when `feature = "display_log"` is enabled.
+Raw output without CPU prefix. Acquires both locks.
 
 **SERIAL-API-004 — `dump_putc(c)` / `dump_puts(s)` / `dump_put_hex(val)` / `dump_put_u64(val)`:**
 Lock-free output that bypasses all spinlocks. Only safe during a fault dump
 (single CPU, interrupts disabled).
-
-**SERIAL-API-005 — `set_console(console)`:**
-Registers a framebuffer `Console` for display mirroring. Called once during
-`Kernel::init()` after page tables cover the framebuffer.
 
 ---
 
@@ -142,8 +115,3 @@ Registers a framebuffer `Console` for display mirroring. Called once during
   if the transmitter stays busy for ~100K iterations, data is written
   anyway (best-effort) to avoid hanging the kernel.
 - `core::fmt::Write` is implemented for `SerialPort` via `write_str`.
-- The `display_log` feature gates all framebuffer console mirroring.
-  `ConsoleCell` uses `UnsafeCell` to avoid the overhead of `Mutex` on
-  every character output; the serial locks already serialize access.
-- `format_hex` and `format_dec` are stack-allocated formatters that
-  produce `&str` slices for console output without heap allocation.

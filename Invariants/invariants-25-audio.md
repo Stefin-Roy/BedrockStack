@@ -1,12 +1,11 @@
 # BedrockOS Invariants — Audio Subsystem & Intel HD Audio Driver
 
-**Version:** 0.1.0
-**Date:** 2026-08-02
+**Version:** 0.2.0
+**Date:** 2026-08-03
 **Source paths:**
 - `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, sine synthesis
 - `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream
 - `kernel/src/audio/codec.rs` — generic HDA codec driver: probe, widget graph, output/input path discovery, path bring-up
-- `kernel/src/module/audio_test.rs` — `AudioTest` boot module (melody smoke test)
 - `kernel/src/lib.rs` — `pub mod audio`, `audio::init()` in `Kernel::run()`
 - `run.bat`, `fullrun.bat` — `-audiodev dsound` + `ich9-intel-hda` + `hda-output` + `hda-duplex` QEMU wiring
 
@@ -15,7 +14,7 @@
 ## Scope & Platform
 
 **AUD-000** The subsystem is x86_64-only. `audio::init()` is a no-op on riscv64
-(the `virt` machine has no PCI audio device); the rest of the module still
+(the `virt` machine has no PCI audio device); the rest of the subsystem still
 compiles there, but `is_ready()` stays `false`.
 - Location: `kernel/src/audio/mod.rs` `init()`, `kernel/src/lib.rs:9`
 
@@ -40,7 +39,7 @@ logged and the scan continues; no controller leaves the subsystem idle.
 
 **AUD-004** `play_pcm()`/`play_tone()` return `Err("audio device not
 initialised")` before any hardware is live. Playback is synchronous and
-blocking; it is only invoked from the boot-module context (serialised).
+blocking; it is only invoked from the boot context (serialised).
 
 **AUD-005** `play_tone(freq_hz, ms)` synthesises a sine into a heap `Vec<i16>`
 (stereo, 48 kHz, 0.35 amplitude) and feeds it to `play_pcm`. The sine uses the
@@ -199,14 +198,9 @@ must match the codec's `SET_CONV` stream tag or the codec ignores the stream.
 ## Boot Sequence
 
 **AUD-021** `audio::init()` runs in `Kernel::run()` immediately after the xHCI
-init block, before VFS init and module tests — it depends only on
+init block, before VFS init — it depends only on
 `pci::init()` (which precedes it) and on the services (DMA, timer).
 - Location: `kernel/src/lib.rs` `run()`
-
-**AUD-022** `AudioTest` sits before `InputTest` in the x86_64 module list. It
-SKIPs (reports OK) when no audio device is present and returns an error on
-playback failure, matching the module-test convention.
-- Location: `kernel/src/module/registry.rs:38-47`, `kernel/src/module/audio_test.rs`
 
 ---
 

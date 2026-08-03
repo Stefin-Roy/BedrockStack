@@ -40,9 +40,6 @@ The following dependencies MUST be respected:
                     │       (identity + higher-half, NXE+WP, PAT WC)
                     │   └── Vmm::activate()
                     │       (switches CR3 / SATP; acpi::init_vmm also here)
-                    ├── enable_framebuffer_log()
-                    │   (Console via set_console() — after page tables
-                    │    cover framebuffer physical address)
                     ├── CurrentArch::init()
                     │   ├── GDT::init()
                     │   ├── IDT::init()
@@ -78,16 +75,7 @@ The following dependencies MUST be respected:
                     │   ├── fstypes::register_all()
                     │   ├── Mount tmpfs on A>
                     │   └── Mount ESP fat32 on B> [x86_64]
-                    ├── module::init_all()
-                    │   ├── HelloModule
-                    │   ├── Fat32Test (B>)
-                    │   ├── MsixTest [x86_64]
-                    │   ├── UsbTest [x86_64]
-                    │   ├── Fat32Ls [B>]
-                    │   ├── VfsTest (A>)
-                    │   └── InputTest (UInputL echo, Backspace/Delete,
-                    │       halts on Esc) [x86_64]
-                    └── Halt loop (reached only when no input device / non-x86_64)
+                    └── Idle loop (xHCI hot-plug poll + halt)
 ```
 
 ---
@@ -145,11 +133,11 @@ capability providers; `smp::init` and all later subsystems consume
 `KernelServices` via `kernel_services()`.
 - Location: `kernel/src/lib.rs:199-207`, `kernel/src/services/mod.rs:62-72`
 
-**INIT-010 — Page tables must be set up before framebuffer console init:**
-Framebuffer memory must be identity-mapped before `enable_framebuffer_log()`
-calls `set_console()` with a `Console` that draws to the framebuffer.
-Console init moved from `Kernel::new()` to after `switch_to_higher_half()`.
-- Location: `kernel/src/lib.rs:` `switch_to_higher_half()` then `enable_framebuffer_log()`
+**INIT-010 — Page tables must be set up before framebuffer mapping:**
+The real scanout framebuffer is identity-mapped (Write-Combining) when the
+higher-half page tables are built in `switch_to_higher_half()`, using the
+framebuffer's physical address, dimensions and bpp.
+- Location: `kernel/src/lib.rs:` `switch_to_higher_half()`
 
 **INIT-011 — Interrupts must be enabled after SMP init:**
 AP startup uses IPIs (x86_64) or SBI ecalls (RISC-V). Interrupts are
@@ -199,13 +187,11 @@ VFS mounts block devices discovered by AHCI. The ESP (first partition on
 first block device) is mounted as `B>` (fat32) after VFS init.
 - Location: `kernel/src/lib.rs:` block drivers → VFS → partition mount
 
-**INIT-017 — Module init runs last:**
-Modules may use VFS, display, input, and all other initialized subsystems.
-The x86_64 module list includes: `HelloModule`, `Fat32Test`, `MsixTest`,
-`UsbTest`, `Fat32Ls`, `VfsTest`, `InputTest`. Non-x86_64 targets exclude
-`MsixTest`, `UsbTest`, and `InputTest`. `InputTest` is last and halts forever
-once an input device is present, so it is the terminal step of the sequence.
-- Location: `kernel/src/lib.rs:` `init_all()` at end of `run()`
+**INIT-017 — The idle loop is the terminal step:**
+After VFS init and the ESP mount, `Kernel::run()` enters a loop that polls the
+retained xHCI controller for port changes (registering newly attached block
+devices) and then halts. There is no per-boot test/module stage.
+- Location: `kernel/src/lib.rs:` `run()` idle loop
 
 **INIT-017a — UInputL core init runs before any input driver:**
 `input::init()` (the core owns the static event queue and registries) must
@@ -214,12 +200,11 @@ is a `static const` so no heap ordering is involved, but the call still marks
 the ordering contract for future drivers.
 - Location: `kernel/src/lib.rs:323-325`, `kernel/src/input/mod.rs:96-101`
 
-**INIT-017b — PS/2 init runs after PCI init and UInputL init, before module tests:**
+**INIT-017b — PS/2 init runs after PCI init and UInputL init:**
 `ps2::init()` registers the keyboard ISR and programs IOAPIC GSI 1 while
-interrupts are already enabled (post-`init()`). It must complete before
-`module::init_all()` so `InputTest` can receive keystrokes. Failure is
-non-fatal — the keyboard simply stays absent and `InputTest` skips itself
-(no `register_device` call, so `input::device_count()` stays 0).
+interrupts are already enabled (post-`init()`). It must complete before the
+idle loop so keystrokes are delivered to the unified input layer. Failure is
+non-fatal — the keyboard simply stays absent.
 - Location: `kernel/src/lib.rs:327-331`, `kernel/src/drivers/ps2.rs:768-784`
 
 ---

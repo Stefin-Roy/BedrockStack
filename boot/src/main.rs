@@ -149,9 +149,6 @@ fn main() -> Status {
     // 6. Print final message before exiting boot services.
     log_msg(&mut output, "[boot] Jumping to kernel...\n");
 
-    // ── Framebuffer stroboscope markers (no serial needed) ──
-    fb_info.draw_rect(0, 0, 64, 64, 255, 0, 0);   // M1: RED — before exit_boot_services
-
     // 7. Exit boot services — after this, only runtime services remain.
     //    The returned map is the authoritative post-exit memory map.
     //    uefi-rs handles the memory-map-key dance internally; if the
@@ -159,8 +156,6 @@ fn main() -> Status {
     //    performs a cold machine reset (uefi-0.37.0/src/boot.rs) rather
     //    than returning an error.
     let mmap = unsafe { uefi::boot::exit_boot_services(Some(allocator::OS_DATA)) };
-
-    fb_info.draw_rect(64, 0, 64, 64, 0, 255, 0);  // M2: GREEN — after exit_boot_services
 
     // 8. Build the region list from the FINAL map into the pre-allocated buffer.
     //    No allocation happens here (we stay within reserved capacity), which is
@@ -198,8 +193,6 @@ fn main() -> Status {
     // 9. We are now bare metal. Jump to kernel.
     // NOTE: Serial I/O still works after exit_boot_services (bare metal port I/O).
     SerialPort::puts("[boot] Boot services exited. Jumping to kernel...\n");
-
-    fb_info.draw_rect(128, 0, 64, 64, 0, 0, 255);  // M3: BLUE — before jump_to_kernel
 
     #[cfg(feature = "cpu_slow")]
     {

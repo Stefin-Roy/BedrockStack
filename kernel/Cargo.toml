@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 cpu_slow = []
 forceslowlogging = []
-display_log = []
 fat_trace = []
 usb_trace = []
 kernelmb2 = []

@@ -1,7 +1,7 @@
 # Display / Framebuffer — Invariants
 
-**Version:** 0.5.1
-**Source:** `graphics/Framebuffer/src/{display,framebuffer,console}.rs`
+**Version:** 0.5.2
+**Source:** `graphics/Framebuffer/src/{display,framebuffer,color}.rs`
 **Status:** Stable
 
 ---
@@ -42,13 +42,8 @@ Copies `(height - rows) * stride * bpp` bytes upward, then zeroes the
 vacated rows at the bottom. If `rows >= height`, clears the entire buffer.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:124-141`
 
-**DISP-008 — `Console` renders white-on-black:**
-All character drawing uses fixed foreground `Color::WHITE` on background
-`Color::BLACK`; there is no per-console color state.
-- Location: `graphics/Framebuffer/src/framebuffer.rs` (`draw_char`)
-
-**DISP-009 — `bpp` parameter is consistent:**
-`Framebuffer`, `Console`, and paging all receive the same `bpp` value.
+**DISP-008 — `bpp` parameter is consistent:**
+`Framebuffer` and paging both receive the same `bpp` value.
 `FramebufferInfo.bpp` is set by the bootloader (default 4 for UEFI GOP).
 - Location: `common/src/types.rs:38`, `boot/src/main.rs:254`
 
@@ -74,19 +69,7 @@ dirty scanlines from shadow to real fb via `core::ptr::copy_nonoverlapping`
 `clear()` mark the full screen dirty and call `flush()` inline.
 - Location: `graphics/Framebuffer/src/framebuffer.rs`
 
-**DISP-013 — Console delegates to `Display` trait:**
-`Console` stores a `*mut dyn Display` (lifetime-erased via `core::mem::transmute`)
-instead of duplicating `fb_ptr`, `stride`, `bpp`, `width`, `height`, and
-`pixel_format`. All drawing (`draw_char`, `scroll_up`, `clear`, `flush`)
-delegates through the `Display` trait interface.
-- Location: `graphics/Framebuffer/src/console.rs`
-
-**DISP-014 — Console flushes once per string output:**
-`Console::puts()` writes the entire string then calls `Display::flush()` once.
-`Console::putc_and_flush()` provides single-character immediate visibility.
-- Location: `graphics/Framebuffer/src/console.rs`
-
-**DISP-015 — `Framebuffer::new()` requires shadow address:**
+**DISP-013 — `Framebuffer::new()` requires shadow address:**
 `shadow_addr: u64` parameter provides the physical address of the shadow
 buffer. `shadow_ptr()` and `shadow_slice()`/`shadow_slice_mut()` expose the
 shadow for direct access.
@@ -117,13 +100,7 @@ Access is single-threaded (only BSP writes to the display). No `Sync`
 impl is provided, preventing data races.
 - Location: `graphics/Framebuffer/src/framebuffer.rs` (implicit)
 
-**DISP-S005 — `Console` delegates through `Display` trait:**
-Console stores `*mut dyn Display` (lifetime-erased via `transmute`) and
-calls trait methods for all drawing. The caller must ensure the `Display`
-outlives the `Console`.
-- Location: `graphics/Framebuffer/src/console.rs`
-
-**DISP-S006 — `phys_addr()` / `shadow_phys_addr()` return raw addresses:**
+**DISP-S005 — `phys_addr()` / `shadow_phys_addr()` return raw addresses:**
 Return the framebuffer and shadow buffer physical addresses for page-table
 mapping. The caller must ensure the addresses are still valid when used.
 - Location: `graphics/Framebuffer/src/framebuffer.rs:39-41`
@@ -153,12 +130,6 @@ Provides:
 real framebuffer via `core::ptr::copy_nonoverlapping`. `flush_full()`
 copies the entire buffer. Both reset the dirty flag.
 
-**DISP-API-004 — `Console`:**
-Wraps a `&mut dyn Display` pointer for cursor-based text output. All
-drawing delegates to the trait interface. Text renders white-on-black.
-`puts()` flushes once after writing the entire string.
-`putc_and_flush()` for single-character visibility.
-
 ---
 
 ## Design Notes
@@ -170,8 +141,8 @@ drawing delegates to the trait interface. Text renders white-on-black.
   use different values (e.g. 3 for 24bpp).
 - `Color` provides named constants (`WHITE`, `BLACK`, `RED`, etc.) and
   format-aware `to_pixel_bytes()` for BGR/RGB byte ordering.
-- The `draw_glyph_raw` function is `pub(crate)` to both `Framebuffer` and
-  `Console`, eliminating the code duplication that existed in v0.2.0.
+- The `draw_glyph_raw` function is `pub(crate)` to `Framebuffer`, eliminating
+  code duplication between the `Framebuffer` and the former `Console` type.
 - Drawing primitives pack pixel data as `bpp` bytes via `Color::to_pixel_bytes()`
   and write to the shadow buffer with regular non-volatile stores. Only
   `flush()` uses `copy_nonoverlapping` to transfer the dirty region to the

@@ -82,12 +82,10 @@ keymap's job in `kernel/src/input/keymap.rs`.
 - Location: `kernel/src/drivers/ps2.rs` `submit_decoded()`,
   `kernel/src/input/keymap.rs`
 
-**PS2-009 — The test module is the last module and may never return:**
-`InputTest` is appended last in the x86_64 `MODULES` list. If any input device
-is present its `init()` runs a never-terminating echo loop; on the physical
-Esc key it prints a message and halts forever. It returns `Ok(())` immediately
-when no input device is present.
-- Location: `kernel/src/module/input_test.rs`
+**PS2-009 — The driver is present iff a keyboard answered the 8042 self-test:**
+`PRESENT` is set once during `init()` when the controller acknowledges and a
+keyboard device is detected. It is never cleared at runtime.
+- Location: `kernel/src/drivers/ps2.rs` `init()`
 
 ---
 
@@ -141,7 +139,7 @@ in-interrupt caller before the lock is held across the disable.
 **PS2-API-001 — `pub fn init() -> bool`:**
 Idempotent; returns `true` iff a keyboard was detected and configured. Must be
 called from `Kernel::run()` (x86_64) after `input::init()` and after PCI/IOAPIC
-init, before the module tests. Failure is non-fatal and logged. On success it
+init. Failure is non-fatal and logged. On success it
 registers the device with UInputL and stores the returned id in `DEVICE_ID`.
 - Location: `kernel/src/drivers/ps2.rs` `init()`, `kernel/src/lib.rs`
 
@@ -155,7 +153,7 @@ thread with interrupts enabled.
 - Location: `kernel/src/drivers/ps2.rs` `poll_device()`, `submit_decoded()`
 
 **PS2-API-003 — `pub fn is_present() -> bool`:**
-Reflects `PRESENT`; consumers (e.g. `InputTest`) must check this (or
+Reflects `PRESENT`; consumers (e.g. a future shell) must check this (or
 `input::device_count()`) before assuming keystrokes are available so headless
 boots do not hang.
 - Location: `kernel/src/drivers/ps2.rs` `is_present()`
@@ -204,6 +202,5 @@ block or take long-lived locks.
   8042 on the next byte because reading the data port clears OBF.
 - The driver is x86_64-only; `kernel/src/drivers/mod.rs` gates the module with
   `#[cfg(target_arch = "x86_64")]`. riscv64's virt machine has no i8042.
-- `InputTest` deliberately never returns once an input device is present; it is
-  the terminal step of `init_all()`. It uses `Console` methods (`clear`,
-  `putc_and_flush`, `backspace`, `delete`) for per-keystroke framebuffer echo.
+- No boot-time input consumer exists yet; keystrokes accumulate in the UInputL
+  queue until a future shell or app reads them via `read_event`/`subscribe`.

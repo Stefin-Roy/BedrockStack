@@ -11,9 +11,9 @@ if /i "%BOOT_MODE%"=="grub" goto :deploy_grub
 goto :deploy_uefi
 
 :deploy_uefi
-REM Build kernel with display_log + cpu_slow (release)
-echo [1/3] Building kernel (release, features: display_log cpu_slow)...
-cargo build --target x86_64-unknown-none -p kernel --features "display_log cpu_slow" --release
+REM Build kernel with cpu_slow (release)
+echo [1/3] Building kernel (release, features: cpu_slow)...
+cargo build --target x86_64-unknown-none -p kernel --features cpu_slow --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Build bootloader with cpu_slow (release)
@@ -35,7 +35,7 @@ goto :done
 :deploy_grub
 echo === GRUB+Multiboot2 USB deployment ===
 echo [1/2] Building kernel (release, kernelmb2)...
-cargo build --target x86_64-unknown-none -p kernel --features "display_log kernelmb2 cpu_slow" --release
+cargo build --target x86_64-unknown-none -p kernel --features "kernelmb2 cpu_slow" --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/2] Creating GRUB standalone image and copying to USB folder...

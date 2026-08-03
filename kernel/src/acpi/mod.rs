@@ -93,36 +93,6 @@ impl AcpiSubsystem {
             tables::parse_tables(rsdp_addr)?
         };
 
-        // Dump all parsed table entries and their signatures (dev-only).
-        #[cfg(feature = "display_log")]
-        {
-            for (i, e) in entries.iter().enumerate() {
-                let sig_bytes = [
-                    e.signature as u8,
-                    (e.signature >> 8) as u8,
-                    (e.signature >> 16) as u8,
-                    (e.signature >> 24) as u8,
-                ];
-                SerialPort::puts("[acpi] entry ");
-                SerialPort::put_u64(i as u64);
-                SerialPort::puts(": sig=0x");
-                SerialPort::put_hex(e.signature as u64);
-                SerialPort::puts(" \"");
-                for &b in &sig_bytes {
-                    if b >= 0x20 && b < 0x7f {
-                        SerialPort::putc(b);
-                    } else {
-                        SerialPort::putc(b'.');
-                    }
-                }
-                SerialPort::puts("\" vaddr=");
-                SerialPort::put_hex(e.vaddr);
-                SerialPort::puts(" len=");
-                SerialPort::put_u64(e.length as u64);
-                SerialPort::puts("\n");
-            }
-        }
-
         let fadt_fields = entries
             .iter()
             .find(|e| e.signature == sig(b"FACP"))

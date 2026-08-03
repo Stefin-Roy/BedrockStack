@@ -70,10 +70,11 @@ if not exist "%OVMF_PATH%" (
 echo [1/4] Building kernel (x86_64-unknown-none, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set BASE_FEATURES=display_log
-if "%CPU_SLOW%"=="1" set BASE_FEATURES=display_log cpu_slow
+set BASE_FEATURES=
+if "%CPU_SLOW%"=="1" set BASE_FEATURES=cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
-set CARGO_FEATURES=--features "%BASE_FEATURES%"
+set CARGO_FEATURES=
+if not "%BASE_FEATURES%"=="" set CARGO_FEATURES=--features "%BASE_FEATURES%"
 cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
@@ -170,9 +171,10 @@ echo.
 echo [1/2] Building kernel (riscv64gc-unknown-none-elf, debug)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set BASE_FEATURES=display_log
+set BASE_FEATURES=
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
-set CARGO_FEATURES=--features "%BASE_FEATURES%"
+set CARGO_FEATURES=
+if not "%BASE_FEATURES%"=="" set CARGO_FEATURES=--features "%BASE_FEATURES%"
 cargo build --target riscv64gc-unknown-none-elf -p kernel %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
@@ -269,7 +271,7 @@ if not exist "%OVMF_PATH%" (
 echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set BASE_FEATURES=display_log kernelmb2
+set BASE_FEATURES=kernelmb2
 if "%CPU_SLOW%"=="1" set BASE_FEATURES=%BASE_FEATURES% cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=--features "%BASE_FEATURES%"

@@ -1,8 +1,8 @@
 # UInputL — Unified Input Layer — Invariants
 
-**Version:** 0.2.0
-**Date:** 2026-08-01
-**Source:** `kernel/src/input/{mod,event,keycode,queue,keymap}.rs`, `kernel/src/drivers/ps2.rs`, `kernel/src/module/input_test.rs`
+**Version:** 0.3.0
+**Date:** 2026-08-03
+**Source:** `kernel/src/input/{mod,event,keycode,queue,keymap}.rs`, `kernel/src/drivers/ps2.rs`
 **Status:** Stable (arch-independent core; x86_64 consumer today via PS/2)
 
 ---
@@ -172,10 +172,10 @@ translation. `Keymap::feed(&mut self, &InputEvent) -> Option<char>`.
 ## Design Notes
 
 - **Producer/consumer split:** PS/2 registers "PS/2 Keyboard" with
-  `CAP_KEYS` and its `poll_device` as the poll hook; the `InputTest` module
-  consumes via `read_event` + a local `Keymap`. Future USB HID, mouse, touch
-  and gamepad drivers plug in with the same API — the queue is MPSC, ids are
-  per-device, and subscribers filter by class.
+  `CAP_KEYS` and its `poll_device` as the poll hook. Future consumers
+  (USB HID, mouse, touch, gamepad drivers and user-space shells) plug in
+  with the same API — the queue is MPSC, ids are per-device, and
+  subscribers filter by class.
 - **Keymap is replaceable:** a Dvorak or national layout is a rewrite of
   `keymap.rs` alone; no driver changes. The keymap observes all events
   (including releases and lock toggles) so its modifier/lock state is

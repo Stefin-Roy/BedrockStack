@@ -26,9 +26,6 @@ pub extern "sysv64" fn _start(
     rsdp_addr: u64,
 ) -> ! {
     // ── Kernel arrived ──
-    if let Some(fb) = unsafe { framebuffer_ptr.as_ref() } {
-        fb.draw_rect(192, 0, 64, 64, 255, 255, 0);  // M4: YELLOW — kernel _start
-    }
 
     // Reinit COM1 — boot already did this, but be safe
     SerialPort::init();
@@ -54,7 +51,6 @@ pub extern "sysv64" fn _start(
     let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
-    SerialPort::puts("[kernel] Init complete, running modules...\n");
     kernel.run();
 }
 
@@ -161,7 +157,6 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
-    SerialPort::puts("[kernel] Init complete, running modules...\n");
     kernel.run();
 }
 
