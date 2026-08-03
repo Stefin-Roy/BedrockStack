@@ -2,10 +2,9 @@
 //!
 //! The Boot domain holds a capability to each provider and reaches it through
 //! the `invoke` entry (§7.9) — full invoke form, no downcast fast path. Each
-//! adapter wraps the existing `Capability` provider (its `Capability` impl is
-//! untouched) by implementing `Obj`: `dispatch` delegates to the same trait
-//! methods the object already uses, so a hook call reaches the singleton's
-//! real internal state.
+//! adapter wraps an existing kernel service provider (implementing `Obj` by
+//! delegating `dispatch` to the same provider-trait methods the object already
+//! uses) so a hook call reaches the singleton's real internal state.
 //!
 //! All adapters are arch-neutral.
 
@@ -20,9 +19,9 @@ use crate::services::serial::KernelSerial;
 use crate::services::dma::KernelDma;
 
 use super::cap_handle::RevocationPolicy;
-use super::contract::ContractId;
+use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
-use super::surface::SurfaceDesc;
+use super::surface::{SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
 
@@ -89,11 +88,45 @@ pub fn serial_node() -> Arc<dyn Obj> {
 
 // ── DMA adapter ────────────────────────────────────────────────────────
 
-pub const DMA_CONTRACT: ContractId = ContractId::from_name("dma:alloc");
+pub const DMA_CONTRACT: ContractId = ContractId::of("dma:alloc", &DMA_SURFACE, &DMA_HOOKS);
 pub const DMA_ALLOC_PAGE: HookId = HookId::of("alloc_page");
 pub const DMA_ALLOC_CONTIG: HookId = HookId::of("alloc_contiguous");
 pub const DMA_MAP_MMIO: HookId = HookId::of("map_mmio");
 pub const DMA_VIRT_TO_PHYS: HookId = HookId::of("virt_to_phys");
+
+pub const DMA_DOC: &str = "if you call alloc_page, you get a (phys, virt, size) \
+buffer owned by this DMA provider; alloc_contiguous(n) is the same for an \
+n-page run; map_mmio(paddr, size) maps device MMIO and returns a VA; \
+virt_to_phys(vaddr) resolves an existing mapping to its physical address.";
+
+const DMA_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "dma:alloc",
+    attrs: &[],
+    events: &[],
+};
+
+const DMA_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "alloc_page",
+        params: &[],
+        reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]),
+    },
+    HookSignature {
+        name: "alloc_contiguous",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]),
+    },
+    HookSignature {
+        name: "map_mmio",
+        params: &[TypeTag::U64, TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "virt_to_phys",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+];
 
 static DMA_CONTRACTS: &[ContractId] = &[DMA_CONTRACT];
 
@@ -169,13 +202,96 @@ fn arg_u64(args: &Args, i: usize) -> Option<u64> {
 
 // ── PCI config-space adapter ───────────────────────────────────────────
 
-pub const PCI_CONTRACT: ContractId = ContractId::from_name("pci-config");
+pub const PCI_CONTRACT: ContractId = ContractId::of("pci-config", &PCI_SURFACE, &PCI_HOOKS);
 pub const PCI_READ8: HookId = HookId::of("read8");
 pub const PCI_READ16: HookId = HookId::of("read16");
 pub const PCI_READ32: HookId = HookId::of("read32");
 pub const PCI_WRITE8: HookId = HookId::of("write8");
 pub const PCI_WRITE16: HookId = HookId::of("write16");
 pub const PCI_WRITE32: HookId = HookId::of("write32");
+
+pub const PCI_DOC: &str = "if you call read{8,16,32}(seg, bus, dev, func, off), \
+you read the given PCI config-space register and get a U64 value; \
+write{8,16,32}(seg, bus, dev, func, off, val) writes the value and replies \
+with nothing.";
+
+const PCI_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "pci-config",
+    attrs: &[],
+    events: &[],
+};
+
+const PCI_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "read8",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "read16",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "read32",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "write8",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::None,
+    },
+    HookSignature {
+        name: "write16",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::None,
+    },
+    HookSignature {
+        name: "write32",
+        params: &[
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+            TypeTag::U64,
+        ],
+        reply: ReplyTag::None,
+    },
+];
 
 static PCI_CONTRACTS: &[ContractId] = &[PCI_CONTRACT];
 
@@ -238,9 +354,31 @@ impl Obj for EcamPciConfig {
 
 // ── Serial console adapter ─────────────────────────────────────────────
 
-pub const SERIAL_CONTRACT: ContractId = ContractId::from_name("serial-console");
+pub const SERIAL_CONTRACT: ContractId = ContractId::of("serial-console", &SERIAL_SURFACE, &SERIAL_HOOKS);
 pub const SERIAL_PUTC: HookId = HookId::of("putc");
 pub const SERIAL_PUTS: HookId = HookId::of("puts");
+
+pub const SERIAL_DOC: &str = "if you call putc(c), one character is written to \
+the console and nothing is replied; puts(s) writes the given string.";
+
+const SERIAL_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "serial-console",
+    attrs: &[],
+    events: &[],
+};
+
+const SERIAL_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "putc",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::None,
+    },
+    HookSignature {
+        name: "puts",
+        params: &[TypeTag::Str],
+        reply: ReplyTag::None,
+    },
+];
 
 static SERIAL_CONTRACTS: &[ContractId] = &[SERIAL_CONTRACT];
 
@@ -282,5 +420,69 @@ impl Obj for KernelSerial {
             return Ok(Reply::None);
         }
         Err(ObjError::NotSupported)
+    }
+}
+
+// ── Contract definitions (§7.2.4, §7.8) ──────────────────────────────────
+//
+// Each provider node advertises a `ContractId` (its `contracts()`); the
+// registry carries the full `Contract` — id, name, surface, hooks, and doc —
+// so a driver holding the registry capability can ask "what does this
+// contract promise?" and get the definition back. The ids are recomputed
+// from the same statics they were declared with, so `def.id` and
+// `ContractId::of(name, surface, hooks)` agree by construction.
+
+static DMA_CONTRACT_DEF: Contract = Contract {
+    id: DMA_CONTRACT,
+    name: "dma:alloc",
+    surface: &DMA_SURFACE,
+    hooks: DMA_HOOKS,
+    doc: DMA_DOC,
+};
+
+static PCI_CONTRACT_DEF: Contract = Contract {
+    id: PCI_CONTRACT,
+    name: "pci-config",
+    surface: &PCI_SURFACE,
+    hooks: PCI_HOOKS,
+    doc: PCI_DOC,
+};
+
+static SERIAL_CONTRACT_DEF: Contract = Contract {
+    id: SERIAL_CONTRACT,
+    name: "serial-console",
+    surface: &SERIAL_SURFACE,
+    hooks: SERIAL_HOOKS,
+    doc: SERIAL_DOC,
+};
+
+/// The canonical definition of the DMA contract (§7.8).
+pub fn dma_contract_def() -> &'static Contract {
+    &DMA_CONTRACT_DEF
+}
+
+/// The canonical definition of the PCI-config contract (§7.8).
+pub fn pci_contract_def() -> &'static Contract {
+    &PCI_CONTRACT_DEF
+}
+
+/// The canonical definition of the serial-console contract (§7.8).
+pub fn serial_contract_def() -> &'static Contract {
+    &SERIAL_CONTRACT_DEF
+}
+
+/// Find the canonical contract definition by contract name (§7.8). The
+/// registry node's `register` hook consults this, so a discovered `def` is
+/// always one the kernel trusts enough to seed — a remote domain cannot
+/// inject an arbitrary tuple.
+pub fn contract_def(name: &str) -> Option<&'static Contract> {
+    if name == DMA_CONTRACT_DEF.name {
+        Some(&DMA_CONTRACT_DEF)
+    } else if name == PCI_CONTRACT_DEF.name {
+        Some(&PCI_CONTRACT_DEF)
+    } else if name == SERIAL_CONTRACT_DEF.name {
+        Some(&SERIAL_CONTRACT_DEF)
+    } else {
+        None
     }
 }

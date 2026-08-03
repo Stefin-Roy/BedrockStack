@@ -4,15 +4,13 @@ use crate::mm::layout::region_next_down;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
 
-use super::capability::Capability;
-
 pub struct DmaBuffer {
     pub phys: u64,
     pub virt: u64,
     pub size: usize,
 }
 
-pub trait DmaAllocator: Capability {
+pub trait DmaAllocator: Send + Sync {
     fn alloc_page(&self) -> Option<DmaBuffer>;
     fn alloc_contiguous(&self, count: usize) -> Option<DmaBuffer>;
     fn map_mmio(&self, paddr: u64, size: u64) -> Result<u64, &'static str>;
@@ -84,12 +82,6 @@ impl KernelDma {
             root,
             inner: Mutex::new(DmaInner { alloc }),
         }
-    }
-}
-
-impl Capability for KernelDma {
-    fn name(&self) -> &str {
-        "kernel-dma"
     }
 }
 

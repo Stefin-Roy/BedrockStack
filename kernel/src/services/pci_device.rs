@@ -1,11 +1,10 @@
-use super::capability::Capability;
 use super::pci_config::PciConfigSpace;
 
 pub use crate::pci::bar::Bar;
 pub use crate::pci::caps::PciCapability;
 pub use crate::pci::PciDevice;
 
-pub trait PciDeviceManager: Capability {
+pub trait PciDeviceManager: Send + Sync {
     fn devices(&self) -> &[PciDevice];
     fn bar(&self, dev: &PciDevice, index: usize) -> Bar;
     fn find_capability(&self, dev: &PciDevice, cap_id: u8) -> Option<PciCapability>;

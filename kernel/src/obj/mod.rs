@@ -16,6 +16,7 @@ pub mod domain;
 pub mod driver;
 pub mod hook;
 pub mod mint;
+pub mod registry;
 pub mod rights;
 pub mod separation;
 pub mod store;
@@ -23,9 +24,12 @@ pub mod surface;
 pub mod table;
 
 pub use cap_handle::{CapHandle, CapId, HandleState, RevocationPolicy};
-pub use contract::{Contract, ContractId, HookSignature};
+pub use contract::{Contract, ContractId, ContractRegistry, HookSignature, ReplyTag};
+pub use registry::{REGISTRY_CONTRACT, REGISTRY_LOOKUP, REGISTRY_REGISTER, RegistryNode};
 pub use rights::{CapRights, ContractRights, Rights};
-pub use surface::{SurfaceAttr, SurfaceDesc};
+pub use store::StoreNode;
+pub use surface::{EventDesc, SurfaceAttr, SurfaceDesc, TypeTag};
+pub use table::TableNode;
 
 use table::CapabilityTable;
 use hook::HookId;
@@ -47,6 +51,22 @@ pub trait Obj: Send + Sync {
 
     fn revocation(&self) -> RevocationPolicy {
         RevocationPolicy::DropDeath
+    }
+
+    /// The contract-right a caller must hold to invoke `hook` on this node
+    /// under `contract` (§3.3). This feeds the third bit-test of `PERMIT`
+    /// (§7.5): the fast path requires the handle's contract mask to contain
+    /// the returned right (or be `empty()`, the transitional "not yet
+    /// narrowed" mask — see `ContractRights`).
+    ///
+    /// The default is `CALL`, so providers that do not discriminate per-hook
+    /// rights (today's adapters) inherit it unchanged. A future provider may
+    /// override this to demand `READ`/`WRITE` for specific hooks, turning the
+    /// third bit-test into a real per-hook read/write gate without touching
+    /// the fast path.
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = (contract, hook);
+        ContractRights::CALL
     }
 
     /// Active face (§4.2). `caller` is the invoking domain's table, threaded
@@ -71,6 +91,7 @@ pub enum ObjError {
     MintAuthorityGone,
     Exhausted,
     NotSupported,
+    ContractCollision,
 }
 
 impl core::fmt::Display for ObjError {
@@ -85,6 +106,7 @@ impl core::fmt::Display for ObjError {
             ObjError::MintAuthorityGone => "mint authority gone",
             ObjError::Exhausted => "id space exhausted",
             ObjError::NotSupported => "operation not supported",
+            ObjError::ContractCollision => "contract id collision: distinct signatures claim the same id",
         };
         f.write_str(s)
     }
@@ -125,7 +147,7 @@ pub fn invoke(
     hook: HookId,
     args: &Args,
 ) -> Result<Reply, ObjError> {
-    let node = table.resolve(id, contract)?;
+    let node = table.resolve(id, contract, hook)?;
     match node.dispatch(table, hook, args)? {
         Reply::Caps(caps) => {
             let mut inserted = Vec::new();

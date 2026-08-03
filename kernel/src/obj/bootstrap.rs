@@ -10,6 +10,7 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::vec;
 
 use spin::Once;
 
@@ -17,7 +18,9 @@ use super::adapters;
 use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::domain::{self, Domain};
 use super::mint::{self, PrincipalContext};
+use super::registry;
 use super::rights::{CapRights, ContractRights, Rights};
+use super::{invoke, Args, Value};
 
 /// The provider capabilities handed to the Boot domain. Later phases (C6/C7)
 /// recover these `CapId`s to `invoke` through `boot_domain().table.resolve(...)`.
@@ -26,6 +29,9 @@ pub struct BootEndowment {
     pub dma: CapId,
     pub pci_cfg: CapId,
     pub serial: CapId,
+    /// The contract-registry capability (§7.8): the boot domain is the first
+    /// domain endowed to consult "what does `dma:alloc` promise?".
+    pub registry: CapId,
 }
 
 /// Rights held by the Boot domain over each primitive family root (§5.4).
@@ -77,11 +83,38 @@ pub fn bootstrap() -> &'static Domain {
         state: HandleState::Live,
     });
 
+    // §7.8 — the contract registry is a node, endowed like any provider. Build
+    // the registry node, insert it as a capability, and seed the real provider
+    // contracts THROUGH that capability (the INVOKE-gated `register` hook), so
+    // the registry carries their definitions before separation proves it.
+    let registry_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: registry::registry_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        state: HandleState::Live,
+    });
+    for def in [
+        adapters::dma_contract_def(),
+        adapters::pci_contract_def(),
+        adapters::serial_contract_def(),
+    ] {
+        let args = Args { vals: vec![Value::Str(def.name)] };
+        invoke(
+            &boot.table,
+            registry_id,
+            registry::REGISTRY_CONTRACT,
+            registry::REGISTRY_REGISTER,
+            &args,
+        )
+        .expect("bootstrap: register provider contract");
+    }
+
     BOOT_DOMAIN.call_once(|| boot);
     BOOT_ENDOWMENT.call_once(|| BootEndowment {
         dma: dma_id,
         pci_cfg: pci_cfg_id,
         serial: serial_id,
+        registry: registry_id,
     });
 
     // C8 — the first driver domain (§6.2): a second, disjoint table endowed

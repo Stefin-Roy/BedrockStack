@@ -2,7 +2,6 @@ use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::platform::riscv_virt::plic;
 
-use super::super::capability::Capability;
 use super::super::interrupts::InterruptManager;
 
 const NUM_PLIC_SOURCES: usize = 127;
@@ -23,12 +22,6 @@ pub fn dispatch_external() {
 }
 
 pub struct RiscvInterrupts;
-
-impl Capability for RiscvInterrupts {
-    fn name(&self) -> &str {
-        "riscv-interrupts"
-    }
-}
 
 impl InterruptManager for RiscvInterrupts {
     fn register_handler(&self, vector: u8, handler: fn()) {

@@ -2,7 +2,7 @@
 
 **Version:** 0.1.1
 **Date:** 2026-08-01
-**Source:** `kernel/src/services/{mod,capability,cpu,dma,interrupts,msi,null_msi,pci_config,ecam_pci_config,pci_device,phys_mem,platform,serial,timer,virt_mem,block_device,acpi,clocksource,clockevent,timer_queue,universal_timer}.rs`, `kernel/src/services/x86_64/*`, `kernel/src/services/riscv64/*`
+**Source:** `kernel/src/services/{mod,cpu,dma,interrupts,msi,null_msi,pci_config,ecam_pci_config,pci_device,phys_mem,platform,serial,timer,virt_mem,block_device,acpi,clocksource,clockevent,timer_queue,universal_timer}.rs`, `kernel/src/services/x86_64/*`, `kernel/src/services/riscv64/*`
 **Status:** Stable
 
 > **Note:** This subsystem was introduced by commit `c9a93b8`, which replaced
@@ -36,10 +36,14 @@ panics if called before `set_global`.
 consumer uses `dyn` dispatch and needs no `cfg` gates.
 - Location: `kernel/src/services/mod.rs:62-72`
 
-**SVC-005 — Every capability provider is `Capability: Send + Sync`:**
-The `Capability` supertrait guarantees all providers are thread-safe and
-immutable, so the container can be shared across CPUs via a `'static` leak.
-- Location: `kernel/src/services/capability.rs:1-3`
+**SVC-005 — Every capability provider is `Send + Sync`:**
+P2 removed the legacy `Capability` supertrait (and its file,
+`services/capability.rs`); every provider now implements the container's
+trait objects as `Send + Sync` directly. The `dyn` capability traits
+declared in `services/mod.rs` require `Send + Sync` supertraits, so all
+providers are thread-safe and immutable — the container can be shared across
+CPUs via a `'static` leak.
+- Location: `kernel/src/services/mod.rs:44-55`
 
 **SVC-006 — `platform`, `cpu`, `pci_cfg`, and `dma` are consumed today:**
 `lib.rs` uses `svc().platform.halt()/enable_interrupts()`;

@@ -1,5 +1,3 @@
-use super::capability::Capability;
-
 pub enum IoBuffer<'a> {
     Buf(&'a mut [u8]),
     ConstBuf(&'a [u8]),
@@ -24,7 +22,7 @@ impl IoCompletions {
     }
 }
 
-pub trait BlockDevice: Send + Sync + Capability {
+pub trait BlockDevice: Send + Sync {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str>;
     fn sector_count(&self) -> u64;
     fn model_string(&self) -> &str;

@@ -52,12 +52,45 @@ impl BitAnd for Rights {
 }
 
 /// The orthogonal contract-right dimension (READ/WRITE, ...). §3.3.
+///
+/// These are the "which hook" rights: they are orthogonal to the universal
+/// five (`INVOKE` gates whether *any* hook may be called; a contract right
+/// gates *which* hook). A provider may demand a specific right per hook
+/// (`Obj::hook_contract_right`); the fast path folds that requirement into
+/// the third bit-test of `PERMIT` (§7.5).
+///
+/// **Transitional rule (empty means unrestricted).** `empty()` is the mask
+/// every bootstrap/driver endowment currently holds (endowment predates this
+/// dimension). An empty contract mask is read as *"not yet narrowed"* — it
+/// satisfies any required right. This keeps the tree green until endowments
+/// are given real masks (P3); it is safe under monotonicity because
+/// `CapRights::attune` only ever ANDs, and a cap narrowed to a non-empty mask
+/// can never return to empty-unrestricted via the same attunement that left it
+/// non-empty. The rule is honoured by `CapabilityTable::resolve`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
 pub struct ContractRights(u32);
 
 impl ContractRights {
+    /// READ — the hook reads data (e.g. a config-space `read*` hook). §3.3.
+    pub const READ: ContractRights = ContractRights(1 << 0);
+
+    /// WRITE — the hook writes data (e.g. a config-space `write*` hook). §3.3.
+    pub const WRITE: ContractRights = ContractRights(1 << 1);
+
+    /// CALL — the hook performs an operation that is neither a read nor a
+    /// write (e.g. an allocation). This is the default requirement of
+    /// `Obj::hook_contract_right`, so providers that do not discriminate
+    /// per-hook rights keep working unmodified.
+    pub const CALL: ContractRights = ContractRights(1 << 2);
+
+    /// Empty mask = "not yet narrowed" / unrestricted (see type docs).
     pub const fn empty() -> Self {
         ContractRights(0)
+    }
+
+    /// Union-OR two contract-right masks (compose a multi-right set).
+    pub const fn or(self, other: ContractRights) -> Self {
+        ContractRights(self.0 | other.0)
     }
 
     pub const fn bits(self) -> u32 {

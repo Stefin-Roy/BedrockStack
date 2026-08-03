@@ -2,16 +2,9 @@ use core::arch::asm;
 
 use crate::arch::riscv64::sbi;
 
-use super::super::capability::Capability;
 use super::super::platform::PlatformControl;
 
 pub struct RiscvPlatform;
-
-impl Capability for RiscvPlatform {
-    fn name(&self) -> &str {
-        "riscv-platform"
-    }
-}
 
 impl PlatformControl for RiscvPlatform {
     fn shutdown(&self) -> ! {

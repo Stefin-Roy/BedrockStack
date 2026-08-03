@@ -1,13 +1,6 @@
-use super::capability::Capability;
 use super::msi::MsiAllocator;
 
 pub struct NullMsi;
-
-impl Capability for NullMsi {
-    fn name(&self) -> &str {
-        "null-msi"
-    }
-}
 
 impl MsiAllocator for NullMsi {
     fn allocate_device_vector(&self, _handler: fn()) -> Option<u8> {

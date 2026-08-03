@@ -1,4 +1,3 @@
-pub mod capability;
 pub mod clocksource;
 pub mod clockevent;
 pub mod timer_queue;

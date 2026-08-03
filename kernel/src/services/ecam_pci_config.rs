@@ -1,14 +1,7 @@
-use super::capability::Capability;
 use super::pci_config::PciConfigSpace;
 
 /// ECAM-based PCI config space access, shared across both architectures.
 pub struct EcamPciConfig;
-
-impl Capability for EcamPciConfig {
-    fn name(&self) -> &str {
-        "ecam-pci-config"
-    }
-}
 
 impl PciConfigSpace for EcamPciConfig {
     fn read8(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u8 {

@@ -3,15 +3,8 @@ use alloc::vec::Vec;
 use crate::mm::vmm::PageFlags;
 
 use super::super::acpi::{AcpiProvider, InterruptModel, PciConfigRegions, PlatformInfo};
-use super::super::capability::Capability;
 
 pub struct RiscvAcpi;
-
-impl Capability for RiscvAcpi {
-    fn name(&self) -> &str {
-        "riscv-acpi"
-    }
-}
 
 impl AcpiProvider for RiscvAcpi {
     fn interrupt_model(&self) -> &InterruptModel {

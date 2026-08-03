@@ -4,9 +4,11 @@ use alloc::vec::Vec;
 use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::cap_handle::{CapHandle, CapId, HandleState};
-use super::contract::ContractId;
+use super::contract::{ContractId, HookSignature};
+use super::hook::HookId;
 use super::rights::{ContractRights, Rights};
-use super::{Obj, ObjError};
+use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
+use super::{Args, Obj, ObjError, ObjId, Reply};
 
 struct TableInner {
     slots: Vec<Option<CapHandle>>,
@@ -64,8 +66,30 @@ impl CapabilityTable {
     }
 
     /// The PERMIT fast path (§7.5): slot fetch, Live, INVOKE, contract
-    /// membership. The lock is released before the returned `Arc` is used.
-    pub fn resolve(&self, id: CapId, contract: ContractId) -> Result<Arc<dyn Obj>, ObjError> {
+    /// membership, then the per-hook contract-right bit-test (§3.3).
+    ///
+    /// Slope (one `IrqMutex` acquire, one array fetch, three bit-tests, no
+    /// allocation — I8/§9.4):
+    /// 1. slot fetch → `NoSuchCap`
+    /// 2. `state != Live` → `Revoked`
+    /// 3. universal `INVOKE` not held → `Denied`
+    /// 4. node does not implement `contract` → `Denied`
+    /// 5. handle's contract mask lacks the hook's required contract-right
+    ///    (from `Obj::hook_contract_right`); an `empty()` mask is the
+    ///    transitional "not yet narrowed" state and satisfies any requirement
+    ///    (see `ContractRights` type docs).
+    ///
+    /// The revocable deny-list check (§3.3: `node.revocation()==Revocable` and
+    /// `store.deny(node)`) is reserved for P3, when revocable nodes arrive; it
+    /// will slot in after step 5 and fail with `Revoked`.
+    ///
+    /// The lock is released before the returned `Arc` is used.
+    pub fn resolve(
+        &self,
+        id: CapId,
+        contract: ContractId,
+        hook: HookId,
+    ) -> Result<Arc<dyn Obj>, ObjError> {
         let inner = self.slots.lock();
         let h = inner
             .slots
@@ -79,6 +103,11 @@ impl CapabilityTable {
             return Err(ObjError::Denied);
         }
         if !h.node.contracts().contains(&contract) {
+            return Err(ObjError::Denied);
+        }
+        let held = h.rights.contract;
+        let required = h.node.hook_contract_right(contract, hook);
+        if held != ContractRights::empty() && !held.contains(required) {
             return Err(ObjError::Denied);
         }
         Ok(Arc::clone(&h.node))
@@ -140,4 +169,72 @@ impl CapabilityTable {
         let inner = self.slots.lock();
         inner.slots.iter().filter(|s| s.is_some()).count()
     }
+}
+
+// ── The table as a node (§2.4, §7.8: "infrastructure is also nodes") ──────
+
+/// The table node's own contract: identity + surface only in this phase.
+pub const TABLE_CONTRACT: ContractId = ContractId::of("infra:table", &TABLE_SURFACE, &TABLE_HOOKS);
+
+const TABLE_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "infra:table",
+    attrs: &[SurfaceAttr { name: "slots", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const TABLE_HOOKS: &[HookSignature] = &[];
+
+static TABLE_CONTRACTS: &[ContractId] = &[TABLE_CONTRACT];
+
+/// Stable identity for a table node (§7.8).
+const TABLE_OBJ_ID: ObjId = ObjId(0x10_0012);
+
+/// A thin `Obj` node adapter wrapping a [`CapabilityTable`] reference (§2.4,
+/// §7.8). This phase exposes identity + surface only; `dispatch` is a stub so
+/// the table is a capability-reachable object without rearchitecting it.
+pub struct TableNode {
+    table: &'static CapabilityTable,
+}
+
+impl TableNode {
+    pub const fn new(table: &'static CapabilityTable) -> Self {
+        TableNode { table }
+    }
+
+    /// The wrapped table (for clients that also need raw table operations).
+    pub fn table(&self) -> &'static CapabilityTable {
+        self.table
+    }
+}
+
+impl Obj for TableNode {
+    fn obj_id(&self) -> ObjId {
+        TABLE_OBJ_ID
+    }
+
+    fn kind(&self) -> &'static str {
+        "infra:table"
+    }
+
+    fn surface(&self) -> Option<&'static SurfaceDesc> {
+        Some(&TABLE_SURFACE)
+    }
+
+    fn contracts(&self) -> &'static [ContractId] {
+        TABLE_CONTRACTS
+    }
+
+    fn dispatch(
+        &self,
+        _caller: &CapabilityTable,
+        _hook: HookId,
+        _args: &Args,
+    ) -> Result<Reply, ObjError> {
+        Err(ObjError::NotSupported)
+    }
+}
+
+/// The table node wrapping a table, for endowing a domain (§7.8).
+pub fn table_node(table: &'static CapabilityTable) -> Arc<dyn Obj> {
+    Arc::new(TableNode::new(table))
 }

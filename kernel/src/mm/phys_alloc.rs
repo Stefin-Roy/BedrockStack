@@ -331,16 +331,9 @@ fn clear_region(bitmap: *mut u8, region: &MemoryRegion, total_frames: usize) {
     }
 }
 
-// ── Service capability traits ─────────────────────────────────────────
+// ── Service provider traits ───────────────────────────────────────────
 
-use crate::services::capability::Capability;
 use crate::services::phys_mem::PhysicalMemoryAllocator;
-
-impl Capability for BitmapAllocator {
-    fn name(&self) -> &str {
-        "bitmap-allocator"
-    }
-}
 
 impl PhysicalMemoryAllocator for BitmapAllocator {
     fn alloc_frames(&mut self, count: usize) -> Result<u64, ()> {

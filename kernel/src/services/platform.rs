@@ -1,6 +1,4 @@
-use super::capability::Capability;
-
-pub trait PlatformControl: Capability {
+pub trait PlatformControl: Send + Sync {
     fn shutdown(&self) -> !;
     fn reset(&self) -> !;
     fn halt(&self);

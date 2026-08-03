@@ -1,15 +1,8 @@
 use core::arch::asm;
 
-use super::super::capability::Capability;
 use super::super::platform::PlatformControl;
 
 pub struct X86Platform;
-
-impl Capability for X86Platform {
-    fn name(&self) -> &str {
-        "x86-platform"
-    }
-}
 
 impl PlatformControl for X86Platform {
     fn shutdown(&self) -> ! {

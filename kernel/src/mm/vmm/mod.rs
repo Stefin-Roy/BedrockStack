@@ -264,21 +264,14 @@ pub fn flush_tlb() {
     }
 }
 
-// ── VirtualMemoryManager capability ──────────────────────────────────
+// ── VirtualMemoryManager provider ─────────────────────────────────────
 //
 // Implemented now that `Vmm` stores its own allocator pointer. The inherent
 // `map`/`unmap` methods (which take an explicit `&mut BitmapAllocator`) are
-// kept for early-boot/explicit callers; the capability methods reuse the
+// kept for early-boot/explicit callers; the provider methods reuse the
 // stored allocator.
 
-use crate::services::capability::Capability;
 use crate::services::virt_mem::VirtualMemoryManager;
-
-impl Capability for Vmm {
-    fn name(&self) -> &str {
-        "kernel-vmm"
-    }
-}
 
 impl VirtualMemoryManager for Vmm {
     fn map(&mut self, vaddr: u64, paddr: u64, size: u64, flags: PageFlags) {
