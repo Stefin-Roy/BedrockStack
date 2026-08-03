@@ -43,6 +43,18 @@ impl ObjectStore {
         id
     }
 
+    /// Register a node under a *stable* id rather than a freshly-issued one
+    /// (§7.3, §7.8). Infrastructure and adapter nodes carry deterministic
+    /// `ObjId`s (e.g. `0x10_0000…0x10_0012`) so they are addressable for
+    /// forensics before any counter bumps. The store stays weak either way —
+    /// the record holds no reference to the node. Used by `bootstrap()` so the
+    /// `kerneldump graph` census can see infra/adapters that were never minted.
+    pub fn register_with_id(&self, id: ObjId, kind: &str, parent: Option<ObjId>) {
+        self.records
+            .lock()
+            .insert(id.0, ObjRecord { id, kind: String::from(kind), parent });
+    }
+
     /// Read-only access to the records for the projection tool (§2.8, §7.13).
     /// The store is not a namespace; this is forensics material only.
     pub fn lock_records(&self) -> spin::MutexGuard<'_, BTreeMap<u64, ObjRecord>> {

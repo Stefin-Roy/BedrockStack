@@ -20,7 +20,9 @@ use super::domain::{self, Domain};
 use super::mint::{self, PrincipalContext};
 use super::registry;
 use super::rights::{CapRights, ContractRights, Rights};
-use super::{invoke, Args, Value};
+use super::store::{object_store, StoreNode};
+use super::table;
+use super::{invoke, Args, Obj, Value};
 
 /// The provider capabilities handed to the Boot domain. Later phases (C6/C7)
 /// recover these `CapId`s to `invoke` through `boot_domain().table.resolve(...)`.
@@ -109,6 +111,18 @@ pub fn bootstrap() -> &'static Domain {
         .expect("bootstrap: register provider contract");
     }
 
+    // §7.3 / §7.8 — register every stable-id infra/adapter node in the
+    // ObjectStore so the `kerneldump graph` census reflects the P2 model, not
+    // just the minted primitive roots. `register_with_id` keeps the store weak
+    // (records hold no node reference) while making the deterministic ids
+    // visible to the projection tool. All are boot-era seeds: parent = none.
+    register_seed_node(table::table_node(&boot.table).as_ref());
+    register_seed_node(&StoreNode);
+    register_seed_node(&registry::RegistryNode);
+    register_seed_node(adapters::dma_node().as_ref());
+    register_seed_node(adapters::pci_cfg_node().as_ref());
+    register_seed_node(adapters::serial_node().as_ref());
+
     BOOT_DOMAIN.call_once(|| boot);
     BOOT_ENDOWMENT.call_once(|| BootEndowment {
         dma: dma_id,
@@ -134,4 +148,11 @@ pub fn boot_domain() -> &'static Domain {
 /// `.pci_cfg` / `.serial` to `invoke` the real providers.
 pub fn boot_endowment() -> &'static BootEndowment {
     BOOT_ENDOWMENT.get().expect("boot endowment not bootstrapped")
+}
+
+/// Register a stable-id boot-era seed node in the ObjectStore under the
+/// identity its `Obj` impl reports (§7.3, §7.8). Read-only with respect to the
+/// node: the store keeps a weak record only, so reach/lifetime is unaffected.
+fn register_seed_node(node: &dyn Obj) {
+    object_store().register_with_id(node.obj_id(), node.kind(), None);
 }
