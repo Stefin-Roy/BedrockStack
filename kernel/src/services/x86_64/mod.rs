@@ -9,8 +9,6 @@ pub mod x86_acpi;
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::services::acpi::AcpiProvider;
-use crate::services::dma::DmaAllocator;
-use crate::services::pci_device::PciDeviceManager;
 use crate::services::KernelServices;
 
 pub fn x86_services(

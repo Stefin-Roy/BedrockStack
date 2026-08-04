@@ -15,7 +15,9 @@ pub mod contract;
 pub mod domain;
 pub mod driver;
 pub mod hook;
+pub mod memregion;
 pub mod mint;
+pub mod nodes;
 pub mod registry;
 pub mod rights;
 pub mod separation;
@@ -67,6 +69,18 @@ pub trait Obj: Send + Sync {
     fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
         let _ = (contract, hook);
         ContractRights::CALL
+    }
+
+    /// Downcast-free access to an interrupt entry point (§7.10.5).
+    ///
+    /// Only nodes that *are* handlers — a [`super::nodes::IrqHandlerNode`],
+    /// materialized by the kernel over a vetted `fn()` — return `Some`. This is
+    /// what lets the `Irq` node's `register_handler` bind a handler from a
+    /// capability instead of trusting a raw function address passed in the
+    /// arguments: the address comes from a node the kernel materialized, never
+    /// from a caller-supplied scalar.
+    fn as_handler(&self) -> Option<fn()> {
+        None
     }
 
     /// Active face (§4.2). `caller` is the invoking domain's table, threaded

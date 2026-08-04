@@ -147,6 +147,13 @@ impl BitmapAllocator {
         self.total_frames
     }
 
+    /// The allocator's forward-scan cursor (next frame index `alloc()` /
+    /// `alloc_contiguous()` will start probing). Read-only; `dma_trace` uses it
+    /// to report allocator state on a frame-alloc failure.
+    pub fn next_free(&self) -> usize {
+        self.next_free
+    }
+
     /// Allocate a physical frame.
     ///
     /// Returns physical address of allocated frame, or None if no frames available.

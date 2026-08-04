@@ -113,6 +113,31 @@ impl CapabilityTable {
         Ok(Arc::clone(&h.node))
     }
 
+    /// Find the first Live cap in this table that resolves `contract`+`hook`
+    /// under PERMIT (§2.7 graph composition). O(n) — tables are tiny (boot ~9,
+    /// driver 4). Returns the CapId so the caller can `invoke` through it.
+    pub fn resolve_first(&self, contract: ContractId, hook: HookId) -> Option<CapId> {
+        // Snapshot the occupied slot ids under one lock, then run the PERMIT
+        // fast path per candidate (resolve re-locks; IrqMutex is not
+        // reentrant, so we never call it while holding `slots`).
+        let ids: Vec<CapId> = {
+            let inner = self.slots.lock();
+            inner
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.is_some())
+                .map(|(i, _)| CapId(i as u64))
+                .collect()
+        };
+        for id in ids {
+            if self.resolve(id, contract, hook).is_ok() {
+                return Some(id);
+            }
+        }
+        None
+    }
+
     /// Duplicate a handle into a fresh slot with identical rights (§7.4).
     pub fn dup(&self, old: CapId) -> Result<CapId, ObjError> {
         let h = {

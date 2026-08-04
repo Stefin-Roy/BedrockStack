@@ -271,7 +271,7 @@ if not exist "%OVMF_PATH%" (
 echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-set BASE_FEATURES=kernelmb2
+set BASE_FEATURES=kernelmb2 dma_trace
 if "%CPU_SLOW%"=="1" set BASE_FEATURES=%BASE_FEATURES% cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=--features "%BASE_FEATURES%"

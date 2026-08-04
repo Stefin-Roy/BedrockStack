@@ -24,6 +24,28 @@ use super::table::CapabilityTable;
 use super::{invoke, Args, ObjError, Reply, Value};
 use crate::services::dma::DmaBuffer;
 
+macro_rules! dma_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "dma_trace")]
+        $($arg)*
+    };
+}
+
+/// Human-readable name for the four DMA hooks (`dma_trace` diagnostics).
+fn dma_hook_name(h: u64) -> &'static str {
+    if h == adapters::DMA_ALLOC_PAGE.0 {
+        "alloc_page"
+    } else if h == adapters::DMA_ALLOC_CONTIG.0 {
+        "alloc_contiguous"
+    } else if h == adapters::DMA_MAP_MMIO.0 {
+        "map_mmio"
+    } else if h == adapters::DMA_VIRT_TO_PHYS.0 {
+        "virt_to_phys"
+    } else {
+        "?"
+    }
+}
+
 /// A capability-mediated DMA allocator. `Copy`: it owns the table reference
 /// (the boot table, or the driver domain's disjoint table) plus the `CapId`
 /// naming the DMA node, so it can be threaded wherever a `&dyn DmaAllocator`
@@ -56,8 +78,8 @@ impl DmaClient {
     /// Invoke the DMA hook and decode a `Reply::Data([Value::U64...])` payload.
     /// Any shape mismatch collapses to `Err`.
     fn call(&self, hook: HookId, args: &Args) -> Result<Vec<u64>, ObjError> {
-        match invoke(self.table, self.cap, adapters::DMA_CONTRACT, hook, args)? {
-            Reply::Data(vals) => {
+        match invoke(self.table, self.cap, adapters::DMA_CONTRACT, hook, args) {
+            Ok(Reply::Data(vals)) => {
                 let mut out = Vec::with_capacity(vals.len());
                 for v in vals {
                     match v {
@@ -67,7 +89,29 @@ impl DmaClient {
                 }
                 Ok(out)
             }
-            _ => Err(ObjError::NotSupported),
+            Ok(_) => Err(ObjError::NotSupported),
+            Err(e) => {
+                dma_trace!({
+                    use crate::drivers::serial::SerialPort;
+                    SerialPort::puts("[DBG:dma-cap] dma hook '");
+                    SerialPort::puts(dma_hook_name(hook.0));
+                    SerialPort::puts("' invoke failed: ");
+                    SerialPort::puts(match e {
+                        ObjError::NoSuchCap => "NoSuchCap",
+                        ObjError::Denied => "Denied",
+                        ObjError::Revoked => "Revoked",
+                        ObjError::OutOfMemory => "OutOfMemory",
+                        ObjError::NotSupported => "NotSupported",
+                        ObjError::Exhausted => "Exhausted",
+                        ObjError::Disowned => "Disowned",
+                        ObjError::NoAmplification => "NoAmplification",
+                        ObjError::MintAuthorityGone => "MintAuthorityGone",
+                        ObjError::ContractCollision => "ContractCollision",
+                    });
+                    SerialPort::puts("\n");
+                });
+                Err(e)
+            }
         }
     }
 

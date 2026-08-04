@@ -190,11 +190,6 @@ impl Kernel {
             heap::init(self.page_table_root, &mut self.allocator);
         }
 
-        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
-        // NX) VM-backed allocation.  The boot-time physical shadow was removed
-        // from `Kernel::new`; nothing dereferences the display until `run()`.
-        self.init_framebuffer_shadow();
-
         CurrentArch::init();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
@@ -226,12 +221,19 @@ impl Kernel {
         // C5 — RootGraph bootstrap: create the Boot domain, mint the primitive
         // family roots, and endow the real service providers as capabilities
         // reachable only through the boot table (§5.4).
-        crate::obj::bootstrap::bootstrap();
+        crate::obj::bootstrap::bootstrap(self.page_table_root, svc_static);
         crate::drivers::serial::SerialPort::puts("[obj] bootstrap: boot domain endowed\n");
 
         // C6 — boot-time separation proof: the endowed DMA capability works,
         // unendowed ids and foreign contracts are refused. Runs once, before SMP.
         crate::obj::separation::run();
+
+        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
+        // NX) VM-backed allocation. Runs AFTER bootstrap so the allocation is
+        // routed through the Boot domain's Heap family-root capability (§7.10.2)
+        // instead of a raw kernel-heap call. Nothing dereferences the display
+        // until `run()`.
+        self.init_framebuffer_shadow();
 
         // Initialise SMP — discover and start Application Processors.
         let ncpus = unsafe {
@@ -253,13 +255,56 @@ impl Kernel {
     ///
     /// The shadow lives in the guard-mapped, NX heap arena rather than as raw
     /// contiguous physical frames, so the display path never dereferences a
-    /// physical address.  The allocation is deliberately leaked: it is needed
+    /// physical address. The allocation is deliberately leaked: it is needed
     /// for the lifetime of the kernel and `Framebuffer` keeps no ownership.
+    ///
+    /// The allocation is routed through the Boot domain's Heap family root
+    /// (§7.10.2): invoke `heap:alloc`, recover the `mem:region` capability it
+    /// replies, and read its base. The block is a kernel-heap `MemRegion`, so
+    /// its base is already the virtual address of the guard-mapped arena —
+    /// exactly what `Framebuffer::set_shadow_va` expects. If the cap-mediated
+    /// path ever fails (e.g. pool exhaustion), we fall back to a plain kernel
+    /// allocation so display stays available; both leaks are deliberate.
     fn init_framebuffer_shadow(&mut self) {
+        use crate::obj::bootstrap::{boot_domain, boot_endowment};
+        use crate::obj::memregion::{MEM_REGION_BASE, MEM_REGION_CONTRACT};
+        use crate::obj::nodes::{HEAP_ALLOC, HEAP_CONTRACT};
+        use crate::obj::{Args, Reply, Value, invoke};
+
         let size = self.framebuffer.total_bytes();
-        let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
-        let va = shadow.as_mut_ptr() as u64;
-        core::mem::forget(shadow);
+        let align = 8u64;
+        let args = Args { vals: alloc::vec![Value::U64(size as u64), Value::U64(align)] };
+        let table = &boot_domain().table;
+        let va = match invoke(table, boot_endowment().heap, HEAP_CONTRACT, HEAP_ALLOC, &args) {
+            Ok(Reply::Caps(caps)) if caps.len() == 1 => {
+                let region_id = caps[0].id;
+                match invoke(table, region_id, MEM_REGION_CONTRACT, MEM_REGION_BASE, &Args::none()) {
+                    Ok(Reply::Data(vals)) if vals.len() == 1 => match &vals[0] {
+                        Value::U64(base) => {
+                            // Preserve the old behaviour: the shadow starts
+                            // zeroed so the first un-drawn frame is black, not
+                            // stale heap.
+                            unsafe { core::ptr::write_bytes(*base as *mut u8, 0, size) };
+                            log::info!("framebuffer shadow: {size} B via heap cap @ {base:#x}");
+                            Some(*base)
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let va = match va {
+            Some(va) => va,
+            None => {
+                log::warn!("framebuffer shadow: heap-cap path failed; falling back");
+                let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
+                let va = shadow.as_mut_ptr() as u64;
+                core::mem::forget(shadow);
+                va
+            }
+        };
         self.framebuffer.set_shadow_va(va);
     }
 

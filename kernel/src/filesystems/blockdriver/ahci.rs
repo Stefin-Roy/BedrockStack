@@ -841,6 +841,17 @@ fn init_one(p: u8, hba: &Hba, dma: DmaClient, max_prdt: usize, n_slots_raw: u32)
         core::hint::spin_loop();
     }
 
+    // Enable link (device presence) detection on this port. This only needs
+    // the PHY to run OOB; it does not require CLB/FB or FRE. Probe BEFORE
+    // allocating so an empty port does not burn DMA buffers (and the finite
+    // pool of `MemRegion` wrappers they consume).
+    hba.pw32(p, port_off::IS, !0);
+    hba.pw32(p, port_off::SERR, !0);
+    hba.pw32(p, port_off::IE, 0);
+    hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD);
+    for _ in 0..100 { core::hint::spin_loop(); }
+    if !wait_ssts_det(hba, p) { return Err("no device"); }
+
     // Allocate Command List (1 page = 32 CmdHeaders × 32 B = 1024 B)
     let cl_buf = dma.alloc_page().ok_or("OOM CL")?;
 
@@ -878,17 +889,8 @@ fn init_one(p: u8, hba: &Hba, dma: DmaClient, max_prdt: usize, n_slots_raw: u32)
     hba.pw32(p, port_off::FB, rfis_buf.phys as u32);
     hba.pw32(p, port_off::FBU, (rfis_buf.phys >> 32) as u32);
 
-    hba.pw32(p, port_off::IS, !0);
-    hba.pw32(p, port_off::SERR, !0);
-    hba.pw32(p, port_off::IE, 0);
-
-    hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD);
-    for _ in 0..100 { core::hint::spin_loop(); }
-
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_FRE);
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_ST);
-
-    if !wait_ssts_det(hba, p) { return Err("no device"); }
 
     let mut port = AhciPort {
         hba: *hba, port: p,

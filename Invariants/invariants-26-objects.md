@@ -1,17 +1,45 @@
 # RootGraph Objects / Capability Model — Invariants
 
-**Version:** 0.1.0
-**Date:** 2026-08-03
-**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation}.rs`
-**Status:** Active (P2)
+**Version:** 0.3.0
+**Date:** 2026-08-04
+**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,nodes,memregion,adapters}.rs`
+**Status:** Active (P3)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
 > model of `Documentation/RootGraph.md`. The canonical property set is the
 > numbered **I1–I10** of §9.3 of that document; this file mirrors that wording
-> verbatim and cites the kernel code that enforces it. It is P2: mint creates
-> placeholder `StubNode`s, service providers are reachable as capabilities,
-> and the registry + separation proof run at boot — but real heap/phys hooks
-> and revocable (deny-list) nodes are deferred to P3.
+> verbatim and cites the kernel code that enforces it. It is P3: the five
+> primitive family roots are now real nodes wrapping the kernel's physical
+> modules — `PhysMemNode` (`BitmapAllocator`, contract `physmem:allocation`),
+> `HeapNode` (`heap:allocation`), `AddressSpaceNode` (`Vmm`,
+> `mm:address_space`), `CpuRootNode` (`smp:cpu`), `IrqRootNode` (`irq:vector`)
+> — and every frame handed out is a pooled `MemRegion` capability
+> (`mem:region`; no allocation inside the allocation hooks, §Phase P3).
+> `mint_node` mints these as family roots; the DMA allocator now allocates and
+> maps through the caller's endowed `physmem`/`addrspace` capabilities (§2.7
+> graph composition). The bootstrap seed window (§5.7) still aborts on OOM;
+> every post-bootstrap node hook returns `ObjError::OutOfMemory`. Deny-list
+> (revocable) nodes remain deferred to P4/P5.
+>
+> P3 refinements in 0.3.0:
+> - `free()` is real, not a stub: the provider `free(region)` hooks take the
+>   region's `CapId` from the caller's table and delegate to the `mem:region`
+>   node's own `free` hook, which returns the backing to its allocator
+>   (`BitmapAllocator::free` per frame for Phys; heap `dealloc` with the
+>   stored `{size, align}` layout for Heap) and recycles the pooled wrapper.
+>   The region zeroes its identity after releasing, so a double free of the
+>   same capability is safe. (`obj/nodes.rs::release_region`,
+>   `obj/memregion.rs::release_backing`, `MemRegionNode.align`.)
+> - IRQ handlers are capability-gated, not raw addresses: a handler is bound
+>   to a vector by passing a kernel-materialized `irq:handler` node
+>   (`IrqHandlerNode`, implements `Obj::as_handler`), never a caller-supplied
+>   scalar `fn()` address. The old `handler_from_addr` transmute is gone.
+>   (`obj/nodes.rs::resolve_handler`, `obj/mod.rs::Obj::as_handler`.)
+> - The framebuffer shadow buffer is allocated through the Boot domain's
+>   Heap family-root capability instead of a raw kernel-heap call; the
+>   `mem:region` cap's base is used as the shadow VA, with a plain-heap
+>   fallback if the cap path ever fails. (`lib.rs::init_framebuffer_shadow`,
+>   moved to run after `bootstrap()`.)
 
 ---
 
@@ -57,7 +85,7 @@ holds the node through a strong `Arc<dyn Obj>`, so a node's lifetime is
 exactly the life of the caps that reach it; the store holds no strong
 reference (see I7), so nothing can resurrect a dead node. Default revocation
 is drop-death (`RevocationPolicy::DropDeath`); deny-list `Revocable` nodes
-are deferred to P3.
+are deferred to P4/P5.
 - Location: `obj/cap_handle.rs::CapHandle{ node: Arc<dyn Obj> }` (obj/cap_handle.rs:27-32), `obj/cap_handle.rs::RevocationPolicy` (obj/cap_handle.rs:18-23), `obj/table.rs::resolve` returns `Arc::clone(&h.node)` (obj/table.rs:109,113)
 
 **I5 (one parent) — every node ≠ P has exactly one parent edge:**
@@ -85,7 +113,7 @@ read-only and gated by the store-node capability.
 **I8 (fast-path bound) — the `PERMIT` check of `R6` is O(1):**
 A constant number of word-size operations: one `IrqMutex` acquire, one slot
 index, Live, `INVOKE`, contract membership, per-hook contract-right test
-(and, in P3, a deny-bit load). All are independent of table size `n` and the
+(and, in a later phase, a deny-bit load). All are independent of table size `n` and the
 contract-membership probe is on a small, frozen set. See §9.4 of
 `RootGraph.md` (I8).
 - Location: `obj/table.rs::resolve` (obj/table.rs:87-114), `obj/mod.rs::Obj::hook_contract_right` (obj/mod.rs:67-70), reference `RootGraph.md` §9.4 (fast-path bound, five named steps)

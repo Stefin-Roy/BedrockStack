@@ -11,19 +11,28 @@
 use alloc::sync::Arc;
 use alloc::vec;
 
-use crate::services::dma::DmaAllocator;
+use crate::mm::vmm::PageFlags;
 use crate::services::ecam_pci_config::EcamPciConfig;
 use crate::services::pci_config::PciConfigSpace;
 use crate::services::serial::SerialConsole;
 use crate::services::serial::KernelSerial;
+
+macro_rules! dma_trace {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "dma_trace")]
+        $($arg)*
+    };
+}
 use crate::services::dma::KernelDma;
 
 use super::cap_handle::RevocationPolicy;
 use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
-use super::surface::{SurfaceDesc, TypeTag};
+use super::memregion;
+use super::nodes;
+use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
-use super::{Args, Obj, ObjError, ObjId, Reply, Value};
+use super::{invoke, Args, Obj, ObjError, ObjId, Reply, Value};
 
 // ── Stable identities (singletons; deterministic, never from the store) ──
 
@@ -149,48 +158,79 @@ impl Obj for KernelDma {
 
     fn dispatch(
         &self,
-        _caller: &CapabilityTable,
+        caller: &CapabilityTable,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
         if hook == DMA_ALLOC_PAGE {
-            return match self.alloc_page() {
-                Some(buf) => reply_dma_buffer(&buf),
-                None => Err(ObjError::OutOfMemory),
-            };
+            return dma_alloc(caller, nodes::PHYSMEM_ALLOC_FRAMES, 1);
         }
         if hook == DMA_ALLOC_CONTIG {
             let count = arg_u64(args, 0).unwrap_or(1) as usize;
-            return match self.alloc_contiguous(count) {
-                Some(buf) => reply_dma_buffer(&buf),
-                None => Err(ObjError::OutOfMemory),
-            };
+            return dma_alloc(caller, nodes::PHYSMEM_ALLOC_CONTIG, count);
         }
         if hook == DMA_MAP_MMIO {
             let paddr = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let size = arg_u64(args, 1).ok_or(ObjError::Denied)?;
-            return match self.map_mmio(paddr, size) {
-                Ok(va) => Ok(Reply::Data(vec![Value::U64(va)])),
-                Err(_) => Err(ObjError::OutOfMemory),
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] map_mmio paddr=0x");
+                SerialPort::put_hex(paddr);
+                SerialPort::puts(" size=");
+                SerialPort::put_u64(size);
+                SerialPort::puts("\n");
+            });
+            let addrspace = caller
+                .resolve_first(nodes::ADDRSPACE_CONTRACT, nodes::ADDRSPACE_MAP)
+                .ok_or(ObjError::Denied)?;
+            let page_aligned = (size + 4095) & !4095;
+            let va = match crate::mm::layout::region_next_down("dma", page_aligned) {
+                Some(v) => v,
+                None => {
+                    dma_trace!({
+                        use crate::drivers::serial::SerialPort;
+                        SerialPort::puts("[DBG:dma-alloc] map_mmio region_next_down -> None (OutOfMemory)\n");
+                    });
+                    return Err(ObjError::OutOfMemory);
+                }
             };
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] map_mmio va=");
+                SerialPort::put_hex(va);
+                SerialPort::puts("\n");
+            });
+            let map_args = Args {
+                vals: vec![
+                    Value::U64(va),
+                    Value::U64(paddr),
+                    Value::U64(page_aligned),
+                    Value::U64(dma_map_flags()),
+                ],
+            };
+            invoke(caller, addrspace, nodes::ADDRSPACE_CONTRACT, nodes::ADDRSPACE_MAP, &map_args)?;
+            return Ok(Reply::Data(vec![Value::U64(va)]));
         }
         if hook == DMA_VIRT_TO_PHYS {
-            let vaddr = arg_u64(args, 0).ok_or(ObjError::Denied)?;
-            return match self.virt_to_phys(vaddr) {
-                Some(phys) => Ok(Reply::Data(vec![Value::U64(phys)])),
-                None => Err(ObjError::Denied),
+            let addrspace = caller
+                .resolve_first(nodes::ADDRSPACE_CONTRACT, nodes::ADDRSPACE_TRANSLATE)
+                .ok_or(ObjError::Denied)?;
+            return match invoke(
+                caller,
+                addrspace,
+                nodes::ADDRSPACE_CONTRACT,
+                nodes::ADDRSPACE_TRANSLATE,
+                args,
+            )? {
+                Reply::Data(vals) => match vals.as_slice() {
+                    [Value::U64(phys)] => Ok(Reply::Data(vec![Value::U64(*phys)])),
+                    _ => Err(ObjError::Denied),
+                },
+                _ => Err(ObjError::Denied),
             };
         }
         Err(ObjError::NotSupported)
     }
-}
-
-fn reply_dma_buffer(buf: &crate::services::dma::DmaBuffer) -> Result<Reply, ObjError> {
-    Ok(Reply::Data(vec![
-        Value::U64(buf.phys),
-        Value::U64(buf.virt),
-        Value::U64(buf.size as u64),
-    ]))
 }
 
 fn arg_u64(args: &Args, i: usize) -> Option<u64> {
@@ -198,6 +238,198 @@ fn arg_u64(args: &Args, i: usize) -> Option<u64> {
         Some(Value::U64(v)) => Some(*v),
         _ => None,
     }
+}
+
+/// The uncached PTE flags a DMA buffer carries, encoded as the raw bits the
+/// `mm:address_space` `map` hook decodes (bit0 READ, bit1 WRITE, bit3 NO_CACHE;
+/// see `nodes::page_flags`).
+fn dma_map_flags() -> u64 {
+    (PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE).bits() as u64
+}
+
+/// §2.7 graph composition — allocate `count` DMA pages through the caller's
+/// endowed `physmem`/`addrspace` capabilities instead of the ambient
+/// allocator. Frames come from `PhysMemNode`, the region's base is read back
+/// through its `mem:region` capability, and the mapping goes through
+/// `AddressSpaceNode::map`. Never panics: every shape mismatch collapses to
+/// `ObjError`.
+fn dma_alloc(
+    caller: &CapabilityTable,
+    alloc_hook: HookId,
+    count: usize,
+) -> Result<Reply, ObjError> {
+    let size = (count as u64) * 4096;
+    dma_trace!({
+        use crate::drivers::serial::SerialPort;
+        SerialPort::puts("[DBG:dma-alloc] hook=");
+        SerialPort::puts(if alloc_hook == nodes::PHYSMEM_ALLOC_FRAMES { "alloc_frames" } else { "alloc_contiguous" });
+        SerialPort::puts(" count=");
+        SerialPort::put_u64(count as u64);
+        SerialPort::puts("\n");
+    });
+
+    let physmem = match caller.resolve_first(nodes::PHYSMEM_CONTRACT, nodes::PHYSMEM_ALLOC_FRAMES) {
+        Some(id) => id,
+        None => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] resolve_first(PHYSMEM) -> None (Denied)\n");
+            });
+            return Err(ObjError::Denied);
+        }
+    };
+    let addrspace = match caller.resolve_first(nodes::ADDRSPACE_CONTRACT, nodes::ADDRSPACE_MAP) {
+        Some(id) => id,
+        None => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] resolve_first(ADDRSPACE) -> None (Denied)\n");
+            });
+            return Err(ObjError::Denied);
+        }
+    };
+
+    // Reserve the VA window (the "keep the window logic" part).
+    let va = match crate::mm::layout::region_next_down("dma", size) {
+        Some(v) => v,
+        None => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] region_next_down(dma,");
+                SerialPort::put_u64(size);
+                SerialPort::puts(") -> None (OutOfMemory)\n");
+            });
+            return Err(ObjError::OutOfMemory);
+        }
+    };
+    dma_trace!({
+        use crate::drivers::serial::SerialPort;
+        SerialPort::puts("[DBG:dma-alloc] va=");
+        SerialPort::put_hex(va);
+        SerialPort::puts("\n");
+    });
+
+    // Allocate the frame(s); `alloc_frames` defaults its count to 1.
+    let alloc_args = Args { vals: vec![Value::U64(count as u64)] };
+    let reply = match invoke(caller, physmem, nodes::PHYSMEM_CONTRACT, alloc_hook, &alloc_args) {
+        Ok(r) => r,
+        Err(e) => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] invoke physmem alloc -> Err(OutOfMemory) (pool or frame)\n");
+            });
+            return Err(e);
+        }
+    };
+    let region_cap_id = match reply {
+        Reply::Caps(caps) => match caps.as_slice() {
+            [h] => h.id,
+            _ => {
+                dma_trace!({
+                    use crate::drivers::serial::SerialPort;
+                    SerialPort::puts("[DBG:dma-alloc] physmem reply caps len != 1 -> OOM\n");
+                });
+                return Err(ObjError::OutOfMemory);
+            }
+        },
+        _ => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] physmem reply not Caps -> OOM\n");
+            });
+            return Err(ObjError::OutOfMemory);
+        }
+    };
+
+    // Read the frame base back through the region's own capability.
+    let base = match invoke(
+        caller,
+        region_cap_id,
+        memregion::MEM_REGION_CONTRACT,
+        memregion::MEM_REGION_BASE,
+        &Args::none(),
+    ) {
+        Ok(Reply::Data(vals)) => match vals.as_slice() {
+            [Value::U64(b)] if *b != 0 => *b,
+            [_] => {
+                dma_trace!({
+                    use crate::drivers::serial::SerialPort;
+                    SerialPort::puts("[DBG:dma-alloc] MEM_REGION_BASE -> base=0 (stale wrapper) -> OOM\n");
+                });
+                return Err(ObjError::OutOfMemory);
+            }
+            _ => {
+                dma_trace!({
+                    use crate::drivers::serial::SerialPort;
+                    SerialPort::puts("[DBG:dma-alloc] MEM_REGION_BASE shape mismatch -> OOM\n");
+                });
+                return Err(ObjError::OutOfMemory);
+            }
+        },
+        Ok(_) => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] MEM_REGION_BASE reply not Data -> OOM\n");
+            });
+            return Err(ObjError::OutOfMemory);
+        }
+        Err(e) => {
+            dma_trace!({
+                use crate::drivers::serial::SerialPort;
+                SerialPort::puts("[DBG:dma-alloc] MEM_REGION_BASE invoke -> Err(Denied/NoSuchCap) -> OOM\n");
+            });
+            return Err(e);
+        }
+    };
+
+    // Map it through the caller's address-space capability, then zero it.
+    let map_args = Args {
+        vals: vec![
+            Value::U64(va),
+            Value::U64(base),
+            Value::U64(size),
+            Value::U64(dma_map_flags()),
+        ],
+    };
+    if let Err(e) = invoke(caller, addrspace, nodes::ADDRSPACE_CONTRACT, nodes::ADDRSPACE_MAP, &map_args) {
+        dma_trace!({
+            use crate::drivers::serial::SerialPort;
+            SerialPort::puts("[DBG:dma-alloc] ADDRSPACE_MAP invoke -> Err(Denied/NoSuchCap) -> OOM\n");
+        });
+        return Err(e);
+    }
+    unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
+
+    // The region wrapper's sole job was to carry the base through a capability
+    // so `alloc_frames` could hand it out without allocating. The caller now
+    // owns the frames as raw scalars, so recycle the wrapper (detach = recycle
+    // without releasing the backing) or every `alloc_page` permanently drains
+    // one entry from the finite wrapper pool.
+    let _ = invoke(
+        caller,
+        region_cap_id,
+        memregion::MEM_REGION_CONTRACT,
+        memregion::MEM_REGION_DETACH,
+        &Args::none(),
+    );
+
+    dma_trace!({
+        use crate::drivers::serial::SerialPort;
+        SerialPort::puts("[DBG:dma-alloc] OK phys=");
+        SerialPort::put_hex(base);
+        SerialPort::puts(" va=");
+        SerialPort::put_hex(va);
+        SerialPort::puts(" size=");
+        SerialPort::put_u64(size);
+        SerialPort::puts("\n");
+    });
+
+    // Same reply shape as before, so `DmaClient::decode_buffer` is unchanged.
+    Ok(Reply::Data(vec![
+        Value::U64(base),
+        Value::U64(va),
+        Value::U64(size),
+    ]))
 }
 
 // ── PCI config-space adapter ───────────────────────────────────────────
@@ -456,6 +688,138 @@ static SERIAL_CONTRACT_DEF: Contract = Contract {
     doc: SERIAL_DOC,
 };
 
+// ── P3 physical-world contracts (`nodes.rs`) ─────────────────────────────
+//
+// The five P3 contracts are declared in `obj/nodes.rs` (content-addressed
+// `ContractId`s like `PHYSMEM_CONTRACT`), but their `SurfaceDesc`/hooks statics
+// there are private. The canonical `Contract` defs therefore re-declare the
+// same surface/hooks here, and pin `id` to the `nodes.rs` consts — the
+// authoritative ids the nodes advertise in `contracts()` — so the registry's
+// `lookup` by a node's contract id resolves to the matching def (I10).
+// The surface/hooks below MUST stay byte-identical to `nodes.rs`.
+
+const PHYSMEM_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "physmem:allocation",
+    attrs: &[SurfaceAttr { name: "total_frames", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const PHYSMEM_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "alloc_frames", params: &[TypeTag::U64], reply: ReplyTag::Caps },
+    HookSignature { name: "alloc_contiguous", params: &[TypeTag::U64], reply: ReplyTag::Caps },
+    HookSignature { name: "free", params: &[TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "reserve", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "stats", params: &[], reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64]) },
+];
+
+const HEAP_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "heap:allocation",
+    attrs: &[SurfaceAttr { name: "arena", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const HEAP_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "alloc", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::Caps },
+    HookSignature { name: "free", params: &[TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "stats", params: &[], reply: ReplyTag::None },
+];
+
+const ADDRSPACE_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "mm:address_space",
+    attrs: &[SurfaceAttr { name: "root", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const ADDRSPACE_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "map", params: &[TypeTag::U64, TypeTag::U64, TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "unmap", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "protect", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "shootdown", params: &[], reply: ReplyTag::None },
+    HookSignature { name: "translate", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "root", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
+];
+
+const CPU_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "smp:cpu",
+    attrs: &[SurfaceAttr { name: "cpus", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const CPU_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "wake", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "ipi", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "shootdown", params: &[], reply: ReplyTag::None },
+    HookSignature { name: "stats", params: &[], reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]) },
+];
+
+const IRQ_SURFACE: SurfaceDesc = SurfaceDesc {
+    kind: "irq:vector",
+    attrs: &[SurfaceAttr { name: "vectors", ty: TypeTag::U64 }],
+    events: &[],
+};
+
+const IRQ_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "register_handler", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "unregister", params: &[TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "ack", params: &[], reply: ReplyTag::None },
+    HookSignature { name: "set_enabled", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+];
+
+static PHYSMEM_CONTRACT_DEF: Contract = Contract {
+    id: nodes::PHYSMEM_CONTRACT,
+    name: "physmem:allocation",
+    surface: &PHYSMEM_SURFACE,
+    hooks: PHYSMEM_HOOKS,
+    doc: nodes::PHYSMEM_DOC,
+};
+
+static HEAP_CONTRACT_DEF: Contract = Contract {
+    id: nodes::HEAP_CONTRACT,
+    name: "heap:allocation",
+    surface: &HEAP_SURFACE,
+    hooks: HEAP_HOOKS,
+    doc: nodes::HEAP_DOC,
+};
+
+static ADDRSPACE_CONTRACT_DEF: Contract = Contract {
+    id: nodes::ADDRSPACE_CONTRACT,
+    name: "mm:address_space",
+    surface: &ADDRSPACE_SURFACE,
+    hooks: ADDRSPACE_HOOKS,
+    doc: nodes::ADDRSPACE_DOC,
+};
+
+static CPU_CONTRACT_DEF: Contract = Contract {
+    id: nodes::CPU_CONTRACT,
+    name: "smp:cpu",
+    surface: &CPU_SURFACE,
+    hooks: CPU_HOOKS,
+    doc: nodes::CPU_DOC,
+};
+
+static IRQ_CONTRACT_DEF: Contract = Contract {
+    id: nodes::IRQ_CONTRACT,
+    name: "irq:vector",
+    surface: &IRQ_SURFACE,
+    hooks: IRQ_HOOKS,
+    doc: nodes::IRQ_DOC,
+};
+
+/// The canonical definitions of the five P3 physical-world contracts (§7.10).
+/// The bootstrap agent registers these through the registry capability.
+static PHYSICAL_CONTRACT_DEFS: &[&Contract] = &[
+    &PHYSMEM_CONTRACT_DEF,
+    &HEAP_CONTRACT_DEF,
+    &ADDRSPACE_CONTRACT_DEF,
+    &CPU_CONTRACT_DEF,
+    &IRQ_CONTRACT_DEF,
+];
+
+/// The canonical definitions of the five P3 physical-world contracts (§7.10).
+pub fn physical_contract_defs() -> &'static [&'static Contract] {
+    PHYSICAL_CONTRACT_DEFS
+}
+
 /// The canonical definition of the DMA contract (§7.8).
 pub fn dma_contract_def() -> &'static Contract {
     &DMA_CONTRACT_DEF
@@ -482,6 +846,16 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
         Some(&PCI_CONTRACT_DEF)
     } else if name == SERIAL_CONTRACT_DEF.name {
         Some(&SERIAL_CONTRACT_DEF)
+    } else if name == PHYSMEM_CONTRACT_DEF.name {
+        Some(&PHYSMEM_CONTRACT_DEF)
+    } else if name == HEAP_CONTRACT_DEF.name {
+        Some(&HEAP_CONTRACT_DEF)
+    } else if name == ADDRSPACE_CONTRACT_DEF.name {
+        Some(&ADDRSPACE_CONTRACT_DEF)
+    } else if name == CPU_CONTRACT_DEF.name {
+        Some(&CPU_CONTRACT_DEF)
+    } else if name == IRQ_CONTRACT_DEF.name {
+        Some(&IRQ_CONTRACT_DEF)
     } else {
         None
     }

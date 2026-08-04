@@ -8,6 +8,7 @@ cpu_slow = []
 forceslowlogging = []
 fat_trace = []
 usb_trace = []
+dma_trace = []
 kernelmb2 = []
 
 [dependencies]

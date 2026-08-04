@@ -14,6 +14,8 @@ use super::adapters::{self, DMA_ALLOC_PAGE};
 use super::bootstrap::{boot_domain, boot_endowment};
 use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::contract;
+use super::memregion::{MEM_REGION_BASE, MEM_REGION_CONTRACT};
+use super::nodes::{HEAP_ALLOC, HEAP_CONTRACT, PHYSMEM_ALLOC_FRAMES, PHYSMEM_CONTRACT};
 use super::registry::{REGISTRY_CONTRACT, REGISTRY_LOOKUP, REGISTRY_REGISTER};
 use super::rights::{CapRights, ContractRights, Rights};
 use super::{invoke, Args, ObjError, Reply, Value};
@@ -71,9 +73,10 @@ pub fn run() {
     let r3b = invoke(&table, narrowed_id, adapters::DMA_CONTRACT, DMA_ALLOC_PAGE, &Args::none());
     expect_err("per-hook contract right", r3b, ObjError::Denied);
 
-    // C8 — first driver domain: disjoint table endowed only with dma+pci_cfg
-    // (§6.2, §8.14). The device sweep runs under this domain; it must be able
-    // to resolve exactly its endowment, and nothing the boot domain kept.
+    // C8 — first driver domain: disjoint table endowed only with
+    // dma+pci_cfg+physmem+addrspace (§6.2, §8.14). The device sweep runs under
+    // this domain; it must be able to resolve exactly its endowment, and
+    // nothing the boot domain kept.
     let drv = crate::obj::driver::driver_domain();
     let dend = crate::obj::driver::driver_endowment();
 
@@ -96,11 +99,15 @@ pub fn run() {
         Err(e) => panic!("driver separation FAIL: unendowed id -> {:?}", e),
     }
 
-    // 7. The driver domain holds exactly its endowment: two slots, no more.
-    //    A driver table of size two cannot name a serial or heap cap the boot
+    // 7. The driver domain holds exactly its endowment: four slots, no more.
+    //    A driver table of size four cannot name a serial or heap cap the boot
     //    domain kept for itself (§8.14: the kernel cannot reach the driver's
     //    addresses by position — and vice versa).
-    assert_eq!(drv.table.count(), 2, "driver domain must hold exactly dma + pci_cfg");
+    assert_eq!(
+        drv.table.count(),
+        4,
+        "driver domain must hold exactly dma + pci_cfg + physmem + addrspace"
+    );
 
     // 8. NEGATIVE — serial is not reachable through the driver domain at all:
     //    the endowed DMA node simply does not implement the serial contract.
@@ -109,8 +116,6 @@ pub fn run() {
         Ok(_) => panic!("driver separation FAIL: dma node implemented serial contract"),
         Err(e) => panic!("driver separation FAIL: serial probe -> {:?}", e),
     }
-
-    SerialPort::puts("[obj] driver separation: OK (dma + pci_cfg only)\n");
 
     // §7.8 — the contract registry: discovery by owned capability, never
     // ambient. The boot domain was endowed with the registry cap; the driver
@@ -187,6 +192,56 @@ pub fn run() {
     );
 
     SerialPort::puts("[obj] registry separation: OK (owned-capability discovery)\n");
+
+    // P3 — the physical world as nodes (§7.10). The boot domain was endowed
+    // with the five family roots; exercise the frame pool through capability
+    // mediation and prove the driver domain (physmem but NO heap) is genuinely
+    // cut off from the heap node.
+
+    // 14. POSITIVE — physmem `alloc_frames` from the boot table returns exactly
+    //     one capability; that cap resolves `MEM_REGION_BASE` to a non-zero
+    //     base. The reply's caps already carry real `CapId`s (invoke inserts
+    //     them into the boot table), so we can invoke the region directly.
+    match invoke(
+        &table,
+        end.physmem,
+        PHYSMEM_CONTRACT,
+        PHYSMEM_ALLOC_FRAMES,
+        &Args::none(),
+    ) {
+        Ok(Reply::Caps(caps)) if caps.len() == 1 => {
+            let region_id = caps[0].id;
+            match invoke(&table, region_id, MEM_REGION_CONTRACT, MEM_REGION_BASE, &Args::none()) {
+                Ok(Reply::Data(vals)) if vals.len() == 1 => match &vals[0] {
+                    Value::U64(base) => {
+                        assert!(*base != 0, "P3: physmem region base is zero");
+                        SerialPort::puts("[obj] P3 ok: physmem alloc_frames -> base=0x");
+                        SerialPort::put_hex(*base);
+                        SerialPort::puts("\n");
+                    }
+                    _ => panic!("P3: region base replied non-u64 payload"),
+                },
+                Ok(_) => panic!("P3: region base replied unexpected shape"),
+                Err(e) => panic!("P3: region base through mem:region failed: {:?}", e),
+            }
+        }
+        Ok(_) => panic!("P3: physmem alloc_frames replied unexpected shape"),
+        Err(e) => panic!("P3: physmem alloc_frames through cap failed: {:?}", e),
+    }
+
+    // 15. NEGATIVE — a driver domain WITHOUT a heap cap cannot resolve the Heap
+    //     node: the id provably isn't endowed (the driver table never received
+    //     a heap cap), so `resolve` fails `NoSuchCap`/`Denied`. This proves "a
+    //     driver domain without a heap cap cannot resolve the Heap node" (§6.2).
+    match drv.table.resolve(CapId(u32::MAX as u64), HEAP_CONTRACT, HEAP_ALLOC) {
+        Err(ObjError::NoSuchCap) | Err(ObjError::Denied) => {
+            SerialPort::puts("[obj] driver sep ok: no heap cap -> Heap node unreachable\n")
+        }
+        Ok(_) => panic!("driver separation FAIL: heap resolved without a heap cap"),
+        Err(e) => panic!("driver separation FAIL: heap probe -> {:?}", e),
+    }
+
+    SerialPort::puts("[obj] driver separation: OK (dma + pci_cfg + physmem + addrspace)\n");
 
     SerialPort::puts("[obj] separation: OK (cap-mediated alloc enforced)\n");
 }
