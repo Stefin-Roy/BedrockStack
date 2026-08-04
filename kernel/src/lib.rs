@@ -223,6 +223,8 @@ impl Kernel {
         // reachable only through the boot table (§5.4).
         crate::obj::bootstrap::bootstrap(self.page_table_root, svc_static);
         crate::drivers::serial::SerialPort::puts("[obj] bootstrap: boot domain endowed\n");
+        crate::obj::domain::register_domain(crate::obj::bootstrap::boot_domain());
+        crate::obj::domain::register_domain(crate::obj::driver::driver_domain());
 
         // C6 — boot-time separation proof: the endowed DMA capability works,
         // unendowed ids and foreign contracts are refused. Runs once, before SMP.
@@ -550,13 +552,22 @@ impl Kernel {
         // boot table; exercise the QUERY-only projection (§7.12.3).
         crate::obj::separation::run_post_mount();
 
-        // P1 gate — emit the `kerneldump graph` node census once (read-only
-        // projection; §7.13, §2.8). x86_64-only: `kerneldump` is not built on
-        // riscv64.
+        // P5 gate — the device sweep is the driver domain's last act; then the
+        // P5 cascade/deny-list proofs run, followed by the §8.7 leak detector
+        // (the gate is the test-suite: "run it after every test-suite
+        // execution"). x86_64-only: `kerneldump` is not built on riscv64.
         #[cfg(target_arch = "x86_64")]
         {
+            crate::obj::devices::materialize_pci_tree();
+            crate::obj::revocation::run_p5_gate();
+
             let mut w = crate::drivers::serial::SerialPort;
             crate::kerneldump::graph_census(&mut w);
+            crate::kerneldump::graph(&mut w);
+            let leaked = crate::kerneldump::leak::leak_detect(&mut w);
+            if leaked {
+                crate::drivers::serial::SerialPort::puts("kerneldump leak_detect: FAIL\n");
+            }
             crate::kerneldump::fs_walk(&mut w);
         }
 

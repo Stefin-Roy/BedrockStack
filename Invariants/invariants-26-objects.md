@@ -3,7 +3,7 @@
 **Version:** 0.4.0
 **Date:** 2026-08-04
 **Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,nodes,memregion,adapters}.rs`
-**Status:** Active (P4)
+**Status:** Active (P5)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
 > model of `Documentation/RootGraph.md`. The canonical property set is the
@@ -19,7 +19,7 @@
 > maps through the caller's endowed `physmem`/`addrspace` capabilities (§2.7
 > graph composition). The bootstrap seed window (§5.7) still aborts on OOM;
 > every post-bootstrap node hook returns `ObjError::OutOfMemory`. Deny-list
-> (revocable) nodes remain deferred to P4/P5.
+> (revocable) nodes are implemented in P5 (§3.7.3, R9).
 >
 > P3 refinements in 0.3.0:
 > - `free()` is real, not a stub: the provider `free(region)` hooks take the
@@ -98,7 +98,7 @@ holds the node through a strong `Arc<dyn Obj>`, so a node's lifetime is
 exactly the life of the caps that reach it; the store holds no strong
 reference (see I7), so nothing can resurrect a dead node. Default revocation
 is drop-death (`RevocationPolicy::DropDeath`); deny-list `Revocable` nodes
-are deferred to P4/P5.
+(P5, §3.7.3, R9) add deactivation with caps retained.
 - Location: `obj/cap_handle.rs::CapHandle{ node: Arc<dyn Obj> }` (obj/cap_handle.rs:27-32), `obj/cap_handle.rs::RevocationPolicy` (obj/cap_handle.rs:18-23), `obj/table.rs::resolve` returns `Arc::clone(&h.node)` (obj/table.rs:109,113)
 
 **I5 (one parent) — every node ≠ P has exactly one parent edge:**
@@ -118,18 +118,20 @@ families.
 
 **I7 (store weakness) — the ObjectStore holds only weak references; it
 never affects `reach`:**
-`ObjRecord` holds no node reference at all (just `id`, `kind`, `parent`),
-so the store cannot keep a node alive nor resurrect one. Projection is
-read-only and gated by the store-node capability.
-- Location: `obj/store.rs::ObjRecord` (no `Arc`/`Weak` node field, obj/store.rs:14-18), `obj/store.rs::ObjectStore` (obj/store.rs:21-24), `obj/store.rs::lock_records` (read-only, obj/store.rs:49-50)
+`ObjRecord` holds a `Weak<dyn Obj>` per node (P5, never strong) alongside
+`id`, `kind`, `parent`, `family_root`, per-root `cascade` state, and the
+per-object deny-list set, so the store cannot keep a node alive nor
+resurrect one. Projection is read-only and gated by the store-node
+capability.
+- Location: `obj/store.rs::ObjRecord` (`Weak<dyn Obj>`, no strong `Arc`/`Weak` node field, obj/store.rs:14-18), `obj/store.rs::register_weak`/`register_with_id_weak` (weak-only registration), `obj/store.rs::seal_cascade`/`is_cascade_severed`/`revoke_deny`/`is_denied` (weak-side bookkeeping), `obj/store.rs::ObjectStore` (obj/store.rs:21-24), `obj/store.rs::lock_records` (read-only, obj/store.rs:49-50)
 
 **I8 (fast-path bound) — the `PERMIT` check of `R6` is O(1):**
 A constant number of word-size operations: one `IrqMutex` acquire, one slot
-index, Live, `INVOKE`, contract membership, per-hook contract-right test
-(and, in a later phase, a deny-bit load). All are independent of table size `n` and the
-contract-membership probe is on a small, frozen set. See §9.4 of
-`RootGraph.md` (I8).
-- Location: `obj/table.rs::resolve` (obj/table.rs:87-114), `obj/mod.rs::Obj::hook_contract_right` (obj/mod.rs:67-70), reference `RootGraph.md` §9.4 (fast-path bound, five named steps)
+index, Live, `INVOKE`, contract membership, per-hook contract-right test,
+and the P5 deny-list probe (one hash-set load, §3.7.3/R9). All are
+independent of table size `n` and the contract-membership probe is on a
+small, frozen set. See §9.4 of `RootGraph.md` (I8).
+- Location: `obj/table.rs::resolve_with_rights` (PERMIT slope incl. step-6 deny probe, obj/table.rs:87-114), `obj/mod.rs::Obj::hook_contract_right` (obj/mod.rs:67-70), reference `RootGraph.md` §9.4 (fast-path bound, five named steps)
 
 **I9 (dispatch safety) — no table-slot lock is held across a hook body;
 in-flight dispatch holds an `Arc` that prevents drop-death reclamation
@@ -206,3 +208,43 @@ The P4 gate (section 7.12) requires:
 
 5. No ambient string VFS: resolve_path, CWD, FD_TABLE, getcwd, chdir, and
    the string fd API are deleted. vfs/path.rs is deleted.
+
+## P5 Gate
+
+The P5 gate (section 7.13 and the Phase P5 section) requires:
+
+1. All three revocation modes wired (R7–R9): drop-death (R7) is the
+   default; cascade (R8) via `CapabilityTable::revoke_cascade` (REVOKE gate
+   → mark the root handle Revoked → `seal_cascade` the subtree → release the
+   root slot), keyed per family root by the store's `cascade` state (§8.6
+   layer 1); deny-list (R9) via `revoke_deny` on the per-object deny set.
+
+2. The store stays weak (I7): `register_weak`/`register_with_id_weak` record
+   a real `Weak<dyn Obj>` per node plus `family_root` and per-root `cascade`
+   state — never a strong reference — with `seal_cascade -> usize` (subtree
+   size) and `is_cascade_severed`/`is_denied` read-backs.
+
+3. PERMIT keeps the fast path (I8): `resolve_with_rights` adds the step-6
+   deny-list probe as a single hash-set probe, so the check stays O(1).
+
+4. The projection tool (§7.13): `kerneldump graph`/`graph_with_flags`
+   (`--roots --edges --caps --contracts --revocations`) plus the P1
+   `graph_census`; `kerneldump/leak.rs::leak_detect` is the §8.7
+   post-process — reachability from all registered domains' tables, with
+   `infra:` seed nodes and cascade-severed-family records exempt (I4/§8.8)
+   — and returns `true` on a leak so CI can fail the run.
+
+5. The PCI forest is a real family root: `materialize_pci_tree`/
+   `materialize_pci_child` register one `PciDeviceNode` per discovered
+   device with weak parent edges (ObjId base 0x11_3000), and the boot
+   domain's PCI forest cap carries REVOKE. `obj/domain.rs` exposes a domain
+   registry (`register_domain`/`all_domains`) for the projection tool.
+
+6. Cascade gate assertion: `run_p5_gate` cascade-revokes a 4-node test
+   subtree (root + three weak-parented children) and asserts the whole
+   subtree is deny-marked and absent from the next projection, with no
+   handle left Live.
+
+7. Deny-list gate assertion: deny-list-revoking a `Revocable` node makes
+   PERMIT fail `Revoked` while the cap slot is retained (Zombie); the leak
+   detector runs clean after the test run.

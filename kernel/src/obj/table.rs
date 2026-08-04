@@ -3,10 +3,11 @@ use alloc::vec::Vec;
 
 use crate::filesystems::vfs::irq::IrqMutex;
 
-use super::cap_handle::{CapHandle, CapId, HandleState};
+use super::cap_handle::{CapHandle, CapId, HandleState, RevocationPolicy};
 use super::contract::{ContractId, HookSignature};
 use super::hook::HookId;
 use super::rights::{CapRights, ContractRights, Rights};
+use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply};
 
@@ -66,13 +67,14 @@ impl CapabilityTable {
     }
 
     /// The PERMIT fast path (§7.5): slot fetch, Live, INVOKE, contract
-    /// membership, then the per-hook contract-right bit-test (§3.3). Returns
-    /// the node's `Arc` *and* the invoking handle's [`CapRights`], copied
-    /// under the same lock, so a downstream provider may check the exact
-    /// rights the caller held (S1).
+    /// membership, the per-hook contract-right bit-test (§3.3), then the
+    /// revocable deny-list probe (§3.3, §3.7.3). Returns the node's `Arc`
+    /// *and* the invoking handle's [`CapRights`], copied under the same lock,
+    /// so a downstream provider may check the exact rights the caller held
+    /// (S1).
     ///
-    /// Slope (one `IrqMutex` acquire, one array fetch, three bit-tests, no
-    /// allocation — I8/§9.4):
+    /// Slope (one `IrqMutex` acquire, one array fetch, three bit-tests, one
+    /// hash-set probe, no allocation — I8/§9.4):
     /// 1. slot fetch → `NoSuchCap`
     /// 2. `state != Live` → `Revoked`
     /// 3. universal `INVOKE` not held → `Denied`
@@ -81,10 +83,10 @@ impl CapabilityTable {
     ///    (from `Obj::hook_contract_right`); an `empty()` mask is the
     ///    transitional "not yet narrowed" state and satisfies any requirement
     ///    (see `ContractRights` type docs).
-    ///
-    /// The revocable deny-list check (§3.3: `node.revocation()==Revocable` and
-    /// `store.deny(node)`) is reserved for P3, when revocable nodes arrive; it
-    /// will slot in after step 5 and fail with `Revoked`.
+    /// 6. `node.revocation() == Revocable` and the store's deny-list marks the
+    ///    node → `Revoked` (a family-root cascade or a `revoke_deny` fired; the
+    ///    node is a zombie — present, counted, inert, §3.7.3). A `HashSet`
+    ///    probe is O(1), so the fast-path bound is preserved.
     ///
     /// The lock is released before the returned `Arc` and the copied rights
     /// are used.
@@ -113,6 +115,11 @@ impl CapabilityTable {
         let required = h.node.hook_contract_right(contract, hook);
         if held != ContractRights::empty() && !held.contains(required) {
             return Err(ObjError::Denied);
+        }
+        if h.node.revocation() == RevocationPolicy::Revocable
+            && object_store().is_denied(h.node.obj_id())
+        {
+            return Err(ObjError::Revoked);
         }
         // Copy the handle's rights while the lock is held (CapRights is Copy).
         Ok((Arc::clone(&h.node), h.rights))
@@ -205,11 +212,59 @@ impl CapabilityTable {
         }
     }
 
+    /// Cascade revocation of a family subtree (R8, §3.7.2, §9.2). Requires
+    /// `REVOKE` in the handle's universal rights, else `Denied`. Marks the
+    /// handle `Revoked`, seals the node's family root in the store (which
+    /// deny-lists the root and every descendant, deactivating them lazily at
+    /// the next PERMIT — §8.6 layer 2), and releases *this* table's strong ref
+    /// to the root cap (the slot is freed; descendant refs in other tables are
+    /// inert-but-held until dropped, §3.7.3). Returns the sealed subtree size
+    /// for the §8.6 latency measurement.
+    pub fn revoke_cascade(&self, id: CapId) -> Result<usize, ObjError> {
+        let node = {
+            let mut inner = self.slots.lock();
+            let Some(h) = inner
+                .slots
+                .get_mut(id.0 as usize)
+                .and_then(|s| s.as_mut())
+            else {
+                return Err(ObjError::NoSuchCap);
+            };
+            if !h.rights.uni.contains(Rights::REVOKE) {
+                return Err(ObjError::Denied);
+            }
+            h.state = HandleState::Revoked;
+            let node = Arc::clone(&h.node);
+            // R8: release this table's strong ref to the subtree's root cap.
+            inner.slots[id.0 as usize] = None;
+            inner.free_list.push(id.0 as u32);
+            node
+        };
+        Ok(object_store().seal_cascade(node.obj_id()))
+    }
+
     /// Number of occupied slots. Separation proofs use it to assert a domain
     /// holds exactly what it was endowed with (§8.14, C8).
     pub fn count(&self) -> usize {
         let inner = self.slots.lock();
         inner.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// Snapshot every occupied slot: `(CapId, node id, rights, state)`.
+    /// Read-only; the lock is dropped before returning. The projection tool
+    /// uses it for the `held-by` report and the leak detector for its
+    /// reachability walk (§7.13, §8.7).
+    pub fn snapshot(&self) -> Vec<(CapId, ObjId, CapRights, HandleState)> {
+        let inner = self.slots.lock();
+        inner
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                s.as_ref()
+                    .map(|h| (CapId(i as u64), h.node.obj_id(), h.rights, h.state))
+            })
+            .collect()
     }
 }
 

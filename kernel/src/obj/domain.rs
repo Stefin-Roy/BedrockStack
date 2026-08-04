@@ -1,3 +1,9 @@
+extern crate alloc;
+
+use alloc::vec::Vec;
+use spin::Mutex;
+use spin::Once;
+
 use super::table::CapabilityTable;
 
 /// An independent principal-in-the-small: an execution context holding its own
@@ -33,4 +39,24 @@ pub fn current_domain() -> Option<&'static Domain> {
         // with a `&'static Domain`, so a non-null pointer is a live reference.
         Some(unsafe { &*p })
     }
+}
+
+/// The domain registry: every domain ever created, for the projection tool's
+/// `held-by` report and the leak detector's reachability roots (§7.13, §8.7).
+/// The store stays weak; this is a set of *tables*, not a namespace.
+static DOMAINS: Once<Mutex<Vec<&'static Domain>>> = Once::new();
+
+fn domain_list() -> &'static Mutex<Vec<&'static Domain>> {
+    DOMAINS.call_once(|| Mutex::new(Vec::new()))
+}
+
+/// Register a domain so the projection tool can see what it holds (§7.13).
+/// Called once per domain at creation (boot, driver, P5 gate).
+pub fn register_domain(d: &'static Domain) {
+    domain_list().lock().push(d);
+}
+
+/// Snapshot of every registered domain, in creation order.
+pub fn all_domains() -> Vec<&'static Domain> {
+    domain_list().lock().clone()
 }

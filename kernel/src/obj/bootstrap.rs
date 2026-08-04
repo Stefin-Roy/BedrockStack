@@ -240,10 +240,15 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         state: HandleState::Live,
     });
 
+    // §3.7.2 — the PCI forest root cap carries REVOKE so the P5 gate and the
+    // §8.6 latency test can cascade-sever the whole device complex at the trunk.
     let pci_forest_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: devices::pci_forest_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY).or(Rights::REVOKE),
+            ContractRights::empty(),
+        ),
         state: HandleState::Live,
     });
     let input_id = boot.table.insert(CapHandle {

@@ -21,6 +21,7 @@ pub mod memregion;
 pub mod mint;
 pub mod nodes;
 pub mod registry;
+pub mod revocation;
 pub mod rights;
 pub mod separation;
 pub mod store;
