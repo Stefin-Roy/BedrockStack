@@ -6,6 +6,15 @@ use super::dentry::Dentry;
 use super::irq::IrqMutex;
 use super::superblock::SuperBlock;
 
+static NEXT_MOUNT_ID: IrqMutex<u64> = IrqMutex::new(1);
+
+pub fn next_mount_id() -> u64 {
+    let mut id = NEXT_MOUNT_ID.lock();
+    let val = *id;
+    *id += 1;
+    val
+}
+
 pub struct DriveMount {
     pub id: u64,
     pub root: Arc<Dentry>,

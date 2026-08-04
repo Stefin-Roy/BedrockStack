@@ -30,8 +30,11 @@ use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::memregion;
 use super::nodes;
+use super::rights::CapRights;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
+use super::devices;
+use super::fs;
 use super::{invoke, Args, Obj, ObjError, ObjId, Reply, Value};
 
 // ── Stable identities (singletons; deterministic, never from the store) ──
@@ -73,10 +76,11 @@ impl<T: Obj + ?Sized> Obj for NodeRef<T> {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
-        self.0.dispatch(caller, hook, args)
+        self.0.dispatch(caller, rights, hook, args)
     }
 }
 
@@ -159,6 +163,7 @@ impl Obj for KernelDma {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -547,6 +552,7 @@ impl Obj for EcamPciConfig {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -634,6 +640,7 @@ impl Obj for KernelSerial {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -856,6 +863,22 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
         Some(&CPU_CONTRACT_DEF)
     } else if name == IRQ_CONTRACT_DEF.name {
         Some(&IRQ_CONTRACT_DEF)
+    } else if name == fs::block_contract_def().name {
+        Some(fs::block_contract_def())
+    } else if name == fs::block_family_contract_def().name {
+        Some(fs::block_family_contract_def())
+    } else if name == fs::mount_contract_def().name {
+        Some(fs::mount_contract_def())
+    } else if name == fs::dir_contract_def().name {
+        Some(fs::dir_contract_def())
+    } else if name == fs::file_contract_def().name {
+        Some(fs::file_contract_def())
+    } else if name == devices::pci_forest_contract_def().name {
+        Some(devices::pci_forest_contract_def())
+    } else if name == devices::input_family_contract_def().name {
+        Some(devices::input_family_contract_def())
+    } else if name == devices::audio_family_contract_def().name {
+        Some(devices::audio_family_contract_def())
     } else {
         None
     }

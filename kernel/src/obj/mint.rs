@@ -116,6 +116,7 @@ impl Obj for StubNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         _hook: HookId,
         _args: &Args,
     ) -> Result<Reply, ObjError> {

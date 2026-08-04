@@ -17,6 +17,7 @@ use alloc::vec;
 use super::adapters;
 use super::contract::{self, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
+use super::rights::CapRights;
 use super::surface::{SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
@@ -76,6 +77,7 @@ impl Obj for RegistryNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {

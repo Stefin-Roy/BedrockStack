@@ -19,7 +19,9 @@ use spin::Once;
 
 use super::adapters;
 use super::cap_handle::{CapHandle, CapId, HandleState};
+use super::devices;
 use super::domain::{self, Domain};
+use super::fs;
 use super::memregion;
 use super::mint::{self, PrincipalContext};
 use super::nodes;
@@ -51,6 +53,11 @@ pub struct BootEndowment {
     pub addrspace: CapId,
     pub cpu: CapId,
     pub irq: CapId,
+    pub block: CapId,
+    pub mount: CapId,
+    pub pci_forest: CapId,
+    pub input: CapId,
+    pub audio: CapId,
 }
 
 /// Rights held by the Boot domain over each primitive family root (§5.4).
@@ -169,6 +176,32 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         )
         .expect("bootstrap: register physical contract");
     }
+    for def in [fs::block_contract_def(), fs::block_family_contract_def(), fs::mount_contract_def(), fs::dir_contract_def(), fs::file_contract_def()] {
+        let args = Args { vals: vec![Value::Str(def.name)] };
+        invoke(
+            &boot.table,
+            registry_id,
+            registry::REGISTRY_CONTRACT,
+            registry::REGISTRY_REGISTER,
+            &args,
+        )
+        .expect("bootstrap: register fs contract");
+    }
+    for def in [
+        devices::pci_forest_contract_def(),
+        devices::input_family_contract_def(),
+        devices::audio_family_contract_def(),
+    ] {
+        let args = Args { vals: vec![Value::Str(def.name)] };
+        invoke(
+            &boot.table,
+            registry_id,
+            registry::REGISTRY_CONTRACT,
+            registry::REGISTRY_REGISTER,
+            &args,
+        )
+        .expect("bootstrap: register device family contract");
+    }
 
     // §7.3 / §7.8 — register every stable-id infra/adapter node in the
     // ObjectStore so the `kerneldump graph` census reflects the P2 model, not
@@ -188,6 +221,43 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     register_seed_node(phys.addrspace.as_ref());
     register_seed_node(phys.cpu_root.as_ref());
     register_seed_node(phys.irq_root.as_ref());
+    register_seed_node(fs::block_family_node().as_ref());
+    register_seed_node(fs::mount_node().as_ref());
+    register_seed_node(devices::pci_forest_node().as_ref());
+    register_seed_node(devices::input_family_node().as_ref());
+    register_seed_node(devices::audio_family_node().as_ref());
+
+    let block_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: fs::block_family_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), ContractRights::empty()),
+        state: HandleState::Live,
+    });
+    let mount_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: fs::mount_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), ContractRights::empty()),
+        state: HandleState::Live,
+    });
+
+    let pci_forest_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: devices::pci_forest_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        state: HandleState::Live,
+    });
+    let input_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: devices::input_family_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        state: HandleState::Live,
+    });
+    let audio_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: devices::audio_family_node(),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        state: HandleState::Live,
+    });
 
     BOOT_DOMAIN.call_once(|| boot);
     BOOT_ENDOWMENT.call_once(|| BootEndowment {
@@ -200,6 +270,11 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         addrspace: addrspace_id,
         cpu: cpu_id,
         irq: irq_id,
+        block: block_id,
+        mount: mount_id,
+        pci_forest: pci_forest_id,
+        input: input_id,
+        audio: audio_id,
     });
 
     // C8 — the first driver domain (§6.2): a second, disjoint table endowed

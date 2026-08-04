@@ -7,6 +7,7 @@ use spin::Once;
 
 use super::contract::{ContractId, HookSignature};
 use super::hook::HookId;
+use super::rights::CapRights;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply};
 
@@ -116,6 +117,7 @@ impl Obj for StoreNode {
     fn dispatch(
         &self,
         _caller: &super::table::CapabilityTable,
+        _rights: &CapRights,
         _hook: HookId,
         _args: &Args,
     ) -> Result<Reply, ObjError> {

@@ -9,11 +9,13 @@ use alloc::vec::Vec;
 
 pub mod adapters;
 pub mod bootstrap;
+pub mod devices;
 pub mod cap_handle;
 pub mod clients;
 pub mod contract;
 pub mod domain;
 pub mod driver;
+pub mod fs;
 pub mod hook;
 pub mod memregion;
 pub mod mint;
@@ -83,11 +85,24 @@ pub trait Obj: Send + Sync {
         None
     }
 
+    /// Downcast access to the concrete node (§7.x). Default `None`; a node that
+    /// must share its concrete interior (e.g. `BlockNode` so a mount can
+    /// recover the `BlockDevice` handle) overrides this to return `Some(self)`.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
+
     /// Active face (§4.2). `caller` is the invoking domain's table, threaded
-    /// per §6.3.
+    /// per §6.3; `rights` is the invoking handle's [`CapRights`] as copied by
+    /// [`CapabilityTable::resolve_with_rights`] under the same PERMIT that let
+    /// this hook through (§7.5), so a provider may gate its hook body on the
+    /// exact rights the caller held (S1). It is a *check* handle only: the
+    /// invocation already passed PERMIT, and no amplification is possible
+    /// through this reference.
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError>;
@@ -161,8 +176,8 @@ pub fn invoke(
     hook: HookId,
     args: &Args,
 ) -> Result<Reply, ObjError> {
-    let node = table.resolve(id, contract, hook)?;
-    match node.dispatch(table, hook, args)? {
+    let (node, rights) = table.resolve_with_rights(id, contract, hook)?;
+    match node.dispatch(table, &rights, hook, args)? {
         Reply::Caps(caps) => {
             let mut inserted = Vec::new();
             for h in caps {

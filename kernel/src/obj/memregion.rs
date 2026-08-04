@@ -46,6 +46,7 @@ use spin::Once;
 
 use super::contract::{ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
+use super::rights::CapRights;
 use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
@@ -196,6 +197,7 @@ impl Obj for MemRegionNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         _args: &Args,
     ) -> Result<Reply, ObjError> {

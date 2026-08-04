@@ -6,7 +6,7 @@ use crate::filesystems::vfs::irq::IrqMutex;
 use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::contract::{ContractId, HookSignature};
 use super::hook::HookId;
-use super::rights::{ContractRights, Rights};
+use super::rights::{CapRights, ContractRights, Rights};
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply};
 
@@ -66,7 +66,10 @@ impl CapabilityTable {
     }
 
     /// The PERMIT fast path (§7.5): slot fetch, Live, INVOKE, contract
-    /// membership, then the per-hook contract-right bit-test (§3.3).
+    /// membership, then the per-hook contract-right bit-test (§3.3). Returns
+    /// the node's `Arc` *and* the invoking handle's [`CapRights`], copied
+    /// under the same lock, so a downstream provider may check the exact
+    /// rights the caller held (S1).
     ///
     /// Slope (one `IrqMutex` acquire, one array fetch, three bit-tests, no
     /// allocation — I8/§9.4):
@@ -83,13 +86,14 @@ impl CapabilityTable {
     /// `store.deny(node)`) is reserved for P3, when revocable nodes arrive; it
     /// will slot in after step 5 and fail with `Revoked`.
     ///
-    /// The lock is released before the returned `Arc` is used.
-    pub fn resolve(
+    /// The lock is released before the returned `Arc` and the copied rights
+    /// are used.
+    pub fn resolve_with_rights(
         &self,
         id: CapId,
         contract: ContractId,
         hook: HookId,
-    ) -> Result<Arc<dyn Obj>, ObjError> {
+    ) -> Result<(Arc<dyn Obj>, CapRights), ObjError> {
         let inner = self.slots.lock();
         let h = inner
             .slots
@@ -110,7 +114,20 @@ impl CapabilityTable {
         if held != ContractRights::empty() && !held.contains(required) {
             return Err(ObjError::Denied);
         }
-        Ok(Arc::clone(&h.node))
+        // Copy the handle's rights while the lock is held (CapRights is Copy).
+        Ok((Arc::clone(&h.node), h.rights))
+    }
+
+    /// Thin wrapper over [`resolve_with_rights`]: the PERMIT-only node fetch
+    /// (§7.5), dropping the handle's rights.
+    pub fn resolve(
+        &self,
+        id: CapId,
+        contract: ContractId,
+        hook: HookId,
+    ) -> Result<Arc<dyn Obj>, ObjError> {
+        self.resolve_with_rights(id, contract, hook)
+            .map(|(node, _)| node)
     }
 
     /// Find the first Live cap in this table that resolves `contract`+`hook`
@@ -252,6 +269,7 @@ impl Obj for TableNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         _hook: HookId,
         _args: &Args,
     ) -> Result<Reply, ObjError> {

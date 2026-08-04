@@ -126,6 +126,7 @@ impl Obj for PhysMemNode {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -295,6 +296,7 @@ impl Obj for HeapNode {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -390,6 +392,7 @@ impl Obj for AddressSpaceNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -489,6 +492,7 @@ impl Obj for CpuRootNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -540,6 +544,7 @@ impl Obj for CpuNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -629,6 +634,7 @@ impl Obj for IrqRootNode {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -685,6 +691,7 @@ impl Obj for IrqNode {
     fn dispatch(
         &self,
         caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
@@ -768,6 +775,7 @@ impl Obj for IrqHandlerNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
+        _rights: &CapRights,
         hook: HookId,
         _args: &Args,
     ) -> Result<Reply, ObjError> {

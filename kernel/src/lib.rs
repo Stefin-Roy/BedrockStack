@@ -447,6 +447,7 @@ impl Kernel {
         // Audio subsystem — probes PCI for an Intel HD Audio controller.
         #[cfg(target_arch = "x86_64")]
         crate::audio::init();
+        crate::obj::devices::init_audio();
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -465,15 +466,78 @@ impl Kernel {
             *crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock() = block_devices.clone();
         }
 
+        // A: tmpfs mount via mount cap (P4-S5, §7.11 — no ambient VFS remaining)
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
-        crate::filesystems::vfs::init().expect("VFS init failed");
+        {
+            crate::filesystems::fstypes::register_all();
+            let table = &crate::obj::bootstrap::boot_domain().table;
+            let boot_end = crate::obj::bootstrap::boot_endowment();
+            let args = crate::obj::Args {
+                vals: alloc::vec![crate::obj::Value::Str("tmpfs"), crate::obj::Value::U64(0)],
+            };
+            match crate::obj::invoke(
+                table,
+                boot_end.mount,
+                crate::obj::fs::MOUNT_CONTRACT,
+                crate::obj::fs::MOUNT_HOOK,
+                &args,
+            ) {
+                Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => {
+                    log::info!("Mounted A> (tmpfs, via mount cap)");
+                    // Create a test directory via the DirNode cap so fs-walk
+                    // has something to exercise (P4-S3, §7.12.3).
+                    let dir_cap = caps[0].id;
+                    let mkdir_args = crate::obj::Args {
+                        vals: alloc::vec![crate::obj::Value::Str("tmp")],
+                    };
+                    match crate::obj::invoke(
+                        table,
+                        dir_cap,
+                        crate::obj::fs::DIR_CONTRACT,
+                        crate::obj::fs::DIR_MKDIR,
+                        &mkdir_args,
+                    ) {
+                        Ok(crate::obj::Reply::Caps(_)) => log::info!("Created A>tmp via DirNode mkdir cap"),
+                        Ok(_) => log::warn!("mkdir A>tmp via cap: unexpected reply"),
+                        Err(e) => log::warn!("mkdir A>tmp via cap failed: {:?}", e),
+                    }
+                }
+                _ => log::warn!("A> tmpfs mount via cap failed"),
+            }
+        }
 
-        // Mount the ESP (first partition on first block device) as B> (fat32)
+        // Mount the ESP via block-family + fs:mount caps (P4-S2, §7.11)
         #[cfg(target_arch = "x86_64")]
-        if let Some(dev) = block_devices.first() {
-            match crate::filesystems::partition::mount_first_partition(dev.clone(), "fat32", 'B') {
-                Ok(()) => log::info!("Mounted ESP as B> (fat32)"),
-                Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
+        {
+            let table = &crate::obj::bootstrap::boot_domain().table;
+            let boot_end = crate::obj::bootstrap::boot_endowment();
+            let mounted = (|| {
+                let first = match crate::obj::invoke(
+                    table, boot_end.block,
+                    crate::obj::fs::BLOCK_FAMILY_CONTRACT,
+                    crate::obj::fs::BLOCK_FAMILY_FIRST,
+                    &crate::obj::Args::none(),
+                ) {
+                    Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => caps[0].id,
+                    _ => return false,
+                };
+                let args = crate::obj::Args {
+                    vals: alloc::vec![crate::obj::Value::Str("fat32"), crate::obj::Value::U64(first.0)],
+                };
+                matches!(
+                    crate::obj::invoke(
+                        table, boot_end.mount,
+                        crate::obj::fs::MOUNT_CONTRACT,
+                        crate::obj::fs::MOUNT_HOOK,
+                        &args,
+                    ),
+                    Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty()
+                )
+            })();
+            if mounted {
+                log::info!("Mounted ESP as B> (fat32, via mount cap)");
+            } else {
+                log::warn!("Could not mount ESP on B> via mount cap");
             }
         }
 
@@ -482,6 +546,10 @@ impl Kernel {
         // boot domain again (§6.2).
         crate::obj::domain::set_current_domain(crate::obj::bootstrap::boot_domain());
 
+        // P4 — post-mount separation proof: DirNode caps now exist in the
+        // boot table; exercise the QUERY-only projection (§7.12.3).
+        crate::obj::separation::run_post_mount();
+
         // P1 gate — emit the `kerneldump graph` node census once (read-only
         // projection; §7.13, §2.8). x86_64-only: `kerneldump` is not built on
         // riscv64.
@@ -489,6 +557,7 @@ impl Kernel {
         {
             let mut w = crate::drivers::serial::SerialPort;
             crate::kerneldump::graph_census(&mut w);
+            crate::kerneldump::fs_walk(&mut w);
         }
 
         loop {

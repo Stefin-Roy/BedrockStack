@@ -14,6 +14,7 @@ use super::adapters::{self, DMA_ALLOC_PAGE};
 use super::bootstrap::{boot_domain, boot_endowment};
 use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::contract;
+use super::fs;
 use super::memregion::{MEM_REGION_BASE, MEM_REGION_CONTRACT};
 use super::nodes::{HEAP_ALLOC, HEAP_CONTRACT, PHYSMEM_ALLOC_FRAMES, PHYSMEM_CONTRACT};
 use super::registry::{REGISTRY_CONTRACT, REGISTRY_LOOKUP, REGISTRY_REGISTER};
@@ -241,9 +242,52 @@ pub fn run() {
         Err(e) => panic!("driver separation FAIL: heap probe -> {:?}", e),
     }
 
+    // P4 — filesystem capability separation (§7.12.3). The boot domain has
+    // DirNode caps from the A: tmpfs mount. A domain holding only a QUERY-only
+    // copy cannot readdir (INVOKE required by PERMIT); a domain with no dir
+    // cap at all sees nothing via resolve_first.
+    //
+    // NOTE: the dir-cap check is deferred to `run_post_mount()` because mounts
+    // happen in `run()` (after this function returns). The driver-domain
+    // negative test runs here since it needs no mount.
+
+    // 18. NEGATIVE — driver domain has no dir cap: resolve_first returns None.
+    match drv.table.resolve_first(fs::DIR_CONTRACT, fs::DIR_READDIR) {
+        None => {
+            SerialPort::puts("[obj] fs sep ok: driver domain resolve_first(DIR_READDIR) -> None\n")
+        }
+        Some(_) => panic!("fs separation FAIL: driver domain found a dir cap"),
+    }
+
     SerialPort::puts("[obj] driver separation: OK (dma + pci_cfg + physmem + addrspace)\n");
 
     SerialPort::puts("[obj] separation: OK (cap-mediated alloc enforced)\n");
+}
+
+/// P4 — post-mount filesystem separation proof (§7.12.3).
+///
+/// Called from `Kernel::run()` after the tmpfs and ESP mounts. The dir cap
+/// must exist in the boot table by now.
+pub fn run_post_mount() {
+    let table = &boot_domain().table;
+
+    // 16. POSITIVE — find a DirNode cap in the boot table.
+    if let Some(dir_id) = table.resolve_first(fs::DIR_CONTRACT, fs::DIR_READDIR) {
+        // 17. NEGATIVE — attune to QUERY-only (no INVOKE): readdir must fail
+        //     with Denied because PERMIT requires the INVOKE right.
+        let query_only = table
+            .dup_limited(dir_id, Rights::QUERY, ContractRights::empty())
+            .expect("dup_limited for QUERY-only dir cap");
+        match invoke(&table, query_only, fs::DIR_CONTRACT, fs::DIR_READDIR, &Args::none()) {
+            Err(ObjError::Denied) => {
+                SerialPort::puts("[obj] fs sep ok: QUERY-only dir cap readdir -> Denied\n")
+            }
+            Ok(_) => panic!("fs separation FAIL: QUERY-only dir cap readdir succeeded"),
+            Err(e) => panic!("fs separation FAIL: QUERY-only dir cap readdir -> {:?}", e),
+        }
+    } else {
+        SerialPort::puts("[obj] fs sep ok: no dir cap in boot table (skipped)\n");
+    }
 }
 
 fn expect_err(tag: &str, res: Result<Reply, ObjError>, want: ObjError) {

@@ -1,9 +1,9 @@
 # RootGraph Objects / Capability Model — Invariants
 
-**Version:** 0.3.0
+**Version:** 0.4.0
 **Date:** 2026-08-04
 **Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,nodes,memregion,adapters}.rs`
-**Status:** Active (P3)
+**Status:** Active (P4)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
 > model of `Documentation/RootGraph.md`. The canonical property set is the
@@ -40,6 +40,19 @@
 >   `mem:region` cap's base is used as the shadow VA, with a plain-heap
 >   fallback if the cap path ever fails. (`lib.rs::init_framebuffer_shadow`,
 >   moved to run after `bootstrap()`.)
+>
+> P4 adds the capability-native VFS and device family nodes: `BlockNode`
+> (block:storage), `BlockFamilyNode` (block:family, materializes child caps
+> from BLOCK_DEVICES — hot-plug without minting), `MountNode` (fs:mount, mount
+> via capability), `DirNode` (fs:dir, traverse/readdir gated by CapRights),
+> `FileNode` (fs:file, read/write/label). Device census nodes:
+> `PciForestNode` (pci:forest), `InputFamilyNode` (input:family),
+> `AudioFamilyNode` (audio:family). The ambient string VFS layer
+> (resolve_path, CWD, FD_TABLE, string fd API, path.rs) is deleted; all VFS
+> access is now capability-native. The `kerneldump fs-walk` diagnostic
+> exercises the capability path; the restricted-domain readdir projection
+> proof asserts that a QUERY-only dir cap sees a strict subset and a domain
+> with no dir cap sees nothing.
 
 ---
 
@@ -168,3 +181,28 @@ and before SMP:
   `Reply::None` (`separation.rs:119-152`).
 
 - Location: `obj/separation.rs::run` (obj/separation.rs:22-192)
+
+## P4 Gate
+
+The P4 gate (section 7.12) requires:
+
+1. Capability-native navigation (7.12.3): DirNode::traverse resolves a child
+   by name and returns a DirNode or FileNode capability attuned to the
+   caller's rights. DirNode::readdir returns child capabilities. Labels are
+   surface data retrieved via label(), not path strings. The kerneldump
+   fs-walk diagnostic exercises this.
+
+2. Both real mounts are capability-native (ordering point 2): A> (tmpfs) via
+   MountNode::mount; B> (ESP fat32) via BlockFamilyNode::first +
+   MountNode::mount.
+
+3. Restricted-domain readdir projection: A QUERY-only dir cap receives
+   Denied on readdir; the driver domain (no dir cap) resolves None on
+   resolve_first(DIR_READDIR).
+
+4. Device families: PCI forest, input, audio, block (with hot-plug via
+   BLOCK_DEVICES extension in the idle loop) are all registered and visible
+   in the kerneldump graph census.
+
+5. No ambient string VFS: resolve_path, CWD, FD_TABLE, getcwd, chdir, and
+   the string fd API are deleted. vfs/path.rs is deleted.
