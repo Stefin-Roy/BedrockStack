@@ -12,8 +12,6 @@
 
 extern crate alloc;
 
-use alloc::boxed::Box;
-
 use spin::Once;
 
 use super::adapters;
@@ -41,8 +39,13 @@ static DRIVER_ENDOWMENT: Once<DriverEndowment> = Once::new();
 /// only with dma + pci_cfg + physmem + addrspace. Called once from
 /// `bootstrap()`, so both domains exist during `init()` and the C8 separation
 /// proof runs before SMP.
-pub fn create() {
-    let driver: &'static Domain = Box::leak(Box::new(Domain::new(1)));
+///
+/// P6-A (paged isolation, §8.14): the driver domain owns its own address space
+/// — a fresh root cloned from the kernel's higher half (`parent_root`), empty
+/// in the low half — so its memory is structurally unreachable from the boot
+/// domain's page tables and vice versa.
+pub fn create(parent_root: u64) {
+    let driver: &'static Domain = Domain::with_addrspace(1, parent_root);
 
     // Endow the driver domain by constructing its CapHandles directly from the
     // same provider nodes the boot domain was endowed with (§5.4); only the

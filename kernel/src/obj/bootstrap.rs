@@ -75,7 +75,10 @@ static BOOT_ENDOWMENT: Once<BootEndowment> = Once::new();
 /// which wraps the kernel's own allocators and services as capability-reachable
 /// nodes (§7.10). The call-site in `lib.rs` passes them; no other caller exists.
 pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServices) -> &'static Domain {
-    let boot: &'static Domain = Box::leak(Box::new(Domain::new(0)));
+    let boot: &'static mut Domain = Box::leak(Box::new(Domain::new(0)));
+    // P6-A — the boot domain *is* the kernel: bind the kernel root as its
+    // address space so re-entering it (idle loop) re-activates the kernel CR3.
+    boot.set_kernel_addrspace(page_table_root);
     domain::set_current_domain(boot);
 
     let principal = PrincipalContext;
@@ -285,8 +288,19 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     // C8 — the first driver domain (§6.2): a second, disjoint table endowed
     // with dma + pci_cfg + physmem + addrspace. Created eagerly alongside the
     // boot domain so the separation property holds from the first commit and
-    // `separation.rs::run()` can prove it before anything else runs.
-    super::driver::create();
+    // `separation.rs::run()` can prove it before anything else runs. The driver
+    // domain gets its own address space (P6-A, §8.14).
+    //
+    // Pre-populate the device-window PML4 entries in the *kernel* root FIRST,
+    // so the driver's higher-half clone shares their subtrees. The device
+    // sweep (ECAM config window, DMA buffers, MMIO) maps into these windows
+    // lazily *after* the clone; sharing the top-level entries makes every such
+    // kernel mapping visible under the driver's CR3 (§6.3, §8.14).
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    crate::mm::vmm::prepopulate_window(alloc, page_table_root, crate::mm::layout::ACPI_VADDR_BASE);
+    crate::mm::vmm::prepopulate_window(alloc, page_table_root, crate::mm::layout::ECAM_VADDR_BASE);
+    crate::mm::vmm::prepopulate_window(alloc, page_table_root, crate::mm::layout::DMA_VADDR_BASE);
+    super::driver::create(page_table_root);
     boot
 }
 

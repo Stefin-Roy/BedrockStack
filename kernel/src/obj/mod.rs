@@ -23,6 +23,7 @@ pub mod nodes;
 pub mod registry;
 pub mod revocation;
 pub mod rights;
+pub mod paged_isolation;
 pub mod separation;
 pub mod store;
 pub mod surface;

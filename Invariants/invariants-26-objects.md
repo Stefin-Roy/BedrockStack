@@ -1,9 +1,9 @@
 # RootGraph Objects / Capability Model — Invariants
 
-**Version:** 0.4.0
+**Version:** 0.4.1
 **Date:** 2026-08-04
-**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,nodes,memregion,adapters}.rs`
-**Status:** Active (P5)
+**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,paged_isolation,nodes,memregion,adapters}.rs`
+**Status:** Active (P5→P6-A, paged isolation)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
 > model of `Documentation/RootGraph.md`. The canonical property set is the
@@ -53,6 +53,22 @@
 > exercises the capability path; the restricted-domain readdir projection
 > proof asserts that a QUERY-only dir cap sees a strict subset and a domain
 > with no dir cap sees nothing.
+>
+> P6-A (0.4.1) — paged domain isolation (§8.14 structural). A non-kernel
+> domain no longer shares the boot CR3: it owns its own address space — a
+> page-table root cloned from the kernel's higher half via
+> `mm::vmm::clone_high_half`, with an empty, disjoint low half. The boot
+> (kernel) domain keeps the kernel root (`Domain::set_kernel_addrspace`);
+> every other domain is built with `Domain::with_addrspace`, which clones the
+> kernel half and stores `Some(Vmm)`. `domain::set_current_domain` now writes
+> the per-CPU slot *and* switches CR3/SATP to the domain's root when it owns
+> one. The device-window PML4 entries (ACPI/ECAM/DMA) are pre-populated in the
+> kernel root before the clone so lazy kernel mappings stay visible under a
+> domain's CR3. `obj/paged_isolation.rs` runs before SMP and proves: disjoint
+> root frames; an empty driver low half that a canary fills but the boot root
+> cannot reach by position; both roots translate the kernel-half alias of a
+> heap frame identically; and table mutation flows only through the
+> capability API (endowed id Ok, unendowed id refused).
 
 ---
 
@@ -152,6 +168,29 @@ with `ObjError::ContractCollision` and the genuine entry is left untouched;
 re-registering the identical tuple is idempotent `Ok`. `ObjError::ContractCollision`
 is defined at `obj/mod.rs:109`.
 - Location: `obj/contract.rs::ContractId::of` (obj/contract.rs:70-125), `obj/contract.rs::ContractRegistry::register` (obj/contract.rs:163-178), `obj/contract.rs::ObjError::ContractCollision` (via `obj/mod.rs:110`), `obj/contract.rs::same_identity` (obj/contract.rs:198-242)
+
+**I11 (paged domain isolation, P6-A) — every non-boot domain owns a disjoint
+low-half address space; capability tables live only in the kernel half; CR3
+follows the current domain:**
+A non-kernel domain's root is produced by `mm::vmm::clone_high_half`: a fresh
+frame with the kernel's higher-half entries (indices 256–511; kernel image,
+heap arena, physmap, and the ACPI/ECAM/DMA device windows) copied and a low
+half that is empty. No two domains share a root frame
+(`domain::with_addrspace` always allocates a fresh one). Capability tables
+are heap allocations, reachable only at `to_physmap` (kernel-half) addresses
+in every domain's root, never in any low half. `domain::set_current_domain`
+writes the per-CPU slot and, when the domain owns an address space, activates
+its root (`mm::vmm::activate`), so the driver sweep executes under the
+driver's CR3 and the idle loop returns to the kernel root. Because every
+domain table carries the kernel higher half, IDT handler, per-CPU GS/GDT/TSS
+data, and the current stack stay reachable across a CR3 switch — IRQs keep
+running in the interrupted domain's context. The ACPI/ECAM/DMA window PML4
+entries are pre-populated in the kernel root before the driver clone
+(`bootstrap`), so lazy kernel mappings made after the clone remain visible
+under a domain's CR3. Proved by `obj/paged_isolation.rs::run()` (disjoint root
+frames, empty-then-canary low half unreachable by position from the boot
+root, shared kernel-half alias, cap-mediated mutation only).
+- Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace), `obj/paged_isolation.rs::run` (proof)
 
 ---
 

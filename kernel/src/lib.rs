@@ -229,6 +229,7 @@ impl Kernel {
         // C6 — boot-time separation proof: the endowed DMA capability works,
         // unendowed ids and foreign contracts are refused. Runs once, before SMP.
         crate::obj::separation::run();
+        crate::obj::paged_isolation::run();
 
         // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
         // NX) VM-backed allocation. Runs AFTER bootstrap so the allocation is

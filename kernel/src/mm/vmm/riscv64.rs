@@ -228,6 +228,42 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     Some(base | offset)
 }
 
+/// Allocate a fresh, zeroed root table and copy the kernel's higher-half
+/// mappings (and only those) from `parent_root`, leaving the low half empty.
+///
+/// Sv39 is three levels; `root` here is the top (L2) table.  The canonical
+/// higher half is the range of virtual addresses with bit 38 set, which maps
+/// to L2 indices `256..=511` — the same split as x86_64's top-256 PML4
+/// entries.  The copied L2 entries reference the parent's shared L1/L0
+/// subtrees, so those tables must stay alive as long as the clone does.  This
+/// gives a new domain its own address space while keeping the kernel image,
+/// heap, physmap and device windows reachable.
+///
+/// # Panics
+/// - If the allocator cannot supply a root frame (OOM).
+pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
+    let (phys, pt) = alloc_pt(alloc);
+    let parent = root_pt(parent_root);
+    pt.entries[256..=511].copy_from_slice(&parent.entries[256..=511]);
+    phys
+}
+
+/// Ensure the top-level (L2) entry covering `vaddr` is present (allocating a
+/// zeroed L1 table if needed) so a later `clone_high_half` copies a *present*
+/// entry and the two tables share the same higher-half subtree.  Levels below
+/// are created on demand by `map_2m`/`map_4k`.
+///
+/// # Panics
+/// - If the allocator cannot supply a frame (OOM).
+pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
+    let root_pt = root_pt_mut(root);
+    let idx2 = vpn_index(vaddr, 2);
+    if !root_pt.entries[idx2].is_valid() {
+        let (phys, _l1) = alloc_pt(alloc);
+        root_pt.entries[idx2] = PageTableEntry::new(paddr_to_ppn(phys), PTE_V);
+    }
+}
+
 /// Switch to the given root table (physical address of L2).
 ///
 /// # Safety

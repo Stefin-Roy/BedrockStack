@@ -278,6 +278,55 @@ pub fn make_read_only_both(root: u64, vaddr: u64) {
     set_ro(crate::mm::vmm::KERNEL_VMA_BASE + vaddr);
 }
 
+/// Allocate a fresh, zeroed page-table root and copy the kernel's higher-half
+/// mappings (and only those) from `parent_root`, leaving the low half empty.
+///
+/// The higher half is the canonical negative-address range (VAs with bit 47
+/// set — at or above `KERNEL_VMA_BASE`), i.e. PML4 indices `256..=511`.  The
+/// copied PML4 entries reference the parent's shared PDPT subtrees, so those
+/// tables must stay alive as long as the clone does.  This gives a new domain
+/// its own address space while keeping the kernel image, heap, physmap and
+/// device windows reachable.
+///
+/// # Panics
+/// - If the allocator cannot supply a root frame (OOM).
+pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
+    let new_root = alloc.alloc().expect("x86_64 VMM: OOM for cloned root");
+    let new_pml4 = pte_deref(new_root);
+    let parent_pml4 = pte_deref(parent_root);
+    unsafe {
+        core::ptr::write_bytes(new_root as *mut u8, 0, 4096);
+        // Copy only the top 256 PML4 entries (indices 256..=511) covering the
+        // higher half.  Entries 0..255 (the low half, user-space) stay empty.
+        for i in 256..=511 {
+            write_pte(new_pml4, i, read_pte(parent_pml4, i));
+        }
+    }
+    new_root
+}
+
+/// Ensure the PML4 entry covering `vaddr` is present (allocating a zeroed PDPT
+/// frame if needed), so a later `clone_high_half` copies a *present* entry and
+/// the two tables share the same higher-half subtree.
+///
+/// The mapping levels below the PDPT are created on demand by `map_4k`/`map_2m`
+/// (the `x86_64` crate's mapper allocates missing intermediate tables), so only
+/// the PML4 entry itself must pre-exist for the shared-subtree property to hold.
+///
+/// # Panics
+/// - If the allocator cannot supply a frame (OOM).
+pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
+    let i = ((vaddr >> 39) & 0x1FF) as usize;
+    unsafe {
+        let pml4 = pte_deref(root);
+        if read_pte(pml4, i) & PTE_PRESENT == 0 {
+            let frame = alloc.alloc().expect("prepopulate_window: OOM for PDPT");
+            core::ptr::write_bytes(pte_deref(frame) as *mut u8, 0, 4096);
+            write_pte(pml4, i, frame | PTE_PRESENT | (1u64 << 1)); // PRESENT | WRITABLE
+        }
+    }
+}
+
 /// Switch to the given root table (physical address of the PML4).
 ///
 /// # Safety

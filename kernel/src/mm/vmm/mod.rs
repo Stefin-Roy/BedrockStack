@@ -11,11 +11,19 @@ use crate::mm::phys_alloc::BitmapAllocator;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::activate;
 #[cfg(target_arch = "x86_64")]
+pub use self::x86_64::clone_high_half;
+#[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::make_read_only_both;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::clone_high_half;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::prepopulate_window;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
