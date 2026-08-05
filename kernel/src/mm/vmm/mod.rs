@@ -18,12 +18,16 @@ pub use self::x86_64::init_pat_wc;
 pub use self::x86_64::make_read_only;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::prepopulate_window;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::protect;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::clone_high_half;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::prepopulate_window;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::protect;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -227,6 +231,15 @@ impl Vmm {
         return x86_64::unmap_4k(self.root, alloc, vaddr);
         #[cfg(target_arch = "riscv64")]
         return riscv64::unmap_4k(self.root, alloc, vaddr);
+    }
+
+    /// Retag the permissions of the 4 KiB page at `vaddr` (§7.10.3).
+    pub fn protect(&mut self, vaddr: u64, flags: PageFlags) {
+        assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not 4K aligned");
+        #[cfg(target_arch = "x86_64")]
+        x86_64::protect(self.root, vaddr, flags);
+        #[cfg(target_arch = "riscv64")]
+        riscv64::protect(self.root, vaddr, flags);
     }
 
     /// Unmap a range of pages (4 KiB granularity).

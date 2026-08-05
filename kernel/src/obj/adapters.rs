@@ -879,6 +879,8 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
         Some(devices::input_family_contract_def())
     } else if name == devices::audio_family_contract_def().name {
         Some(devices::audio_family_contract_def())
+    } else if name == memregion::MEM_REGION_CONTRACT_DEF.name {
+        Some(&memregion::MEM_REGION_CONTRACT_DEF)
     } else {
         None
     }

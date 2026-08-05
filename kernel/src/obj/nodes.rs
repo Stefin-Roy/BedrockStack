@@ -123,6 +123,22 @@ impl Obj for PhysMemNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&PHYSMEM_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { PHYSMEM_CONTRACTS }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "total_frames" => Some(Value::U64(heap::get_phys_allocator_mut().total_frames() as u64)),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            PHYSMEM_ALLOC_FRAMES | PHYSMEM_ALLOC_CONTIG => ContractRights::CALL,
+            PHYSMEM_FREE | PHYSMEM_RESERVE => ContractRights::WRITE,
+            PHYSMEM_STATS => ContractRights::READ,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         caller: &CapabilityTable,
@@ -260,8 +276,8 @@ pub const HEAP_STATS: HookId = HookId::of("stats");
 
 pub const HEAP_DOC: &str = "if you call alloc(size, align), you get a Heap \
 MemRegion capability over a block allocated from the kernel arena; \
-free(region) deallocates the block back to the arena; stats() is reserved \
-pending a public heap arena accessor.";
+free(region) deallocates the block back to the arena; stats() reports the \
+arena's live allocation count, committed bytes, and chunk count.";
 
 const HEAP_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "heap:allocation",
@@ -272,7 +288,7 @@ const HEAP_SURFACE: SurfaceDesc = SurfaceDesc {
 const HEAP_HOOKS: &[HookSignature] = &[
     HookSignature { name: "alloc", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::Caps },
     HookSignature { name: "free", params: &[TypeTag::U64], reply: ReplyTag::None },
-    HookSignature { name: "stats", params: &[], reply: ReplyTag::None },
+    HookSignature { name: "stats", params: &[], reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]) },
 ];
 
 static HEAP_CONTRACTS: &[ContractId] = &[HEAP_CONTRACT];
@@ -293,6 +309,22 @@ impl Obj for HeapNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&HEAP_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { HEAP_CONTRACTS }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "arena" => Some(Value::U64(crate::mm::heap::stats().1)),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            HEAP_ALLOC => ContractRights::CALL,
+            HEAP_FREE => ContractRights::WRITE,
+            HEAP_STATS => ContractRights::READ,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         caller: &CapabilityTable,
@@ -310,8 +342,12 @@ impl Obj for HeapNode {
             return release_region(caller, cap);
         }
         if hook == HEAP_STATS {
-            // No public arena-stats accessor on heap.rs yet; reply nothing.
-            return Ok(Reply::None);
+            let (live, committed, chunks) = crate::mm::heap::stats();
+            return Ok(Reply::Data(vec![
+                Value::U64(live),
+                Value::U64(committed),
+                Value::U64(chunks),
+            ]));
         }
         Err(ObjError::NotSupported)
     }
@@ -346,9 +382,9 @@ pub const ADDRSPACE_ROOT: HookId = HookId::of("root");
 
 pub const ADDRSPACE_DOC: &str = "if you call map(va, phys, size, flags), the \
 range is mapped through the page walk rooted at this node; unmap(va, size) \
-unmaps it; shootdown() flushes the local TLB; translate(va) resolves a VA; \
-root() reports the page-table root. protect is reserved pending a PTE-walk \
-mutation API.";
+unmaps it; protect(va, flags) retags the permissions of a mapped page; \
+shootdown() flushes the local TLB; translate(va) resolves a VA; \
+root() reports the page-table root.";
 
 const ADDRSPACE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "mm:address_space",
@@ -389,6 +425,22 @@ impl Obj for AddressSpaceNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&ADDRSPACE_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { ADDRSPACE_CONTRACTS }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "root" => Some(Value::U64(self.root)),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            ADDRSPACE_MAP | ADDRSPACE_UNMAP | ADDRSPACE_PROTECT => ContractRights::WRITE,
+            ADDRSPACE_SHOOTDOWN => ContractRights::CALL,
+            ADDRSPACE_TRANSLATE | ADDRSPACE_ROOT => ContractRights::READ,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
@@ -413,10 +465,11 @@ impl Obj for AddressSpaceNode {
             return Ok(Reply::None);
         }
         if hook == ADDRSPACE_PROTECT {
-            // No public PTE-walk mutation API exists yet to retag a mapping;
-            // reserved for a future `Vmm::protect`. Refuse honestly.
-            let _ = (arg_u64(args, 0), arg_u64(args, 1));
-            return Err(ObjError::NotSupported);
+            let va = arg_u64(args, 0).ok_or(ObjError::Denied)?;
+            let flags = arg_u64(args, 1).unwrap_or(0);
+            let mut vmm = Vmm::from_root(self.root);
+            vmm.protect(va, page_flags(flags));
+            return Ok(Reply::None);
         }
         if hook == ADDRSPACE_SHOOTDOWN {
             // Local TLB flush (arch-agnostic); the cross-CPU broadcast routes
@@ -459,7 +512,7 @@ const CPU_SURFACE: SurfaceDesc = SurfaceDesc {
 };
 
 const CPU_HOOKS: &[HookSignature] = &[
-    HookSignature { name: "wake", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "wake", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64]) },
     HookSignature { name: "ipi", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
     HookSignature { name: "shootdown", params: &[], reply: ReplyTag::None },
     HookSignature { name: "stats", params: &[], reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]) },
@@ -489,6 +542,21 @@ impl Obj for CpuRootNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "cpus" => Some(Value::U64(self.cpu.cpu_count() as u64)),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            CPU_WAKE | CPU_IPI | CPU_SHOOTDOWN => ContractRights::CALL,
+            CPU_STATS => ContractRights::READ,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
@@ -497,13 +565,14 @@ impl Obj for CpuRootNode {
         args: &Args,
     ) -> Result<Reply, ObjError> {
         if hook == CPU_WAKE {
-            // The ApContext list is built by `smp::init`; a capability hook
-            // cannot reconstruct it from scalar args, so re-invoking
-            // `wake_aps` here would re-run the trampoline broadcast with no
-            // targets. Acknowledge the online set instead; the real AP bring-up
-            // is the `materialize_cpu_child` path at SMP start.
+            // The ApContext list is built by `smp::init`; a capability hook cannot
+            // reconstruct it from scalar args, so the real AP bring-up stays the
+            // `materialize_cpu_child` path. Acknowledge the online set instead.
             let _ = arg_u64(args, 0);
-            return Ok(Reply::Data(vec![Value::U64(self.cpu.cpu_count() as u64)]));
+            return Ok(Reply::Data(vec![
+                Value::U64(self.cpu.cpu_count() as u64),
+                Value::U64(crate::smp::started_count() as u64),
+            ]));
         }
         if hook == CPU_IPI {
             let target = arg_u64(args, 0).ok_or(ObjError::Denied)? as u32;
@@ -519,7 +588,7 @@ impl Obj for CpuRootNode {
             return Ok(Reply::Data(vec![
                 Value::U64(self.cpu.current_cpu_id() as u64),
                 Value::U64(self.cpu.cpu_count() as u64),
-                Value::U64(0),
+                Value::U64(crate::smp::started_count() as u64),
             ]));
         }
         Err(ObjError::NotSupported)
@@ -541,6 +610,21 @@ impl Obj for CpuNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "cpus" => Some(Value::U64(self.cpu_id as u64)),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            CPU_WAKE | CPU_IPI | CPU_SHOOTDOWN => ContractRights::CALL,
+            CPU_STATS => ContractRights::READ,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
@@ -549,7 +633,13 @@ impl Obj for CpuNode {
         args: &Args,
     ) -> Result<Reply, ObjError> {
         if hook == CPU_WAKE {
-            return Ok(Reply::Data(vec![Value::U64(self.cpu.cpu_count() as u64)]));
+            // Same limitation as the family root: the real AP bring-up is the
+            // `materialize_cpu_child` path. Acknowledge the online set.
+            let _ = arg_u64(args, 0);
+            return Ok(Reply::Data(vec![
+                Value::U64(self.cpu.cpu_count() as u64),
+                Value::U64(crate::smp::started_count() as u64),
+            ]));
         }
         if hook == CPU_IPI {
             let target = arg_u64(args, 0).unwrap_or(self.cpu_id as u64) as u32;
@@ -631,6 +721,14 @@ impl Obj for IrqRootNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&IRQ_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { IRQ_CONTRACTS }
 
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            IRQ_REGISTER | IRQ_ACK => ContractRights::CALL,
+            IRQ_UNREGISTER | IRQ_SET_ENABLED => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         caller: &CapabilityTable,
@@ -687,6 +785,14 @@ impl Obj for IrqNode {
     fn kind(&self) -> &'static str { "irq:node" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&IRQ_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { IRQ_CONTRACTS }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            IRQ_REGISTER | IRQ_ACK => ContractRights::CALL,
+            IRQ_UNREGISTER | IRQ_SET_ENABLED => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
+    }
 
     fn dispatch(
         &self,
@@ -950,7 +1056,7 @@ fn region_cap(node: Arc<MemRegionNode>) -> CapHandle {
     CapHandle {
         id: CapId(0),
         node,
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::READ.or(ContractRights::WRITE)),
         state: HandleState::Live,
     }
 }

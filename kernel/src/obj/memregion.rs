@@ -44,9 +44,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
 use spin::Once;
 
-use super::contract::{ContractId, HookSignature, ReplyTag};
+use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
-use super::rights::CapRights;
+use super::rights::{CapRights, ContractRights};
 use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::table::CapabilityTable;
@@ -63,10 +63,26 @@ pub enum RegionKind {
 /// range so region ids never collide with adapter singletons).
 pub const REGION_ID_BASE: u64 = 0x12_0000;
 
+/// Per-kind id stride: each `RegionKind` owns a dedicated `0x1000`-wide block
+/// starting at [`REGION_ID_BASE`] + `kind_index * REGION_POOL_STRIDE`, so a
+/// pool can be topped up with [`replenish`] without ever colliding with the
+/// other kind's wrappers (Phys occupies `0x12_0000..0x12_0fff`, Heap
+/// `0x12_1000..0x12_1fff`).
+pub const REGION_POOL_STRIDE: u64 = 0x1000;
+
 // ── The contract (content-addressed; mirrors `adapters.rs`) ───────────
 
 pub const MEM_REGION_CONTRACT: ContractId =
     ContractId::of("mem:region", &MEM_REGION_SURFACE, &MEM_REGION_HOOKS);
+
+/// Canonical definition of the `mem:region` contract (§7.8), for the registry.
+pub static MEM_REGION_CONTRACT_DEF: Contract = Contract {
+    id: MEM_REGION_CONTRACT,
+    name: "mem:region",
+    surface: &MEM_REGION_SURFACE,
+    hooks: &MEM_REGION_HOOKS,
+    doc: "a capability over one physical frame run or heap block; base/size read it, free/detach recycle it.",
+};
 
 /// Hook: reply `Value::U64(base)` — the region's start address.
 pub const MEM_REGION_BASE: HookId = HookId::of("base");
@@ -192,6 +208,22 @@ impl Obj for MemRegionNode {
 
     fn contracts(&self) -> &'static [ContractId] {
         MEM_REGION_CONTRACTS
+    }
+
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "base" => Some(Value::U64(self.base.load(Ordering::Relaxed))),
+            "size" => Some(Value::U64(self.size.load(Ordering::Relaxed))),
+            _ => None,
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            MEM_REGION_BASE | MEM_REGION_SIZE => ContractRights::READ,
+            MEM_REGION_FREE | MEM_REGION_DETACH => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
     }
 
     fn dispatch(
@@ -324,18 +356,26 @@ fn build_pool(kind: RegionKind, capacity: usize) {
 
 /// Build a pool of `capacity` pre-allocated region wrappers for each kind,
 /// assign each a unique `mem:region` `ObjId` (from [`REGION_ID_BASE`] upward,
-/// contiguous per kind), register them weakly in the store, and seed both
-/// pools so `take()` can serve allocator hooks with zero allocation.
+/// each kind in its own [`REGION_POOL_STRIDE`]-wide block), register them
+/// weakly in the store, and seed both pools so `take()` can serve allocator
+/// hooks with zero allocation.
 ///
-/// Called once at bootstrap once the heap is up. `Phys` occupies the lower
-/// id range, `Heap` the next `capacity` ids above it.
+/// Called once at bootstrap once the heap is up. Phys occupies the lower
+/// id block, Heap the next stride block above it.
 pub fn materialize_region_pools(capacity: usize) {
     mem_region_pool(RegionKind::Phys)
         .seq
         .store(REGION_ID_BASE, Ordering::Relaxed);
     mem_region_pool(RegionKind::Heap)
         .seq
-        .store(REGION_ID_BASE + capacity as u64, Ordering::Relaxed);
+        .store(REGION_ID_BASE + REGION_POOL_STRIDE, Ordering::Relaxed);
     build_pool(RegionKind::Phys, capacity);
     build_pool(RegionKind::Heap, capacity);
+}
+
+/// Top up a pool with `n` fresh pre-built wrappers at its current id sequence
+/// (ids stay unique because `seq` keeps advancing). Call only from safe points
+/// — never from inside a memory hook — so `take()` stays allocation-free.
+pub fn replenish(kind: RegionKind, n: usize) {
+    build_pool(kind, n);
 }

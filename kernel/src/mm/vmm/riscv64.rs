@@ -228,6 +228,29 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     Some(base | offset)
 }
 
+/// Retag the leaf mapping at `vaddr` with the given permissions. Handles both
+/// 4 KiB leaves and 2 MiB megapages. No-op if the address is not mapped.
+pub fn protect(root: u64, vaddr: u64, flags: PageFlags) {
+    let root_pt = root_pt_mut(root);
+    let idx2 = vpn_index(vaddr, 2);
+    let idx1 = vpn_index(vaddr, 1);
+    let idx0 = vpn_index(vaddr, 0);
+    if !root_pt.entries[idx2].is_valid() { return; }
+    let l2 = pt_at_mut(root_pt.entries[idx2].ppn());
+    if !l2.entries[idx1].is_valid() { return; }
+    let entry = l2.entries[idx1];
+    if entry.0 & PTE_LEAF != 0 {
+        l2.entries[idx1] = PageTableEntry::new(entry.ppn(), page_flags_to_riscv(flags) | (entry.0 & (PTE_A | PTE_D)));
+        unsafe { asm!("sfence.vma"); }
+        return;
+    }
+    let l1 = pt_at_mut(entry.ppn());
+    if !l1.entries[idx0].is_valid() { return; }
+    let pte = l1.entries[idx0];
+    l1.entries[idx0] = PageTableEntry::new(pte.ppn(), page_flags_to_riscv(flags) | (pte.0 & (PTE_A | PTE_D)));
+    unsafe { asm!("sfence.vma"); }
+}
+
 /// Allocate a fresh, zeroed root table and copy the kernel's higher-half
 /// mappings (and only those) from `parent_root`, leaving the low half empty.
 ///

@@ -35,6 +35,12 @@ pub struct DriverEndowment {
 static DRIVER_DOMAIN: Once<&'static Domain> = Once::new();
 static DRIVER_ENDOWMENT: Once<DriverEndowment> = Once::new();
 
+/// Contract-right mask held by the driver domain over its controllers'
+/// providers and the physical nodes the device sweep works over: the full
+/// READ|WRITE|CALL set, so every per-hook requirement (`hook_contract_right`)
+/// of the dma / pci_cfg / physmem / addrspace nodes passes from creation.
+const DRIVER_CONTRACT: ContractRights = ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL);
+
 /// Create the first driver domain (§6.2): a second, disjoint table endowed
 /// only with dma + pci_cfg + physmem + addrspace. Called once from
 /// `bootstrap()`, so both domains exist during `init()` and the C8 separation
@@ -53,13 +59,13 @@ pub fn create(parent_root: u64) {
     let dma_id = driver.table.insert(CapHandle {
         id: CapId(0),
         node: adapters::dma_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, DRIVER_CONTRACT),
         state: HandleState::Live,
     });
     let pci_cfg_id = driver.table.insert(CapHandle {
         id: CapId(0),
         node: adapters::pci_cfg_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, DRIVER_CONTRACT),
         state: HandleState::Live,
     });
     // The device sweep allocates frames and maps them; endow those nodes
@@ -68,13 +74,13 @@ pub fn create(parent_root: u64) {
     let physmem_id = driver.table.insert(CapHandle {
         id: CapId(0),
         node: nodes::phys_mem_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, DRIVER_CONTRACT),
         state: HandleState::Live,
     });
     let addrspace_id = driver.table.insert(CapHandle {
         id: CapId(0),
         node: nodes::addr_space_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, DRIVER_CONTRACT),
         state: HandleState::Live,
     });
 

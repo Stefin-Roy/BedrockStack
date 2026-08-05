@@ -1,15 +1,16 @@
 use alloc::sync::Arc;
+use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::cap_handle::{CapHandle, CapId, HandleState, RevocationPolicy};
-use super::contract::{ContractId, HookSignature};
+use super::contract::{ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::{CapRights, ContractRights, Rights};
 use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
-use super::{Args, Obj, ObjError, ObjId, Reply};
+use super::{Args, Obj, ObjError, ObjId, Reply, Value};
 
 struct TableInner {
     slots: Vec<Option<CapHandle>>,
@@ -137,6 +138,32 @@ impl CapabilityTable {
             .map(|(node, _)| node)
     }
 
+    /// Node fetch gated by the universal `QUERY` right only — the surface-read
+    /// path (§4.1). Skips the INVOKE and contract-membership tests of
+    /// [`resolve_with_rights`] (a surface is not a contract hook), but still
+    /// requires the handle to be `Live` and still probes the revocable
+    /// deny-list, so a revoked node's surface is inert too.
+    pub fn resolve_for_query(&self, id: CapId) -> Result<(Arc<dyn Obj>, CapRights), ObjError> {
+        let inner = self.slots.lock();
+        let h = inner
+            .slots
+            .get(id.0 as usize)
+            .and_then(|s| s.as_ref())
+            .ok_or(ObjError::NoSuchCap)?;
+        if h.state != HandleState::Live {
+            return Err(ObjError::Revoked);
+        }
+        if !h.rights.uni.contains(Rights::QUERY) {
+            return Err(ObjError::Denied);
+        }
+        if h.node.revocation() == RevocationPolicy::Revocable
+            && object_store().is_denied(h.node.obj_id())
+        {
+            return Err(ObjError::Revoked);
+        }
+        Ok((Arc::clone(&h.node), h.rights))
+    }
+
     /// Find the first Live cap in this table that resolves `contract`+`hook`
     /// under PERMIT (§2.7 graph composition). O(n) — tables are tiny (boot ~9,
     /// driver 4). Returns the CapId so the caller can `invoke` through it.
@@ -197,6 +224,28 @@ impl CapabilityTable {
         nh.rights = nh.rights.attune(keep, keep_contract)?;
         nh.state = HandleState::Live;
         Ok(self.insert(nh))
+    }
+
+    /// Delegate a handle to another domain's table (§3.4.3, §8.24): a rights-
+    /// preserving clone inserted into `target` under a fresh `CapId`. The source
+    /// handle is untouched; delegation never amplifies.
+    pub fn delegate(&self, target: &CapabilityTable, id: CapId) -> Result<CapId, ObjError> {
+        let h = {
+            let inner = self.slots.lock();
+            inner
+                .slots
+                .get(id.0 as usize)
+                .and_then(|s| s.as_ref())
+                .ok_or(ObjError::NoSuchCap)?
+                .clone()
+        };
+        Ok(target.insert(h))
+    }
+
+    /// Total allocated slots (occupied + freed-but-reserved), i.e. the table's
+    /// high-water capacity. Read-only.
+    pub fn capacity(&self) -> usize {
+        self.slots.lock().slots.len()
     }
 
     /// Mark a handle `Revoked` (§3.7). The slot and its strong reference are
@@ -270,8 +319,13 @@ impl CapabilityTable {
 
 // ── The table as a node (§2.4, §7.8: "infrastructure is also nodes") ──────
 
-/// The table node's own contract: identity + surface only in this phase.
+/// The table node's own contract: introspection + administration hooks.
 pub const TABLE_CONTRACT: ContractId = ContractId::of("infra:table", &TABLE_SURFACE, &TABLE_HOOKS);
+
+pub const TABLE_COUNT: HookId = HookId::of("count");
+pub const TABLE_SNAPSHOT_SIZE: HookId = HookId::of("snapshot_size");
+pub const TABLE_REVOKE_CASCADE: HookId = HookId::of("revoke_cascade");
+pub const TABLE_DELEGATE: HookId = HookId::of("delegate");
 
 const TABLE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "infra:table",
@@ -279,7 +333,28 @@ const TABLE_SURFACE: SurfaceDesc = SurfaceDesc {
     events: &[],
 };
 
-const TABLE_HOOKS: &[HookSignature] = &[];
+const TABLE_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "count",
+        params: &[],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "snapshot_size",
+        params: &[],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "revoke_cascade",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "delegate",
+        params: &[TypeTag::U64, TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+];
 
 static TABLE_CONTRACTS: &[ContractId] = &[TABLE_CONTRACT];
 
@@ -287,8 +362,12 @@ static TABLE_CONTRACTS: &[ContractId] = &[TABLE_CONTRACT];
 const TABLE_OBJ_ID: ObjId = ObjId(0x10_0012);
 
 /// A thin `Obj` node adapter wrapping a [`CapabilityTable`] reference (§2.4,
-/// §7.8). This phase exposes identity + surface only; `dispatch` is a stub so
-/// the table is a capability-reachable object without rearchitecting it.
+/// §7.8). Exposes the table's introspection hooks (`count`, `snapshot_size`)
+/// and its administration hooks (`revoke_cascade`, `delegate`) as
+/// capability-gated operations, so a table is reachable and administrable as
+/// a node. `revoke_cascade` requires the caller's handle to hold the universal
+/// `REVOKE` right; delegation requires no amplification — the inserted copy
+/// carries exactly the source's rights.
 pub struct TableNode {
     table: &'static CapabilityTable,
 }
@@ -317,6 +396,13 @@ impl Obj for TableNode {
         Some(&TABLE_SURFACE)
     }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "slots" => Some(Value::U64(self.table.count() as u64)),
+            _ => None,
+        }
+    }
+
     fn contracts(&self) -> &'static [ContractId] {
         TABLE_CONTRACTS
     }
@@ -324,10 +410,41 @@ impl Obj for TableNode {
     fn dispatch(
         &self,
         _caller: &CapabilityTable,
-        _rights: &CapRights,
-        _hook: HookId,
-        _args: &Args,
+        rights: &CapRights,
+        hook: HookId,
+        args: &Args,
     ) -> Result<Reply, ObjError> {
+        if hook == TABLE_COUNT {
+            return Ok(Reply::Data(vec![Value::U64(self.table.count() as u64)]));
+        }
+        if hook == TABLE_SNAPSHOT_SIZE {
+            return Ok(Reply::Data(vec![Value::U64(
+                self.table.capacity() as u64
+            )]));
+        }
+        if hook == TABLE_REVOKE_CASCADE {
+            if !rights.uni.contains(Rights::REVOKE) {
+                return Err(ObjError::Denied);
+            }
+            let id = match args.vals.first() {
+                Some(Value::U64(id)) => CapId(*id),
+                _ => return Err(ObjError::Denied),
+            };
+            let n = self.table.revoke_cascade(id)?;
+            return Ok(Reply::Data(vec![Value::U64(n as u64)]));
+        }
+        if hook == TABLE_DELEGATE {
+            let (target_id, cap_id) = match args.vals.first() {
+                Some(Value::U64(t)) => match args.vals.get(1) {
+                    Some(Value::U64(c)) => (*t, *c),
+                    _ => return Err(ObjError::Denied),
+                },
+                _ => return Err(ObjError::Denied),
+            };
+            let target = super::domain::find_domain(target_id as u32).ok_or(ObjError::NoSuchCap)?;
+            let new_id = self.table.delegate(&target.table, CapId(cap_id))?;
+            return Ok(Reply::Data(vec![Value::U64(new_id.0)]));
+        }
         Err(ObjError::NotSupported)
     }
 }

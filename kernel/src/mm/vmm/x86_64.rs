@@ -277,6 +277,20 @@ pub fn make_read_only(root: u64, vaddr: u64) {
     }
 }
 
+/// Retag the 4 KiB page at `vaddr` with the given permissions. The page must
+/// already be mapped with 4 KiB granularity. Panics if the page is not present.
+pub fn protect(root: u64, vaddr: u64, flags: PageFlags) {
+    let mut mapper = mapper_at(root);
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+    let x86_flags = page_flags_to_x86(flags);
+    unsafe {
+        mapper
+            .update_flags(page, x86_flags)
+            .expect("x86_64 protect: update_flags failed")
+            .flush();
+    }
+}
+
 /// Allocate a fresh, zeroed page-table root and copy the kernel's higher-half
 /// mappings (and only those) from `parent_root`, leaving the low half empty.
 ///

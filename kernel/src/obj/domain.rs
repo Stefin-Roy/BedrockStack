@@ -116,3 +116,8 @@ pub fn register_domain(d: &'static Domain) {
 pub fn all_domains() -> Vec<&'static Domain> {
     domain_list().lock().clone()
 }
+
+/// Find a domain by its numeric `id` among every registered domain (§6, §7.13).
+pub fn find_domain(id: u32) -> Option<&'static Domain> {
+    all_domains().into_iter().find(|d| d.id == id)
+}

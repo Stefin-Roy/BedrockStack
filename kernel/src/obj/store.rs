@@ -14,11 +14,11 @@ use hashbrown::{HashMap, HashSet};
 use spin::Mutex;
 use spin::Once;
 
-use super::contract::{ContractId, HookSignature};
+use super::contract::{ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::CapRights;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
-use super::{Args, Obj, ObjError, ObjId, Reply};
+use super::{Args, Obj, ObjError, ObjId, Reply, Value};
 
 /// A weak bookkeeping record of a node (§7.3). `weak` never keeps the node
 /// alive (I7); the record is projection material, cascade bookkeeping, and
@@ -215,9 +215,12 @@ pub fn object_store() -> &'static ObjectStore {
 
 // ── The store as a node (§2.4, §7.8: "infrastructure is also nodes") ──────
 
-/// The store node's own contract: identity + surface only in this phase; its
-/// hooks arrive with the rest of the physical-nodes wiring.
+/// The store node's own contract: weak-registry introspection (§7.3, §7.8).
 pub const STORE_CONTRACT: ContractId = ContractId::of("infra:store", &STORE_SURFACE, &STORE_HOOKS);
+
+pub const STORE_COUNT: HookId = HookId::of("count");
+pub const STORE_LOOKUP: HookId = HookId::of("lookup");
+pub const STORE_DENIED: HookId = HookId::of("denied");
 
 const STORE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "infra:store",
@@ -225,7 +228,23 @@ const STORE_SURFACE: SurfaceDesc = SurfaceDesc {
     events: &[],
 };
 
-const STORE_HOOKS: &[HookSignature] = &[];
+const STORE_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "count",
+        params: &[],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+    HookSignature {
+        name: "lookup",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::U64, TypeTag::U64]),
+    },
+    HookSignature {
+        name: "denied",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::Data(&[TypeTag::U64]),
+    },
+];
 
 static STORE_CONTRACTS: &[ContractId] = &[STORE_CONTRACT];
 
@@ -233,8 +252,9 @@ static STORE_CONTRACTS: &[ContractId] = &[STORE_CONTRACT];
 const STORE_OBJ_ID: ObjId = ObjId(0x10_0011);
 
 /// A thin `Obj` node adapter over the [`ObjectStore`] singleton (§2.4, §7.8).
-/// This phase exposes identity + surface only; `dispatch` is a stub so the
-/// node is a capability-reachable object without rearchitecting the store.
+/// Exposes the store's weak registry as read-only forensics hooks (`count`,
+/// `lookup`, `denied`) — the store is consulted by the projection tool and the
+/// cascade machinery, never as an access key (§2.8).
 pub struct StoreNode;
 
 impl Obj for StoreNode {
@@ -250,6 +270,13 @@ impl Obj for StoreNode {
         Some(&STORE_SURFACE)
     }
 
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "records" => Some(Value::U64(object_store().lock_records().len() as u64)),
+            _ => None,
+        }
+    }
+
     fn contracts(&self) -> &'static [ContractId] {
         STORE_CONTRACTS
     }
@@ -258,9 +285,37 @@ impl Obj for StoreNode {
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
-        _hook: HookId,
-        _args: &Args,
+        hook: HookId,
+        args: &Args,
     ) -> Result<Reply, ObjError> {
+        let store = object_store();
+        if hook == STORE_COUNT {
+            return Ok(Reply::Data(vec![Value::U64(
+                store.lock_records().len() as u64
+            )]));
+        }
+        if hook == STORE_LOOKUP {
+            let id = match args.vals.first() {
+                Some(Value::U64(id)) => *id,
+                _ => return Err(ObjError::Denied),
+            };
+            let records = store.lock_records();
+            let rec = records.get(&id).ok_or(ObjError::NoSuchCap)?;
+            return Ok(Reply::Data(vec![
+                Value::U64(rec.parent.map(|p| p.0).unwrap_or(0)),
+                Value::U64(rec.family_root.map(|f| f.0).unwrap_or(0)),
+                Value::U64(store.is_denied(rec.id) as u64),
+            ]));
+        }
+        if hook == STORE_DENIED {
+            let id = match args.vals.first() {
+                Some(Value::U64(id)) => *id,
+                _ => return Err(ObjError::Denied),
+            };
+            return Ok(Reply::Data(vec![Value::U64(
+                store.is_denied(ObjId(id)) as u64
+            )]));
+        }
         Err(ObjError::NotSupported)
     }
 }

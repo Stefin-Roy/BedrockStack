@@ -19,3 +19,9 @@ impl HookId {
         HookId(h)
     }
 }
+
+/// The reserved surface-read hook (§4.1): reads one typed attribute off a
+/// node's passive surface. It is node-level, gated by the universal `QUERY`
+/// right, and is not part of any contract — `invoke` handles it before the
+/// PERMIT contract-membership test.
+pub const SURFACE_READ: HookId = HookId::of("_read_surface");

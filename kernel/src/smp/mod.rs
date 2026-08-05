@@ -155,6 +155,18 @@ pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)>
     None
 }
 
+/// Number of CPUs that have signalled started (the BSP plus brought-up APs).
+pub fn started_count() -> u32 {
+    let mut n = 0;
+    for i in 0..MAX_CPUS {
+        let pc = unsafe { &mut PER_CPU_SLOTS[i] };
+        if pc.started.load(Ordering::Relaxed) != 0 {
+            n += 1;
+        }
+    }
+    n
+}
+
 /// Context needed to wake an AP.
 pub struct ApContext {
     pub cpu_id: u32,

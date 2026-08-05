@@ -22,10 +22,12 @@ use spin::Once;
 
 use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
-use super::rights::CapRights;
+use super::rights::{CapRights, ContractRights};
 use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
+
+use crate::services::pci_config::PciConfigSpace;
 
 // ── Audio readiness flag ────────────────────────────────────────────
 
@@ -113,9 +115,29 @@ pub fn pci_forest_node() -> Arc<dyn Obj> {
 /// id is deterministic for a given slot (§7.8 stable-identity convention).
 pub const PCI_DEVICE_CHILD_ID_BASE: u64 = 0x11_3000;
 
+pub const PCI_DEVICE_CONTRACT: ContractId =
+    ContractId::of("pci:device", &PCI_DEVICE_SURFACE, &PCI_DEVICE_HOOKS);
+pub const PCI_DEVICE_READ8: HookId = HookId::of("read8");
+pub const PCI_DEVICE_READ16: HookId = HookId::of("read16");
+pub const PCI_DEVICE_READ32: HookId = HookId::of("read32");
+pub const PCI_DEVICE_WRITE8: HookId = HookId::of("write8");
+pub const PCI_DEVICE_WRITE16: HookId = HookId::of("write16");
+pub const PCI_DEVICE_WRITE32: HookId = HookId::of("write32");
+pub const PCI_DEVICE_VENDOR_ID: HookId = HookId::of("vendor_id");
+pub const PCI_DEVICE_DEVICE_ID: HookId = HookId::of("device_id");
+pub const PCI_DEVICE_CLASS: HookId = HookId::of("class");
+pub const PCI_DEVICE_BAR: HookId = HookId::of("bar");
+pub const PCI_DEVICE_IRQ_LINE: HookId = HookId::of("irq_line");
+
+pub const PCI_DEVICE_DOC: &str = "the pci:device contract (§7.11.4): config-space \
+read8/read16/read32/offset() and write8/write16/write32/offset,value() reach the \
+ECAM config space of this device; vendor_id(), device_id(), class(), bar(index) \
+and irq_line() read the discovered identity without touching config space. \
+READ-gated hooks read; WRITE-gated hooks write (per-hook contract rights, §3.3).";
+
 /// Small surface schema for a `PciDeviceNode` — the discoverable attributes a
-/// projection tool renders per child (§4.1, §7.13). Contracts are empty for
-/// now; dispatch is the Seed-phase stub.
+/// projection tool renders per child (§4.1, §7.13), now also reachable through
+/// the `pci:device` contract as live identity reads.
 const PCI_DEVICE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "pci:device",
     attrs: &[
@@ -129,11 +151,28 @@ const PCI_DEVICE_SURFACE: SurfaceDesc = SurfaceDesc {
     events: &[],
 };
 
+const PCI_DEVICE_HOOKS: &[HookSignature] = &[
+    HookSignature { name: "read8", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "read16", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "read32", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "write8", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "write16", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "write32", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "vendor_id", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "device_id", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "class", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "bar", params: &[TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
+    HookSignature { name: "irq_line", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
+];
+
+static PCI_DEVICE_CONTRACTS: &[ContractId] = &[PCI_DEVICE_CONTRACT];
+
 /// A materialized PCI device child under the `pci:forest` root. Carries a
 /// `Copy` of the discovered `PciDevice`; its `ObjId` is derived from the
 /// device's PCI address so the same slot always names the same child (§2.1,
-/// §7.8). No contracts yet — a leaf the cascade test can sever at the
-/// trunk (§3.7.2).
+/// §7.8). Exposes the `pci:device` contract: config-space read/write plus
+/// identity reads, with per-hook READ/WRITE gating (§3.3). Still a leaf the
+/// cascade test can sever at the trunk (§3.7.2).
 pub struct PciDeviceNode {
     dev: crate::pci::PciDevice,
 }
@@ -164,17 +203,117 @@ impl Obj for PciDeviceNode {
     }
 
     fn contracts(&self) -> &'static [ContractId] {
-        &[]
+        PCI_DEVICE_CONTRACTS
     }
 
     fn dispatch(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
-        _hook: HookId,
-        _args: &Args,
+        hook: HookId,
+        args: &Args,
     ) -> Result<Reply, ObjError> {
-        Err(ObjError::NotSupported)
+        let ecam = crate::services::ecam_pci_config::ecam_static();
+        let (seg, bus, dev, func) =
+            (self.dev.segment, self.dev.bus, self.dev.device, self.dev.function);
+
+        let offset = |i: usize| -> Result<u16, ObjError> {
+            match args.vals.get(i) {
+                Some(Value::U64(o)) => Ok(*o as u16),
+                _ => Err(ObjError::Denied),
+            }
+        };
+
+        match hook {
+            PCI_DEVICE_READ8 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read8(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_READ16 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read16(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_READ32 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read32(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_WRITE8 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u8,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write8(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_WRITE16 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u16,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write16(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_WRITE32 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u32,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write32(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_VENDOR_ID => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.vendor_id))]))
+            }
+            PCI_DEVICE_DEVICE_ID => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.device_id))]))
+            }
+            PCI_DEVICE_CLASS => Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.class))])),
+            PCI_DEVICE_BAR => {
+                let index = match args.vals.first() {
+                    Some(Value::U64(i)) => *i,
+                    _ => return Err(ObjError::Denied),
+                };
+                if index >= 6 {
+                    return Err(ObjError::Denied);
+                }
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.bars[index as usize]))]))
+            }
+            PCI_DEVICE_IRQ_LINE => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.interrupt_line))]))
+            }
+            _ => Err(ObjError::NotSupported),
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            PCI_DEVICE_READ8 | PCI_DEVICE_READ16 | PCI_DEVICE_READ32
+            | PCI_DEVICE_VENDOR_ID | PCI_DEVICE_DEVICE_ID | PCI_DEVICE_CLASS
+            | PCI_DEVICE_BAR | PCI_DEVICE_IRQ_LINE => ContractRights::READ,
+            PCI_DEVICE_WRITE8 | PCI_DEVICE_WRITE16 | PCI_DEVICE_WRITE32 => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
+    }
+
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "bus" => Some(Value::U64(self.dev.bus as u64)),
+            "device" => Some(Value::U64(self.dev.device as u64)),
+            "function" => Some(Value::U64(self.dev.function as u64)),
+            "vendor_id" => Some(Value::U64(self.dev.vendor_id as u64)),
+            "device_id" => Some(Value::U64(self.dev.device_id as u64)),
+            "class" => Some(Value::U64(self.dev.class as u64)),
+            _ => None,
+        }
     }
 }
 
@@ -347,6 +486,14 @@ static PCI_FOREST_CONTRACT_DEF: Contract = Contract {
     doc: PCI_FOREST_DOC,
 };
 
+static PCI_DEVICE_CONTRACT_DEF: Contract = Contract {
+    id: PCI_DEVICE_CONTRACT,
+    name: "pci:device",
+    surface: &PCI_DEVICE_SURFACE,
+    hooks: PCI_DEVICE_HOOKS,
+    doc: PCI_DEVICE_DOC,
+};
+
 static INPUT_FAMILY_CONTRACT_DEF: Contract = Contract {
     id: INPUT_FAMILY_CONTRACT,
     name: "input:family",
@@ -365,6 +512,10 @@ static AUDIO_FAMILY_CONTRACT_DEF: Contract = Contract {
 
 pub fn pci_forest_contract_def() -> &'static Contract {
     &PCI_FOREST_CONTRACT_DEF
+}
+
+pub fn pci_device_contract_def() -> &'static Contract {
+    &PCI_DEVICE_CONTRACT_DEF
 }
 
 pub fn input_family_contract_def() -> &'static Contract {

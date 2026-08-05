@@ -38,7 +38,7 @@ pub use surface::{EventDesc, SurfaceAttr, SurfaceDesc, TypeTag};
 pub use table::TableNode;
 
 use table::CapabilityTable;
-use hook::HookId;
+use hook::{HookId, SURFACE_READ};
 
 /// Globally unique node identity. Confers nothing; used by the store and by
 /// forensics only. Never an access key (§2.1).
@@ -52,6 +52,15 @@ pub trait Obj: Send + Sync {
     fn kind(&self) -> &'static str;
 
     fn surface(&self) -> Option<&'static SurfaceDesc>;
+
+    /// Read one typed attribute off this node's surface by name (§4.1).
+    /// Default `None`: the node exposes no dynamic value for that attribute,
+    /// and the surface read answers `NotSupported`. Overridden by nodes that
+    /// want live surface values reachable through a `QUERY`-bearing cap (the
+    /// `SURFACE_READ` hook is handled centrally in `invoke`).
+    fn surface_value(&self, _name: &str) -> Option<Value> {
+        None
+    }
 
     fn contracts(&self) -> &'static [ContractId];
 
@@ -178,6 +187,21 @@ pub fn invoke(
     hook: HookId,
     args: &Args,
 ) -> Result<Reply, ObjError> {
+    // §4.1 surface reads: node-level, gated by the universal `QUERY` right, and
+    // exempt from contract membership — a surface is not a contract hook. The
+    // attribute name is the sole argument; the value comes from
+    // `Obj::surface_value`.
+    if hook == SURFACE_READ {
+        let (node, _) = table.resolve_for_query(id)?;
+        let name = match args.vals.first() {
+            Some(Value::Str(n)) => *n,
+            _ => return Err(ObjError::Denied),
+        };
+        return match node.surface_value(name) {
+            Some(v) => Ok(Reply::Data(alloc::vec![v])),
+            None => Err(ObjError::NotSupported),
+        };
+    }
     let (node, rights) = table.resolve_with_rights(id, contract, hook)?;
     match node.dispatch(table, &rights, hook, args)? {
         Reply::Caps(caps) => {

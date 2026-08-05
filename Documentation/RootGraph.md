@@ -2,10 +2,10 @@
 
 **Document:** Documentation/RootGraph.md
 **Canonical companion:** `Invariants/invariants-26-objects.md` (numbered invariants distilled from this document)
-**Status:** Design Specification (normative for implementation phases P0–P6)
-**Version:** 1.0.0
-**Date:** 2026-08-03
-**Target repository state:** commit `4624b92` (post module-runtime purge)
+**Status:** Design Specification — normative for implementation phases P0–P6; phases **P0–P5 and P6-A/B are implemented** in the tree (see §10 for per-phase status). Remaining future work: P6 user boundary + sessions.
+**Version:** 1.1.0
+**Date:** 2026-08-05
+**Target repository state:** post capability-system upgrade (P6-B)
 
 ---
 
@@ -511,6 +511,23 @@ The check is a few loads and bit-tests; it is designed to be the fast path,
 not an abstraction barrier that costs a function call per operation (see 7.5
 and 9.4).
 
+**Implementation (P6-B).** This is `CapabilityTable::resolve_with_rights`
+(`obj/table.rs:94-127`), with two refinements. First, the contract-right test
+is a *per-hook* bit-test: the node's `Obj::hook_contract_right(contract, hook)`
+states what a hook requires (e.g. `PhysMemNode`: `free`/`reserve` → `WRITE`,
+`stats` → `READ`, `alloc_frames` → `CALL`; `HeapNode`: `alloc` → `CALL`,
+`stats` → `READ`; `AddressSpaceNode`: `map`/`unmap`/`protect` → `WRITE`,
+`translate`/`root` → `READ`; `MemRegionNode`: `base`/`size` → `READ`,
+`free`/`detach` → `WRITE`; `PciDeviceNode` and the fs nodes similarly
+split), so a narrowed contract mask gates the exact hooks a cap may reach.
+Second, the transitional rule: an `empty()` contract mask is read as
+*"not yet narrowed"* and satisfies any requirement (`if held != empty() &&
+!held.contains(required)`), so endowments predating the dimension keep
+working; monotonicity guarantees a cap narrowed to a non-empty mask can never
+return to unrestricted. The deny-list probe is step 6 (§3.7.3, §9.4).
+Surface reads skip `INVOKE` and contract membership entirely and resolve via
+`resolve_for_query` with only the universal `QUERY` right (§4.1).
+
 ## 3.4 Obtaining Capabilities — Mint and Attunement
 
 The system permits exactly two *kinds* of capability production. The first
@@ -555,12 +572,15 @@ single choke point where new family roots are issued:
 - Is the caller the Principal (that is, the Principal itself, acting through
   its rooted bootstrapper, only during boot and only before its
   self-revoke)?
-- If not, deny. There is no "elevated" second mint path. `MINT` is a right
-  that exists precisely so that this check is the *only* check: any holder
-  of a `MINT` capability could mint, but the only such capability ever
-  issued is the bootstrapper's (the Principal's authority), and it is
-  self-revoked and drop-dead before the world settles. After boot, the set
-  of nodes that could possibly mint is empty.
+- If not, deny. There is no "elevated" second mint path. In the P6-B build
+  the guard is `mint_node` (§7.6): it is callable only with a
+  `PrincipalContext` (a seed value only the bootstrap path can enter) and
+  only while `MINT_FROZEN` is clear. No capability anywhere carries a `MINT`
+  *right* — `PRIM_RIGHTS` is `INVOKE|QUERY|TRAVERSE`, never `MINT` — so the
+  check is authority itself, not a bit. The bootstrapper self-revokes as the
+  last step of `init()` (`finalize_mint`), and every later `mint_node` fails
+  with `MintAuthorityGone`. After boot, the set of nodes that could possibly
+  mint is empty.
 
 ## 3.5 Materialization
 
@@ -751,6 +771,22 @@ node *is*, as opposed to what it *does*.
 **The surface contract.** The *kind* of a surface is part of the node's
 contract identity. Two nodes with identical surface kinds expect to be read
 with compatible semantics. The exact schema is defined per contract (see 4.3).
+
+**Implementation (P6-B).** Surface reads are the reserved `_read_surface`
+hook (`SURFACE_READ` in `obj/hook.rs`). `invoke` intercepts it *before* the
+contract-membership test and resolves the handle through
+`CapabilityTable::resolve_for_query`, which requires only that the handle be
+`Live` and hold the universal `QUERY` right (no `INVOKE`, no contract
+membership), and still probes the revocable deny-list so a revoked node's
+surface is inert too. The value comes from `Obj::surface_value(name)`
+(default `None` → `NotSupported`); live overrides include
+`PhysMemNode` (`total_frames`), `HeapNode` (`arena`), `AddressSpaceNode`
+(`root`), `CpuRootNode`/`CpuNode` (`cpus`), `TableNode` (`slots`),
+`StoreNode` (`records`), `MemRegionNode` (`base`/`size`), `PciDeviceNode`
+(`bus`/`device`/`function`/`vendor_id`/`device_id`/`class`); the fs nodes
+advertise surface schemas but do not yet override `surface_value`
+(`NotSupported`). Separation proves the gate: an `INVOKE`-only cap (QUERY
+dropped) is refused `Denied` on any surface read (`separation.rs:335-342`).
 
 ## 4.2 Hook
 
@@ -969,6 +1005,12 @@ The bootstrapper is born with a single capability: a `CapHandle` naming a
 authority. This is the *only* capability with `MINT` that has ever been
 issued, and (by §3.4) the only one that *can* be issued (mint is
 Principal-only). It is the trunk of the whole tree.
+
+*(P6-B implementation note: the authority is the `PrincipalContext` seed, not
+a capability — no `CapHandle` in the system ever carries a `MINT` bit. The
+bootstrapper performs its mints by passing the seed to `mint_node`, and the
+guard freezes at `init()`'s end (`MINT_FROZEN`, §7.6). The narrative above is
+the authority model; the concrete mechanism is in `obj/{mint,bootstrap}.rs`.)*
 
 ## 5.4 Stage 2 — Mint the First Graph
 
@@ -1450,11 +1492,15 @@ Differences from `FdTable`:
 2.  `dup(old)` attunes a *copy* with the *same* rights — `FdTable::dup`
     semantics. `dup_limited(old, rights)` attunes with reduced rights
     (§3.4.3). There is no operation that increases rights.
-3.  `get(id)` is the `PERMIT`-less raw fetch (used by the object's own
-    dispatch, which already passed `PERMIT`); the *public* path is
-    `resolve(id, contract, hook) -> Result<&dyn Obj>` which runs the full
-    `PERMIT` (3.3) and returns a type-erased-but-contract-checked reference.
-4.  Revocation-aware: `revoke(id)` marks `HandleState::Revoked`; family-root
+ 3.  `get(id)` is the `PERMIT`-less raw fetch (used by the object's own
+     dispatch, which already passed `PERMIT`); the *public* path is
+     `resolve_with_rights(id, contract, hook) -> Result<(Arc<dyn Obj>,
+     CapRights)>` which runs the full `PERMIT` (3.3), returns a
+     contract-checked reference *and* the invoking handle's rights (copied
+     under the same lock, so a provider may re-check them, S1); `resolve`
+     drops the rights; `resolve_for_query(id)` is the QUERY-only surface-read
+     fetch (§4.1).
+ 4.  Revocation-aware: `revoke(id)` marks `HandleState::Revoked`; family-root
     cascade severs *every* reachable descendant (via store cascade
     bookkeeping).
 
@@ -1469,55 +1515,68 @@ calls.
 cheap. Its shape on the hot path:
 
 ```
-resolve(id, contract, hook):
+resolve_with_rights(id, contract, hook):
     slot = slots.lock()?                        // IrqMutex (spin; cheap)
     h    = slot[id]?                            // array fetch
     if h.state != Live           -> Err(Revoked)
     if !(h.rights & INVOKE)      -> Err(Denied)
     if !node.implements(contract) -> Err(Denied)
+    if h.contract != empty() and
+       !(h.contract & node.hook_contract_right(contract, hook)) -> Err(Denied)
     if node.revocation()==Revocable and store.deny(node) -> Err(Revoked)
-    ok
+    ok (node, h.rights copied under the lock)
 ```
 
-That is: one mutex acquire, one array index, two bit-tests, one table
-membership check, one deny-bit test. The `dyn` downcast + call follows. No
-allocation, no serialization, no message encoding — on the in-kernel path.
-The contract right (per-hook) is a third bit-test folded into the `Rights`
-word (§3.3). This is the whole "cost of the graph": a few loads per
+That is: one mutex acquire, one array index, three bit-tests (INVOKE, per-hook
+contract right, deny), one contract-membership hash probe, one deny-bit hash
+probe. The `dyn` downcast + call follows. No allocation, no serialization, no
+message encoding — on the in-kernel path. An `empty()` contract mask is the
+transitional "not yet narrowed" state and passes the per-hook test
+unconditionally (§3.3). This is the whole "cost of the graph": a few loads per
 privileged operation. Section 9.4 proves the bound.
 
 ## 7.6 The Mint Guard
 
 `obj::mint` is the single place a *brand-new family root* — and with it a new
 capability — is brought into being. It is the most audited code in the
-kernel, and it is the Principal's act and the Principal's alone.
+kernel, and it is the Principal's act and the Principal's alone. In the P6-B
+build the mint entry is `mint_node`: it mints over an **already-constructed
+real node** (the `StubNode` placeholders and the old `mint(kind, …)` helper
+are deleted), and it seeds the handle's *contract-right* mask (`first_contract`)
+so the per-hook gate is live from the first commit (§3.3, §7.5).
 
 ```rust
-/// Returns the root capability of a newly created family. Callable ONLY
-/// by the Principal — which, at boot, acts through its rooted agent, the
-/// bootstrapper, and only before the bootstrapper's self-revoke.
-pub fn mint(
+/// Returns the root capability of a newly created family, over an already
+/// constructed node. Callable ONLY by the Principal — which, at boot, acts
+/// through its rooted agent, the bootstrapper, and only before the
+/// bootstrapper's self-revoke.
+pub fn mint_node(
     caller: &PrincipalContext,       // who is asking (must be the Principal's)
-    kind: &'static str,
-    first_rights: Rights,            // the root's rights
+    node: Arc<dyn Obj>,              // the node to root (it owns its identity)
+    first_rights: Rights,            // the root's universal rights
+    first_contract: ContractRights,  // the root's contract-right mask (READ|WRITE|CALL)
 ) -> Result<CapHandle, ObjError>;
 ```
 
 Guard logic:
 
-1.  `first_rights` may not contain `MINT` unless the caller *is* the
-    Principal (the bootstrapper's own mint authority is the one exception,
-    granted at rooting and burned at self-revoke — and even then it is the
-    Principal's right, merely exercised through its agent).
+1.  `MINT_FROZEN` is a single-shot: the bootstrapper self-revokes as the last
+    step of `init()` (`finalize_mint`), after which every `mint_node` fails
+    with `MintAuthorityGone` (§8.2). A `MINT` *right* is never granted in any
+    endowment — the guard is authority itself, not a capability (`PRIM_RIGHTS`
+    = `INVOKE|QUERY|TRAVERSE`, never `MINT`).
 2.  The `PrincipalContext` is a special value of the current-domain slot that
     only the bootstrap seed (§5.2) can enter; after `run()` begins it is no
     longer enterable.
-3.  Mint creates the node, gives it `ObjId = store.next_id()`, registers the
-    weak record with `parent = caller.family`, and returns the single
-    capability that *is* the family root.
+3.  Mint takes an already-constructed node that *owns* its identity: the
+    physical-world roots carry stable family-root `ObjId`s (e.g. `0x11_0000`)
+    registered in the store under their own id and kind with `parent = None`.
+    `mint_node` registers that record (no fresh id is allocated) and returns
+    the single `CapHandle` that *is* the family root, carrying
+    `CapRights::new(first_rights, first_contract)`.
 
-There is no path to "issue a new family root" other than through `mint`. All
-other capability creation (§3.4.2–4) is *attunement* — it derives narrower
+There is no path to "issue a new family root" other than through `mint_node`.
+All other capability creation (§3.4.2–4) is *attunement* — it derives narrower
 handles from existing ones and never touches the guard.
 
 ## 7.7 Killing the Ambient Globals
@@ -1600,6 +1659,19 @@ discovery-by-owned-capability, not ambient. The registry's own hooks
 (`register`, `lookup`) require `INVOKE`; only domains endowed with the
 registry cap can consult it.
 
+**Implementation (P6-B).** The boot domain is endowed with the registry cap
+(`BootEndowment.registry`, holding `INVOKE|QUERY`), and every contract —
+providers (`dma:alloc`, `pci:cfg`, serial), the five physical-world families,
+the fs families, the device families (`pci:forest`, input, audio), and
+`mem:region` — is seeded **through that owned capability** (the
+`invoke(… REGISTRY_REGISTER)` calls in `obj/bootstrap.rs`), so registration
+is never ambient. The table is itself a node (`infra:table`, `obj/table.rs`):
+the boot domain holds a table cap (`INVOKE|QUERY|REVOKE`) exposing `count`,
+`snapshot_size`, `delegate`, and `revoke_cascade` hooks, making delegation and
+cascade revocation capability-mediated (§8.24). The store is a node too
+(`infra:store`): read-only `count`/`lookup`/`denied` forensics hooks over the
+weak records.
+
 ## 7.9 Dispatch Entry (wiring the table to the object)
 
 The single entry point the rest of the kernel calls to reach a node:
@@ -1612,9 +1684,14 @@ pub fn invoke(
     hook: HookId,
     args: &Args,
 ) -> Result<Reply, ObjError> {
-    // §7.5 fast path
-    let node = table.resolve(id, contract, hook)?;
-    node.dispatch(table, hook, args)        // §4.4 step 4
+    // §4.1 surface reads: node-level, QUERY-gated, exempt from contract
+    // membership; resolved via resolve_for_query before PERMIT.
+    if hook == SURFACE_READ { … node.surface_value(name) … }
+    // §7.5 fast path; the caller's exact CapRights are copied under the same
+    // lock and threaded into dispatch for the provider to re-check (S1).
+    let (node, rights) = table.resolve_with_rights(id, contract, hook)?;
+    // capabilities in the reply are inserted into the caller's table
+    node.dispatch(table, &rights, hook, args)        // §4.4 step 4
 }
 ```
 
@@ -1626,7 +1703,7 @@ table by the kernel *before* the reply is returned — never handed over as raw
 
 ---
 
-## 7.10 The Physical World as Nodes (P3)
+## 7.10 The Physical World as Nodes (P3) *(implemented)*
 
 Under the graph, the "core memory" layer is not a kernel-private backroom —
 it is a set of nodes with surfaces, hooks, and contracts, reached only by
@@ -1719,7 +1796,7 @@ node's `deliver` hook body; it runs with the interrupted domain's table as
 no code attaches to an interrupt by position. MSI/MSI-X programming becomes
 an `Irq`-family operation gated by the cap the device domain holds.
 
-## 7.11 The Device / Service World as Nodes (P4)
+## 7.11 The Device / Service World as Nodes (P4) *(implemented)*
 
 Every trait-object that the kernel already dispatches through `dyn` becomes
 a node by *implementing* `Obj` (a thin adapter), and every global registry
@@ -1836,6 +1913,10 @@ capability operations. This preserves shell usability while keeping the
 kernel pure.
 
 ## 7.13 The Projection Tool: `kerneldump graph` (P5)
+
+*Status: implemented (P6-B). `kernel/src/kerneldump/{graph,leak}.rs` provide
+`graph_census`, `graph`, `graph_with_flags` and `leak_detect`; the walker is
+live, not a stub (the P1-era "returns the node census only" stub is gone).*
 
 `kernel/src/kerneldump/*` (`dump.rs` `dump_full_fault`, `disasm.rs`) gains a
 graph projector. It walks `ObjectStore.records` (§7.3) and emits a
@@ -2433,12 +2514,22 @@ able to amplify it.
 **Principle.** Delegation is a capability operation (§3.4.3); rights are
 monotone (§3.2, §7.2.2).
 
-**Handling.** Sending a cap is `send(table_other, cap, transfer | copy)`. A
-*copy* duplicates the handle into the receiver's table with identical rights
-(the sender keeps theirs). A *transfer* moves it (the sender's slot is
-cleared). There is no operation that increases rights, so a receiver can
-never amplify. This is `dup`/`dup2` generalized across domains — the same
-mechanism the `FdTable` already provides within one table.
+**Handling.** In the P6-B build, cross-domain delegation is
+`CapabilityTable::delegate(&target, id)`: it clones the source handle into
+the receiver's table under a fresh `CapId` with **identical rights** (the
+sender keeps theirs — a copy, not a transfer; a transfer primitive is a
+future extension). The clone carries the handle's whole state verbatim, so a
+`Revoked`/deny-listed handle cannot be smuggled back to life, and a
+nonexistent source id fails `NoSuchCap`. The capability-mediated path is the
+`infra:table` node's `delegate` hook (boot's table cap carries `INVOKE` +
+`QUERY` + `REVOKE`), which resolves the target domain by id through
+`domain::find_domain` (unknown id → `NoSuchCap`) and then clones the named
+source handle. There is no operation that increases rights, so a receiver
+can never amplify. This is `dup`/`dup2` generalized across domains — the same
+mechanism the `FdTable` already provides within one table. (Note: this is the
+delegation *of capabilities between domains*; it is distinct from the
+Principal's one-time delegation of *mint authority* to the bootstrapper at
+boot, §3.4.1.)
 
 ## 8.25 CapId / ObjId exhaustion
 
@@ -2569,8 +2660,9 @@ root (mint is the only root creator).
 
 **R6 (invoke).** `invoke(d, c, contract, hook, args)` succeeds iff:
 `state(c)=Live ∧ INVOKE ∈ rights(c) ∧ hook ∈ contract ∧ node(c) implements
-contract ∧ not deny-list-revoked`. On success the hook runs and returns a
-reply (which may carry caps inserted into `C(d)`).
+contract ∧ (rights(c).contract = ∅ ∨ node(c).hook_contract_right(contract,
+hook) ∈ rights(c).contract) ∧ not deny-list-revoked`. On success the hook runs
+and returns a reply (which may carry caps inserted into `C(d)`).
 
 **R7 (revoke, drop-death).** Removing `c` from `C(d)` decrements
 `node(c)`'s refcount. If the count reaches zero, `node(c)` dies: its
@@ -2598,7 +2690,11 @@ instant. They are the executable contract of this document.
   times `{ c ∈ C : MINT ∈ rights(c) }` has cardinality ≤ 1, and that cap is
   the Principal's — the Principal exercises it through the bootstrapper at
   boot, and the bootstrapper self-revokes at boot end, after which the set
-  of nodes that could mint is empty.
+  of nodes that could mint is empty. *(P6-B implementation: no capability
+  carries a `MINT` bit at all — `PRIM_RIGHTS = INVOKE|QUERY|TRAVERSE`. The
+  guard is `mint_node`'s `PrincipalContext` plus the `MINT_FROZEN` single-shot
+  (`finalize_mint` as `init()`'s last statement), after which every
+  `mint_node` returns `MintAuthorityGone`; §3.4, §7.6.)*
 - **I3 (monotone attunement).** For any attunement chain
   `c1 → c2 → … → ck`, `rights(c1) ⊇ rights(c2) ⊇ … ⊇ rights(ck)`. No
   capability ever gains a right; every attuned capability is more precise
@@ -2622,6 +2718,21 @@ instant. They are the executable contract of this document.
 - **I10 (contract identity).** `ContractId` is content-addressed; two
   distinct `(name, surface, hooks)` tuples never share an id (§7.2.4,
   §8.18).
+- **I12 (per-hook contract-right enforcement).** A hook is invoked only if
+  the handle's contract-right mask contains the hook's required right
+  (`node.hook_contract_right(contract, hook)`); an `empty()` mask is the
+  transitional "unrestricted" state (I13) — §3.3, §7.5.
+- **I13 (transitional empty contract mask).** An `empty()` contract-right
+  mask is read as "not yet narrowed" and satisfies any per-hook requirement;
+  monotonicity prevents a non-empty-attuned cap from returning to
+  unrestricted (§3.3).
+- **I14 (QUERY-gated surface reads).** Reading a node's surface requires the
+  universal `QUERY` right and nothing else — no `INVOKE`, no contract
+  membership; the `SURFACE_READ` hook is handled centrally in `invoke` via
+  `resolve_for_query` (§4.1).
+- **I15 (delegation never amplifies).** Cross-domain delegation is a
+  rights-preserving clone; `revoke_cascade` requires the universal `REVOKE`
+  right (§8.24).
 
 ## 9.4 The Fast-Path Bound (I8)
 
@@ -2632,7 +2743,10 @@ Let `P(n)` be the cost of `PERMIT` on a table of size `n`. The operation is:
 3. test `state == Live` (1 compare),
 4. test `INVOKE ∈ rights` (1 bit-test),
 5. test contract membership (1 hash-table probe on a small, frozen set),
-6. test deny-flag (1 load).
+6. test per-hook contract right (1 bit-test of the handle's contract mask
+   against `node.hook_contract_right(contract, hook)`; an `empty()` mask is
+   the transitional "unrestricted" state and passes — §3.3),
+7. test deny-flag (1 hash-set probe, O(1)).
 
 All steps are independent of `n` (the contract-membership table is constant
 size for a given node's advertised contracts; the slot index is direct).
@@ -2703,14 +2817,32 @@ re-increment). The total case (power-off) is a single external act. ∎
 
 # 10. Migration Roadmap
 
-## Phase P0 — The Spec
+**Status legend.** Phases below reflect the current tree (P6-B). The
+capability-system upgrade landed in the `obj/` crate as planned; the "stub"
+gates listed under P1–P3 were design-era placeholders and are superseded by
+the implemented code (see the invariants document §7.6, §7.8 and the P6-B
+note).
+
+| Phase | Status |
+|---|---|
+| P0 — The Spec | **Done** (this document + `invariants-26-objects.md`) |
+| P1 — Seed + Domains | **Done** (`obj/{mod,rights,cap_handle,table,domain,store,contract,surface,hook,mint}.rs`) |
+| P2 — Trinity Core | **Done** (PERMIT fast path, ContractRegistry, store/registry/tables as nodes) |
+| P3 — Physical World as Nodes | **Done** (physmem/heap/addrspace/cpu/irq nodes; `REGION_POOL_CAPACITY = 64`) |
+| P4 — Device/Service Nodes + Capability VFS | **Done** (`obj/{devices,fs}.rs`; tmpfs + ESP mounts) |
+| P5 — Revocation Modes + Projection | **Done** (`obj/revocation.rs`, `kerneldump/{graph,leak}.rs`) |
+| P6-A — Paged Domain Isolation | **Done** (`obj/paged_isolation.rs`) |
+| P6-B — Capability-system upgrade | **Done** (per-hook contract rights, QUERY surface reads, delegation, real mem:region/PCI/fs nodes) |
+| P6 — User Boundary + Sessions | **Open** (see below) |
+
+## Phase P0 — The Spec *(implemented)*
 
 **Deliverable.** This document + `Invariants/invariants-26-objects.md` (the
 numbered I1–I10 distilled into the repo's invariants format).
 
 **Gate.** Document review. No code changes. The repo remains at `4624b92`.
 
-## Phase P1 — Seed + Domains (the foundation)
+## Phase P1 — Seed + Domains (the foundation) *(implemented)*
 
 **Scope.** The single most invasive phase (§6, §7.2–7.8).
 
@@ -2754,9 +2886,10 @@ foundation is compromised and the phase has not finished.
 
 **Gate.** Both targets build (§7.15); x86_64 boots; serial log shows the
 bootstrap self-revoke message. `kerneldump graph` is stubbed (returns the
-node census only).
+node census only). *(Implemented — the full walker landed in P5 and the
+P1-era stub is gone; see §7.13.)*
 
-## Phase P2 — Trinity Core
+## Phase P2 — Trinity Core *(implemented)*
 
 **Scope.** §4.4, §7.2, §7.8.
 
@@ -2770,7 +2903,7 @@ node census only).
 through its endowment and gets a frame back; ambient `kernel_services()`
 fully gone.
 
-## Phase P3 — Physical World as Nodes
+## Phase P3 — Physical World as Nodes *(implemented)*
 
 **Scope.** §7.10.
 
@@ -2806,7 +2939,7 @@ deliberately tiny heap and observing that the failure surfaces as
 capability-mediated allocation; `kerneldump graph` shows the physical layer
 as a node family.
 
-## Phase P4 — Device/Service Nodes + Pure-Capability VFS
+## Phase P4 — Device/Service Nodes + Pure-Capability VFS *(implemented)*
 
 **Scope.** §7.11–7.12.
 
@@ -2845,7 +2978,7 @@ checked by the P4 gate's restricted-domain readdir test.
 drive letters; `readdir` on a restricted domain returns the subset its
 rights allow; hot-plug materializes without minting.
 
-## Phase P5 — Revocation Modes + Projection
+## Phase P5 — Revocation Modes + Projection *(implemented)*
 
 **Scope.** §3.7, §7.13.
 
@@ -2884,7 +3017,7 @@ checked mechanically.
 subtree disappears from the next projection; deny-list revocation makes a
 `Revocable` node `Zombie` while caps remain.
 
-## Phase P6 — User Boundary + Sessions
+## Phase P6 — User Boundary + Sessions *(open — the only unimplemented phase)*
 
 **Scope.** §7.14, §6.6.
 

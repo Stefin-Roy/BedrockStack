@@ -33,7 +33,7 @@ use super::{invoke, Args, Obj, Value};
 
 /// Pre-built `MemRegion` wrappers per kind, materialized at bootstrap so a
 /// memory hook can hand out a region with zero allocation (PhysicalNodes phase).
-const REGION_POOL_CAPACITY: usize = 16;
+const REGION_POOL_CAPACITY: usize = 64;
 
 /// The provider capabilities handed to the Boot domain. Later phases (C6/C7)
 /// recover these `CapId`s to `invoke` through `boot_domain().table.resolve(...)`.
@@ -58,10 +58,20 @@ pub struct BootEndowment {
     pub pci_forest: CapId,
     pub input: CapId,
     pub audio: CapId,
+    /// The capability table's own node, endowed to the Boot domain (§7.8:
+    /// infrastructure is also a node). Lets boot delegate capabilities and
+    /// query table state through a real capability, making `TableNode`'s
+    /// hooks reachable instead of ambient.
+    pub table: CapId,
 }
 
 /// Rights held by the Boot domain over each primitive family root (§5.4).
 const PRIM_RIGHTS: Rights = Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE);
+
+/// Contract-right mask held by the Boot domain over each primitive family
+/// root and provider: the full READ|WRITE|CALL set, so every per-hook
+/// requirement of the physical nodes (`hook_contract_right`) passes from boot.
+const PRIM_CONTRACT: ContractRights = ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL);
 
 static BOOT_DOMAIN: Once<&'static Domain> = Once::new();
 static BOOT_ENDOWMENT: Once<BootEndowment> = Once::new();
@@ -98,23 +108,23 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     // `StubNode` placeholders; each minted handle is inserted and its `CapId`
     // remembered for the endowment.
     let physmem_id = boot.table.insert(
-        mint::mint_node(&principal, Arc::clone(&phys.physmem), PRIM_RIGHTS)
+        mint::mint_node(&principal, Arc::clone(&phys.physmem), PRIM_RIGHTS, PRIM_CONTRACT)
             .expect("mint physmem family root"),
     );
     let heap_id = boot.table.insert(
-        mint::mint_node(&principal, Arc::clone(&phys.heap), PRIM_RIGHTS)
+        mint::mint_node(&principal, Arc::clone(&phys.heap), PRIM_RIGHTS, PRIM_CONTRACT)
             .expect("mint heap family root"),
     );
     let addrspace_id = boot.table.insert(
-        mint::mint_node(&principal, Arc::clone(&phys.addrspace), PRIM_RIGHTS)
+        mint::mint_node(&principal, Arc::clone(&phys.addrspace), PRIM_RIGHTS, PRIM_CONTRACT)
             .expect("mint addrspace family root"),
     );
     let cpu_id = boot.table.insert(
-        mint::mint_node(&principal, Arc::clone(&phys.cpu_root), PRIM_RIGHTS)
+        mint::mint_node(&principal, Arc::clone(&phys.cpu_root), PRIM_RIGHTS, PRIM_CONTRACT)
             .expect("mint cpu family root"),
     );
     let irq_id = boot.table.insert(
-        mint::mint_node(&principal, Arc::clone(&phys.irq_root), PRIM_RIGHTS)
+        mint::mint_node(&principal, Arc::clone(&phys.irq_root), PRIM_RIGHTS, PRIM_CONTRACT)
             .expect("mint irq family root"),
     );
 
@@ -123,19 +133,19 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     let dma_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: adapters::dma_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, PRIM_CONTRACT),
         state: HandleState::Live,
     });
     let pci_cfg_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: adapters::pci_cfg_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, PRIM_CONTRACT),
         state: HandleState::Live,
     });
     let serial_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: adapters::serial_node(),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE, PRIM_CONTRACT),
         state: HandleState::Live,
     });
 
@@ -146,7 +156,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     let registry_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: registry::registry_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), PRIM_CONTRACT),
         state: HandleState::Live,
     });
     for def in [
@@ -190,6 +200,20 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         )
         .expect("bootstrap: register fs contract");
     }
+    // §7.8 — the `mem:region` contract joins the registry through the owned
+    // capability, exactly like the fs/device families above. Its canonical def
+    // lives in `obj/memregion.rs`; `adapters::contract_def` resolves the name.
+    {
+        let args = Args { vals: vec![Value::Str(memregion::MEM_REGION_CONTRACT_DEF.name)] };
+        invoke(
+            &boot.table,
+            registry_id,
+            registry::REGISTRY_CONTRACT,
+            registry::REGISTRY_REGISTER,
+            &args,
+        )
+        .expect("bootstrap: register mem:region contract");
+    }
     for def in [
         devices::pci_forest_contract_def(),
         devices::input_family_contract_def(),
@@ -205,6 +229,19 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         )
         .expect("bootstrap: register device family contract");
     }
+
+    // §7.8 — the capability table is itself a node; endow the boot domain
+    // with a table cap (INVOKE for `delegate`, REVOKE for `revoke_cascade`,
+    // QUERY for surface reads) so delegation is capability-mediated.
+    let table_id = boot.table.insert(CapHandle {
+        id: CapId(0),
+        node: table::table_node(&boot.table),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY).or(Rights::REVOKE),
+            PRIM_CONTRACT,
+        ),
+        state: HandleState::Live,
+    });
 
     // §7.3 / §7.8 — register every stable-id infra/adapter node in the
     // ObjectStore so the `kerneldump graph` census reflects the Trinity model, not
@@ -233,13 +270,13 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     let block_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: fs::block_family_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), PRIM_CONTRACT),
         state: HandleState::Live,
     });
     let mount_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: fs::mount_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY).or(Rights::TRAVERSE), PRIM_CONTRACT),
         state: HandleState::Live,
     });
 
@@ -250,20 +287,20 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         node: devices::pci_forest_node(),
         rights: CapRights::new(
             Rights::INVOKE.or(Rights::QUERY).or(Rights::REVOKE),
-            ContractRights::empty(),
+            PRIM_CONTRACT,
         ),
         state: HandleState::Live,
     });
     let input_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: devices::input_family_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), PRIM_CONTRACT),
         state: HandleState::Live,
     });
     let audio_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: devices::audio_family_node(),
-        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::empty()),
+        rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), PRIM_CONTRACT),
         state: HandleState::Live,
     });
 
@@ -283,6 +320,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         pci_forest: pci_forest_id,
         input: input_id,
         audio: audio_id,
+        table: table_id,
     });
 
     // C8 — the first driver domain (§6.2): a second, disjoint table endowed

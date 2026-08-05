@@ -111,6 +111,15 @@ impl Obj for BlockNode {
         Some(self)
     }
 
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = contract;
+        match hook {
+            BLOCK_SECTOR_COUNT | BLOCK_MODEL_STRING => ContractRights::READ,
+            BLOCK_SUBMIT => ContractRights::CALL,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &super::table::CapabilityTable,
@@ -205,6 +214,14 @@ impl Obj for BlockFamilyNode {
         BLOCK_FAMILY_CONTRACTS
     }
 
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = contract;
+        match hook {
+            BLOCK_FAMILY_FIRST => ContractRights::CALL,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &super::table::CapabilityTable,
@@ -221,7 +238,7 @@ impl Obj for BlockFamilyNode {
                 Some(dev) => {
                     let node = Arc::new(BlockNode::new(dev));
                     let rights = rights
-                        .attune(Rights::INVOKE, ContractRights::empty())
+                        .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
                         .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
                     Ok(Reply::Caps(vec![CapHandle {
                         id: CapId(0),
@@ -286,6 +303,14 @@ impl Obj for MountNode {
         MOUNT_CONTRACTS
     }
 
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = contract;
+        match hook {
+            MOUNT_HOOK => ContractRights::CALL,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         caller: &super::table::CapabilityTable,
@@ -316,7 +341,7 @@ impl Obj for MountNode {
                     .root.clone();
                 let node: Arc<dyn Obj> = Arc::new(DirNode::new(root));
                 let child_rights = rights
-                    .attune(Rights::INVOKE, ContractRights::empty())
+                    .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
                     .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
                 return Ok(Reply::Caps(vec![CapHandle {
                     id: CapId(0),
@@ -342,7 +367,7 @@ impl Obj for MountNode {
                 .root.clone();
             let node = Arc::new(DirNode::new(root));
             let rights = rights
-                .attune(Rights::INVOKE, ContractRights::empty())
+                .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
                 .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
             return Ok(Reply::Caps(vec![CapHandle {
                 id: CapId(0),
@@ -415,7 +440,7 @@ impl DirNode {
         rights: &CapRights,
     ) -> Result<CapHandle, ObjError> {
         let child_rights = rights
-            .attune(Rights::INVOKE, ContractRights::empty())
+            .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
             .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
         let lock = child.inode.lock();
         let inode = lock.as_ref().ok_or(ObjError::Denied)?;
@@ -498,6 +523,15 @@ impl Obj for DirNode {
         Some(self)
     }
 
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = contract;
+        match hook {
+            DIR_TRAVERSE | DIR_READDIR | DIR_LABEL => ContractRights::READ,
+            DIR_MKDIR => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
+    }
+
     fn dispatch(
         &self,
         _caller: &super::table::CapabilityTable,
@@ -505,6 +539,14 @@ impl Obj for DirNode {
         hook: HookId,
         args: &Args,
     ) -> Result<Reply, ObjError> {
+        // Navigation (traverse/readdir) hands out capabilities into the tree,
+        // so it is gated on the universal TRAVERSE right in addition to the
+        // INVOKE that PERMIT already demanded.
+        if (hook == DIR_TRAVERSE || hook == DIR_READDIR)
+            && !rights.uni.contains(Rights::TRAVERSE)
+        {
+            return Err(ObjError::Denied);
+        }
         if hook == DIR_TRAVERSE {
             let name = match args.vals.get(0) {
                 Some(Value::Str(s)) => *s,
@@ -641,6 +683,15 @@ impl Obj for FileNode {
 
     fn as_any(&self) -> Option<&dyn core::any::Any> {
         Some(self)
+    }
+
+    fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
+        let _ = contract;
+        match hook {
+            FILE_READ_AT | FILE_SIZE | FILE_GETATTR | FILE_LABEL => ContractRights::READ,
+            FILE_WRITE_AT => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
     }
 
     fn dispatch(

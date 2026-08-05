@@ -1,25 +1,27 @@
 # RootGraph Objects / Capability Model — Invariants
 
-**Version:** 0.4.1
-**Date:** 2026-08-04
-**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,paged_isolation,nodes,memregion,adapters}.rs`
-**Status:** Active (P5→P6-A, paged isolation)
+**Version:** 0.5.0
+**Date:** 2026-08-05
+**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,paged_isolation,nodes,memregion,devices,fs,adapters}.rs`
+**Status:** Active (P6-B, capability-system upgrade complete)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
 > model of `Documentation/RootGraph.md`. The canonical property set is the
 > numbered **I1–I10** of §9.3 of that document; this file mirrors that wording
-> verbatim and cites the kernel code that enforces it. It is P3: the five
-> primitive family roots are now real nodes wrapping the kernel's physical
-> modules — `PhysMemNode` (`BitmapAllocator`, contract `physmem:allocation`),
+> verbatim and cites the kernel code that enforces it. The object/capability
+> graph is fully implemented — no stubs, no placeholders. The five primitive
+> family roots are real nodes wrapping the kernel's physical modules —
+> `PhysMemNode` (`BitmapAllocator`, contract `physmem:allocation`),
 > `HeapNode` (`heap:allocation`), `AddressSpaceNode` (`Vmm`,
 > `mm:address_space`), `CpuRootNode` (`smp:cpu`), `IrqRootNode` (`irq:vector`)
-> — and every frame handed out is a pooled `MemRegion` capability
-> (`mem:region`; no allocation inside the allocation hooks, §Phase P3).
-> `mint_node` mints these as family roots; the DMA allocator now allocates and
+> — minted by `mint_node` (§7.6) with real universal *and* contract-right
+> masks (`PRIM_CONTRACT = READ|WRITE|CALL`, `obj/bootstrap.rs`), and every
+> frame handed out is a pooled `MemRegion` capability (`mem:region`; no
+> allocation inside the allocation hooks). The DMA allocator allocates and
 > maps through the caller's endowed `physmem`/`addrspace` capabilities (§2.7
 > graph composition). The bootstrap seed window (§5.7) still aborts on OOM;
 > every post-bootstrap node hook returns `ObjError::OutOfMemory`. Deny-list
-> (revocable) nodes are implemented in P5 (§3.7.3, R9).
+> (revocable) nodes are implemented (§3.7.3, R9; `obj/revocation.rs`).
 >
 > P3 refinements in 0.3.0:
 > - `free()` is real, not a stub: the provider `free(region)` hooks take the
@@ -76,6 +78,33 @@
 > translate the kernel-half alias of a heap frame identically; and table
 > mutation flows only through the capability API (endowed id Ok, unendowed id
 > refused).
+>
+> P6-B (0.5.0) — the capability system is complete and real end to end.
+> `StubNode` and the old `mint()` helper are deleted; `mint_node` takes
+> `(caller, node, first_rights, first_contract)` and seeds each family root's
+> contract-right mask, so the per-hook gate is live from boot (§7.6,
+> `obj/mint.rs`). Per-hook contract rights are enforced in `resolve_with_rights`
+> (`obj/table.rs`) against `Obj::hook_contract_right` (I12); an empty contract
+> mask in a handle remains the transitional "unrestricted" rule (I13). The
+> `SURFACE_READ` hook (`_read_surface`, `obj/hook.rs`) is handled centrally in
+> `invoke` via `resolve_for_query`, which requires only the universal `QUERY`
+> right — no INVOKE, no contract membership — and calls `Obj::surface_value`
+> (I14). `CapabilityTable` gained `delegate` (rights-preserving clone into
+> another domain's table, I15), `capacity`, and `revoke_cascade` gated on the
+> universal `REVOKE` right; the boot domain holds a capability to its own
+> table (`BootEndowment.table`), so delegation and table administration are
+> capability-mediated (§7.8). The real `mem:region` contract joins the
+> registry through the owned registry capability (`bootstrap.rs`), with
+> `REGION_POOL_CAPACITY = 64` and `memregion::replenish`/`materialize_region_pools`.
+> Real backing APIs: `Vmm::protect` (x86_64 `Mapper::update_flags`, riscv64
+> hand-walk preserving `PTE_A|PTE_D` + `sfence.vma`), `heap::stats() ->
+> (live, committed, chunk_count)`, `smp::started_count()`. The PCI device
+> contract is real (`devices.rs` `pci:device` over `ecam_static()`/`PciConfigSpace`),
+> and fs nodes carry `hook_contract_right` and `Rights::INVOKE.or(Rights::TRAVERSE)`
+> attunement at every materialization site. `obj/separation.rs` (C6) now also
+> proves QUERY surface reads, per-hook contract-right negatives, `addrspace:root`,
+> `mem:region` registry membership, and capability-mediated delegation (positive
+> boot→driver via the table cap, negative unknown-domain → `NoSuchCap`).
 
 ---
 
@@ -91,18 +120,18 @@ Live → `INVOKE` → contract membership → per-hook contract right) and only 
 `get` exists solely for an object's *own* dispatch (which already passed
 PERMIT). Providers are endowed only by inserting `CapHandle`s into a domain's
 table (`bootstrap`, `driver`); nothing reaches a node out of band.
-- Location: `obj/table.rs::resolve` (`PERMIT` slope, table.rs:87-114), `obj/mod.rs::invoke` (table.rs:150 then `dispatch`), `obj/table.rs::get` (PERMIT-less fetch, table.rs:58-66), `obj/bootstrap.rs:67-110` (endowment via table insert), `obj/driver.rs:43-54`
+- Location: `obj/table.rs::resolve_with_rights` (`PERMIT` slope, table.rs:94-127), `obj/table.rs::resolve_for_query` (QUERY-only slope, table.rs:146-165), `obj/mod.rs::invoke` (dispatch after `resolve`, obj/mod.rs:183-218), `obj/table.rs::get` (PERMIT-less fetch, table.rs:60-68), `obj/bootstrap.rs:110-305` (mint + endowment via table insert), `obj/driver.rs:59-85`
 
 **I2 (mint monopoly) — A new family root is created only by `R1`:**
 At all times `{ c ∈ C : MINT ∈ rights(c) }` has cardinality ≤ 1, and that cap
 is the Principal's — the Principal exercises it through the bootstrapper at
 boot, and the bootstrapper self-revokes at boot end, after which the set of
-nodes that could mint is empty. `mint` is only callable given a
+nodes that could mint is empty. `mint_node` is only callable given a
 `PrincipalContext`; once `MINT_FROZEN` is set by `finalize_mint()` every
-subsequent `mint` fails with `MintAuthorityGone`, with an assert as a loud
+subsequent `mint_node` fails with `MintAuthorityGone`, with an assert as a loud
 canary against a concurrent/ISR-path mint racing the self-revoke. Only
 `bootstrap()` holds a `PrincipalContext`, and only before self-revoke.
-- Location: `obj/mint.rs::mint` (obj/mint.rs:35-57), `obj/mint.rs::PrincipalContext` (obj/mint.rs:16), `obj/mint.rs::finalize_mint` (obj/mint.rs:22-24), `obj/mint.rs::MINT_FROZEN` (obj/mint.rs:19), `obj/bootstrap.rs:50-63` (with `finalize_mint` called as `init()`'s last statement)
+- Location: `obj/mint.rs::mint_node` (obj/mint.rs:32-56), `obj/mint.rs::PrincipalContext` (obj/mint.rs:12), `obj/mint.rs::finalize_mint` (obj/mint.rs:18-20), `obj/mint.rs::MINT_FROZEN` (obj/mint.rs:15), `obj/bootstrap.rs:110-129` (with `finalize_mint` called as `init()`'s last statement)
 
 **I3 (monotone attunement) — for any attunement chain
 `c₁ → c₂ → … → cₖ`, `rights(c₁) ⊇ rights(c₂) ⊇ … ⊇ rights(cₖ)`:**
@@ -112,7 +141,7 @@ contract-rights mask (`NoAmplification` is a canary, unreachable via AND),
 and `dup_limited` is the only handle-derivation path that shrinks rights —
 `dup` copies rights identically and there is no operation that increases
 them.
-- Location: `obj/rights.rs::Rights::attune` (obj/rights.rs:37-44), `obj/rights.rs::CapRights::attune` (both dims, obj/rights.rs:125-138), `obj/table.rs::dup_limited` (obj/table.rs:147-148), `obj/table.rs::dup` (same-rights copy, obj/table.rs:117-128)
+- Location: `obj/rights.rs::Rights::attune` (obj/rights.rs:37-44), `obj/rights.rs::CapRights::attune` (both dims, obj/rights.rs:125-138), `obj/table.rs::dup_limited` (obj/table.rs:208-227), `obj/table.rs::dup` (same-rights copy, obj/table.rs:193-204)
 
 **I4 (lifetime = reachability) — `n` is allocated iff `reach(n) ≠ ∅` or `n`
 is the Principal or a boot-era seed node:**
@@ -122,12 +151,12 @@ exactly the life of the caps that reach it; the store holds no strong
 reference (see I7), so nothing can resurrect a dead node. Default revocation
 is drop-death (`RevocationPolicy::DropDeath`); deny-list `Revocable` nodes
 (P5, §3.7.3, R9) add deactivation with caps retained.
-- Location: `obj/cap_handle.rs::CapHandle{ node: Arc<dyn Obj> }` (obj/cap_handle.rs:27-32), `obj/cap_handle.rs::RevocationPolicy` (obj/cap_handle.rs:18-23), `obj/table.rs::resolve` returns `Arc::clone(&h.node)` (obj/table.rs:109,113)
+- Location: `obj/cap_handle.rs::CapHandle{ node: Arc<dyn Obj> }` (obj/cap_handle.rs:27-32), `obj/cap_handle.rs::RevocationPolicy` (obj/cap_handle.rs:18-23), `obj/table.rs::resolve_with_rights` returns `Arc::clone(&h.node)` (obj/table.rs:126)
 
 **I5 (one parent) — every node ≠ P has exactly one parent edge:**
 `P` has none. The node-store record carries a single `parent: Option<ObjId>`
 written once at registration; there is no structure for multiple parents.
-- Location: `obj/store.rs::ObjRecord.parent` (obj/store.rs:14-18), `obj/store.rs::register` (parent written once, obj/store.rs:38-44)
+- Location: `obj/store.rs::ObjRecord.parent` (obj/store.rs:29), `obj/store.rs::register` (parent written once, obj/store.rs:67-71)
 
 **I6 (subsumption consistency) — if c names family root r, then any child
 materialized under r has rights ⊆ rights(c), and r's parent edge is r's own
@@ -135,9 +164,9 @@ materializer's edge:**
 A node is in exactly one family. Attunement restricts rights to a subset
 (`attune`), and a node is bound to one parent (`ObjRecord.parent`), so a
 child's rights shrink within its parent's family and no node straddles two
-families; roots minted by `mint` register with `parent = None` and start new
+families; roots minted by `mint_node` register with `parent = None` and start new
 families.
-- Location: `obj/table.rs::dup_limited` (rights ⊆, obj/table.rs:132-151), `obj/rights.rs::attune` (obj/rights.rs:37-44,125-138), `obj/store.rs::parent` (one family, obj/store.rs:17), `obj/mint.rs::mint` (root registers with `None` parent, obj/mint.rs:49)
+- Location: `obj/table.rs::dup_limited` (rights ⊆, obj/table.rs:208-227), `obj/rights.rs::attune` (obj/rights.rs:37-44,125-138), `obj/store.rs::parent` (one family, obj/store.rs:26-32), `obj/mint.rs::mint_node` (root registers with `None` parent, obj/mint.rs:50)
 
 **I7 (store weakness) — the ObjectStore holds only weak references; it
 never affects `reach`:**
@@ -146,7 +175,7 @@ never affects `reach`:**
 per-object deny-list set, so the store cannot keep a node alive nor
 resurrect one. Projection is read-only and gated by the store-node
 capability.
-- Location: `obj/store.rs::ObjRecord` (`Weak<dyn Obj>`, no strong `Arc`/`Weak` node field, obj/store.rs:14-18), `obj/store.rs::register_weak`/`register_with_id_weak` (weak-only registration), `obj/store.rs::seal_cascade`/`is_cascade_severed`/`revoke_deny`/`is_denied` (weak-side bookkeeping), `obj/store.rs::ObjectStore` (obj/store.rs:21-24), `obj/store.rs::lock_records` (read-only, obj/store.rs:49-50)
+- Location: `obj/store.rs::ObjRecord` (`Weak<dyn Obj>`, no strong `Arc`/`Weak` node field, obj/store.rs:26-32), `obj/store.rs::register_weak`/`register_with_id_weak` (weak-only registration), `obj/store.rs::seal_cascade`/`is_cascade_severed`/`revoke_deny`/`is_denied` (weak-side bookkeeping), `obj/store.rs::ObjectStore` (obj/store.rs:40-45), `obj/store.rs::lock_records` (read-only, obj/store.rs:125-127)
 
 **I8 (fast-path bound) — the `PERMIT` check of `R6` is O(1):**
 A constant number of word-size operations: one `IrqMutex` acquire, one slot
@@ -154,7 +183,7 @@ index, Live, `INVOKE`, contract membership, per-hook contract-right test,
 and the P5 deny-list probe (one hash-set load, §3.7.3/R9). All are
 independent of table size `n` and the contract-membership probe is on a
 small, frozen set. See §9.4 of `RootGraph.md` (I8).
-- Location: `obj/table.rs::resolve_with_rights` (PERMIT slope incl. step-6 deny probe, obj/table.rs:87-114), `obj/mod.rs::Obj::hook_contract_right` (obj/mod.rs:67-70), reference `RootGraph.md` §9.4 (fast-path bound, five named steps)
+- Location: `obj/table.rs::resolve_with_rights` (PERMIT slope incl. step-6 per-hook contract-right bit-test and step-7 deny probe, obj/table.rs:94-127), `obj/mod.rs::Obj::hook_contract_right` (obj/mod.rs:82-85), reference `RootGraph.md` §9.4 (fast-path bound, seven named steps)
 
 **I9 (dispatch safety) — no table-slot lock is held across a hook body;
 in-flight dispatch holds an `Arc` that prevents drop-death reclamation
@@ -162,7 +191,7 @@ until the reply returns:**
 `resolve` releases the `IrqMutex` before returning the cloned `Arc`, so
 `invoke`'s subsequent `dispatch` runs lock-free; the strong `Arc` keeps the
 node alive even if the last table entry is revoked mid-hook.
-- Location: `obj/mod.rs::invoke` (dispatch after `resolve` returns, obj/mod.rs:150-151), `obj/table.rs::resolve` (lock released on return; `Arc::clone` at obj/table.rs:113)
+- Location: `obj/mod.rs::invoke` (dispatch after `resolve_with_rights` returns, obj/mod.rs:205-218), `obj/table.rs::resolve_with_rights` (lock released on return; `Arc::clone` at obj/table.rs:126)
 
 **I10 (contract identity) — `ContractId` is content-addressed; two distinct
 `(name, surface, hooks)` tuples never share an id:**
@@ -173,8 +202,8 @@ yield distinct streams. `ContractRegistry::register` validates the id: a
 distinct tuple claiming an already-registered `ContractId` is refused loudly
 with `ObjError::ContractCollision` and the genuine entry is left untouched;
 re-registering the identical tuple is idempotent `Ok`. `ObjError::ContractCollision`
-is defined at `obj/mod.rs:109`.
-- Location: `obj/contract.rs::ContractId::of` (obj/contract.rs:70-125), `obj/contract.rs::ContractRegistry::register` (obj/contract.rs:163-178), `obj/contract.rs::ObjError::ContractCollision` (via `obj/mod.rs:110`), `obj/contract.rs::same_identity` (obj/contract.rs:198-242)
+is defined at `obj/mod.rs:134`.
+- Location: `obj/contract.rs::ContractId::of` (obj/contract.rs:80-125), `obj/contract.rs::ContractRegistry::register` (obj/contract.rs:163-178), `obj/contract.rs::ObjError::ContractCollision` (via `obj/mod.rs:134`), `obj/contract.rs::same_identity` (obj/contract.rs:198-242)
 
 **I11 (paged domain isolation, P6-A) — every non-boot domain owns a disjoint
 low-half address space; capability tables live only in the kernel half; CR3
@@ -204,6 +233,66 @@ and fault on the first device access. Proved by `obj/paged_isolation.rs::run()`
 the boot root, shared kernel-half alias, cap-mediated mutation only).
 - Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace), `obj/paged_isolation.rs::run` (proof)
 
+**I12 (per-hook contract-right enforcement) — a hook is invoked only if the
+handle's contract-right mask contains the hook's required right:**
+`resolve_with_rights` folds the per-hook contract right into the third bit-test
+of `PERMIT`: the node's `Obj::hook_contract_right(contract, hook)` states the
+right a hook needs (`PhysMemNode`: `free`/`reserve` → `WRITE`, `stats` → `READ`,
+`alloc_frames`/`alloc_contiguous` → `CALL` default; `HeapNode`: `alloc` →
+`CALL`, `stats` → `READ`; `AddressSpaceNode`: `map`/`unmap`/`protect` →
+`WRITE`, `translate`/`root` → `READ`; `MemRegionNode`: `base`/`size` → `READ`,
+`free`/`detach` → `WRITE`; `PciDeviceNode`: reads → `READ`, writes → `WRITE`;
+`DirNode`/`FileNode`/`BlockNode` similar per-hook splits), and the handle's
+held contract mask must contain that right or the invocation fails `Denied`
+(§3.3, I8). The provider also receives the caller's exact rights through
+`dispatch(…, rights: &CapRights)` and may gate its hook body further (S1).
+- Location: `obj/table.rs::resolve_with_rights` step 5 (obj/table.rs:115-119), `obj/mod.rs::Obj::hook_contract_right` default `CALL` (obj/mod.rs:82-85), per-node overrides in `obj/nodes.rs` (PhysMem 133-140, Heap 319-326, Addrspace 435-442, Cpu 552-558/620-626, Irq 724-730/789-795), `obj/memregion.rs` (214-220), `obj/devices.rs` (297-305), `obj/fs.rs` (114-121, 217-223, 306-312, 526-533, 688-695)
+
+**I13 (transitional empty contract mask) — an `empty()` contract-right mask
+in a handle is read as "unrestricted":**
+Until every endowment carries a narrowed mask, a handle whose contract mask is
+`ContractRights::empty()` satisfies any per-hook requirement — the third
+bit-test passes unconditionally (I12). An *empty* mask is therefore strictly
+more permissive than any explicit mask, so a cap attuned to a non-empty mask
+can never return to unrestricted via the same monotone attunement that left it
+non-empty (`CapRights::attune` only ANDs). This is the documented transitional
+rule of `ContractRights`, honoured by `resolve_with_rights` at obj/table.rs:117.
+- Location: `obj/rights.rs::ContractRights` type docs (obj/rights.rs:54-69), `obj/rights.rs::ContractRights::empty` (obj/rights.rs:87-89), `obj/table.rs::resolve_with_rights` (`held != empty() && !held.contains(required)` gate, obj/table.rs:115-119)
+
+**I14 (QUERY-gated surface reads) — reading a node's surface requires the
+universal `QUERY` right and nothing else:**
+The `SURFACE_READ` hook (`HookId::of("_read_surface")`) is not part of any
+contract. `invoke` intercepts it before the contract-membership test and
+resolves the handle through `CapabilityTable::resolve_for_query`, which
+requires the handle to be `Live`, to hold the universal `QUERY` right, and to
+pass the revocable deny-list probe — but *not* `INVOKE` and *not* contract
+membership. The value comes from `Obj::surface_value(name)`, which defaults to
+`None` (→ `NotSupported`) and is overridden by `PhysMemNode` ("total_frames"),
+`HeapNode` ("arena"), `AddressSpaceNode` ("root"), `CpuRootNode`/`CpuNode`
+("cpus"), `TableNode` ("slots"), `StoreNode` ("records"), `MemRegionNode`
+("base"/"size"), and `PciDeviceNode`. The fs nodes (`fs:dir`, `fs:file`,
+`fs:mount`, `fs:block`, `fs:block:family`) advertise surface *schemas* but do
+not yet override `surface_value` — their surface reads answer `NotSupported`.
+- Location: `obj/hook.rs::SURFACE_READ` (obj/hook.rs:23-27), `obj/mod.rs::invoke` surface branch (obj/mod.rs:194-204), `obj/table.rs::resolve_for_query` (obj/table.rs:146-165), `obj/mod.rs::Obj::surface_value` default (obj/mod.rs:61-63), overrides in `obj/nodes.rs` (126-131, 312-317, 428-433, 545-550, 613-618), `obj/table.rs` (399-404), `obj/store.rs` (273-278), `obj/memregion.rs` (206-212), `obj/devices.rs` (307-317)
+
+**I15 (delegation never amplifies; `revoke_cascade` requires universal
+`REVOKE`) — capability flow across domains is a rights-preserving clone, and
+cascade severing is gated:**
+`CapabilityTable::delegate(&target, id)` inserts a *clone* of the source
+handle into the target table under a fresh `CapId` with rights identical to
+the source's — no right is ever added (I3). The clone carries the handle's
+whole state verbatim, so a `Revoked` or deny-listed source cannot be smuggled
+back to life by delegation (a nonexistent id → `NoSuchCap`). The
+capability-mediated path runs through the table node's `delegate` hook
+(`infra:table`), which first resolves the target domain via
+`domain::find_domain` (an unknown id → `NoSuchCap`). `CapabilityTable::revoke_cascade(id)`
+requires `REVOKE` in the handle's universal rights (else `Denied`), marks the
+handle `Revoked`, frees the root slot, and seals the family in the store via
+`seal_cascade`, which deny-lists the root and every descendant (R8) and
+returns the severed subtree size; the `TableNode::revoke_cascade` hook re-checks
+the universal `REVOKE` on the caller's handle.
+- Location: `obj/table.rs::delegate` (obj/table.rs:232-243), `obj/table.rs::revoke_cascade` (obj/table.rs:272-293), `obj/table.rs::TableNode::dispatch` `delegate`/`revoke_cascade` hooks (obj/table.rs:425-447), `obj/domain.rs::find_domain` (obj/domain.rs:121-123), `obj/store.rs::seal_cascade` (obj/store.rs:139-177)
+
 ---
 
 ## Cross-Check
@@ -213,27 +302,38 @@ The invariants are exercised at boot, not only asserted statically.
 and before SMP:
 
 - **I1 / I8 — no ambient authority, reachability only via the table:** a
-  genuine DMA alloc through the endowed cap succeeds (`separation.rs:27`);
-  an unendowed id is refused with `NoSuchCap` (`separation.rs:47-54`); a
-  foreign contract is refused by PERMIT with `Denied` (`separation.rs:57-59`);
+  genuine DMA alloc through the endowed cap succeeds (`separation.rs:38-55`);
+  an unendowed id is refused with `NoSuchCap` (`separation.rs:58-65`); a
+  foreign contract is refused by PERMIT with `Denied` (`separation.rs:67-70`);
   and a per-hook contract right (READ held, CALL required) is refused
-  (`separation.rs:65-72`). The driver domain resolves exactly its two
-  endowed caps and nothing else (`separation.rs:81-103`).
+  (`separation.rs:72-83`).
 - **C8 separation — the driver domain is disjoint from boot:** endowed
-  DMA/PCI-config resolve; unendowed ids and foreign (serial / registry)
-  contracts resolve `NoSuchCap`/`Denied` (`separation.rs:81-126`); its table
-  holds exactly `count() == 2` (`separation.rs:103`).
-- **I10 — contract identity validated loudly, not in the field:** a
-  duplicate-name contract with an empty hook list claiming an
-  already-registered `ContractId` is refused with `ContractCollision`, and
-  the genuine entry survives (`separation.rs:162-187`); registration is
-  idempotent for the identical tuple (`separation.rs:156-160`).
-- **Registry is discovery-by-owned-capability, not ambient:** a domain
-  without the registry cap cannot consult it (`Denied`); a domain holding it
-  looks up `dma:alloc` and gets name + doc back; a bogus id returns
-  `Reply::None` (`separation.rs:119-152`).
+  dma/pci_cfg resolve from the driver table; unendowed ids and foreign
+  (serial / registry) contracts resolve `NoSuchCap`/`Denied`
+  (`separation.rs:92-127`); its table holds exactly `count() == 4`
+  (dma + pci_cfg + physmem + addrspace, `separation.rs:111-119`); the heap
+  cap is provably absent (`separation.rs:245-251`).
+- **I12 — per-hook contract rights are live on the real nodes:** a CALL-only
+  physmem mask reaches neither `free` (WRITE required) nor `stats` (READ
+  required), while the full mask reaches `stats` (`separation.rs:344-374`).
+- **I14 — QUERY-gated surface reads:** physmem / heap / addrspace / table
+  surfaces answer live values through the endowed caps
+  (`separation.rs:275-333`); a cap with QUERY dropped is refused `Denied`
+  (`separation.rs:335-342`).
+- **I15 / I10 — capability-mediated delegation and registry:** the boot
+  domain delegates its physmem cap to the driver domain through the table
+  node's `delegate` hook; the clone resolves in the driver table while the
+  source stays untouched (`separation.rs:433-463`), and an unknown target
+  domain is refused `NoSuchCap` (`separation.rs:465-480`). A duplicate-name
+  contract claiming an already-registered `ContractId` is refused with
+  `ContractCollision` and the genuine entry survives (`separation.rs:176-201`);
+  re-registering the same tuple is idempotent (`separation.rs:168-174`).
+- **Registry is discovery-by-owned-capability, not ambient:** the driver
+  domain (no registry cap) is refused `Denied`; the boot domain looks up
+  `dma:alloc` and `mem:region` and gets name + doc back; a bogus id returns
+  `Reply::None` (`separation.rs:133-166`, `separation.rs:393-414`).
 
-- Location: `obj/separation.rs::run` (obj/separation.rs:22-192)
+- Location: `obj/separation.rs::run` (obj/separation.rs:33-485), `obj/separation.rs::run_post_mount` (obj/separation.rs:491-511)
 
 ## P4 Gate
 

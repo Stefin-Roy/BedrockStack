@@ -708,5 +708,14 @@ unsafe impl GlobalAlloc for HeapAllocator {
     }
 }
 
+/// Heap arena statistics snapshot: (live allocations, committed bytes, chunk count).
+/// Read-only under the heap lock; used by the HeapNode `stats` hook.
+pub fn stats() -> (u64, u64, u64) {
+    let heap = HEAP.lock();
+    let live: u64 = heap.chunks[..heap.chunk_count].iter().map(|c| c.live as u64).sum();
+    let committed: u64 = heap.chunks[..heap.chunk_count].iter().map(|c| c.size).sum();
+    (live, committed, heap.chunk_count as u64)
+}
+
 #[global_allocator]
 static ALLOCATOR: HeapAllocator = HeapAllocator;

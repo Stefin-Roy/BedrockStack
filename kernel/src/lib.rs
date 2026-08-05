@@ -591,6 +591,14 @@ impl Kernel {
         // boot table; exercise the QUERY-only projection (§7.12.3).
         crate::obj::separation::run_post_mount();
 
+        // Top up the pre-built `mem:region` wrapper pools once the boot-time
+        // allocation work (mounts, PCI tree, revocation gate) has consumed the
+        // bootstrap stock, so allocator hooks keep handing out region wrappers
+        // with zero allocation during the idle loop. Safe point: no memory hook
+        // is on the stack here.
+        crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Phys, 32);
+        crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Heap, 32);
+
         // Revocation gate — the device sweep is the driver domain's last act; then the
         // cascade/deny-list proofs run, followed by the §8.7 leak detector
         // (the gate is the test-suite: "run it after every test-suite
