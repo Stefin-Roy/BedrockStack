@@ -230,25 +230,6 @@ fn init_controller(dev: &PciDevice, dma: DmaClient) -> Result<Vec<Arc<dyn BlockD
 
     event::drain_pending_and_clear_intr();
 
-    {
-        use crate::drivers::serial::SerialPort;
-        let usbsts = regs.read_op32(registers::OP_USBSTS);
-        let iman = unsafe { core::ptr::read_volatile((rt_va + 0x20) as *const u32) };
-        let portsc = regs.read_portsc(1);
-        let erdp_lo = unsafe { core::ptr::read_volatile((rt_va + 0x38) as *const u32) };
-        let erdp_hi = unsafe { core::ptr::read_volatile((rt_va + 0x3C) as *const u32) };
-        let erdp = (erdp_lo as u64) | ((erdp_hi as u64) << 32);
-        SerialPort::puts("[xhci] dump: USBSTS=0x");
-        SerialPort::put_hex(usbsts as u64);
-        SerialPort::puts(" IMAN=0x");
-        SerialPort::put_hex(iman as u64);
-        SerialPort::puts(" PORTSC1=0x");
-        SerialPort::put_hex(portsc as u64);
-        SerialPort::puts(" ERDP=0x");
-        SerialPort::put_hex(erdp);
-        SerialPort::puts("\n");
-    }
-
     let mut dev_mgr = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
         regs.doorbell_va(), ctx_size, max_slots);
 
@@ -556,7 +537,6 @@ fn verify_message_interrupt_delivery(
     dev: &PciDevice,
     msix_fallback: Option<MsixFallback>,
 ) {
-    use crate::drivers::serial::SerialPort;
     use crate::usb::xhci::event;
 
     let before = event::irq_count();
@@ -568,8 +548,7 @@ fn verify_message_interrupt_delivery(
     command::ring_command_doorbell(doorbell_va);
 
     // Do not busy-spin here.  Under QEMU TCG that can starve device
-    // emulation, delaying the command completion (and its MSI/MSI-X write)
-    // until after this diagnostic has already reported a false failure.
+    // emulation, delaying the command completion (and its MSI/MSI-X write).
     // HLT yields to the interrupt/device scheduler and wakes on the LAPIC
     // timer or the xHCI message interrupt.  The universal timer guarantees
     // the halt cannot sleep past the deadline even if the MSI-X route never
@@ -578,65 +557,13 @@ fn verify_message_interrupt_delivery(
     let deadline = now_ns() + 100_000_000;
     let irq_fired = wait_until_cond(deadline, &|| event::irq_count() != before);
 
-    // Snapshot the controller before polling/acknowledging the event.  IP=1
-    // together with USBSTS.EINT=1 proves that the xHC requested an interrupt;
-    // if no CPU vector arrived, the fault is below the driver (PCI/QEMU/APIC).
-    let iman_before_poll = unsafe { core::ptr::read_volatile((_regs.runtime_va() + 0x20) as *const u32) };
-    let usbsts_before_poll = _regs.read_op32(registers::OP_USBSTS);
-    SerialPort::puts("[xhci] irq snapshot: IF=");
-    SerialPort::put_u64(crate::arch::CurrentArch::are_interrupts_enabled() as u64);
-    SerialPort::puts(" USBSTS=0x");
-    SerialPort::put_hex(usbsts_before_poll as u64);
-    SerialPort::puts(" IMAN=0x");
-    SerialPort::put_hex(iman_before_poll as u64);
-    // Read MSI-X table entry directly from the BAR to see if our writes stuck.
-    let diag_addr = crate::pci::msix::diag_read_addr();
-    let diag_data = crate::pci::msix::diag_read_data();
-    let diag_vc = crate::pci::msix::diag_read_vc();
-    let diag_pba = crate::pci::msix::diag_read_pba();
-    fn print_diag(name: &str, val: Option<u64>) {
-        SerialPort::puts(name);
-        SerialPort::puts("=");
-        match val {
-            Some(v) => {
-                SerialPort::puts("0x");
-                SerialPort::put_hex(v);
-            }
-            None => SerialPort::puts("unset"),
-        }
-    }
-    print_diag(" tbl_addr", diag_addr);
-    print_diag(" data", diag_data.map(|v| v as u64));
-    print_diag(" vc", diag_vc.map(|v| v as u64));
-    print_diag(" pba", diag_pba.map(|v| v as u64));
-    SerialPort::puts("\n");
-
-    // Fallback: poll the event ring so we don't leave a dangling completion.
+    // Poll the event ring so we don't leave a dangling completion.
     event::drain_pending_and_clear_intr();
 
     // Check if the completion arrived via the event ring at all.
     let completed = event::last_command_completion().is_some();
 
-    SerialPort::puts("[xhci] message interrupt delivery: irq=");
-    SerialPort::put_u64(event::irq_count() - before);
-    if irq_fired {
-        SerialPort::puts(" (via interrupt)");
-    } else if completed {
-        // The timeout has already elapsed.  This is not a delayed delivery:
-        // the xHC requested an interrupt but no CPU vector was dispatched.
-        SerialPort::puts(" (NOT delivered; completion recovered by poll)");
-        // Extra diagnostics for the failed delivery.
-        let lapic_base = crate::platform::x86_64_pc::apic::lapic_base();
-        if lapic_base != 0 {
-            let svr = unsafe { core::ptr::read_volatile((lapic_base + 0xF0) as *const u32) };
-            let tpr = unsafe { core::ptr::read_volatile((lapic_base + 0x80) as *const u32) };
-            SerialPort::puts("[xhci] lapic_diag: SVR=0x");
-            SerialPort::put_hex(svr as u64);
-            SerialPort::puts(" TPR=0x");
-            SerialPort::put_hex(tpr as u64);
-            SerialPort::puts("\n");
-        }
-
+    if !irq_fired && completed {
         if let Some(fallback) = msix_fallback {
             // MSI-X is configured and the xHC has asserted IP/EINT, so this
             // is a real delivery failure rather than a slow command.  QEMU
@@ -649,7 +576,6 @@ fn verify_message_interrupt_delivery(
                 fallback.vector,
                 fallback.dest_apic_id,
             );
-            SerialPort::puts("[xhci] MSI-X delivery failed; retrying with MSI\n");
 
             let msi_before = event::irq_count();
             cmd_ring.enqueue(&memory::make_no_op_command_trb());
@@ -657,15 +583,9 @@ fn verify_message_interrupt_delivery(
             command::ring_command_doorbell(doorbell_va);
             let msi_deadline = now_ns() + 100_000_000;
             wait_until_cond(msi_deadline, &|| event::irq_count() != msi_before);
-            SerialPort::puts("[xhci] MSI fallback delivery: irq=");
-            SerialPort::put_u64(event::irq_count() - msi_before);
-            SerialPort::puts("\n");
             event::drain_pending_and_clear_intr();
         }
-    } else {
-        SerialPort::puts(" (no completion - stuck)");
     }
-    SerialPort::puts("\n");
 }
 
 fn parse_ext_caps(mmio_va: u64, xecp_off: u64) -> Vec<ProtocolCap> {
@@ -785,14 +705,6 @@ fn setup_interrupts(
     } as u8;
 
     let caps_list = caps::all(dev);
-    SerialPort::puts("[xhci] caps:");
-    for c in caps_list.iter() {
-        SerialPort::puts(" id=");
-        SerialPort::put_u64(c.id as u64);
-        SerialPort::puts("@0x");
-        SerialPort::put_hex(c.offset as u64);
-    }
-    SerialPort::puts("\n");
     let msix_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSIX);
     let msi_cap = caps_list.iter().find(|c| c.id == caps::CAP_MSI);
 

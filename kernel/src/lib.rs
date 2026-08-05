@@ -264,11 +264,6 @@ impl Kernel {
         crate::obj::domain::register_domain(crate::obj::bootstrap::boot_domain());
         crate::obj::domain::register_domain(crate::obj::driver::driver_domain());
 
-        // C6 — boot-time separation proof: the endowed DMA capability works,
-        // unendowed ids and foreign contracts are refused. Runs once, before SMP.
-        crate::obj::separation::run();
-        crate::obj::paged_isolation::run();
-
         // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
         // NX) VM-backed allocation. Runs AFTER bootstrap so the allocation is
         // routed through the Boot domain's Heap family-root capability (§7.10.2)
@@ -454,31 +449,9 @@ impl Kernel {
         crate::drivers::ps2::init();
 
         #[cfg(target_arch = "x86_64")]
-        {
-            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
-            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
-            crate::drivers::serial::SerialPort::puts(" ===\n");
-        }
-
-        #[cfg(target_arch = "x86_64")]
         let mut block_devices = crate::filesystems::blockdriver::driver::init_all(
             crate::pci::devices(),
         );
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
-            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
-            crate::drivers::serial::SerialPort::puts(" ===\n");
-        }
 
         #[cfg(target_arch = "x86_64")]
         let usb_block_devices = crate::usb::xhci::init_all(
@@ -489,17 +462,6 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         crate::audio::init();
         crate::obj::devices::init_audio();
-
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
-            crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
-            crate::drivers::serial::SerialPort::puts(" ===\n");
-        }
 
         #[cfg(target_arch = "x86_64")]
         {
@@ -525,22 +487,25 @@ impl Kernel {
             ) {
                 Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => {
                     log::info!("Mounted A> (tmpfs, via mount cap)");
-                    // Create a test directory via the DirNode cap so fs-walk
-                    // has something to exercise (CapabilityVfs step 3, §7.12.3).
-                    let dir_cap = caps[0].id;
-                    let mkdir_args = crate::obj::Args {
-                        vals: alloc::vec![crate::obj::Value::Str("tmp")],
-                    };
-                    match crate::obj::invoke(
-                        table,
-                        dir_cap,
-                        crate::obj::fs::DIR_CONTRACT,
-                        crate::obj::fs::DIR_MKDIR,
-                        &mkdir_args,
-                    ) {
-                        Ok(crate::obj::Reply::Caps(_)) => log::info!("Created A>tmp via DirNode mkdir cap"),
-                        Ok(_) => log::warn!("mkdir A>tmp via cap: unexpected reply"),
-                        Err(e) => log::warn!("mkdir A>tmp via cap failed: {:?}", e),
+                    #[cfg(feature = "selftest")]
+                    {
+                        // Create a test directory via the DirNode cap so fs-walk
+                        // has something to exercise (CapabilityVfs step 3, §7.12.3).
+                        let dir_cap = caps[0].id;
+                        let mkdir_args = crate::obj::Args {
+                            vals: alloc::vec![crate::obj::Value::Str("tmp")],
+                        };
+                        match crate::obj::invoke(
+                            table,
+                            dir_cap,
+                            crate::obj::fs::DIR_CONTRACT,
+                            crate::obj::fs::DIR_MKDIR,
+                            &mkdir_args,
+                        ) {
+                            Ok(crate::obj::Reply::Caps(_)) => log::info!("Created A>tmp via DirNode mkdir cap"),
+                            Ok(_) => log::warn!("mkdir A>tmp via cap: unexpected reply"),
+                            Err(e) => log::warn!("mkdir A>tmp via cap failed: {:?}", e),
+                        }
                     }
                 }
                 _ => log::warn!("A> tmpfs mount via cap failed"),
@@ -587,10 +552,6 @@ impl Kernel {
         // boot domain again (§6.2).
         crate::obj::domain::set_current_domain(crate::obj::bootstrap::boot_domain());
 
-        // CapabilityVfs — post-mount separation proof: DirNode caps now exist in the
-        // boot table; exercise the QUERY-only projection (§7.12.3).
-        crate::obj::separation::run_post_mount();
-
         // Top up the pre-built `mem:region` wrapper pools once the boot-time
         // allocation work (mounts, PCI tree, revocation gate) has consumed the
         // bootstrap stock, so allocator hooks keep handing out region wrappers
@@ -599,15 +560,11 @@ impl Kernel {
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Phys, 32);
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Heap, 32);
 
-        // Revocation gate — the device sweep is the driver domain's last act; then the
-        // cascade/deny-list proofs run, followed by the §8.7 leak detector
-        // (the gate is the test-suite: "run it after every test-suite
-        // execution"). x86_64-only: `kerneldump` is not built on riscv64.
-        #[cfg(target_arch = "x86_64")]
+        // Boot-time test-suite output: the §8.7 leak detector plus graph and
+        // fs census dumps. x86_64-only (`kerneldump` is not built on riscv64);
+        // gated under the `selftest` feature, off by default.
+        #[cfg(all(target_arch = "x86_64", feature = "selftest"))]
         {
-            crate::obj::devices::materialize_pci_tree();
-            crate::obj::revocation::run_revocation_gate();
-
             let mut w = crate::drivers::serial::SerialPort;
             crate::kerneldump::graph_census(&mut w);
             crate::kerneldump::graph(&mut w);

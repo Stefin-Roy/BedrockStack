@@ -1,7 +1,6 @@
 use alloc::vec::Vec;
 use spin::Mutex;
 
-use crate::drivers::serial::SerialPort;
 use crate::mm::layout::region_next_down;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{Vmm, PageFlags};
@@ -100,19 +99,6 @@ impl AcpiSubsystem {
             .find(|e| e.signature == sig(b"APIC"))
             .and_then(|e| madt::parse_madt(e.vaddr, e.phys_addr, e.length).ok())
             .unwrap_or((InterruptModel::Unknown, None));
-
-        if let Some(ref pi) = processor_info {
-            SerialPort::puts("[acpi] after parse_madt: boot=");
-            SerialPort::put_u64(pi.boot_processor.local_apic_id as u64);
-            SerialPort::puts(" aps=");
-            for p in &pi.application_processors {
-                SerialPort::put_u64(p.local_apic_id as u64);
-                SerialPort::puts(" ");
-            }
-            SerialPort::puts("\n");
-        } else {
-            SerialPort::puts("[acpi] after parse_madt: processor_info is None\n");
-        }
 
         // Build a direct CPU list that bypasses the ProcessorInfo struct
         // to avoid potential layout/corruption issues when reading later.

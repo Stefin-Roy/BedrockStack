@@ -1,5 +1,4 @@
 use core::ptr::{read_volatile, write_volatile};
-use spin::Mutex;
 
 use super::bar::Bar;
 use super::caps::{self, PciCapability};
@@ -8,52 +7,6 @@ use crate::drivers::serial::SerialPort;
 
 fn cfg() -> crate::obj::clients::PciCfgClient {
     crate::obj::clients::PciCfgClient::driver_pci()
-}
-
-/// Diagnostic snapshot of the last programmed MSI-X entry.
-pub struct MsixDiag {
-    pub table_va: u64,
-    pub pba_va: u64,
-}
-static MSIX_DIAG: Mutex<Option<MsixDiag>> = Mutex::new(None);
-
-/// Store diagnostic addresses for the MSI-X table and PBA.
-pub fn set_diag_addrs(table_va: u64, pba_va: u64) {
-    *MSIX_DIAG.lock() = Some(MsixDiag { table_va, pba_va });
-}
-
-/// Read back entry 0's msg_addr from the diagnosed table.
-/// Returns `None` when no MSI-X table has been diagnosed (the caller must
-/// not confuse that with a genuinely programmed address of 0).
-pub fn diag_read_addr() -> Option<u64> {
-    let guard = MSIX_DIAG.lock();
-    let d = guard.as_ref()?;
-    unsafe {
-        let lo = read_volatile(d.table_va as *const u32);
-        let hi = read_volatile((d.table_va + 4) as *const u32);
-        Some((lo as u64) | ((hi as u64) << 32))
-    }
-}
-
-/// Read back entry 0's msg_data from the diagnosed table.
-pub fn diag_read_data() -> Option<u32> {
-    let guard = MSIX_DIAG.lock();
-    let d = guard.as_ref()?;
-    unsafe { Some(read_volatile((d.table_va + 8) as *const u32)) }
-}
-
-/// Read back entry 0's vector control from the diagnosed table.
-pub fn diag_read_vc() -> Option<u32> {
-    let guard = MSIX_DIAG.lock();
-    let d = guard.as_ref()?;
-    unsafe { Some(read_volatile((d.table_va + 12) as *const u32)) }
-}
-
-/// Read the PBA word for entry 0.
-pub fn diag_read_pba() -> Option<u32> {
-    let guard = MSIX_DIAG.lock();
-    let d = guard.as_ref()?;
-    unsafe { Some(read_volatile(d.pba_va as *const u32)) }
 }
 
 /// MSI-X Message Control register bits (capability offset +2).
@@ -103,14 +56,14 @@ pub fn table_info(dev: &PciDevice, cap: &PciCapability) -> MsixInfo {
 ///
 /// `bar_va` is the virtual address of the mapped BAR that contains the
 /// MSI-X table (the BAR index is read from the MSI-X capability).
-/// `pba_va` is the virtual address of the mapped BAR that contains the
+/// `_pba_va` is the virtual address of the mapped BAR that contains the
 /// Pending Bit Array (its BAR index is `info.pba_bir`).  When the table
 /// and PBA share a BAR (common), pass the same address for both.
 pub fn enable(
     dev: &PciDevice,
     cap: &PciCapability,
     bar_va: u64,
-    pba_va: u64,
+    _pba_va: u64,
     table_entries: u16,
     vector: u8,
     dest_apic_id: u8,
@@ -140,10 +93,7 @@ pub fn enable(
         }
     }
 
-    // Store diagnostic addresses so snapshot functions work immediately.
     let table_va = bar_va + info.table_offset;
-    let pba_va_full = pba_va + info.pba_offset;
-    set_diag_addrs(table_va, pba_va_full);
 
     let mc = caps::read_u16(dev, cap, 2);
 
