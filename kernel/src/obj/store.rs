@@ -61,7 +61,8 @@ impl ObjectStore {
     }
 
     /// Weak-register a node under a freshly-issued id (§7.3). Compatibility
-    /// wrapper: no family membership and a dead `Weak` — the P5 callers that
+    /// wrapper: no family membership and a dead `Weak` — the revocation-gate
+    /// callers that
     /// know the node pass it via [`ObjectStore::register_weak`].
     pub fn register(&self, kind: &str, parent: Option<ObjId>) -> ObjId {
         let id = self.next_id();
@@ -206,7 +207,7 @@ static OBJECT_STORE: Once<ObjectStore> = Once::new();
 
 /// Access the process-global object store, initializing it on first use.
 ///
-/// Safe once the heap is up (all P1 users); the store itself is a
+/// Safe once the heap is up (all Seed-phase users); the store itself is a
 /// const-constructible struct whose `BTreeMap` is empty until first insert.
 pub fn object_store() -> &'static ObjectStore {
     OBJECT_STORE.call_once(ObjectStore::new)
@@ -215,7 +216,7 @@ pub fn object_store() -> &'static ObjectStore {
 // ── The store as a node (§2.4, §7.8: "infrastructure is also nodes") ──────
 
 /// The store node's own contract: identity + surface only in this phase; its
-/// hooks arrive with the rest of P3's node wiring.
+/// hooks arrive with the rest of the physical-nodes wiring.
 pub const STORE_CONTRACT: ContractId = ContractId::of("infra:store", &STORE_SURFACE, &STORE_HOOKS);
 
 const STORE_SURFACE: SurfaceDesc = SurfaceDesc {

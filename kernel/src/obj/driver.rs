@@ -5,7 +5,7 @@
 //! (called in `Kernel::init()`) can prove the separation property. The driver
 //! domain holds its OWN capability table (disjoint from the boot domain's) and
 //! is endowed with ONLY its controllers' provider caps — dma + pci_cfg, plus
-//! the P3 physical nodes the device sweep works over: physmem + addrspace. It
+//! the physical nodes the device sweep works over: physmem + addrspace. It
 //! holds no heap, no serial, and no other primitive family roots, so "the
 //! kernel cannot silently reach the driver's addresses by position" (§6.2): a
 //! cap the driver table never received resolves to `NoSuchCap` / `Denied`.
@@ -22,7 +22,7 @@ use super::rights::{CapRights, ContractRights, Rights};
 
 /// The provider capabilities handed to the first driver domain (§6.2).
 /// Exactly the device-sweep controllers' providers: dma + pci_cfg, plus the
-/// P3 physical nodes the sweep works over: physmem + addrspace. No heap, no
+/// physical nodes the sweep works over: physmem + addrspace. No heap, no
 /// serial, no cpu, no irq.
 #[derive(Clone, Copy)]
 pub struct DriverEndowment {
@@ -40,7 +40,7 @@ static DRIVER_ENDOWMENT: Once<DriverEndowment> = Once::new();
 /// `bootstrap()`, so both domains exist during `init()` and the C8 separation
 /// proof runs before SMP.
 ///
-/// P6-A (paged isolation, §8.14): the driver domain owns its own address space
+/// Paged isolation (§8.14): the driver domain owns its own address space
 /// — a fresh root cloned from the kernel's higher half (`parent_root`), empty
 /// in the low half — so its memory is structurally unreachable from the boot
 /// domain's page tables and vice versa.
@@ -62,7 +62,7 @@ pub fn create(parent_root: u64) {
         rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
         state: HandleState::Live,
     });
-    // P3 — the device sweep allocates frames and maps them; endow those nodes
+    // The device sweep allocates frames and maps them; endow those nodes
     // too (INVOKE-only, no heap — the heap stays a boot-domain secret, which
     // separation.rs proves negatively).
     let physmem_id = driver.table.insert(CapHandle {

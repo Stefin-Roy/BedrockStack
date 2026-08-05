@@ -46,7 +46,7 @@ pub struct HookSignature {
 /// Content-addressed contract identity (§4.3, §7.2.4). The id is the FNV-1a
 /// hash of the identity tuple `(name, surface schema, ordered hook
 /// signatures)`. Renaming any part changes the identity — a breaking change.
-/// Registry lookup is a P2 concern.
+/// Registry lookup is a Trinity-phase concern.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ContractId(pub u64);
 
@@ -68,7 +68,7 @@ const fn fnv_bytes(mut h: u64, bytes: &[u8]) -> u64 {
 }
 
 impl ContractId {
-    /// P2 content-addressing (§7.2.4). `const` so providers can expose stable
+    /// Trinity-phase content-addressing (§7.2.4). `const` so providers can expose stable
     /// contract identifiers at compile time.
     ///
     /// The byte stream is: `name` SEP `surface.kind` SEP then per-attr
@@ -245,7 +245,7 @@ static CONTRACT_REGISTRY: Once<ContractRegistry> = Once::new();
 
 /// Access the process-global contract registry, initializing it on first use.
 ///
-/// Safe once the heap is up (all P2 users); the registry itself is a
+/// Safe once the heap is up (all Trinity-phase users); the registry itself is a
 /// const-constructible struct whose `BTreeMap` is empty until first insert.
 pub fn contract_registry() -> &'static ContractRegistry {
     CONTRACT_REGISTRY.call_once(ContractRegistry::new)

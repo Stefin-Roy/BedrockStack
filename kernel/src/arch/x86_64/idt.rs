@@ -302,11 +302,15 @@ extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error_code: u6
 /// Make the .idt pages read-only in the page tables so any wild write
 /// to the IDT or its canary triggers an immediate page fault.
 /// Must be called after all IDT initialisation is complete.
-pub fn protect_idt(root: u64, idt_start_phys: u64, idt_end_phys: u64) {
-    let mut page = idt_start_phys & !0xFFF;
-    let end = (idt_end_phys + 0xFFF) & !0xFFF;
+///
+/// `idt_start` / `idt_end` are the kernel-region VMAs of the `.idt` section
+/// (from `KernelLayout`, which now holds higher-half link addresses); the
+/// kernel is mapped once at `KERNEL_VMA`, so these are the VAs to protect.
+pub fn protect_idt(root: u64, idt_start: u64, idt_end: u64) {
+    let mut page = idt_start & !0xFFF;
+    let end = (idt_end + 0xFFF) & !0xFFF;
     while page < end {
-        crate::mm::vmm::make_read_only_both(root, page);
+        crate::mm::vmm::make_read_only(root, page);
         page += 0x1000;
     }
     // Flush TLB after modifying page tables.

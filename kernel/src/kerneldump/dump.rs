@@ -128,7 +128,17 @@ unsafe fn pf_read_volatile(ptr: *const u64) -> Option<u64> {
     }
 }
 
-// ── Safe memory probes (identity-map: phys == virt for all RAM) ────
+// ── Safe memory probes (page-table frames via the private physmap) ──
+// After `init_physmap` arms the DIRECT_MAP, low physical RAM is reachable only
+// through `PHYS_MAP_BASE` — the identity window covers just the trampoline /
+// bootstack / APIC / framebuffer.  So every page-table frame and the final
+// data page must be deref'd at `to_physmap(phys)`.  Before the physmap is live
+// `to_physmap` returns the identity value, matching the VMM walkers.
+
+/// Virtual deref address for a page-table frame / physical data page.
+fn frame_va(phys: u64) -> u64 {
+    crate::mm::layout::to_physmap(phys)
+}
 
 fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     let ext = (addr as i64) >> 47;
@@ -139,33 +149,33 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
     unsafe {
-        let pml4_entry = pf_read_volatile((pml4_phys + (addr >> 39 & 0x1FF) * 8) as *const u64)?;
+        let pml4_entry = pf_read_volatile(frame_va(pml4_phys + (addr >> 39 & 0x1FF) * 8) as *const u64)?;
         if pml4_entry & PTE_PRESENT == 0 { return None; }
 
         let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
         let pdp_entry =
-            pf_read_volatile((pdp_phys + (addr >> 30 & 0x1FF) * 8) as *const u64)?;
+            pf_read_volatile(frame_va(pdp_phys + (addr >> 30 & 0x1FF) * 8) as *const u64)?;
         if pdp_entry & PTE_PRESENT == 0 { return None; }
         if pdp_entry & (1 << 7) != 0 {
             let page = pdp_entry & 0x000F_FFC0_0000_0000;
-            return pf_read_volatile((page | (addr & 0x3FFF_FFFF)) as *const u64);
+            return pf_read_volatile(frame_va(page | (addr & 0x3FFF_FFFF)) as *const u64);
         }
 
         let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
         let pd_entry =
-            pf_read_volatile((pd_phys + (addr >> 21 & 0x1FF) * 8) as *const u64)?;
+            pf_read_volatile(frame_va(pd_phys + (addr >> 21 & 0x1FF) * 8) as *const u64)?;
         if pd_entry & PTE_PRESENT == 0 { return None; }
         if pd_entry & (1 << 7) != 0 {
             let page = pd_entry & 0x000F_FFFF_FE00_0000;
-            return pf_read_volatile((page | (addr & 0x1F_FFFF)) as *const u64);
+            return pf_read_volatile(frame_va(page | (addr & 0x1F_FFFF)) as *const u64);
         }
 
         let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
-        let pte = pf_read_volatile((pt_phys + (addr >> 12 & 0x1FF) * 8) as *const u64)?;
+        let pte = pf_read_volatile(frame_va(pt_phys + (addr >> 12 & 0x1FF) * 8) as *const u64)?;
         if pte & PTE_PRESENT == 0 { return None; }
 
         let page = pte & 0x000F_FFFF_FFFF_F000;
-        pf_read_volatile((page | (addr & 0xFFF)) as *const u64)
+        pf_read_volatile(frame_va(page | (addr & 0xFFF)) as *const u64)
     }
 }
 
@@ -512,7 +522,7 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
     let idx4 = ((vaddr >> 39) & 0x1FF) as usize;
-    let e4 = match unsafe { pf_read_volatile((pml4_phys + (idx4 as u64) * 8) as *const u64) } {
+    let e4 = match unsafe { pf_read_volatile(frame_va(pml4_phys + (idx4 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PML4 unreadable)"); return; }
     };
@@ -521,7 +531,7 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 
     let pdp_phys = e4 & 0x000F_FFFF_FFFF_F000;
     let idx3 = ((vaddr >> 30) & 0x1FF) as usize;
-    let e3 = match unsafe { pf_read_volatile((pdp_phys + (idx3 as u64) * 8) as *const u64) } {
+    let e3 = match unsafe { pf_read_volatile(frame_va(pdp_phys + (idx3 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PDP unreadable)"); return; }
     };
@@ -535,7 +545,7 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 
     let pd_phys = e3 & 0x000F_FFFF_FFFF_F000;
     let idx2 = ((vaddr >> 21) & 0x1FF) as usize;
-    let e2 = match unsafe { pf_read_volatile((pd_phys + (idx2 as u64) * 8) as *const u64) } {
+    let e2 = match unsafe { pf_read_volatile(frame_va(pd_phys + (idx2 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PD unreadable)"); return; }
     };
@@ -549,7 +559,7 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 
     let pt_phys = e2 & 0x000F_FFFF_FFFF_F000;
     let idx1 = ((vaddr >> 12) & 0x1FF) as usize;
-    let e1 = match unsafe { pf_read_volatile((pt_phys + (idx1 as u64) * 8) as *const u64) } {
+    let e1 = match unsafe { pf_read_volatile(frame_va(pt_phys + (idx1 as u64) * 8) as *const u64) } {
         Some(v) => v,
         None => { let _ = writeln!(w, "  (PT unreadable)"); return; }
     };

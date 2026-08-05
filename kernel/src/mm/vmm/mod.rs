@@ -15,7 +15,7 @@ pub use self::x86_64::clone_high_half;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "x86_64")]
-pub use self::x86_64::make_read_only_both;
+pub use self::x86_64::make_read_only;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "riscv64")]
@@ -101,9 +101,10 @@ impl Vmm {
     /// Allocate a fresh, empty page table (one zeroed root frame).
     pub fn new(alloc: &mut BitmapAllocator) -> Self {
         let root = alloc.alloc().expect("VMM: OOM for root page table");
-        // Zero the frame.
+        // Zero the frame (through the physmap — the identity window no longer
+        // covers all of RAM, so a raw physical write would fault).
         unsafe {
-            core::ptr::write_bytes(root as *mut u8, 0, 4096);
+            core::ptr::write_bytes(crate::mm::layout::to_physmap(root) as *mut u8, 0, 4096);
         }
         Vmm { root, alloc: alloc as *mut BitmapAllocator }
     }

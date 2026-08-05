@@ -11,7 +11,7 @@ use crate::mm::vmm::Vmm;
 /// An independent principal-in-the-small: an execution context holding its own
 /// capability table (§6).
 ///
-/// P6-A (paged isolation, §8.14): a non-kernel domain also owns its own address
+/// Paged isolation (§8.14): a non-kernel domain also owns its own address
 /// space — a page-table root cloned from the kernel's higher half, empty in the
 /// low half — so two domains cannot reach each other's memory by position. The
 /// kernel (boot) domain is `addrspace = None` + `is_kernel = true`; it *is* the
@@ -36,6 +36,12 @@ impl Domain {
     /// Build a non-kernel domain with its own address space: a fresh root that
     /// inherits the kernel's higher-half mappings from `parent_root` (the
     /// active kernel root) and starts with an empty low half (§8.14).
+    ///
+    /// The clone deliberately SHARES the kernel root's PML4/PDPT subtrees (see
+    /// `mm::vmm::clone_high_half`) rather than re-mapping the device windows
+    /// per-domain: the device sweep maps ECAM/DMA/MMIO lazily into the kernel
+    /// root after the clone, and only the shared subtrees keep those mappings
+    /// visible under this domain's CR3.  The kernel root outlives every clone.
     ///
     /// # Panics
     /// - On fatal memory shortage while cloning the page tables.
@@ -101,7 +107,7 @@ fn domain_list() -> &'static Mutex<Vec<&'static Domain>> {
 }
 
 /// Register a domain so the projection tool can see what it holds (§7.13).
-/// Called once per domain at creation (boot, driver, P5 gate).
+/// Called once per domain at creation (boot, driver, revocation gate).
 pub fn register_domain(d: &'static Domain) {
     domain_list().lock().push(d);
 }

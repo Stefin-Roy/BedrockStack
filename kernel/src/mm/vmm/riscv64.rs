@@ -234,10 +234,20 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
 /// Sv39 is three levels; `root` here is the top (L2) table.  The canonical
 /// higher half is the range of virtual addresses with bit 38 set, which maps
 /// to L2 indices `256..=511` — the same split as x86_64's top-256 PML4
-/// entries.  The copied L2 entries reference the parent's shared L1/L0
+/// entries.  With `KERNEL_VMA_BASE = 0xFFFFFFFF80000000` the higher half is
+/// the very top of Sv39's canonical space (the L2 slot 511 region).  The
+/// copied L2 entries reference the parent's shared L1/L0
 /// subtrees, so those tables must stay alive as long as the clone does.  This
 /// gives a new domain its own address space while keeping the kernel image,
 /// heap, physmap and device windows reachable.
+///
+/// # Intentional shared-subtree (do NOT "simplify" to a per-domain rebuild)
+/// The device-window entries are pre-populated in the kernel root before this
+/// clone and the device sweep maps them lazily into the kernel root after it;
+/// sharing the top-level entries is exactly what keeps those later kernel-root
+/// mappings visible under the clone's SATP.  A per-domain rebuild would strand
+/// the windows empty in the clone and fault on first device access.  The
+/// parent root outlives every clone, so there is no per-domain teardown hazard.
 ///
 /// # Panics
 /// - If the allocator cannot supply a root frame (OOM).

@@ -302,7 +302,7 @@ impl Obj for MountNode {
                 Some(Value::U64(id)) => *id,
                 _ => return Err(ObjError::Denied),
             };
-            // Handle tmpfs without a block device cap (P4-S3, §7.11)
+            // Handle tmpfs without a block device cap (CapabilityVfs step 3, §7.11)
             if fstype == "tmpfs" && id == 0 {
                 // Check if drive A: is already mounted (vfs::init may have
                 // done the ambient mount). Only mount if not already present.

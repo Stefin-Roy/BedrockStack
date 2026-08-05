@@ -64,11 +64,18 @@
 > the per-CPU slot *and* switches CR3/SATP to the domain's root when it owns
 > one. The device-window PML4 entries (ACPI/ECAM/DMA) are pre-populated in the
 > kernel root before the clone so lazy kernel mappings stay visible under a
-> domain's CR3. `obj/paged_isolation.rs` runs before SMP and proves: disjoint
-> root frames; an empty driver low half that a canary fills but the boot root
-> cannot reach by position; both roots translate the kernel-half alias of a
-> heap frame identically; and table mutation flows only through the
-> capability API (endowed id Ok, unendowed id refused).
+> domain's CR3. The clone intentionally *shares* those PML4 entries (and their
+> PDPT/PD/PT subtrees) with the kernel root rather than re-mapping the windows
+> per-domain: the device sweep maps ECAM/DMA/MMIO lazily into the kernel root
+> *after* the clone, and a per-domain rebuild would leave the driver pointing
+> at empty private subtrees (ECAM config reads would fault). The parent root
+> outlives every clone, so the shared-subtree lifetime is bounded by the
+> kernel itself — there is no per-domain teardown hazard. `obj/paged_isolation.rs`
+> runs before SMP and proves: disjoint root frames; an empty driver low half
+> that a canary fills but the boot root cannot reach by position; both roots
+> translate the kernel-half alias of a heap frame identically; and table
+> mutation flows only through the capability API (endowed id Ok, unendowed id
+> refused).
 
 ---
 
@@ -187,9 +194,14 @@ data, and the current stack stay reachable across a CR3 switch — IRQs keep
 running in the interrupted domain's context. The ACPI/ECAM/DMA window PML4
 entries are pre-populated in the kernel root before the driver clone
 (`bootstrap`), so lazy kernel mappings made after the clone remain visible
-under a domain's CR3. Proved by `obj/paged_isolation.rs::run()` (disjoint root
-frames, empty-then-canary low half unreachable by position from the boot
-root, shared kernel-half alias, cap-mediated mutation only).
+under a domain's CR3. This shared-subtree design is intentional (not a
+rebuild-from-constants per domain): device mappings (ECAM config, DMA
+buffers, MMIO) are created lazily into the kernel root *after* the clone, and
+only the shared PDPT/PD/PT subtrees keep them reachable under the driver's
+CR3; a per-domain rebuild would strand those windows empty in the driver root
+and fault on the first device access. Proved by `obj/paged_isolation.rs::run()`
+(disjoint root frames, empty-then-canary low half unreachable by position from
+the boot root, shared kernel-half alias, cap-mediated mutation only).
 - Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace), `obj/paged_isolation.rs::run` (proof)
 
 ---
@@ -279,7 +291,7 @@ The P5 gate (section 7.13 and the Phase P5 section) requires:
    domain's PCI forest cap carries REVOKE. `obj/domain.rs` exposes a domain
    registry (`register_domain`/`all_domains`) for the projection tool.
 
-6. Cascade gate assertion: `run_p5_gate` cascade-revokes a 4-node test
+6. Cascade gate assertion: `run_revocation_gate` cascade-revokes a 4-node test
    subtree (root + three weak-parented children) and asserts the whole
    subtree is deny-marked and absent from the next projection, with no
    handle left Live.

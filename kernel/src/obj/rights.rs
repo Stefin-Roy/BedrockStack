@@ -63,7 +63,7 @@ impl BitAnd for Rights {
 /// every bootstrap/driver endowment currently holds (endowment predates this
 /// dimension). An empty contract mask is read as *"not yet narrowed"* — it
 /// satisfies any required right. This keeps the tree green until endowments
-/// are given real masks (P3); it is safe under monotonicity because
+/// are given real masks (PhysicalNodes phase); it is safe under monotonicity because
 /// `CapRights::attune` only ever ANDs, and a cap narrowed to a non-empty mask
 /// can never return to empty-unrestricted via the same attunement that left it
 /// non-empty. The rule is honoured by `CapabilityTable::resolve`.

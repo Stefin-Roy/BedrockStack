@@ -1,4 +1,4 @@
-//! P3 — The physical world as nodes (§7.10).
+//! The physical world as nodes (§7.10).
 //!
 //! Wraps the kernel's own allocators and service providers so that "core
 //! memory" is a set of capability-reachable nodes, not an ambient backroom:
@@ -8,7 +8,7 @@
 //! that reach the original module state (`get_phys_allocator_mut`, the
 //! captured page-table root, and the `&'static dyn` service references).
 //!
-//! ## Allocation-failure contract (§Phase P3)
+//! ## Allocation-failure contract (PhysicalNodes phase)
 //!
 //! The abort-on-OOM behaviour is reserved for the bootstrap seed; every hook
 //! here treats OOM as a *recoverable* `Result` — a failed allocation through
@@ -813,7 +813,7 @@ fn resolve_handler(caller: &CapabilityTable, cap_id: u64) -> Result<fn(), ObjErr
 // The family children are materialized by SMP bring-up / IRQ registration. The
 // fixed materializer signatures do not take a service container, so the
 // `&'static dyn` service references seeded by `build_physical_nodes` are
-// captured in module `Once`s for the children to share. This is the P3
+// captured in module `Once`s for the children to share. This is the physical-nodes
 // materializer seam: only these two helpers read the statics.
 
 static CPU_SERVICE: Once<&'static dyn CpuManager> = Once::new();
@@ -895,7 +895,7 @@ pub fn build_physical_nodes(
 
 // ── Per-node accessors for the endowing domains (§6.2) ─────────────────
 //
-// The first driver domain is endowed with the P3 physical nodes it needs but
+// The first driver domain is endowed with the physical nodes it needs but
 // is created after `build_physical_nodes` has returned its `PhysicalNodes`.
 // Rather than thread the whole struct through `driver::create()`, expose the
 // two nodes the driver domain holds over the shared providers. Both nodes are

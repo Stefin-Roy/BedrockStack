@@ -1,4 +1,4 @@
-//! C5/P3 — `MemRegion`: a page of memory is *a thing with a capability*.
+//! C5 — `MemRegion`: a page of memory is *a thing with a capability*.
 //!
 //! Wraps a handed-out frame (`RegionKind::Phys`, from the `PhysMem` node over
 //! `mm/phys_alloc.rs`) or a heap block (`RegionKind::Heap`, from the `Heap`
@@ -7,7 +7,7 @@
 //! capability*, and the node itself is the recyclable wrapper that carries a
 //! stable `obj_id` plus the region's `base`/`size`.
 //!
-//! ## The no-alloc-in-alloc-hooks rule (§Phase P3)
+//! ## The no-alloc-in-alloc-hooks rule (PhysicalNodes phase)
 //!
 //! The `PhysMem::alloc_frames` / `Heap::alloc` hooks must not allocate to
 //! *construct* the returned `MemRegion` capability — frames require frames,
@@ -246,13 +246,13 @@ impl Obj for MemRegionNode {
     }
 }
 
-// ── The pre-allocated pool (§Phase P3) ────────────────────────────────
+// ── The pre-allocated pool (PhysicalNodes phase) ─────────────────────────
 
 /// A process-global set of pre-built region wrappers of one kind.
 ///
 /// `take()` and `recycle()` only `pop`/`push` `Arc`s — no allocation — so a
 /// memory-hook may hand out a region without the circular "frames need frames"
-/// dependency (§Phase P3).
+/// dependency (PhysicalNodes phase).
 pub struct MemRegionPool {
     free: Mutex<Vec<Arc<MemRegionNode>>>,
     kind: RegionKind,

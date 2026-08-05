@@ -1,7 +1,7 @@
 //! C5 — Boot-domain bootstrap (§5). Arch-neutral.
 //!
 //! Called once from `Kernel::init()` after the service container exists and
-//! before SMP bring-up. Creates the Boot domain, builds the P3 physical-world
+//! before SMP bring-up. Creates the Boot domain, builds the physical-world
 //! nodes (`nodes::build_physical_nodes`), mints the five real family roots
 //! (physmem / heap / addrspace / cpu / irq) over them (§5.1, §7.10), endows the
 //! real service providers (DMA / PCI-config / serial) as capabilities
@@ -32,7 +32,7 @@ use super::table;
 use super::{invoke, Args, Obj, Value};
 
 /// Pre-built `MemRegion` wrappers per kind, materialized at bootstrap so a
-/// memory hook can hand out a region with zero allocation (§Phase P3).
+/// memory hook can hand out a region with zero allocation (PhysicalNodes phase).
 const REGION_POOL_CAPACITY: usize = 16;
 
 /// The provider capabilities handed to the Boot domain. Later phases (C6/C7)
@@ -45,7 +45,7 @@ pub struct BootEndowment {
     /// The contract-registry capability (§7.8): the boot domain is the first
     /// domain endowed to consult "what does `dma:alloc` promise?".
     pub registry: CapId,
-    /// The five P3 physical-world family roots (§7.10), minted over the real
+    /// The five physical-world family roots (§7.10), minted over the real
     /// nodes so the boot domain can allocate frames, heap, address space, CPUs,
     /// and interrupt vectors through capabilities only.
     pub physmem: CapId,
@@ -76,7 +76,7 @@ static BOOT_ENDOWMENT: Once<BootEndowment> = Once::new();
 /// nodes (§7.10). The call-site in `lib.rs` passes them; no other caller exists.
 pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServices) -> &'static Domain {
     let boot: &'static mut Domain = Box::leak(Box::new(Domain::new(0)));
-    // P6-A — the boot domain *is* the kernel: bind the kernel root as its
+    // Paged isolation — the boot domain *is* the kernel: bind the kernel root as its
     // address space so re-entering it (idle loop) re-activates the kernel CR3.
     boot.set_kernel_addrspace(page_table_root);
     domain::set_current_domain(boot);
@@ -88,13 +88,13 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     // child-materializer service references.
     let phys = nodes::build_physical_nodes(page_table_root, svc);
 
-    // §Phase P3 — materialize the pre-built `MemRegion` wrapper pools BEFORE
+    // PhysicalNodes phase — materialize the pre-built `MemRegion` wrapper pools BEFORE
     // any alloc: a memory hook must be able to hand out a region with zero
     // allocation, so the pool must exist before the first `alloc_frames`.
     memregion::materialize_region_pools(REGION_POOL_CAPACITY);
 
-    // §5.1 primitive service family roots — the real P3 nodes minted as the
-    // Boot domain's roots (§7.6, §7.10). The five family roots replace the P1
+    // §5.1 primitive service family roots — the real physical nodes minted as the
+    // Boot domain's roots (§7.6, §7.10). The five family roots replace the Seed-phase
     // `StubNode` placeholders; each minted handle is inserted and its `CapId`
     // remembered for the endowment.
     let physmem_id = boot.table.insert(
@@ -164,7 +164,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         )
         .expect("bootstrap: register provider contract");
     }
-    // §7.10 / §7.8 — the five P3 physical-world contracts join the registry the
+    // §7.10 / §7.8 — the five physical-world contracts join the registry the
     // same way: through the owned registry capability, not ambiently. The
     // registry's `register` hook resolves each name via `adapters::contract_def`
     // (extended for the five names), so only kernel-trusted defs are seeded.
@@ -207,7 +207,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     }
 
     // §7.3 / §7.8 — register every stable-id infra/adapter node in the
-    // ObjectStore so the `kerneldump graph` census reflects the P2 model, not
+    // ObjectStore so the `kerneldump graph` census reflects the Trinity model, not
     // just the minted primitive roots. `register_with_id` keeps the store weak
     // (records hold no node reference) while making the deterministic ids
     // visible to the projection tool. All are boot-era seeds: parent = none.
@@ -243,7 +243,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         state: HandleState::Live,
     });
 
-    // §3.7.2 — the PCI forest root cap carries REVOKE so the P5 gate and the
+    // §3.7.2 — the PCI forest root cap carries REVOKE so the revocation gate and the
     // §8.6 latency test can cascade-sever the whole device complex at the trunk.
     let pci_forest_id = boot.table.insert(CapHandle {
         id: CapId(0),
@@ -289,7 +289,7 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     // with dma + pci_cfg + physmem + addrspace. Created eagerly alongside the
     // boot domain so the separation property holds from the first commit and
     // `separation.rs::run()` can prove it before anything else runs. The driver
-    // domain gets its own address space (P6-A, §8.14).
+    // domain gets its own address space (paged isolation, §8.14).
     //
     // Pre-populate the device-window PML4 entries in the *kernel* root FIRST,
     // so the driver's higher-half clone shares their subtrees. The device

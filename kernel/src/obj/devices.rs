@@ -3,7 +3,7 @@
 //! The PCI controller forest (§7.11.4) is a *real* family (§2.4):
 //! `PciForestNode` is the family root and `materialize_pci_tree` realizes one
 //! `PciDeviceNode` child per discovered device (parent edge = the forest root)
-//! so P5 cascade revocation can sever the whole complex in one operation
+//! so cascade revocation can sever the whole complex in one operation
 //! (§3.7.2) and the §8.6 latency budget can be measured over a dozen-plus
 //! devices. Input and audio remain census-only singletons. Every node exposes
 //! a `count` hook that replies `[U64]`; they are seeded into the Boot domain
@@ -115,7 +115,7 @@ pub const PCI_DEVICE_CHILD_ID_BASE: u64 = 0x11_3000;
 
 /// Small surface schema for a `PciDeviceNode` — the discoverable attributes a
 /// projection tool renders per child (§4.1, §7.13). Contracts are empty for
-/// now; dispatch is the P1 stub.
+/// now; dispatch is the Seed-phase stub.
 const PCI_DEVICE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "pci:device",
     attrs: &[
@@ -132,7 +132,7 @@ const PCI_DEVICE_SURFACE: SurfaceDesc = SurfaceDesc {
 /// A materialized PCI device child under the `pci:forest` root. Carries a
 /// `Copy` of the discovered `PciDevice`; its `ObjId` is derived from the
 /// device's PCI address so the same slot always names the same child (§2.1,
-/// §7.8). No contracts yet — a leaf the P5 cascade test can sever at the
+/// §7.8). No contracts yet — a leaf the cascade test can sever at the
 /// trunk (§3.7.2).
 pub struct PciDeviceNode {
     dev: crate::pci::PciDevice,
@@ -180,7 +180,7 @@ impl Obj for PciDeviceNode {
 
 /// Materialize one PCI device as a child node under the forest root
 /// `root_id` (§3.5, §7.11.4). Registers it in the store with
-/// `parent = Some(root_id)` so the P5 projection sees the family edge
+/// `parent = Some(root_id)` so the projection sees the family edge
 /// (§2.1, §7.13); returns the node.
 pub fn materialize_pci_child(root_id: ObjId, dev: &crate::pci::PciDevice) -> Arc<dyn Obj> {
     let node: Arc<dyn Obj> = Arc::new(PciDeviceNode { dev: *dev });

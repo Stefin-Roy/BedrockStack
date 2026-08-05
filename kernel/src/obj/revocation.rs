@@ -1,8 +1,8 @@
-//! P5 gate — cascade revocation + deny-list revocation proofs (§3.7, §8.6).
+//! Revocation gate — cascade revocation + deny-list revocation proofs (§3.7, §8.6).
 //!
 //! Runs once from `Kernel::run()` after the mounts, on a **fresh test domain**
 //! (disjoint table, registered so the projection tool sees it). It proves the
-//! P5 gate (§RootGraph _Phase P5_ "Gate"):
+//! revocation gate (§RootGraph _Phase Revocation_ "Gate"):
 //!
 //! 1. **Cascade** — `revoke_cascade` on a family root severs the whole
 //!    subtree in one operation (R8, §3.7.2): the returned size is root+children,
@@ -96,10 +96,11 @@ impl Obj for GateObj {
     }
 }
 
-/// The P5 gate. Builds a test domain with a family root + 3 children, cascade-
-/// revokes the root, asserts the whole subtree is deactivated; then deny-list
-/// revokes a `Revocable` node and asserts PERMIT goes `Revoked` (Zombie).
-pub fn run_p5_gate() {
+/// The revocation gate. Builds a test domain with a family root + 3 children,
+/// cascade-revokes the root, asserts the whole subtree is deactivated; then
+/// deny-list revokes a `Revocable` node and asserts PERMIT goes `Revoked`
+/// (Zombie).
+pub fn run_revocation_gate() {
     let store = object_store();
     let test: &'static Domain = Box::leak(Box::new(Domain::new(99)));
     register_domain(test);
@@ -129,31 +130,31 @@ pub fn run_p5_gate() {
     // Pre-state: the root cap is live in the test table, children reachable.
     assert!(
         test.table.snapshot().iter().any(|(_, n, _, _)| *n == root_id),
-        "p5 gate: root cap not live before cascade"
+        "revocation gate: root cap not live before cascade"
     );
 
     // revoke_cascade returns root + children (subtree size).
     let severed = match test.table.revoke_cascade(root_cap) {
         Ok(n) => n,
-        Err(e) => panic!("p5 gate: revoke_cascade failed: {:?}", e),
+        Err(e) => panic!("revocation gate: revoke_cascade failed: {:?}", e),
     };
-    assert_eq!(severed, 4, "p5 gate: cascade must sever root + 3 children");
+    assert_eq!(severed, 4, "revocation gate: cascade must sever root + 3 children");
 
     // Whole subtree deny-marked (deactivated at next PERMIT, §8.6 layer 2) and
     // no handle stays Live in any projection.
     assert!(
         store.is_denied(root_id),
-        "p5 gate: cascade root not deny-marked"
+        "revocation gate: cascade root not deny-marked"
     );
     for c in &children {
         let id = c.obj_id();
-        assert!(store.is_denied(id), "p5 gate: descendant 0x{:x} not severed", id.0);
+        assert!(store.is_denied(id), "revocation gate: descendant 0x{:x} not severed", id.0);
     }
     assert!(
         !test.table.snapshot().iter().any(|(_, n, _, _)| *n == root_id),
-        "p5 gate: root handle still live after cascade"
+        "revocation gate: root handle still live after cascade"
     );
-    SerialPort::puts("[obj] p5 cascade: revoked 4-node subtree, all deactivated\n");
+    SerialPort::puts("[obj] cascade: revoked 4-node subtree, all deactivated\n");
 
     // ── 2. Deny-list revocation (R9, §3.7.3) ───────────────────────────
     // A Revocable node: PERMIT passes until revoke_deny; after it fails Revoked
@@ -170,25 +171,26 @@ pub fn run_p5_gate() {
 
     match test.table.resolve(zcap, TEST_CONTRACT, TEST_HOOK_PING) {
         Ok(_) => {}
-        Err(e) => panic!("p5 gate: revocable node refused before deny: {:?}", e),
+        Err(e) => panic!("revocation gate: revocable node refused before deny: {:?}", e),
     }
 
     store.revoke_deny(zid);
     match test.table.resolve(zcap, TEST_CONTRACT, TEST_HOOK_PING) {
         Err(ObjError::Revoked) => {}
-        Ok(_) => panic!("p5 gate: deny-list PERMIT passed after revoke_deny"),
-        Err(e) => panic!("p5 gate: deny-list produced wrong error {:?}", e),
+        Ok(_) => panic!("revocation gate: deny-list PERMIT passed after revoke_deny"),
+        Err(e) => panic!("revocation gate: deny-list produced wrong error {:?}", e),
     }
     assert!(
         test.table.snapshot().iter().any(|(_, n, _, s)| *n == zid && *s == HandleState::Live),
-        "p5 gate: zombie cap must still exist (slot retained)"
+        "revocation gate: zombie cap must still exist (slot retained)"
     );
-    SerialPort::puts("[obj] p5 deny-list: revoked node -> Zombie (cap retained, PERMIT Revoked)\n");
+    SerialPort::puts("[obj] deny-list: revoked node -> Zombie (cap retained, PERMIT Revoked)\n");
 
-    SerialPort::puts("[obj] p5 gate: OK (cascade + deny-list)\n");
+    SerialPort::puts("[obj] revocation gate: OK (cascade + deny-list)\n");
 }
 
-/// P5 census helper: point count of `test:*` records still in the store — the
+/// Revocation-gate census helper: point count of `test:*` records still in the
+/// store — the
 /// "what died with that root" forensic residue (§8.8), printable before/after.
 pub fn test_node_count() -> usize {
     let guard = object_store().lock_records();

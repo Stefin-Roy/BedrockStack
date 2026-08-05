@@ -695,9 +695,9 @@ static SERIAL_CONTRACT_DEF: Contract = Contract {
     doc: SERIAL_DOC,
 };
 
-// ── P3 physical-world contracts (`nodes.rs`) ─────────────────────────────
+// ── physical-world contracts (`nodes.rs`) ────────────────────────────────
 //
-// The five P3 contracts are declared in `obj/nodes.rs` (content-addressed
+// The five physical-world contracts are declared in `obj/nodes.rs` (content-addressed
 // `ContractId`s like `PHYSMEM_CONTRACT`), but their `SurfaceDesc`/hooks statics
 // there are private. The canonical `Contract` defs therefore re-declare the
 // same surface/hooks here, and pin `id` to the `nodes.rs` consts — the
@@ -812,7 +812,7 @@ static IRQ_CONTRACT_DEF: Contract = Contract {
     doc: nodes::IRQ_DOC,
 };
 
-/// The canonical definitions of the five P3 physical-world contracts (§7.10).
+/// The canonical definitions of the five physical-world contracts (§7.10).
 /// The bootstrap agent registers these through the registry capability.
 static PHYSICAL_CONTRACT_DEFS: &[&Contract] = &[
     &PHYSMEM_CONTRACT_DEF,
@@ -822,7 +822,7 @@ static PHYSICAL_CONTRACT_DEFS: &[&Contract] = &[
     &IRQ_CONTRACT_DEF,
 ];
 
-/// The canonical definitions of the five P3 physical-world contracts (§7.10).
+/// The canonical definitions of the five physical-world contracts (§7.10).
 pub fn physical_contract_defs() -> &'static [&'static Contract] {
     PHYSICAL_CONTRACT_DEFS
 }

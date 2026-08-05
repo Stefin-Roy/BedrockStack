@@ -3,7 +3,7 @@
 pub struct HookId(pub u64);
 
 impl HookId {
-    /// Simple FNV-1a over the identifier. Signature content-addressing is a P2 concern.
+    /// Simple FNV-1a over the identifier. Signature content-addressing is a Trinity-phase concern.
     /// `const` so providers can expose stable hook identifiers in `dispatch`.
     pub const fn of(name: &'static str) -> HookId {
         const OFFSET: u64 = 0xcbf29ce484222325;

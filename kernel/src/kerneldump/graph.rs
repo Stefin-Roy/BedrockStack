@@ -1,8 +1,8 @@
-//! Graph projection — `kerneldump graph` (P1 gate: node census; P5: full
-//! walker, §7.13).
+//! Graph projection — `kerneldump graph` (seed gate: node census; later:
+//! full walker, §7.13).
 //!
 //! Walks the `ObjectStore` and emits a read-only snapshot of every node's
-//! record. P5 adds the full command-line form (roots / edges / caps /
+//! record. The Revocation phase adds the full command-line form (roots / edges / caps /
 //! contracts / revocations). Read-only: it never calls the mint, a hook, or
 //! mutates the store (properties a–d, §7.13). The weak records carry only
 //! `kind`/`parent`/`family_root`; `surface` and `contracts` are recovered by
@@ -24,7 +24,8 @@ use crate::obj::store::object_store;
 use crate::obj::ObjId;
 
 /// Print the node census: one line per store record plus a summary (§7.13).
-/// Retained from P1; the P5 gate also uses it as a cheap pre/post snapshot.
+/// Retained from the Seed phase; the revocation gate also uses it as a cheap
+/// pre/post snapshot.
 pub fn graph_census(w: &mut impl Write) {
     let _ = writeln!(w, "=== kerneldump graph (node census) ===");
 

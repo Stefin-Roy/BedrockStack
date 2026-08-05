@@ -25,11 +25,13 @@ When both ends are 2 MiB-aligned and `remaining >= 2 MiB`, huge pages are
 used via `map_2m`. The remainder uses 4 KiB pages via `map_4k`.
 - Location: `kernel/src/mm/vmm/mod.rs:158-190`
 
-**VMM-004 — Higher-half alias at `KERNEL_VMA_BASE` (0xFFFFFF8000000000):**
-The kernel image is mapped at `KERNEL_VMA_BASE + phys_addr` for each
-4 KiB page, with identical permissions. This provides a kernel-space view
-without changing the linker script.
-- Location: `kernel/src/mm/vmm/mod.rs:79`, `kernel/src/arch/x86_64/paging.rs:129-134`
+**VMM-004 — Kernel image is the PRIMARY map at `KERNEL_VMA_BASE`:**
+The kernel links higher-half (Phase 2 linker split) and `paging::setup`
+maps it once, at `[KERNEL_VMA_BASE, kernel_end)`, with `phys = vaddr -
+KERNEL_VMA_BASE + KERNEL_LMA_BASE` and per-section W^X permissions. There is
+no low identity alias of the kernel image and no `KERNEL_VMA_BASE + phys`
+alias — the kernel is mapped exactly once.
+- Location: `kernel/src/mm/layout.rs:22`, `kernel/src/arch/x86_64/paging.rs:90-104`
 
 **VMM-005 — VMM manages intermediate page-table frames:**
 When creating page-table entries, the arch-specific code allocates frames
@@ -49,20 +51,24 @@ tables, since freeing them can drop more than the single unmapped page's
 translation.
 - Location: `kernel/src/mm/vmm/mod.rs:245-268`, `kernel/src/mm/vmm/x86_64.rs`
 
-**VMM-006 — Identity map covers `[0, ram_end)`, framebuffer extension beyond:**
-`ram_end = alloc_end().max(apic_base + PAGE_4K)` (x86_64) or
-`ram_end = alloc_end().max(fb_end)` (RISC-V), rounded up to 2 MiB.
-No hardcoded 4 GiB minimum. If the framebuffer sits above `ram_end`, it is
-identity-mapped as a separate extension with `WRITE_COMBINING` (x86_64) or
-`NO_CACHE` (RISC-V).
-- Location: `kernel/src/arch/x86_64/paging.rs:55-58`, `kernel/src/arch/riscv64/paging.rs`
+**VMM-006 — Minimal low identity windows + private physmap (Phase 4):**
+The only low-memory identity mappings kept by `paging::setup` are the live
+windows: the SMP trampoline `[0x8000, 0x9000)` (RWX), the local APIC MMIO
+(uncacheable), the BSP's low `.bootstack`, and the framebuffer's physical
+range (write-combining). Everything else in low memory — including the old
+kernel-image region `[0x400000, __low_end)` — is unmapped. The private
+physmap (DIRECT_MAP) is mapped at `PHYS_MAP_BASE` covering physical
+`[0, alloc_end)` (2 MiB bulk + 4 KiB tail) with the stack-guard frame
+excluded. RISC-V retains the older `[0, ram_end)` identity-map model.
+- Location: `kernel/src/arch/x86_64/paging.rs:106-216`, `kernel/src/arch/riscv64/paging.rs`
 
-**VMM-007 — `init_pat_wc` and `make_read_only_both` are re-exported:**
+**VMM-007 — `init_pat_wc` and `make_read_only` are re-exported:**
 `init_pat_wc()` (programs PAT MSR entry 1 as WC) is re-exported at
-`vmm::init_pat_wc`. `make_read_only_both()` is re-exported at
-`vmm::make_read_only_both` for making kernel pages read-only in both
-identity and higher-half mappings.
-- Location: `kernel/src/mm/vmm/mod.rs:14,16`
+`vmm::init_pat_wc`. `make_read_only(root, vaddr)` is re-exported at
+`vmm::make_read_only` for making a single kernel page read-only. The kernel
+is mapped once (at `KERNEL_VMA`), so there is no two-map `_both` variant —
+the Phase 4 rename to the single-VA `make_read_only` reflects this.
+- Location: `kernel/src/mm/vmm/mod.rs:16,18`
 
 ---
 
@@ -151,8 +157,8 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 - On x86_64, `WRITE_COMBINING` requires PAT programming (`init_pat_wc()`)
   before any page with that flag is mapped. This is done at the start of
   `paging::setup()`, before any identity-map entries are created.
-- `KERNEL_VMA_BASE = 0xFFFFFF8000000000` provides the higher-half view
-  of the kernel image.
+- `KERNEL_VMA_BASE = 0xFFFFFFFF80000000` is the higher-half link address;
+  the kernel image is the primary map there (see VMM-004).
 - The `VirtualMemoryManager` capability trait (`services/virt_mem.rs`) is
   intentionally **unimplemented** — `Vmm` is used directly at init. See
   `invariants-23-services.md` (SVC-D001, orphaned/dead trait).

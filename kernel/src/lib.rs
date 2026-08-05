@@ -46,10 +46,23 @@ unsafe extern "C" {
     pub static __stack_end: u8;
     pub static __idt_start: u8;
     pub static __idt_end: u8;
+    // Absolute linker symbols holding the kernel image's PHYSICAL (LMA)
+    // bounds, defined in linker.ld for x86_64 (`__kernel_start_phys =
+    // __low_end`, `__kernel_end_phys = __kernel_end + __phys_delta`, and
+    // `__stack_start_phys = LOADADDR(.stack)`).  The RISC-V script does not
+    // define these (that kernel is not yet higher-half), so they are gated.
+    #[cfg(target_arch = "x86_64")]
+    static __kernel_start_phys: u8;
+    #[cfg(target_arch = "x86_64")]
+    static __kernel_end_phys: u8;
+    #[cfg(target_arch = "x86_64")]
+    pub static __stack_start_phys: u8;
 }
 
-/// Physical-address boundaries of the kernel image sections, used to apply
-/// W^X permissions when building the page tables.
+/// Higher-half VIRTUAL-address boundaries of the kernel image sections, used
+/// to apply W^X permissions when building the page tables (the kernel links
+/// at `KERNEL_VMA_BASE`).  Physical (LMA) bounds live in the `__*_phys`
+/// linker symbols, which the physical allocator uses instead.
 #[derive(Clone, Copy)]
 pub struct KernelLayout {
     pub kernel_start: u64,
@@ -85,6 +98,17 @@ impl Kernel {
     /// memory_map must be a valid slice of MemoryRegion.
     /// framebuffer must be a valid reference to data collected before exit_boot_services.
     /// stack_guard is the physical address of the stack guard page to leave unmapped.
+    ///
+    /// # Handoff-pointer lifetime (Phase 5)
+    /// `memory_map` and `framebuffer` point into low PHYSICAL memory handed
+    /// over by the bootloader.  `Kernel::new` runs BEFORE `switch_to_higher_half`,
+    /// while the static `.boottables` identity map is still live, so the raw
+    /// derefs below (bitmap sizing, `Framebuffer::new`) are safe.  Nothing
+    /// after the switch may deref these raw pointers: the only values retained
+    /// are `fb_phys` (covered by the identity framebuffer window that
+    /// `paging::setup` maps) and `rsdp_addr` (deref'd through the VMM), and
+    /// `rsdp_data` is either absent (UEFI path) or a `'static` copy that was
+    /// moved into kernel memory before the switch (MB2 path).
     pub unsafe fn new(
         memory_map: &'static [MemoryRegion],
         framebuffer: &FramebufferInfo,
@@ -116,17 +140,31 @@ impl Kernel {
         };
 
         SerialPort::puts("[kernel] Kernel::new: BitmapAllocator::new\n");
+        // The allocator consumes PHYSICAL kernel bounds (bitmap placement,
+        // frame reservation).  `layout.*` holds higher-half VMAs for paging
+        // (Phase 4), so the physical extent comes from the `__*_phys` linker
+        // symbols.  RISC-V still links low (VMA == physical), so its VMA
+        // bounds ARE the physical bounds.
+        #[cfg(target_arch = "x86_64")]
+        let (kernel_start_phys, kernel_end_phys) = unsafe {
+            (
+                &__kernel_start_phys as *const u8 as u64,
+                &__kernel_end_phys as *const u8 as u64,
+            )
+        };
+        #[cfg(target_arch = "riscv64")]
+        let (kernel_start_phys, kernel_end_phys) = (layout.kernel_start, layout.kernel_end);
         let mut allocator = unsafe {
             BitmapAllocator::new(
                 bitmap_region,
                 memory_map,
-                layout.kernel_start,
-                layout.kernel_end,
+                kernel_start_phys,
+                kernel_end_phys,
             )
         };
 
         SerialPort::puts("[kernel] Kernel::new: reserve_region\n");
-        allocator.reserve_region(layout.kernel_start, layout.kernel_end);
+        allocator.reserve_region(kernel_start_phys, kernel_end_phys);
 
         SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
         let fb_size = (framebuffer.stride as u64)
@@ -469,7 +507,7 @@ impl Kernel {
             *crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock() = block_devices.clone();
         }
 
-        // A: tmpfs mount via mount cap (P4-S5, §7.11 — no ambient VFS remaining)
+        // A: tmpfs mount via mount cap (CapabilityVfs step 5, §7.11 — no ambient VFS remaining)
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         {
             crate::filesystems::fstypes::register_all();
@@ -488,7 +526,7 @@ impl Kernel {
                 Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => {
                     log::info!("Mounted A> (tmpfs, via mount cap)");
                     // Create a test directory via the DirNode cap so fs-walk
-                    // has something to exercise (P4-S3, §7.12.3).
+                    // has something to exercise (CapabilityVfs step 3, §7.12.3).
                     let dir_cap = caps[0].id;
                     let mkdir_args = crate::obj::Args {
                         vals: alloc::vec![crate::obj::Value::Str("tmp")],
@@ -509,7 +547,7 @@ impl Kernel {
             }
         }
 
-        // Mount the ESP via block-family + fs:mount caps (P4-S2, §7.11)
+        // Mount the ESP via block-family + fs:mount caps (CapabilityVfs step 2, §7.11)
         #[cfg(target_arch = "x86_64")]
         {
             let table = &crate::obj::bootstrap::boot_domain().table;
@@ -549,18 +587,18 @@ impl Kernel {
         // boot domain again (§6.2).
         crate::obj::domain::set_current_domain(crate::obj::bootstrap::boot_domain());
 
-        // P4 — post-mount separation proof: DirNode caps now exist in the
+        // CapabilityVfs — post-mount separation proof: DirNode caps now exist in the
         // boot table; exercise the QUERY-only projection (§7.12.3).
         crate::obj::separation::run_post_mount();
 
-        // P5 gate — the device sweep is the driver domain's last act; then the
-        // P5 cascade/deny-list proofs run, followed by the §8.7 leak detector
+        // Revocation gate — the device sweep is the driver domain's last act; then the
+        // cascade/deny-list proofs run, followed by the §8.7 leak detector
         // (the gate is the test-suite: "run it after every test-suite
         // execution"). x86_64-only: `kerneldump` is not built on riscv64.
         #[cfg(target_arch = "x86_64")]
         {
             crate::obj::devices::materialize_pci_tree();
-            crate::obj::revocation::run_p5_gate();
+            crate::obj::revocation::run_revocation_gate();
 
             let mut w = crate::drivers::serial::SerialPort;
             crate::kerneldump::graph_census(&mut w);

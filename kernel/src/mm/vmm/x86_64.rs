@@ -252,41 +252,54 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())
 }
 
-/// Remove the WRITABLE flag from a single 4 KiB page, making it read-only
-/// in both the identity and higher-half mappings.
+/// Remove the WRITABLE flag from a single 4 KiB page, making it read-only.
+///
+/// Phase 4: the kernel image is mapped exactly once, at `KERNEL_VMA` — there
+/// is no separate identity alias any more — so this operates on the single VA
+/// passed in.  `protect_idt` passes the `.idt` section's high VMA directly.
 ///
 /// The page must already be mapped with 4 KiB granularity via 4-level paging
-/// (the kernel identity map uses 4 KiB pages for kernel-image pages).
+/// (the kernel image is mapped 4 KiB-per-page).
 /// Panics if the page is not present.
-pub fn make_read_only_both(root: u64, vaddr: u64) {
-    let set_ro = |addr: u64| {
-        let mut mapper = mapper_at(root);
-        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(addr));
-        // Reconstruct flags matching what leaf_flags() would have set for
-        // .data/.bss (READ | WRITE | NO_EXECUTE) minus WRITABLE.
-        let flags = PageTableFlags::PRESENT
-            | PageTableFlags::ACCESSED
-            | PageTableFlags::NO_EXECUTE;
-        unsafe {
-            mapper
-                .update_flags(page, flags)
-                .expect("make_read_only: update_flags failed")
-                .flush();
-        }
-    };
-    set_ro(vaddr);
-    set_ro(crate::mm::vmm::KERNEL_VMA_BASE + vaddr);
+pub fn make_read_only(root: u64, vaddr: u64) {
+    let mut mapper = mapper_at(root);
+    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+    // Reconstruct flags matching what leaf_flags() would have set for
+    // .data/.bss (READ | WRITE | NO_EXECUTE) minus WRITABLE.
+    let flags = PageTableFlags::PRESENT
+        | PageTableFlags::ACCESSED
+        | PageTableFlags::NO_EXECUTE;
+    unsafe {
+        mapper
+            .update_flags(page, flags)
+            .expect("make_read_only: update_flags failed")
+            .flush();
+    }
 }
 
 /// Allocate a fresh, zeroed page-table root and copy the kernel's higher-half
 /// mappings (and only those) from `parent_root`, leaving the low half empty.
 ///
 /// The higher half is the canonical negative-address range (VAs with bit 47
-/// set — at or above `KERNEL_VMA_BASE`), i.e. PML4 indices `256..=511`.  The
+/// set — at or above `KERNEL_VMA_BASE`), i.e. PML4 indices `256..=511`.  With
+/// `KERNEL_VMA_BASE = 0xFFFFFFFF80000000` the higher half is the very top of
+/// canonical space (the PML4 slot 511 region).  The
 /// copied PML4 entries reference the parent's shared PDPT subtrees, so those
 /// tables must stay alive as long as the clone does.  This gives a new domain
 /// its own address space while keeping the kernel image, heap, physmap and
 /// device windows reachable.
+///
+/// # Intentional shared-subtree (do NOT "simplify" to a per-domain rebuild)
+/// The ACPI/ECAM/DMA device-window PML4 entries are pre-populated in the
+/// kernel root BEFORE this clone (`bootstrap`), and the device sweep maps
+/// ECAM/DMA/MMIO lazily into the kernel root AFTER it (`pci::init` passes the
+/// kernel root).  Sharing the PML4 entries — and therefore their PDPT/PD/PT
+/// subtrees — is exactly what keeps those later kernel-root mappings visible
+/// under the clone's CR3.  Rebuilding the windows from layout constants in the
+/// clone would leave the driver pointing at empty private subtrees and fault
+/// on the first device access.  The parent root outlives every clone (the
+/// boot domain is never torn down), so the shared-subtree lifetime is bounded
+/// by the kernel itself — there is no per-domain teardown hazard.
 ///
 /// # Panics
 /// - If the allocator cannot supply a root frame (OOM).
@@ -295,7 +308,7 @@ pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
     let new_pml4 = pte_deref(new_root);
     let parent_pml4 = pte_deref(parent_root);
     unsafe {
-        core::ptr::write_bytes(new_root as *mut u8, 0, 4096);
+        core::ptr::write_bytes(new_pml4 as *mut u8, 0, 4096);
         // Copy only the top 256 PML4 entries (indices 256..=511) covering the
         // higher half.  Entries 0..255 (the low half, user-space) stay empty.
         for i in 256..=511 {

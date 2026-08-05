@@ -19,7 +19,7 @@ use spin::Mutex;
 ///
 /// Start of the canonical higher-half region (also Start of x86_64's standard
 /// negative-address kernel range and Sv39's sign-extended high half).
-pub const KERNEL_VMA_BASE: u64 = 0xFFFFFF80_00000000;
+pub const KERNEL_VMA_BASE: u64 = 0xFFFFFFFF_80000000;
 
 /// Size reserved for the higher-half kernel image (Phase E target).
 pub const KERNEL_IMAGE_SIZE: u64 = 0x1000_0000; // 256 MiB
@@ -33,9 +33,20 @@ pub const HEAP_GUARD_PAGES: u64 = 1;
 pub const HEAP_GUARD_BYTES: u64 = HEAP_GUARD_PAGES * 4096;
 
 /// Private physmap: DIRECT_MAP maps physical `[0, alloc_end)` here.  Grows
-/// upward from this base to cover all of usable RAM (no fixed ceiling — the
-/// window extends into the canonical half above, which has no neighbours).
-pub const PHYS_MAP_BASE: u64 = KERNEL_VMA_BASE + 0x4000_0000; // +1 GiB
+/// upward from this base to cover all of usable RAM; bounded above by the DMA
+/// device-window floor (see `DMA_VADDR_FLOOR`), which leaves ~252 GiB of room.
+///
+/// **Deliberately NOT derived from `KERNEL_VMA_BASE`.**  The physmap is the
+/// single largest VA consumer (it must cover *all* RAM) and its base must
+/// therefore sit at the bottom of the canonical higher half, far below the
+/// kernel image / heap / device windows.  Anchoring it to the kernel base
+/// squeezes it next to `u64::MAX` (only 1 GiB of headroom at the current
+/// `KERNEL_VMA_BASE`) and overflows the DIRECT_MAP on any machine with more
+/// than 1 GiB of RAM.  This value is the Sv39 canonical high-half boundary,
+/// is also canonical under x86_64 48-bit paging, and lies inside PML4/L2 slot
+/// 511 — so `clone_high_half` (which copies slot 511) carries it into every
+/// driver domain automatically.
+pub const PHYS_MAP_BASE: u64 = 0xFFFFFFC0_00000000;
 
 // ── Device mapping arenas (below KERNEL_VMA_BASE, edge-to-edge) ───────
 //

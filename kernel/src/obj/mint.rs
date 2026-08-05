@@ -26,9 +26,9 @@ pub fn finalize_mint() {
 /// Create a new family root and its first capability (§7.6). Callable ONLY by
 /// the Principal (acting through the rooted bootstrapper, before self-revoke).
 ///
-/// P1 placeholder: the node is a `StubNode` whose dispatch refuses everything;
+/// Seed placeholder: the node is a `StubNode` whose dispatch refuses everything;
 /// the `id` is assigned when the handle is inserted into a table. Superseded
-/// for primitives by [`mint_node`] (P3), which mints over a real node; `mint`
+/// for primitives by [`mint_node`] (PhysicalNodes phase), which mints over a real node; `mint`
 /// remains for ad-hoc stub roots until they are switched over.
 pub fn mint(
     _caller: &PrincipalContext,
@@ -61,7 +61,7 @@ pub fn mint(
 /// Callable ONLY by the Principal (acting through the rooted bootstrapper,
 /// before self-revoke).
 ///
-/// Unlike [`mint`] it does not build a `StubNode`: the P3 physical-world nodes
+/// Unlike [`mint`] it does not build a `StubNode`: the physical-world nodes
 /// (`PhysMemNode`, `HeapNode`, …) carry their own stable family-root `ObjId`
 /// (e.g. `0x11_0000`), which is registered in the store under its stable id and
 /// kind. No fresh id is allocated — the node already owns its identity.
@@ -91,7 +91,7 @@ pub fn mint_node(
     })
 }
 
-/// Minimal P1 node standing in for real service nodes.
+/// Minimal Seed-phase node standing in for real service nodes.
 struct StubNode {
     id: ObjId,
 }

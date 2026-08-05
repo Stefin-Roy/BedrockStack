@@ -12,11 +12,25 @@ TARGET_DIR = os.path.join(WORKSPACE, "target")
 
 
 def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Create the BedrockOS GPT+FAT32 disk image")
+    parser.add_argument(
+        "--boot",
+        default=None,
+        help="Override the EFI binary used as EFI/BOOT/BOOTX64.EFI "
+        "(default: target/x86_64-unknown-uefi/<profile>/boot.efi)",
+    )
+    args = parser.parse_args()
+
     print("Creating GPT+FAT32 disk image...")
 
-    boot_path = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "debug", "boot.efi")
-    if not os.path.exists(boot_path):
-        boot_path = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "release", "boot.efi")
+    if args.boot:
+        boot_path = args.boot
+    else:
+        boot_path = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "debug", "boot.efi")
+        if not os.path.exists(boot_path):
+            boot_path = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", "release", "boot.efi")
     kernel_path = os.path.join(TARGET_DIR, "x86_64-unknown-none", "debug", "kernel")
     if not os.path.exists(kernel_path):
         kernel_path = os.path.join(TARGET_DIR, "x86_64-unknown-none", "release", "kernel")

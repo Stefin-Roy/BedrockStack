@@ -194,7 +194,7 @@ pub fn run() {
 
     SerialPort::puts("[obj] registry separation: OK (owned-capability discovery)\n");
 
-    // P3 — the physical world as nodes (§7.10). The boot domain was endowed
+    // The physical world as nodes (§7.10). The boot domain was endowed
     // with the five family roots; exercise the frame pool through capability
     // mediation and prove the driver domain (physmem but NO heap) is genuinely
     // cut off from the heap node.
@@ -215,19 +215,19 @@ pub fn run() {
             match invoke(&table, region_id, MEM_REGION_CONTRACT, MEM_REGION_BASE, &Args::none()) {
                 Ok(Reply::Data(vals)) if vals.len() == 1 => match &vals[0] {
                     Value::U64(base) => {
-                        assert!(*base != 0, "P3: physmem region base is zero");
-                        SerialPort::puts("[obj] P3 ok: physmem alloc_frames -> base=0x");
+                        assert!(*base != 0, "physmem region base is zero");
+                        SerialPort::puts("[obj] physmem ok: alloc_frames -> base=0x");
                         SerialPort::put_hex(*base);
                         SerialPort::puts("\n");
                     }
-                    _ => panic!("P3: region base replied non-u64 payload"),
+                    _ => panic!("region base replied non-u64 payload"),
                 },
-                Ok(_) => panic!("P3: region base replied unexpected shape"),
-                Err(e) => panic!("P3: region base through mem:region failed: {:?}", e),
+                Ok(_) => panic!("region base replied unexpected shape"),
+                Err(e) => panic!("region base through mem:region failed: {:?}", e),
             }
         }
-        Ok(_) => panic!("P3: physmem alloc_frames replied unexpected shape"),
-        Err(e) => panic!("P3: physmem alloc_frames through cap failed: {:?}", e),
+        Ok(_) => panic!("physmem alloc_frames replied unexpected shape"),
+        Err(e) => panic!("physmem alloc_frames through cap failed: {:?}", e),
     }
 
     // 15. NEGATIVE — a driver domain WITHOUT a heap cap cannot resolve the Heap
@@ -242,7 +242,7 @@ pub fn run() {
         Err(e) => panic!("driver separation FAIL: heap probe -> {:?}", e),
     }
 
-    // P4 — filesystem capability separation (§7.12.3). The boot domain has
+    // CapabilityVfs — filesystem capability separation (§7.12.3). The boot domain has
     // DirNode caps from the A: tmpfs mount. A domain holding only a QUERY-only
     // copy cannot readdir (INVOKE required by PERMIT); a domain with no dir
     // cap at all sees nothing via resolve_first.
@@ -264,7 +264,7 @@ pub fn run() {
     SerialPort::puts("[obj] separation: OK (cap-mediated alloc enforced)\n");
 }
 
-/// P4 — post-mount filesystem separation proof (§7.12.3).
+/// CapabilityVfs — post-mount filesystem separation proof (§7.12.3).
 ///
 /// Called from `Kernel::run()` after the tmpfs and ESP mounts. The dir cap
 /// must exist in the boot table by now.

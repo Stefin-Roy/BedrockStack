@@ -1,4 +1,4 @@
-//! P6-A — paged domain isolation proof (§8.14).
+//! Paged domain isolation proof (§8.14).
 //!
 //! Boot-time and arch-neutral. Proves the driver domain's own page tables are
 //! structurally disjoint from the boot domain's in the low half, share the
@@ -24,35 +24,35 @@ pub fn run() {
     let drv = driver_domain();
     let dend = driver_endowment();
 
-    let boot_root_phys = boot.page_root().expect("p6: boot domain has no addrspace");
-    let drv_root_phys = drv.page_root().expect("p6: driver domain has no addrspace");
+    let boot_root_phys = boot.page_root().expect("paged: boot domain has no addrspace");
+    let drv_root_phys = drv.page_root().expect("paged: driver domain has no addrspace");
     let boot_vmm = Vmm::from_root(boot_root_phys);
     let mut drv_vmm = Vmm::from_root(drv_root_phys);
 
     // (1) Disjoint low halves.
     assert!(
         CANARY_VA < KERNEL_VMA_BASE,
-        "p6: canary VA must live below the kernel higher half"
+        "paged: canary VA must live below the kernel higher half"
     );
     assert_ne!(
         drv_root_phys,
         boot_root_phys,
-        "p6: boot and driver domains share a root frame"
+        "paged: boot and driver domains share a root frame"
     );
 
     let mut alloc = get_phys_allocator_mut();
-    let canary_phys = alloc.alloc().expect("p6: OOM for canary frame");
+    let canary_phys = alloc.alloc().expect("paged: OOM for canary frame");
     assert_ne!(
         canary_phys,
         CANARY_VA,
-        "p6: canary frame collides with the canary VA (identity-map alias)"
+        "paged: canary frame collides with the canary VA (identity-map alias)"
     );
 
     // The driver root's low half starts empty: the clone carries no low-half
     // mappings, so the canary VA must be unmapped before we touch it.
     assert!(
         drv_vmm.translate(CANARY_VA).is_none(),
-        "p6 FAIL: driver root low half not empty before canary map"
+        "paged FAIL: driver root low half not empty before canary map"
     );
     drv_vmm.map_4k(
         &mut alloc,
@@ -64,14 +64,14 @@ pub fn run() {
     assert_eq!(
         drv_vmm.translate(CANARY_VA),
         Some(canary_phys),
-        "p6 FAIL: driver root cannot translate the mapped canary VA"
+        "paged FAIL: driver root cannot translate the mapped canary VA"
     );
     assert_ne!(
         boot_vmm.translate(CANARY_VA),
         Some(canary_phys),
-        "p6 FAIL: boot root reaches the driver's low-half page by position"
+        "paged FAIL: boot root reaches the driver's low-half page by position"
     );
-    SerialPort::puts("[obj] p6 ok: disjoint low halves va=0x");
+    SerialPort::puts("[obj] paged ok: disjoint low halves va=0x");
     SerialPort::put_hex(CANARY_VA);
     SerialPort::puts(" phys=0x");
     SerialPort::put_hex(canary_phys);
@@ -84,14 +84,14 @@ pub fn run() {
     assert_eq!(
         boot_vmm.translate(alias),
         Some(canary_phys),
-        "p6 FAIL: boot root lost the kernel higher-half alias"
+        "paged FAIL: boot root lost the kernel higher-half alias"
     );
     assert_eq!(
         drv_vmm.translate(alias),
         Some(canary_phys),
-        "p6 FAIL: driver root lost the kernel higher-half alias"
+        "paged FAIL: driver root lost the kernel higher-half alias"
     );
-    SerialPort::puts("[obj] p6 ok: shared kernel half phys=0x");
+    SerialPort::puts("[obj] paged ok: shared kernel half phys=0x");
     SerialPort::put_hex(canary_phys);
     SerialPort::puts(" alias=0x");
     SerialPort::put_hex(alias);
@@ -101,23 +101,23 @@ pub fn run() {
     // the endowed DMA cap (invoke, not just resolve), an unendowed id is
     // refused, and the two domains hold structurally disjoint root frames.
     match invoke(&drv.table, dend.dma, adapters::DMA_CONTRACT, DMA_ALLOC_PAGE, &Args::none()) {
-        Ok(_) => SerialPort::puts("[obj] p6 ok: endowed dma mutates through cap only\n"),
-        Err(e) => panic!("p6 FAIL: endowed dma invoke refused: {:?}", e),
+        Ok(_) => SerialPort::puts("[obj] paged ok: endowed dma mutates through cap only\n"),
+        Err(e) => panic!("paged FAIL: endowed dma invoke refused: {:?}", e),
     }
 
     match drv.table.resolve(CapId(u32::MAX as u64), adapters::DMA_CONTRACT, DMA_ALLOC_PAGE) {
         Err(ObjError::NoSuchCap) => {
-            SerialPort::puts("[obj] p6 ok: unendowed id refused\n")
+            SerialPort::puts("[obj] paged ok: unendowed id refused\n")
         }
-        Ok(_) => panic!("p6 FAIL: unendowed id resolved"),
-        Err(e) => panic!("p6 FAIL: unendowed id -> {:?}", e),
+        Ok(_) => panic!("paged FAIL: unendowed id resolved"),
+        Err(e) => panic!("paged FAIL: unendowed id -> {:?}", e),
     }
 
-    SerialPort::puts("[obj] p6 ok: disjoint root frames boot=0x");
+    SerialPort::puts("[obj] paged ok: disjoint root frames boot=0x");
     SerialPort::put_hex(boot_root_phys);
     SerialPort::puts(" driver=0x");
     SerialPort::put_hex(drv_root_phys);
     SerialPort::puts("\n");
 
-    SerialPort::puts("[obj] p6 separation: OK (paged domain isolation)\n");
+    SerialPort::puts("[obj] paged isolation: OK\n");
 }
