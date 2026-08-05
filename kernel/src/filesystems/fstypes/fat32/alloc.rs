@@ -65,7 +65,10 @@ impl Fat32SuperBlock {
                     continue;
                 }
                 let off = (i * 4) as usize;
-                let val = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+                if off + 4 > buf.len() {
+                    return Err(VfsError::IOError);
+                }
+                let val = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
                 if val & 0x0FFFFFFF == FREE_CLUSTER {
                     count += 1;
                 }

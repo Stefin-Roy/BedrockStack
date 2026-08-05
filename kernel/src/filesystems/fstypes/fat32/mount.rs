@@ -28,6 +28,10 @@ pub struct Fat32SuperBlock {
     pub(crate) next_alloc_hint: Mutex<u32>,
     pub(crate) free_clus_count: AtomicU32,
     pub(crate) volume_dirty: AtomicBool,
+    /// Set when the root directory could not be read at mount (corrupt root
+    /// cluster chain with a valid BPB).  The volume stays mounted but every
+    /// InodeOps path short-circuits to `IOError` instead of walking garbage.
+    pub(crate) degraded: AtomicBool,
 }
 
 impl Fat32SuperBlock {
@@ -128,6 +132,7 @@ impl FileSystem for Fat32FileSystem {
             next_alloc_hint: Mutex::new(2),
             free_clus_count: AtomicU32::new(0),
             volume_dirty: AtomicBool::new(false),
+            degraded: AtomicBool::new(false),
         });
 
         // Mark the volume dirty for the whole session so an unclean shutdown
@@ -174,6 +179,16 @@ impl FileSystem for Fat32FileSystem {
         let root_inode = Arc::new(Inode::new(root_ops.clone()));
         let super_ops = sb.clone() as Arc<dyn SuperOps>;
         let sb_vfs = Arc::new(SuperBlock::new(super_ops, root_inode));
+
+        // A corrupt root directory (valid BPB, garbage root cluster chain)
+        // must not fail the mount — but later lookups would walk garbage.
+        // Mark the volume degraded; every InodeOps path on it short-circuits
+        // to IOError instead.
+        if super::dir::read_dir_slots(&sb, root_clus).is_err() {
+            sb.degraded.store(true, Ordering::Relaxed);
+            log::warn!("FAT32: root directory unreadable; volume mounted degraded");
+        }
+
         Ok((sb_vfs, root_ops))
     }
 }

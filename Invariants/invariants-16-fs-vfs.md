@@ -1,7 +1,7 @@
 # VFS Core — Invariants
 
 **Version:** 0.3.0
-**Source:** `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,drive,path,irq,types,error}.rs`
+**Source:** `kernel/src/filesystems/vfs/{mod,dentry,inode,superblock,file,fdtable,mount,irq,types,error}.rs` (`path.rs` and `drive.rs` are deleted)
 **Status:** Stable
 
 ---
@@ -30,13 +30,18 @@ weak parent reference, mount-point flag, and optional `mount_id`
 pointing to a `DriveMount` covering this dentry.
 - Location: `kernel/src/filesystems/vfs/dentry.rs`
 
-**VFS-013 — Mount point crossing in path resolution:**
-`walk_from()` calls `attempt_mount_cross()` after resolving each path
-component. If the dentry has a non-zero `mount_id`, it looks up the
-corresponding `DriveMount` via `DriveMap::lookup_by_id()` and switches
-to that mount's root dentry, enabling transparent traversal into
-subdirectory-mounted filesystems.
-- Location: `kernel/src/filesystems/vfs/path.rs:41-130`
+**VFS-013 — Mounts are first-class `Arc<DriveMount>` values; a dentry's
+`mount_id` marks the mount covering it:**
+`vfs::mount` and `mount_first_partition` return `Result<Arc<DriveMount>,
+VfsError>` — the mount *is* the returned value, with no drive map naming it.
+A dentry's `mount_id` records the `DriveMount` covering that dentry
+(`dentry.rs::get_mount_id`/`set_mount_id`). The old
+`DriveMap::lookup_by_id()` registry and the `walk_from`/
+`attempt_mount_cross` string-walk that consumed it are deleted — `vfs/path.rs`
+and `vfs/drive.rs` are gone. Mounts are held by a module-private registry
+behind the capability-native mount node (`obj/fs.rs` `MOUNT_REGISTRY`, keyed
+by drive letter) and are reached only through the mount cap.
+- Location: `kernel/src/filesystems/vfs/mod.rs:24-38` (`mount`), `kernel/src/filesystems/partition/mod.rs:127-140` (`mount_first_partition`), `kernel/src/filesystems/vfs/mount.rs` (`DriveMount`), `kernel/src/obj/fs.rs:293-326` (`MountNode`/`MOUNT_REGISTRY`)
 
 **VFS-004 — Dcache is initialized exactly once via `spin::Once`:**
 The dentry cache (`Dcache`) maps `(parent_ino, name) → Weak<Dentry>`.
@@ -45,10 +50,15 @@ Used for quick path component lookup.
 
 ### Drive Map
 
-**VFS-005 — Drive letters `A:` through `Z:`:**
+**VFS-005 — Drive letters `A:` through `Z:` (ambient map deleted):**
 Each letter maps to an `Arc<DriveMount>` containing root dentry,
-superblock, and optional block device. Protected by `IrqMutex`.
-- Location: `kernel/src/filesystems/vfs/drive.rs`
+superblock, and optional block device. The ambient `DriveMap` type and the
+`DRIVE_MAP` global that lived in `kernel/src/filesystems/vfs/drive.rs` are
+deleted; the same mapping now lives as a module-private registry behind the
+capability-native mount node (`obj/fs.rs` `MOUNT_REGISTRY`, per-letter
+`IrqMutex<Option<Arc<DriveMount>>>`) and is touched only through the mount
+cap.
+- Location: `kernel/src/obj/fs.rs:293-326` (`MOUNT_REGISTRY`/`drive_slot`/`mount_into`); `kernel/src/filesystems/vfs/drive.rs` is deleted
 
 ### File Descriptors
 
@@ -164,8 +174,10 @@ superblock's `shutdown()` before dropping the drive.
 ## Design Notes
 
 - VFS supports `tmpfs` (always) and `fat32` (x86_64, via the ESP/block device).
-  The ESP is mounted on `B>` during `Kernel::run()` via
-  `partition::mount_first_partition(dev, "fat32", 'B')` (see
+  The mounts are performed capability-native in `Kernel::run()`: tmpfs via the
+  mount cap (`fs:mount` on `A>`), and the ESP on `B>` via the block-family
+  + `fs:mount` caps, whose `MountNode::dispatch` invokes
+  `partition::mount_first_partition(device, fstype, 'B')` (see
   `invariants-19-fs-partition.md`).
 - `/dev` is not populated; no device special file type exists. Console
   I/O goes through `SerialPort` directly, not through VFS.

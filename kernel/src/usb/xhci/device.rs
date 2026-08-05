@@ -118,7 +118,8 @@ fn wait_for_transfer_timeout(slot_id: u8, ep_id: u8, timeout_ns: u64) -> Result<
     if !completed {
         return Err("transfer timeout");
     }
-    let (_sid, _eid, cc, _remaining) = event::last_transfer_completion().unwrap();
+    let (_sid, _eid, cc, _remaining) = event::last_transfer_completion()
+        .ok_or("transfer completion lost")?;
     if cc == 1 || cc == 13 {
         Ok(cc)
     } else {

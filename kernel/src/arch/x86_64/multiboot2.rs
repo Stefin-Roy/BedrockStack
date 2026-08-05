@@ -15,8 +15,17 @@ const MAX_REGIONS: usize = 64;
 // page tables afterwards.  ACPI parses `rsdp_data` only after the switch, so
 // the bytes must be copied into a kernel-resident ('static) buffer here.
 const RSDP_BUF_SIZE: usize = 512; // RSDP v2 is ~44 bytes; 512 is ample.
-static mut RSDP_BUF: [u8; RSDP_BUF_SIZE] = [0u8; RSDP_BUF_SIZE];
-static mut RSDP_LEN: usize = 0;
+
+/// Shared wrapper so the RSDP stash links without a `static mut`.
+/// Written once (single-threaded BSP, pre-SMP) and read-only afterwards.
+struct Shared<T>(core::cell::UnsafeCell<T>);
+
+unsafe impl<T> Sync for Shared<T> {}
+unsafe impl<T> Send for Shared<T> {}
+
+static RSDP_BUF: Shared<[u8; RSDP_BUF_SIZE]> =
+    Shared(core::cell::UnsafeCell::new([0u8; RSDP_BUF_SIZE]));
+static RSDP_LEN: Shared<usize> = Shared(core::cell::UnsafeCell::new(0));
 
 /// Copy `data` into the static RSDP stash and return it as `'static`.
 ///
@@ -29,14 +38,11 @@ unsafe fn stash_rsdp(data: &[u8]) -> &'static [u8] {
         "RSDP too large for stash ({})",
         data.len()
     );
+    let buf = RSDP_BUF.0.get();
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            data.as_ptr(),
-            core::ptr::addr_of_mut!(RSDP_BUF) as *mut u8,
-            data.len(),
-        );
-        RSDP_LEN = data.len();
-        core::slice::from_raw_parts(core::ptr::addr_of!(RSDP_BUF) as *const u8, RSDP_LEN)
+        core::ptr::copy_nonoverlapping(data.as_ptr(), buf as *mut u8, data.len());
+        *RSDP_LEN.0.get() = data.len();
+        core::slice::from_raw_parts(buf as *const u8, *RSDP_LEN.0.get())
     }
 }
 

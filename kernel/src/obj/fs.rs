@@ -27,6 +27,9 @@ use super::surface::{SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoRequest};
 use crate::filesystems::vfs::dentry::{Dentry, dcache};
+use crate::filesystems::vfs::error::VfsError;
+use crate::filesystems::vfs::irq::IrqMutex;
+use crate::filesystems::vfs::mount::DriveMount;
 use crate::filesystems::vfs::types::FileType;
 
 const BLOCK_FAMILY_OBJ_ID: ObjId = ObjId(0x10_0003);
@@ -179,9 +182,12 @@ pub struct BlockFamilyNode;
 pub const BLOCK_FAMILY_CONTRACT: ContractId =
     ContractId::of("block:family", &BLOCK_FAMILY_SURFACE, &BLOCK_FAMILY_HOOKS);
 pub const BLOCK_FAMILY_FIRST: HookId = HookId::of("first");
+pub const BLOCK_FAMILY_REGISTER: HookId = HookId::of("register");
 
 pub const BLOCK_FAMILY_DOC: &str = "if you first(), you get a capability to \
-the first registered block device as a block:storage node.";
+the first registered block device as a block:storage node. register(\
+block_cap_id) resolves the given block:storage capability and pushes its \
+device into the family interior (bring-up registration path).";
 
 const BLOCK_FAMILY_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "block:family",
@@ -189,11 +195,18 @@ const BLOCK_FAMILY_SURFACE: SurfaceDesc = SurfaceDesc {
     events: &[],
 };
 
-const BLOCK_FAMILY_HOOKS: &[HookSignature] = &[HookSignature {
-    name: "first",
-    params: &[],
-    reply: ReplyTag::Caps,
-}];
+const BLOCK_FAMILY_HOOKS: &[HookSignature] = &[
+    HookSignature {
+        name: "first",
+        params: &[],
+        reply: ReplyTag::Caps,
+    },
+    HookSignature {
+        name: "register",
+        params: &[TypeTag::U64],
+        reply: ReplyTag::None,
+    },
+];
 
 static BLOCK_FAMILY_CONTRACTS: &[ContractId] = &[BLOCK_FAMILY_CONTRACT];
 
@@ -217,18 +230,36 @@ impl Obj for BlockFamilyNode {
     fn hook_contract_right(&self, contract: ContractId, hook: HookId) -> ContractRights {
         let _ = contract;
         match hook {
-            BLOCK_FAMILY_FIRST => ContractRights::CALL,
+            BLOCK_FAMILY_FIRST | BLOCK_FAMILY_REGISTER => ContractRights::CALL,
             _ => ContractRights::CALL,
         }
     }
 
     fn dispatch(
         &self,
-        _caller: &super::table::CapabilityTable,
+        caller: &super::table::CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        _args: &Args,
+        args: &Args,
     ) -> Result<Reply, ObjError> {
+        if hook == BLOCK_FAMILY_REGISTER {
+            // Bring-up registration: the caller passes the id of a
+            // `block:storage` cap it inserted into its own table; resolve it
+            // and push the device into the family interior (§7.11.4).
+            let id = match args.vals.first() {
+                Some(Value::U64(id)) => *id,
+                _ => return Err(ObjError::Denied),
+            };
+            let dev_node = caller.get(CapId(id))?;
+            let block = dev_node
+                .as_any()
+                .and_then(|a| a.downcast_ref::<BlockNode>())
+                .ok_or(ObjError::Denied)?;
+            crate::filesystems::blockdriver::driver::BLOCK_DEVICES
+                .lock()
+                .push(block.device());
+            return Ok(Reply::None);
+        }
         if hook == BLOCK_FAMILY_FIRST {
             let dev = crate::filesystems::blockdriver::driver::BLOCK_DEVICES
                 .lock()
@@ -260,6 +291,39 @@ pub fn block_family_node() -> Arc<dyn Obj> {
 }
 
 // ── MountNode ──────────────────────────────────────────────────────────
+
+// The capability layer owns mount roots. This module-private registry, keyed
+// by drive letter, keeps each mounted DriveMount alive and makes re-entry
+// idempotent (a second mount cap for the same letter reuses the existing
+// superblock instead of building a new one).
+static MOUNT_REGISTRY: [IrqMutex<Option<Arc<DriveMount>>>; 26] = {
+    const EMPTY: IrqMutex<Option<Arc<DriveMount>>> = IrqMutex::new(None);
+    [EMPTY; 26]
+};
+
+fn drive_slot(letter: char) -> Option<&'static IrqMutex<Option<Arc<DriveMount>>>> {
+    let idx = (letter.to_ascii_uppercase() as usize).wrapping_sub('A' as usize);
+    MOUNT_REGISTRY.get(idx)
+}
+
+/// Mount into the per-drive slot, reusing an existing mount if one is present.
+fn mount_into(
+    letter: char,
+    mounter: impl FnOnce() -> Result<Arc<DriveMount>, VfsError>,
+) -> Result<Arc<DriveMount>, ObjError> {
+    let slot = drive_slot(letter).ok_or(ObjError::Denied)?;
+    if let Some(existing) = slot.lock().as_ref() {
+        return Ok(existing.clone());
+    }
+    let mount = mounter().map_err(|_| ObjError::Denied)?;
+    let mut slot = slot.lock();
+    if let Some(existing) = slot.as_ref() {
+        Ok(existing.clone())
+    } else {
+        *slot = Some(mount.clone());
+        Ok(mount)
+    }
+}
 
 /// The mount root: `mount(fstype, block_cap_id)` mounts the first partition
 /// of the given block capability and returns a `DirNode` for the drive root.
@@ -329,17 +393,8 @@ impl Obj for MountNode {
             };
             // Handle tmpfs without a block device cap (CapabilityVfs step 3, §7.11)
             if fstype == "tmpfs" && id == 0 {
-                // Check if drive A: is already mounted (vfs::init may have
-                // done the ambient mount). Only mount if not already present.
-                if crate::filesystems::vfs::DRIVE_MAP.lookup('A').is_err() {
-                    crate::filesystems::vfs::mount("tmpfs", None, 'A')
-                        .map_err(|_| ObjError::Denied)?;
-                }
-                let root = crate::filesystems::vfs::DRIVE_MAP
-                    .lookup('A')
-                    .map_err(|_| ObjError::Denied)?
-                    .root.clone();
-                let node: Arc<dyn Obj> = Arc::new(DirNode::new(root));
+                let mount = mount_into('A', || crate::filesystems::vfs::mount("tmpfs", None, 'A'))?;
+                let node: Arc<dyn Obj> = Arc::new(DirNode::new(mount.root.clone()));
                 let child_rights = rights
                     .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
                     .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
@@ -359,13 +414,10 @@ impl Obj for MountNode {
                 .and_then(|a| a.downcast_ref::<BlockNode>())
                 .ok_or(ObjError::Denied)?;
             let device = block.device();
-            crate::filesystems::partition::mount_first_partition(device, fstype, 'B')
-                .map_err(|_| ObjError::Denied)?;
-            let root = crate::filesystems::vfs::DRIVE_MAP
-                .lookup('B')
-                .map_err(|_| ObjError::Denied)?
-                .root.clone();
-            let node = Arc::new(DirNode::new(root));
+            let mount = mount_into('B', || {
+                crate::filesystems::partition::mount_first_partition(device, fstype, 'B')
+            })?;
+            let node = Arc::new(DirNode::new(mount.root.clone()));
             let rights = rights
                 .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
                 .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));

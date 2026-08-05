@@ -14,10 +14,12 @@ pub const MIE_SSIE: u64 = 1 << 1;
 pub const MIE_STIE: u64 = 1 << 5;
 pub const MIE_SEIE: u64 = 1 << 9;
 
-/// Interval between timer ticks, in `time` CSR units.
+/// Boot-time fallback interval between timer ticks, in `time` CSR units.
 ///
-/// QEMU riscv-virt typically provides a 10 MHz timebase, so 100,000
-/// ticks ≈ 10 ms → 100 Hz (matching the x86_64 APIC timer rate).
+/// Used only while the universal timer is not yet initialised (very early
+/// boot).  QEMU riscv-virt typically provides a 10 MHz timebase, so 100,000
+/// ticks ≈ 10 ms → 100 Hz.  Once the universal timer is ready, the SBI
+/// clockevent reprograms the timer from the DTB-derived timebase instead.
 const TICK_INTERVAL: u64 = 100_000;
 
 core::arch::global_asm!(
@@ -115,7 +117,15 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
         let interrupt = scause & !SCAUSE_INTERRUPT;
         match interrupt {
             SUPV_TIMER => {
-                sbi::set_timer(time::read_time() + TICK_INTERVAL);
+                if crate::services::universal_timer::is_ready() {
+                    // Process expired timers; this reprograms the clockevent
+                    // (and hence the SBI timer) for the next deadline.
+                    crate::services::universal_timer::universal_timer_impl().tick();
+                } else {
+                    // Very early boot — universal timer not ready yet.
+                    // Keep the legacy periodic re-arm for timer interrupts.
+                    sbi::set_timer(time::read_time() + TICK_INTERVAL);
+                }
             }
             SUPV_EXTERNAL => {
                 let irq = plic::claim();

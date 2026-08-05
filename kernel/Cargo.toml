@@ -11,6 +11,7 @@ usb_trace = []
 dma_trace = []
 kernelmb2 = []
 selftest = []
+lockdep = []
 
 [dependencies]
 spin = "0.9"

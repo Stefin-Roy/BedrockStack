@@ -12,17 +12,21 @@ pub trait SerialConsole: Send + Sync {
 pub struct KernelSerial;
 
 impl SerialConsole for KernelSerial {
+    // This is the serial node's implementation — the ONE place raw port I/O
+    // happens, reached only via the serial capability.  It must call the raw
+    // primitives, never the public cap-routing `SerialPort` wrappers, or the
+    // cap dispatch would recurse on itself.
     fn putc(&self, c: u8) {
-        crate::drivers::serial::SerialPort::putc(c);
+        crate::drivers::serial::raw_putc(c);
     }
     fn puts(&self, s: &str) {
-        crate::drivers::serial::SerialPort::puts(s);
+        crate::drivers::serial::raw_puts(s);
     }
     fn put_hex(&self, val: u64) {
-        crate::drivers::serial::SerialPort::put_hex(val);
+        crate::drivers::serial::raw_put_hex(val);
     }
     fn put_u64(&self, val: u64) {
-        crate::drivers::serial::SerialPort::put_u64(val);
+        crate::drivers::serial::raw_put_u64(val);
     }
 }
 

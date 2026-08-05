@@ -19,20 +19,43 @@ pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 /// Size of the dedicated double-fault stack (20 KB).
 const DF_STACK_SIZE: usize = 4096 * 5;
 
+/// Shared storage wrapper so the per-CPU GDT/TSS/DF tables link without a
+/// `static mut`.  Each CPU only ever touches its own slot (indexed by its
+/// `cpu_id`), so concurrent access is to disjoint slots.
+struct Shared<T>(core::cell::UnsafeCell<T>);
+
+unsafe impl<T> Sync for Shared<T> {}
+unsafe impl<T> Send for Shared<T> {}
+
 /// Per-CPU double-fault stacks.  Each CPU's TSS.IST[0] points into its own
 /// slot so that a simultaneous double fault on two CPUs does not corrupt
 /// either stack.
-static mut DF_STACKS: [[u8; DF_STACK_SIZE]; MAX_CPUS] = [[0; DF_STACK_SIZE]; MAX_CPUS];
+static DF_STACKS: Shared<[[u8; DF_STACK_SIZE]; MAX_CPUS]> =
+    Shared(core::cell::UnsafeCell::new([[0; DF_STACK_SIZE]; MAX_CPUS]));
 
 /// Per-CPU TSS objects (each CPU gets its own IST stack).
 ///
 /// These must live forever because the GDT descriptor encodes their address.
-static mut CPU_TSS: [MaybeUninit<TaskStateSegment>; MAX_CPUS] = [MaybeUninit::uninit(); MAX_CPUS];
+static CPU_TSS: Shared<[MaybeUninit<TaskStateSegment>; MAX_CPUS]> =
+    Shared(core::cell::UnsafeCell::new([MaybeUninit::uninit(); MAX_CPUS]));
 
 /// Per-CPU GDT objects (contains a per-CPU TSS entry).
 ///
 /// The GDT heap-buffer stays alive because the struct is stored here.
-static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] = [const { MaybeUninit::uninit() }; MAX_CPUS];
+static CPU_GDT: Shared<[MaybeUninit<GlobalDescriptorTable>; MAX_CPUS]> =
+    Shared(core::cell::UnsafeCell::new([const { MaybeUninit::uninit() }; MAX_CPUS]));
+
+fn df_stacks() -> &'static mut [[u8; DF_STACK_SIZE]; MAX_CPUS] {
+    unsafe { &mut *DF_STACKS.0.get() }
+}
+
+fn cpu_tss() -> &'static mut [MaybeUninit<TaskStateSegment>; MAX_CPUS] {
+    unsafe { &mut *CPU_TSS.0.get() }
+}
+
+fn cpu_gdt() -> &'static mut [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] {
+    unsafe { &mut *CPU_GDT.0.get() }
+}
 
 /// Return the kernel GDT pointer (base + limit) for AP trampoline use.
 ///
@@ -53,7 +76,7 @@ pub fn init() {
 
     // ── build per-CPU TSS ───────────────────────────────────────────
     let stack_end = {
-        let df_stack = unsafe { &DF_STACKS[cpu_id] };
+        let df_stack = &df_stacks()[cpu_id];
         VirtAddr::from_ptr(df_stack.as_ptr()) + DF_STACK_SIZE as u64
     };
 
@@ -61,8 +84,8 @@ pub fn init() {
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
 
     // Store TSS at a stable address *before* creating the GDT descriptor.
-    unsafe { CPU_TSS[cpu_id].write(tss); }
-    let tss_ref = unsafe { &*CPU_TSS[cpu_id].as_ptr() };
+    cpu_tss()[cpu_id].write(tss);
+    let tss_ref = unsafe { &*cpu_tss()[cpu_id].as_ptr() };
 
     // ── build per-CPU GDT ───────────────────────────────────────────
     let mut gdt = GlobalDescriptorTable::new();
@@ -71,10 +94,10 @@ pub fn init() {
     let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
 
     unsafe {
-        CPU_GDT[cpu_id].write(gdt);
+        cpu_gdt()[cpu_id].write(gdt);
 
         // Load the GDT, segments, and task register for this CPU.
-        let gdt_ref = &*CPU_GDT[cpu_id].as_ptr();
+        let gdt_ref = &*cpu_gdt()[cpu_id].as_ptr();
         gdt_ref.load();
         CS::set_reg(code_sel);
         DS::set_reg(data_sel);

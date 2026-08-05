@@ -6,10 +6,10 @@ pub struct X86Interrupts;
 
 impl InterruptManager for X86Interrupts {
     fn register_handler(&self, vector: u8, handler: fn()) {
-        let idx = (vector - crate::arch::x86_64::idt::DEVICE_VECTOR_BASE) as usize;
-        if idx < crate::arch::x86_64::idt::NUM_DEVICE_VECTORS {
-            crate::arch::x86_64::idt::register_device_handler_at(vector, handler);
-        }
+        // register_device_handler_at bounds-checks the vector range itself, so
+        // out-of-range vectors are dropped instead of panicking on the index
+        // subtraction below DEVICE_VECTOR_BASE.
+        crate::arch::x86_64::idt::register_device_handler_at(vector, handler);
     }
 
     fn unregister_handler(&self, vector: u8) {

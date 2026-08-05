@@ -15,18 +15,27 @@ use super::mount::Fat32SuperBlock;
 use super::fat::EOC_MARKER;
 
 pub(super) fn read_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &mut [u8]) -> Result<(), VfsError> {
+    // Reject out-of-range cluster numbers BEFORE mapping to an LBA: the old
+    // saturating_sub in cluster_to_lba silently mapped garbage clusters onto
+    // valid-but-wrong sectors of the disk (the real "bad disk" hazard).
+    if cluster < 2 || cluster >= sb.bpb.total_clus + 2 {
+        return Err(VfsError::IOError);
+    }
     let lba = sb.bpb.cluster_to_lba(cluster);
     fat_trace!({
-        crate::drivers::serial::dump_puts("[DBG:fat32] read_cluster clus=0x");
-        crate::drivers::serial::dump_put_hex(cluster as u64);
-        crate::drivers::serial::dump_puts(" lba=0x");
-        crate::drivers::serial::dump_put_hex(lba);
-        crate::drivers::serial::dump_puts("\n");
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] read_cluster clus=0x");
+        crate::drivers::serial::SerialPort::put_hex(cluster as u64);
+        crate::drivers::serial::SerialPort::puts(" lba=0x");
+        crate::drivers::serial::SerialPort::put_hex(lba);
+        crate::drivers::serial::SerialPort::puts("\n");
     });
     read_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }
 
 pub(super) fn write_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &[u8]) -> Result<(), VfsError> {
+    if cluster < 2 || cluster >= sb.bpb.total_clus + 2 {
+        return Err(VfsError::IOError);
+    }
     let lba = sb.bpb.cluster_to_lba(cluster);
     write_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }

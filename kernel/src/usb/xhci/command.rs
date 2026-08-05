@@ -14,7 +14,11 @@ pub fn ring_command_doorbell(doorbell_va: u64) {
 
 /// Wait for a command completion event with a 5 s timeout.
 /// Returns `(slot_id, completion_code)` on success.
-fn wait_for_completion() -> Result<(u8, u8), &'static str> {
+///
+/// `expected_slot` is the slot the command was issued for; pass `0` when the
+/// completion carries the slot assignment itself (Enable Slot).  A completion
+/// for a different slot is a stale/foreign event and is never trusted.
+fn wait_for_completion(expected_slot: u8) -> Result<(u8, u8), &'static str> {
     use crate::services::universal_timer::{now_ns, wait_until_cond};
     let deadline = now_ns() + 5_000_000_000;
     let completed = wait_until_cond(deadline, &|| {
@@ -25,7 +29,21 @@ fn wait_for_completion() -> Result<(u8, u8), &'static str> {
         SerialPort::puts("[xhci] CMD TIMEOUT\n");
         return Err("command completion timeout");
     }
-    let (slot_id, cc, _param) = super::event::last_command_completion().unwrap();
+    let (slot_id, cc, _param) = match super::event::last_command_completion() {
+        Some(c) => c,
+        None => {
+            SerialPort::puts("[xhci] CMD completion lost\n");
+            return Err("command completion lost");
+        }
+    };
+    if expected_slot != 0 && slot_id != expected_slot {
+        SerialPort::puts("[xhci] CMD stale completion slot=");
+        SerialPort::put_u64(slot_id as u64);
+        SerialPort::puts(" expected=");
+        SerialPort::put_u64(expected_slot as u64);
+        SerialPort::puts("\n");
+        return Err("stale completion");
+    }
     if cc == 1 {
         Ok((slot_id, cc))
     } else {
@@ -46,7 +64,7 @@ pub fn submit_enable_slot(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    let (slot_id, _cc) = wait_for_completion()?;
+    let (slot_id, _cc) = wait_for_completion(0)?;
     Ok(slot_id)
 }
 
@@ -61,7 +79,7 @@ pub fn submit_address_device(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    wait_for_completion()?;
+    wait_for_completion(slot_id)?;
     Ok(())
 }
 
@@ -76,7 +94,7 @@ pub fn submit_configure_endpoint(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    wait_for_completion()?;
+    wait_for_completion(slot_id)?;
     Ok(())
 }
 
@@ -90,7 +108,7 @@ pub fn submit_evaluate_context(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    wait_for_completion()?;
+    wait_for_completion(slot_id)?;
     Ok(())
 }
 
@@ -103,6 +121,6 @@ pub fn submit_disable_slot(
     cmd_ring.enqueue(&trb);
     cmd_ring.flush();
     ring_command_doorbell(doorbell_va);
-    wait_for_completion()?;
+    wait_for_completion(slot_id)?;
     Ok(())
 }

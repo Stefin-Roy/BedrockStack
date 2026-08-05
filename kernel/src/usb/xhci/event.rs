@@ -233,7 +233,17 @@ pub fn consume_pending_events() {
         return;
     }
     let er_trb_count = XHCI_ER_SIZE.load(Ordering::Relaxed);
+    if er_trb_count == 0 {
+        // No event ring configured; nothing to consume and the modulo below
+        // would divide by zero.
+        return;
+    }
     let mut dequeue = XHCI_ER_DEQUEUE.load(Ordering::Relaxed);
+    if (dequeue as u32) >= er_trb_count {
+        // Malformed/foreign dequeue index — clamp back to ring start rather
+        // than reading TRBs outside the event ring.
+        dequeue = 0;
+    }
     let mut expected_cycle = XHCI_ER_CYCLE.load(Ordering::Relaxed);
 
     for _ in 0..er_trb_count {
@@ -274,7 +284,11 @@ pub fn consume_pending_events() {
                     SerialPort::put_u64((control & 1) as u64);
                     SerialPort::puts("\n");
                 });
-                port_events_push(port_id as u8);
+                // Port ids are 1-based; a zero id is a malformed event and
+                // must not be pushed (the push itself is bounds-safe).
+                if port_id != 0 {
+                    port_events_push(port_id as u8);
+                }
             }
             32 => {
                 let status = unsafe { core::ptr::read_volatile((trb_va + 8) as *const u32) };
@@ -293,7 +307,10 @@ pub fn consume_pending_events() {
                     SerialPort::put_u64(remaining as u64);
                     SerialPort::puts("\n");
                 });
-                if route_to_interrupt_target(slot_id, ep_id, cc, remaining) {
+                // Slot ids are 1-based; 0 is never a valid target for the
+                // interrupt-IN routing table (ep_id is already masked to
+                // 0..31 by the control word extraction).
+                if slot_id != 0 && route_to_interrupt_target(slot_id, ep_id, cc, remaining) {
                     // Consumed by an interrupt-IN target; leave
                     // LAST_TRANSFER_STATE untouched so wait_for_transfer
                     // never observes a foreign completion.

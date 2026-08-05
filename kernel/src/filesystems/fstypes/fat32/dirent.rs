@@ -171,13 +171,31 @@ pub fn needs_vfat(name: &str) -> bool {
 
 pub fn decode_vfat_name(entries: &[[u8; DIR_ENTRY_SIZE]]) -> String {
     let mut utf16_buf: Vec<u16> = Vec::new();
-    for entry in entries.iter().rev() {
-        if entry[0] == DIR_DELETED || entry[0] & 0x1F == 0 { continue; }
+    // A 255-char LFN needs at most 20 LFN entries (13 chars each).  A
+    // malicious directory can present an arbitrarily long chain of
+    // long-name slots, so cap the input before decoding.
+    let chain = entries.iter().take(20);
+    // LFN sequence ordinals must count down to 1.  Entries with ordinal 0
+    // (or deleted slots) are skipped; if a later entry's ordinal does not
+    // match the expected countdown the chain is malformed — bail out
+    // rather than decode garbage into a filename.
+    let mut expected_ord = 0u8;
+    for entry in chain.rev() {
+        if entry[0] == DIR_DELETED || entry[0] & 0x1F == 0 {
+            continue;
+        }
+        let ord = entry[0] & 0x1F;
+        if expected_ord != 0 && ord != expected_ord {
+            utf16_buf.clear();
+            break;
+        }
+        expected_ord = ord.wrapping_sub(1);
         for j in 0..13 {
             let c = get_vfat_char(entry, j);
             if c == 0 || c == 0xFFFF { break; }
             utf16_buf.push(c);
         }
+        if utf16_buf.len() >= 255 { break; }
     }
     String::from_utf16_lossy(&utf16_buf)
 }

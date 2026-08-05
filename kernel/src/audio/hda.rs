@@ -833,11 +833,10 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
 /// advertises MSI by default, so the MSI path is the normal one.
 #[cfg(target_arch = "x86_64")]
 fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32) {
-    use crate::arch::x86_64::idt;
     use crate::pci::caps;
     use crate::drivers::serial::SerialPort;
 
-    let Some(vector) = idt::register_device_handler(hda_irq_handler) else {
+    let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, hda_irq_handler) else {
         SerialPort::puts("[audio] hda: no device vector free, polling BCIS\n");
         return;
     };
@@ -861,13 +860,13 @@ fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32) {
         )
         .is_none()
         {
-            idt::unregister_device_handler(vector);
+            let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
             SerialPort::puts("[audio] hda: INTx route failed, polling BCIS\n");
             return;
         }
         SerialPort::puts("[audio] hda: INTx enabled\n");
     } else {
-        idt::unregister_device_handler(vector);
+        let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
         SerialPort::puts("[audio] hda: no interrupt source, polling BCIS\n");
         return;
     }

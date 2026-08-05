@@ -23,6 +23,23 @@ impl Riscv64 {
         );
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: PLIC\n");
         plic::init();
+        // Initialise the universal timer as early as possible — before
+        // interrupts are enabled.  The timebase comes from the DTB, falling
+        // back to the 10 MHz QEMU riscv-virt default.
+        if let Some(dtb) = crate::platform::riscv_virt::get_dtb_ptr() {
+            let hz = crate::dtb::timebase_hz(dtb);
+            if hz != 0 {
+                crate::services::riscv64::riscv_timebase::set_timebase_hz(hz);
+            } else {
+                crate::drivers::serial::SerialPort::puts(
+                    "[arch] riscv64: DTB timebase absent — using 10 MHz fallback\n",
+                );
+            }
+        }
+        crate::services::universal_timer::early_init(
+            &crate::services::riscv64::riscv_timebase::RiscvTimebaseClocksource,
+            &crate::services::riscv64::riscv_timebase::RiscvSbiClockevent,
+        );
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: enabling supervisor interrupts\n");
         unsafe {
             asm!("csrw sie, {}", in(reg) trap::MIE_SEIE | trap::MIE_SSIE | trap::MIE_STIE);

@@ -813,19 +813,19 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: DmaClient) -> Result<Vec<Ar
 
     // Register IRQ once per controller (all ports share the same INTX# line).
     if !port_numbers.is_empty() && dev.interrupt_line != 0 {
-        if let Some(vector) = crate::arch::x86_64::idt::register_device_handler(handle_ahci_irq) {
-            if crate::platform::x86_64_pc::ioapic::enable_irq(
-                dev.interrupt_line as u32,
-                crate::acpi::Polarity::ActiveLow,
-                crate::acpi::TriggerMode::Level,
-            ).is_some() {
-                for &p in &port_numbers {
-                    mmio.pw32(p, port_off::IE, 0x0000_0089);
-                }
-            } else {
-                crate::arch::x86_64::idt::unregister_device_handler(vector);
+    if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, handle_ahci_irq) {
+        if crate::platform::x86_64_pc::ioapic::enable_irq(
+            dev.interrupt_line as u32,
+            crate::acpi::Polarity::ActiveLow,
+            crate::acpi::TriggerMode::Level,
+        ).is_some() {
+            for &p in &port_numbers {
+                mmio.pw32(p, port_off::IE, 0x0000_0089);
             }
+        } else {
+            let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
         }
+    }
     }
 
     Ok(ports)

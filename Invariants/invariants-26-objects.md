@@ -2,7 +2,7 @@
 
 **Version:** 0.5.0
 **Date:** 2026-08-05
-**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation,paged_isolation,nodes,memregion,devices,fs,adapters}.rs`
+**Source:** `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,nodes,memregion,devices,fs,adapters}.rs`
 **Status:** Active (P6-B, capability-system upgrade complete)
 
 > **Note:** This subsystem implements the RootGraph object-graph / capability
@@ -21,7 +21,9 @@
 > maps through the caller's endowed `physmem`/`addrspace` capabilities (§2.7
 > graph composition). The bootstrap seed window (§5.7) still aborts on OOM;
 > every post-bootstrap node hook returns `ObjError::OutOfMemory`. Deny-list
-> (revocable) nodes are implemented (§3.7.3, R9; `obj/revocation.rs`).
+> (revocable) nodes are implemented (§3.7.3, R9): the per-object deny set,
+> `revoke_deny`, `is_denied`, and `seal_cascade` live in `obj/store.rs`, and
+> `obj/table.rs::resolve_with_rights` probes the deny set on the PERMIT slope.
 >
 > P3 refinements in 0.3.0:
 > - `free()` is real, not a stub: the provider `free(region)` hooks take the
@@ -36,7 +38,11 @@
 >   to a vector by passing a kernel-materialized `irq:handler` node
 >   (`IrqHandlerNode`, implements `Obj::as_handler`), never a caller-supplied
 >   scalar `fn()` address. The old `handler_from_addr` transmute is gone.
->   (`obj/nodes.rs::resolve_handler`, `obj/mod.rs::Obj::as_handler`.)
+>   (`obj/nodes.rs::resolve_handler`, `obj/mod.rs::Obj::as_handler`.) All live
+>   drivers bind through `IrqClient` on the driver domain's irq cap — ps2,
+>   ahci, hda, and xhci call `IrqClient::driver_irq().register(...)`, which
+>   invokes the materialized `irq:handler` node; `IRQ_REGISTER` replies
+>   `Reply::Data([U64(vector)])` (`obj/clients.rs::IrqClient::driver_irq`).
 > - The framebuffer shadow buffer is allocated through the Boot domain's
 >   Heap family-root capability instead of a raw kernel-heap call; the
 >   `mem:region` cap's base is used as the shadow VA, with a plain-heap
@@ -52,9 +58,10 @@
 > `AudioFamilyNode` (audio:family). The ambient string VFS layer
 > (resolve_path, CWD, FD_TABLE, string fd API, path.rs) is deleted; all VFS
 > access is now capability-native. The `kerneldump fs-walk` diagnostic
-> exercises the capability path; the restricted-domain readdir projection
-> proof asserts that a QUERY-only dir cap sees a strict subset and a domain
-> with no dir cap sees nothing.
+> exercises the capability path; the restricted-domain readdir projection —
+> a QUERY-only dir cap sees a strict subset and a domain with no dir cap sees
+> nothing — is enforced by the gate in `obj/table.rs` (the runtime assertion
+> of it was part of the deleted `separation.rs` module).
 >
 > P6-A (0.4.1) — paged domain isolation (§8.14 structural). A non-kernel
 > domain no longer shares the boot CR3: it owns its own address space — a
@@ -72,12 +79,12 @@
 > *after* the clone, and a per-domain rebuild would leave the driver pointing
 > at empty private subtrees (ECAM config reads would fault). The parent root
 > outlives every clone, so the shared-subtree lifetime is bounded by the
-> kernel itself — there is no per-domain teardown hazard. `obj/paged_isolation.rs`
-> runs before SMP and proves: disjoint root frames; an empty driver low half
-> that a canary fills but the boot root cannot reach by position; both roots
-> translate the kernel-half alias of a heap frame identically; and table
-> mutation flows only through the capability API (endowed id Ok, unendowed id
-> refused).
+> kernel itself — there is no per-domain teardown hazard. The mechanism is
+> implemented in `obj/domain.rs` (`with_addrspace`, `set_kernel_addrspace`,
+> `set_current_domain`) and `mm/vmm` (`clone_high_half`,
+> `prepopulate_window`). No boot-time proof runs — the boot-time
+> paged-isolation self-test module (`obj/paged_isolation.rs`) was removed in
+> commit 6adbc4e; the isolation is structural, not boot-verified.
 >
 > P6-B (0.5.0) — the capability system is complete and real end to end.
 > `StubNode` and the old `mint()` helper are deleted; `mint_node` takes
@@ -101,10 +108,12 @@
 > (live, committed, chunk_count)`, `smp::started_count()`. The PCI device
 > contract is real (`devices.rs` `pci:device` over `ecam_static()`/`PciConfigSpace`),
 > and fs nodes carry `hook_contract_right` and `Rights::INVOKE.or(Rights::TRAVERSE)`
-> attunement at every materialization site. `obj/separation.rs` (C6) now also
-> proves QUERY surface reads, per-hook contract-right negatives, `addrspace:root`,
-> `mem:region` registry membership, and capability-mediated delegation (positive
-> boot→driver via the table cap, negative unknown-domain → `NoSuchCap`).
+> attunement at every materialization site. The dedicated separation/verification
+> module (`obj/separation.rs`) that proved QUERY surface reads, per-hook
+> contract-right negatives, `addrspace:root`/`mem:region` registry membership,
+> and capability-mediated delegation was removed in commit 6adbc4e; the
+> underlying mechanism (resolve_with_rights, hook_contract_right, delegate,
+> surface_value) is implemented and live.
 
 ---
 
@@ -112,14 +121,25 @@
 
 **I1 (no ambient authority) — Every access to a protected resource is the
 result of `R6` on a `Live` capability:**
-There is no code path that reaches a node except through a domain table.
+The *domain-facing service surface* is the protected-resource set: the serial
+console, IRQ binding, block devices, PCI devices, mounts/filesystems, DMA,
+PCI config space, memory/address space, and the registries that name them.
+There is no code path that reaches the surface except through a domain table.
 The single dispatch entry point is `invoke`, which PERMITs via `resolve`
 before any hook body runs; `resolve` applies the whole slope (slot fetch →
 Live → `INVOKE` → contract membership → per-hook contract right) and only a
 `Live` handle passing every check yields the node's `Arc`. The raw, PERMIT-less
 `get` exists solely for an object's *own* dispatch (which already passed
 PERMIT). Providers are endowed only by inserting `CapHandle`s into a domain's
-table (`bootstrap`, `driver`); nothing reaches a node out of band.
+table (`bootstrap`, `driver`); nothing reaches a node out of band. The
+exceptions are implementation, not authority: a node's own `dispatch` and the
+concrete resource it wraps (`pci::devices()`, `BLOCK_DEVICES`, the xHCI
+controller state, the `MsiAllocator`/`InterruptManager` service impls), the
+IDT/exception dispatch table, the pre-bootstrap boot seed, and the single-CPU
+fault-dump path (`dump_*`). This is the exact ambient surface enumerated in
+`RootGraph.md` §8.29 and mechanically checked by `check_ambient.py` (repo
+root), which greps `kernel/src` for the ambient blocklist and fails on any hit
+outside the whitelisted interior/implementation files.
 - Location: `obj/table.rs::resolve_with_rights` (`PERMIT` slope, table.rs:94-127), `obj/table.rs::resolve_for_query` (QUERY-only slope, table.rs:146-165), `obj/mod.rs::invoke` (dispatch after `resolve`, obj/mod.rs:183-218), `obj/table.rs::get` (PERMIT-less fetch, table.rs:60-68), `obj/bootstrap.rs:110-305` (mint + endowment via table insert), `obj/driver.rs:59-85`
 
 **I2 (mint monopoly) — A new family root is created only by `R1`:**
@@ -228,10 +248,11 @@ rebuild-from-constants per domain): device mappings (ECAM config, DMA
 buffers, MMIO) are created lazily into the kernel root *after* the clone, and
 only the shared PDPT/PD/PT subtrees keep them reachable under the driver's
 CR3; a per-domain rebuild would strand those windows empty in the driver root
-and fault on the first device access. Proved by `obj/paged_isolation.rs::run()`
-(disjoint root frames, empty-then-canary low half unreachable by position from
-the boot root, shared kernel-half alias, cap-mediated mutation only).
-- Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace), `obj/paged_isolation.rs::run` (proof)
+and fault on the first device access. The mechanism (`with_addrspace` fresh
+root, empty low half, shared kernel-half subtrees, `set_current_domain` CR3
+switch) is implemented in `obj/domain.rs` and `mm/vmm`; no boot-time proof
+runs — the paged-isolation self-test module was removed in commit 6adbc4e.
+- Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace)
 
 **I12 (per-hook contract-right enforcement) — a hook is invoked only if the
 handle's contract-right mask contains the hook's required right:**
@@ -241,12 +262,12 @@ right a hook needs (`PhysMemNode`: `free`/`reserve` → `WRITE`, `stats` → `RE
 `alloc_frames`/`alloc_contiguous` → `CALL` default; `HeapNode`: `alloc` →
 `CALL`, `stats` → `READ`; `AddressSpaceNode`: `map`/`unmap`/`protect` →
 `WRITE`, `translate`/`root` → `READ`; `MemRegionNode`: `base`/`size` → `READ`,
-`free`/`detach` → `WRITE`; `PciDeviceNode`: reads → `READ`, writes → `WRITE`;
+`free`/`detach` → `WRITE`;
 `DirNode`/`FileNode`/`BlockNode` similar per-hook splits), and the handle's
 held contract mask must contain that right or the invocation fails `Denied`
 (§3.3, I8). The provider also receives the caller's exact rights through
 `dispatch(…, rights: &CapRights)` and may gate its hook body further (S1).
-- Location: `obj/table.rs::resolve_with_rights` step 5 (obj/table.rs:115-119), `obj/mod.rs::Obj::hook_contract_right` default `CALL` (obj/mod.rs:82-85), per-node overrides in `obj/nodes.rs` (PhysMem 133-140, Heap 319-326, Addrspace 435-442, Cpu 552-558/620-626, Irq 724-730/789-795), `obj/memregion.rs` (214-220), `obj/devices.rs` (297-305), `obj/fs.rs` (114-121, 217-223, 306-312, 526-533, 688-695)
+- Location: `obj/table.rs::resolve_with_rights` step 5 (obj/table.rs:115-119), `obj/mod.rs::Obj::hook_contract_right` default `CALL` (obj/mod.rs:82-85), per-node overrides in `obj/nodes.rs` (PhysMem 133-140, Heap 319-326, Addrspace 435-442, Cpu 552-558/620-626, Irq 724-730/789-795), `obj/memregion.rs` (214-220), `obj/fs.rs` (114-121, 217-223, 306-312, 526-533, 688-695)
 
 **I13 (transitional empty contract mask) — an `empty()` contract-right mask
 in a handle is read as "unrestricted":**
@@ -270,10 +291,10 @@ membership. The value comes from `Obj::surface_value(name)`, which defaults to
 `None` (→ `NotSupported`) and is overridden by `PhysMemNode` ("total_frames"),
 `HeapNode` ("arena"), `AddressSpaceNode` ("root"), `CpuRootNode`/`CpuNode`
 ("cpus"), `TableNode` ("slots"), `StoreNode` ("records"), `MemRegionNode`
-("base"/"size"), and `PciDeviceNode`. The fs nodes (`fs:dir`, `fs:file`,
+("base"/"size"). The fs nodes (`fs:dir`, `fs:file`,
 `fs:mount`, `fs:block`, `fs:block:family`) advertise surface *schemas* but do
 not yet override `surface_value` — their surface reads answer `NotSupported`.
-- Location: `obj/hook.rs::SURFACE_READ` (obj/hook.rs:23-27), `obj/mod.rs::invoke` surface branch (obj/mod.rs:194-204), `obj/table.rs::resolve_for_query` (obj/table.rs:146-165), `obj/mod.rs::Obj::surface_value` default (obj/mod.rs:61-63), overrides in `obj/nodes.rs` (126-131, 312-317, 428-433, 545-550, 613-618), `obj/table.rs` (399-404), `obj/store.rs` (273-278), `obj/memregion.rs` (206-212), `obj/devices.rs` (307-317)
+- Location: `obj/hook.rs::SURFACE_READ` (obj/hook.rs:23-27), `obj/mod.rs::invoke` surface branch (obj/mod.rs:194-204), `obj/table.rs::resolve_for_query` (obj/table.rs:146-165), `obj/mod.rs::Obj::surface_value` default (obj/mod.rs:61-63), overrides in `obj/nodes.rs` (126-131, 312-317, 428-433, 545-550, 613-618), `obj/table.rs` (399-404), `obj/store.rs` (273-278), `obj/memregion.rs` (206-212)
 
 **I15 (delegation never amplifies; `revoke_cascade` requires universal
 `REVOKE`) — capability flow across domains is a rights-preserving clone, and
@@ -295,45 +316,55 @@ the universal `REVOKE` on the caller's handle.
 
 ---
 
-## Cross-Check
+## Boot-Time Verification (removed)
 
-The invariants are exercised at boot, not only asserted statically.
-`obj/separation.rs` proves them against the live graph right after bootstrap
-and before SMP:
+The invariants used to be exercised at boot, not only asserted statically.
+The dedicated proof module `obj/separation.rs` proved them against the live
+graph right after bootstrap and before SMP:
 
 - **I1 / I8 — no ambient authority, reachability only via the table:** a
-  genuine DMA alloc through the endowed cap succeeds (`separation.rs:38-55`);
-  an unendowed id is refused with `NoSuchCap` (`separation.rs:58-65`); a
-  foreign contract is refused by PERMIT with `Denied` (`separation.rs:67-70`);
-  and a per-hook contract right (READ held, CALL required) is refused
-  (`separation.rs:72-83`).
+  genuine DMA alloc through the endowed cap succeeded;
+  an unendowed id was refused with `NoSuchCap`; a
+  foreign contract was refused by PERMIT with `Denied`;
+  and a per-hook contract right (READ held, CALL required) was refused.
 - **C8 separation — the driver domain is disjoint from boot:** endowed
-  dma/pci_cfg resolve from the driver table; unendowed ids and foreign
-  (serial / registry) contracts resolve `NoSuchCap`/`Denied`
-  (`separation.rs:92-127`); its table holds exactly `count() == 4`
-  (dma + pci_cfg + physmem + addrspace, `separation.rs:111-119`); the heap
-  cap is provably absent (`separation.rs:245-251`).
+  dma/pci_cfg resolved from the driver table; unendowed ids and foreign
+  (serial / registry) contracts resolved `NoSuchCap`/`Denied`; its table held
+  exactly `count() == 4` (dma + pci_cfg + physmem + addrspace); the heap cap
+  was provably absent.
 - **I12 — per-hook contract rights are live on the real nodes:** a CALL-only
-  physmem mask reaches neither `free` (WRITE required) nor `stats` (READ
-  required), while the full mask reaches `stats` (`separation.rs:344-374`).
+  physmem mask reached neither `free` (WRITE required) nor `stats` (READ
+  required), while the full mask reached `stats`.
 - **I14 — QUERY-gated surface reads:** physmem / heap / addrspace / table
-  surfaces answer live values through the endowed caps
-  (`separation.rs:275-333`); a cap with QUERY dropped is refused `Denied`
-  (`separation.rs:335-342`).
+  surfaces answered live values through the endowed caps; a cap with QUERY
+  dropped was refused `Denied`.
 - **I15 / I10 — capability-mediated delegation and registry:** the boot
-  domain delegates its physmem cap to the driver domain through the table
-  node's `delegate` hook; the clone resolves in the driver table while the
-  source stays untouched (`separation.rs:433-463`), and an unknown target
-  domain is refused `NoSuchCap` (`separation.rs:465-480`). A duplicate-name
-  contract claiming an already-registered `ContractId` is refused with
-  `ContractCollision` and the genuine entry survives (`separation.rs:176-201`);
-  re-registering the same tuple is idempotent (`separation.rs:168-174`).
+  domain delegated its physmem cap to the driver domain through the table
+  node's `delegate` hook; the clone resolved in the driver table while the
+  source stayed untouched, and an unknown target domain was refused `NoSuchCap`.
+  A duplicate-name contract claiming an already-registered `ContractId` was
+  refused with `ContractCollision` and the genuine entry survived; re-registering
+  the same tuple was idempotent.
 - **Registry is discovery-by-owned-capability, not ambient:** the driver
-  domain (no registry cap) is refused `Denied`; the boot domain looks up
-  `dma:alloc` and `mem:region` and gets name + doc back; a bogus id returns
-  `Reply::None` (`separation.rs:133-166`, `separation.rs:393-414`).
+  domain (no registry cap) was refused `Denied`; the boot domain looked up
+  `dma:alloc` and `mem:region` and got name + doc back; a bogus id returned
+  `Reply::None`.
 
-- Location: `obj/separation.rs::run` (obj/separation.rs:33-485), `obj/separation.rs::run_post_mount` (obj/separation.rs:491-511)
+> **Status update:** the capability MECHANISM for the checks above
+> (I1/I8/C8/I12/I14/I15 — `resolve_with_rights` PERMIT slope, deny probe,
+> `hook_contract_right`, `resolve_for_query`, `delegate`/`revoke_cascade`) is
+> implemented and live in `obj/table.rs` and `obj/store.rs`. The dedicated
+> boot-time proof module (`obj/separation.rs`) and its post-mount variant
+> (`run_post_mount`) were removed in commit 6adbc4e to keep the production
+> boot quiet; no file:line proof cites remain. The only boot-time verification
+> that runs today is the kerneldump census — `graph_census`, `graph`,
+> `leak_detect`, `fs_walk` (kerneldump/{graph,leak,fs}.rs) — gated behind the
+> `selftest` cargo feature (`kernel/src/lib.rs:566-576`), off by default. In
+> addition, the ambient-authority boundary (I1) is now mechanically checked
+> out of band by `check_ambient.py` (repo root), which greps `kernel/src` for
+> the ambient blocklist and fails on any hit outside the whitelisted
+> interior/implementation files (the exact carve-out set of `RootGraph.md`
+> §8.29).
 
 ## P4 Gate
 
@@ -351,11 +382,21 @@ The P4 gate (section 7.12) requires:
 
 3. Restricted-domain readdir projection: A QUERY-only dir cap receives
    Denied on readdir; the driver domain (no dir cap) resolves None on
-   resolve_first(DIR_READDIR).
+   resolve_first(DIR_READDIR). (The original runtime assertion of this was
+   part of the deleted `separation.rs` module; the gating mechanism —
+   `resolve_with_rights` rejecting non-INVOKE hooks as `Denied`, and
+   `resolve_first` returning `None` for absent caps — is implemented in
+   `obj/table.rs`.)
 
 4. Device families: PCI forest, input, audio, block (with hot-plug via
    BLOCK_DEVICES extension in the idle loop) are all registered and visible
-   in the kerneldump graph census.
+   in the kerneldump graph census. The forest/input/audio/block family ROOTS
+   (`PciForestNode`, `InputFamilyNode`, `AudioFamilyNode`, `BlockFamilyNode`)
+   are registered census nodes; per-device `PciDeviceNode` children are
+   materialized at boot by `materialize_pci_tree` (`obj/devices.rs`, called
+   from `Kernel::run` after `pci::init`; ObjId base `0x11_3000`, parent edge =
+   the forest root), so the forest's `children` hook answers the discovered
+   device count.
 
 5. No ambient string VFS: resolve_path, CWD, FD_TABLE, getcwd, chdir, and
    the string fd API are deleted. vfs/path.rs is deleted.
@@ -385,17 +426,25 @@ The P5 gate (section 7.13 and the Phase P5 section) requires:
    `infra:` seed nodes and cascade-severed-family records exempt (I4/§8.8)
    — and returns `true` on a leak so CI can fail the run.
 
-5. The PCI forest is a real family root: `materialize_pci_tree`/
-   `materialize_pci_child` register one `PciDeviceNode` per discovered
-   device with weak parent edges (ObjId base 0x11_3000), and the boot
-   domain's PCI forest cap carries REVOKE. `obj/domain.rs` exposes a domain
-   registry (`register_domain`/`all_domains`) for the projection tool.
+5. The PCI forest is a real family root: `PciForestNode` is registered and
+   its `count` hook answers the discovered device count; per-device
+   `PciDeviceNode` children are materialized at boot by `materialize_pci_tree`
+   (`obj/devices.rs`, called from `Kernel::run` after `pci::init`), so the
+   forest's `children` hook answers the discovered device count. The boot
+   domain's PCI forest cap carries REVOKE.
+   `obj/domain.rs` exposes a domain registry (`register_domain`/`all_domains`)
+   for the projection tool.
 
-6. Cascade gate assertion: `run_revocation_gate` cascade-revokes a 4-node test
-   subtree (root + three weak-parented children) and asserts the whole
-   subtree is deny-marked and absent from the next projection, with no
-   handle left Live.
+6. Cascade gate assertion (REMOVED): `run_revocation_gate` cascade-revoked a
+   4-node test subtree (root + three weak-parented children) and asserted the
+   whole subtree was deny-marked and absent from the next projection, with no
+   handle left Live. The assertion was deleted with the self-test suite in
+   commit 6adbc4e; the mechanism it would exercise —
+   `CapabilityTable::revoke_cascade` → `seal_cascade` (`obj/table.rs` +
+   `obj/store.rs`) — is implemented.
 
-7. Deny-list gate assertion: deny-list-revoking a `Revocable` node makes
-   PERMIT fail `Revoked` while the cap slot is retained (Zombie); the leak
-   detector runs clean after the test run.
+7. Deny-list gate assertion (REMOVED): the assertion that deny-list-revoking
+   a `Revocable` node makes PERMIT fail `Revoked` while the cap slot is
+   retained (Zombie), followed by a clean leak-detector run, was deleted with
+   the self-test suite in commit 6adbc4e. `kerneldump/leak.rs::leak_detect`
+   still exists and runs under the `selftest` feature (`kernel/src/lib.rs:566-576`).

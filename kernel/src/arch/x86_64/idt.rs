@@ -1,6 +1,6 @@
 //! Interrupt Descriptor Table for x86_64.
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use spin::Once;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -48,18 +48,56 @@ pub fn check_integrity() -> bool {
 
 pub const NUM_DEVICE_VECTORS: usize = 16;
 pub const DEVICE_VECTOR_BASE: u8 = 33;
-static DEVICE_HANDLERS: [AtomicPtr<fn()>; NUM_DEVICE_VECTORS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_DEVICE_VECTORS];
+
+// Handlers are stored as `usize` addresses and recovered via a typed-union
+// reinterpretation, avoiding `transmute`.  A null slot (0) is never a valid
+// function address and means "not registered".
+static DEVICE_HANDLERS: [AtomicUsize; NUM_DEVICE_VECTORS] =
+    [const { AtomicUsize::new(0) }; NUM_DEVICE_VECTORS];
+
+/// Bit-compatible storage of a `fn()` handler address as a `usize`.
+///
+/// Function pointers are thin (just the code address) on every supported
+/// target, so the two fields always hold identical bytes.
+union HandlerAddr {
+    func: fn(),
+    addr: usize,
+}
+
+/// Load a registered handler from an `AtomicUsize` slot, panicking if empty.
+///
+/// A null slot is a logic error (the caller forgot to register a handler);
+/// previously it was silently skipped, hiding the bug.
+fn load_handler(slot: &AtomicUsize) -> fn() {
+    let addr = slot.load(Ordering::Acquire);
+    if addr == 0 {
+        panic!("idt: interrupt handler not registered (logic error)");
+    }
+    // SAFETY: the stored value was produced by `HandlerAddr { func }.addr`,
+    // so `func` and `addr` are valid representations of the same bytes.
+    unsafe { HandlerAddr { addr }.func }
+}
+
+/// Encode a handler as its `usize` address for `AtomicUsize` storage.
+fn handler_addr(handler: fn()) -> usize {
+    // SAFETY: see `load_handler`; storing a function pointer in the union.
+    unsafe { HandlerAddr { func: handler }.addr }
+}
+
+/// Store a handler into a slot that is exclusively owned by the caller.
+fn store_handler(slot: &AtomicUsize, handler: fn()) {
+    slot.store(handler_addr(handler), Ordering::Release);
+}
 
 /// Register a handler for a device interrupt vector (index 0-15, mapping to
 /// IDT vectors 33-48). Returns the allocated vector number or `None` if the
 /// slot is already taken.
 pub fn register_device_handler(handler: fn()) -> Option<u8> {
+    let addr = handler_addr(handler);
     for (i, slot) in DEVICE_HANDLERS.iter().enumerate() {
-        if slot.load(Ordering::Acquire).is_null() {
-            let ptr = handler as *mut fn();
+        if slot.load(Ordering::Acquire) == 0 {
             if slot.compare_exchange(
-                core::ptr::null_mut(), ptr,
+                0usize, addr,
                 Ordering::Release, Ordering::Relaxed,
             ).is_ok() {
                 return Some(DEVICE_VECTOR_BASE + i as u8);
@@ -79,7 +117,7 @@ pub fn register_device_handler_at(vector: u8, handler: fn()) {
         return;
     }
     let idx = (vector - DEVICE_VECTOR_BASE) as usize;
-    DEVICE_HANDLERS[idx].store(handler as *mut fn(), Ordering::Release);
+    store_handler(&DEVICE_HANDLERS[idx], handler);
 }
 
 /// Unregister a previously registered device interrupt handler.
@@ -88,28 +126,24 @@ pub fn unregister_device_handler(vector: u8) {
         return;
     }
     let idx = (vector - DEVICE_VECTOR_BASE) as usize;
-    DEVICE_HANDLERS[idx].store(core::ptr::null_mut(), Ordering::Release);
+    DEVICE_HANDLERS[idx].store(0, Ordering::Release);
 }
 
 /// Callback invoked by the BSP's APIC timer ISR before EOI.
-static TIMER_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
+static TIMER_CALLBACK: AtomicUsize = AtomicUsize::new(0);
 
 /// Set the function called on each APIC timer interrupt.
 ///
 /// Used by `UniversalTimer` to wire up queue processing and clockevent
 /// reprogramming.
 pub fn set_timer_callback(cb: fn()) {
-    TIMER_CALLBACK.store(cb as *mut fn(), Ordering::Release);
+    store_handler(&TIMER_CALLBACK, cb);
 }
 
 fn device_irq_handler(vector: u8) {
     let idx = (vector - DEVICE_VECTOR_BASE) as usize;
     if idx < NUM_DEVICE_VECTORS {
-        let ptr = DEVICE_HANDLERS[idx].load(Ordering::Acquire);
-        if !ptr.is_null() {
-            let handler: fn() = unsafe { core::mem::transmute(ptr) };
-            handler();
-        }
+        load_handler(&DEVICE_HANDLERS[idx])();
     }
     apic::apic_eoi();
 }
@@ -204,11 +238,7 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
         apic::apic_eoi();
         return;
     }
-    let ptr = TIMER_CALLBACK.load(Ordering::Acquire);
-    if !ptr.is_null() {
-        let handler: fn() = unsafe { core::mem::transmute(ptr) };
-        handler();
-    }
+    load_handler(&TIMER_CALLBACK)();
     apic::apic_eoi();
 }
 

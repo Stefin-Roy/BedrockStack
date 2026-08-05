@@ -11,15 +11,20 @@ use super::mount::Fat32SuperBlock;
 
 impl Fat32SuperBlock {
     pub fn read_fat_entry(&self, cluster: u32) -> Result<u32, VfsError> {
+        // Invariant: fat_entry_position places a 4-byte FAT32 entry entirely
+        // inside one 512-byte sector (a sector holds exactly 128 entries), so
+        // offset + 4 never straddles or overruns.  The defensive bounds check
+        // below only guards against a future bytes_per_sec change.
         let (sector_idx, offset) = self.bpb.fat_entry_position(cluster);
         let fat_idx = self.bpb.active_fat_idx();
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
         let sector = cache.get_or_read(&*self.device, lba)?;
-        let val = u32::from_le_bytes([
-            sector[offset as usize], sector[offset as usize + 1],
-            sector[offset as usize + 2], sector[offset as usize + 3],
-        ]);
+        let off = offset as usize;
+        if off + 4 > sector.len() {
+            return Err(VfsError::IOError);
+        }
+        let val = u32::from_le_bytes([sector[off], sector[off + 1], sector[off + 2], sector[off + 3]]);
         Ok(val & 0x0FFFFFFF)
     }
 
@@ -29,8 +34,12 @@ impl Fat32SuperBlock {
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
         let sector = cache.get_or_read_mut(&*self.device, lba)?;
+        let off = offset as usize;
+        if off + 4 > sector.len() {
+            return Err(VfsError::IOError);
+        }
         let bytes = (value & 0x0FFFFFFF).to_le_bytes();
-        sector[offset as usize..offset as usize + 4].copy_from_slice(&bytes);
+        sector[off..off + 4].copy_from_slice(&bytes);
         Ok(())
     }
 

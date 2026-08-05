@@ -15,6 +15,8 @@ pub mod null_msi;
 pub mod dma;
 pub mod block_device;
 pub mod pci_device;
+pub mod irqsafe;
+pub mod lockorder;
 pub mod acpi;
 pub mod wallclock;
 

@@ -14,12 +14,15 @@ use alloc::vec::Vec;
 
 use super::adapters::{
     self, DMA_ALLOC_CONTIG, DMA_ALLOC_PAGE, DMA_MAP_MMIO, DMA_VIRT_TO_PHYS, PCI_CONTRACT,
-    PCI_READ16, PCI_READ32, PCI_READ8, PCI_WRITE16, PCI_WRITE32, PCI_WRITE8,
+    PCI_READ16, PCI_READ32, PCI_READ8, PCI_WRITE16, PCI_WRITE32, PCI_WRITE8, SERIAL_PUTC,
+    SERIAL_PUTS,
 };
 use super::bootstrap::{boot_domain, boot_endowment};
-use super::cap_handle::CapId;
+use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::driver::{driver_domain, driver_endowment};
 use super::hook::HookId;
+use super::nodes;
+use super::rights::{CapRights, ContractRights, Rights};
 use super::table::CapabilityTable;
 use super::{invoke, Args, ObjError, Reply, Value};
 use crate::services::dma::DmaBuffer;
@@ -244,5 +247,191 @@ fn write_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u64) -> Args 
             Value::U64(off as u64),
             Value::U64(val),
         ]),
+    }
+}
+
+/// A capability-mediated console writer. `Copy`: it owns the table reference
+/// (the boot table — the console is a boot-domain service) plus the `CapId`
+/// naming the serial provider node, so it can be threaded wherever raw console
+/// writes once went (§7.7.1, §7.9). Every write is fire-and-forget: the hooks
+/// reply `Reply::None` and any error is discarded, matching the current console
+/// semantics.
+#[derive(Clone, Copy)]
+pub struct SerialClient {
+    table: &'static CapabilityTable,
+    cap: CapId,
+}
+
+impl SerialClient {
+    /// Bind a serial client to an explicit domain's table + CapId (C8: clients
+    /// are constructed per-domain, never from a global).
+    pub fn new(table: &'static CapabilityTable, cap: CapId) -> Self {
+        SerialClient { table, cap }
+    }
+
+    /// The Boot domain's serial capability (§5.4). The console is a
+    /// boot-domain service — there is no driver-domain serial endowment — so
+    /// this is the only constructor.
+    pub fn boot_serial() -> Self {
+        Self::new(&boot_domain().table, boot_endowment().serial)
+    }
+
+    /// Invoke a serial hook and drop the (always `Reply::None`) reply. Errors
+    /// are discarded: console output is best-effort.
+    fn call(&self, hook: HookId, args: &Args) {
+        let _ = invoke(self.table, self.cap, adapters::SERIAL_CONTRACT, hook, args);
+    }
+
+    /// Write `s` to the console (fire-and-forget). The string crosses the
+    /// capability as a buffer, so runtime `&str`s are supported.
+    pub fn puts(&self, s: &str) {
+        let args = Args { vals: Vec::from([Value::Buf(s.as_bytes().to_vec())]) };
+        self.call(SERIAL_PUTS, &args);
+    }
+
+    /// Write one byte to the console (fire-and-forget).
+    pub fn putc(&self, c: u8) {
+        let args = Args { vals: Vec::from([Value::U64(c as u64)]) };
+        self.call(SERIAL_PUTC, &args);
+    }
+
+    /// Write `v` as lowercase hex with no prefix (fire-and-forget). Mirrors
+    /// `SerialPort::put_hex` output.
+    pub fn put_hex(&self, v: u64) {
+        let mut buf = [0u8; 16];
+        let s = hex_str(v, &mut buf);
+        self.puts(s);
+    }
+
+    /// Write `v` in decimal with no prefix (fire-and-forget). Mirrors
+    /// `SerialPort::put_u64` output.
+    pub fn put_u64(&self, v: u64) {
+        let mut buf = [0u8; 20];
+        let s = dec_str(v, &mut buf);
+        self.puts(s);
+    }
+}
+
+/// Format `v` as lowercase hex into `buf` (needs 16 bytes) and return the
+/// slice, mirroring `common::serial::SerialPort::put_hex`.
+fn hex_str<'a>(v: u64, buf: &'a mut [u8; 16]) -> &'a str {
+    let mut val = v;
+    if val == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("");
+    }
+    let mut i = 16;
+    while val > 0 {
+        i -= 1;
+        let digit = (val & 0xF) as u8;
+        buf[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+        val >>= 4;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap_or("")
+}
+
+/// Format `v` in decimal into `buf` (needs 20 bytes) and return the slice,
+/// mirroring `common::serial::SerialPort::put_u64`.
+fn dec_str<'a>(v: u64, buf: &'a mut [u8; 20]) -> &'a str {
+    let mut val = v;
+    if val == 0 {
+        buf[0] = b'0';
+        return core::str::from_utf8(&buf[..1]).unwrap_or("");
+    }
+    let mut i = 20;
+    while val > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    core::str::from_utf8(&buf[i..]).unwrap_or("")
+}
+
+/// A capability-mediated interrupt-family client. `Copy`: it owns the table
+/// reference plus the `CapId` naming the `irq:vector` root, so it can be
+/// threaded wherever the IRQ family was once reached ambiently (§7.7.1, §7.9).
+/// Handlers reach `register_handler` *by capability*: each `register`
+/// materializes a kernel `IrqHandlerNode` over the `fn()` and hands its `CapId`
+/// to the hook — never a raw caller-supplied address.
+#[derive(Clone, Copy)]
+pub struct IrqClient {
+    table: &'static CapabilityTable,
+    cap: CapId,
+}
+
+impl IrqClient {
+    /// Bind an IRQ client to an explicit domain's table + CapId (C8).
+    pub fn new(table: &'static CapabilityTable, cap: CapId) -> Self {
+        IrqClient { table, cap }
+    }
+
+    /// The Boot domain's IRQ-family capability (§5.4). Valid once bootstrap has
+    /// run.
+    pub fn boot_irq() -> Self {
+        Self::new(&boot_domain().table, boot_endowment().irq)
+    }
+
+    /// The first driver domain's IRQ-family capability (§6.2). The irq cap the
+    /// driver table holds carries READ|WRITE|CALL, so `register`/`ack` (CALL)
+    /// and `unregister`/`set_enabled` (WRITE) all pass PERMIT.
+    pub fn driver_irq() -> Self {
+        Self::new(&driver_domain().table, driver_endowment().irq)
+    }
+
+    /// Invoke an IRQ hook and collapse the (always `Reply::None`) reply to
+    /// `Ok(())`; errors are preserved.
+    fn call(&self, hook: HookId, args: &Args) -> Result<(), ObjError> {
+        match invoke(self.table, self.cap, nodes::IRQ_CONTRACT, hook, args) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Bind `handler` to `vector`, or to an MSI-allocated free device vector
+    /// when `vector` is `None` (the vector may be omitted; auto-allocation
+    /// happens inside the Irq node). A fresh [`nodes::IrqHandlerNode`] is
+    /// materialized over the `fn()` and inserted into this client's table; its
+    /// `CapId` is passed to the `register_handler` hook. The hook replies the
+    /// assigned vector, so auto-allocation is observable: on
+    /// `Reply::Data([Value::U64(v)])` this returns `Ok(v as u8)`. Any other
+    /// reply shape collapses to `Err` (a shape mismatch maps to `Denied`, a
+    /// non-`Data` reply to `NotSupported`); invoke errors are preserved.
+    pub fn register(&self, vector: Option<u8>, handler: fn()) -> Result<u8, ObjError> {
+        let handler_cap = self.table.insert_handle(CapHandle {
+            id: CapId(0),
+            node: nodes::handler_node(handler),
+            rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+            state: HandleState::Live,
+        });
+        let args = Args {
+            vals: Vec::from([Value::U64(vector.unwrap_or(0) as u64), Value::U64(handler_cap.0)]),
+        };
+        match invoke(self.table, self.cap, nodes::IRQ_CONTRACT, nodes::IRQ_REGISTER, &args) {
+            Ok(Reply::Data(vals)) => match vals.first() {
+                Some(Value::U64(v)) => Ok(*v as u8),
+                _ => Err(ObjError::Denied),
+            },
+            Ok(_) => Err(ObjError::NotSupported),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Unbind the handler on `vector` and release its device vector (§7.10.5).
+    pub fn unregister(&self, vector: u8) -> Result<(), ObjError> {
+        let args = Args { vals: Vec::from([Value::U64(vector as u64)]) };
+        self.call(nodes::IRQ_UNREGISTER, &args)
+    }
+
+    /// Send end-of-interrupt (§7.10.5).
+    pub fn ack(&self) -> Result<(), ObjError> {
+        self.call(nodes::IRQ_ACK, &Args::none())
+    }
+
+    /// Enable or disable the handler on `vector`.
+    pub fn set_enabled(&self, vector: u8, on: bool) -> Result<(), ObjError> {
+        let args = Args {
+            vals: Vec::from([Value::U64(vector as u64), Value::U64(on as u64)]),
+        };
+        self.call(nodes::IRQ_SET_ENABLED, &args)
     }
 }

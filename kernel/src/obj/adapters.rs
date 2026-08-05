@@ -652,8 +652,13 @@ impl Obj for KernelSerial {
         }
         if hook == SERIAL_PUTS {
             for v in &args.vals {
-                if let Value::Str(s) = v {
-                    self.puts(s);
+                match v {
+                    // `&'static str` labels (the classic form).
+                    Value::Str(s) => self.puts(s),
+                    // Runtime `&str` payloads marshalled by `SerialClient`
+                    // (`Value::Str` cannot carry a non-static string).
+                    Value::Buf(b) => self.puts(core::str::from_utf8(b).unwrap_or("")),
+                    _ => {}
                 }
             }
             return Ok(Reply::None);

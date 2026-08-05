@@ -1,17 +1,27 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 
+use spin::Once;
+
 use crate::pci::PciDevice;
 
 fn cfg() -> crate::obj::clients::PciCfgClient {
     crate::obj::clients::PciCfgClient::driver_pci()
 }
 
-/// Leaked slice of PCI devices — set once by `enumerate_all()` and never freed.
-static mut DEVICES: Option<&'static [PciDevice]> = None;
+/// The discovered PCI device census — the interior of [`crate::pci::devices`]
+/// and the `pci:forest` `PciForestNode` (obj/devices.rs §7.11.4). Set once by
+/// `enumerate_all()` and never freed. Not a public enumeration API:
+/// capability-gated consumers must go through the forest node's `count`/
+/// `children` hooks, not this slice.
+static DEVICES: Once<&'static [PciDevice]> = Once::new();
 
-pub fn all() -> &'static [PciDevice] {
-    unsafe { DEVICES.expect("PCI not enumerated yet") }
+/// Interior accessor for the `pci:forest` census: the full discovered device
+/// list. See `DEVICES`. Crate-internal so the ambient slice stays out of the
+/// library's public surface; the forest node and the driver sweep read it
+/// through `crate::pci::devices`.
+pub(crate) fn all() -> &'static [PciDevice] {
+    *DEVICES.get().expect("PCI not enumerated yet")
 }
 
 /// Enumerate every segment group in `segments`, merging the results into a
@@ -22,7 +32,7 @@ pub fn enumerate_all(segments: &[u16]) {
         scan_bus(segment, 0, &mut devices);
     }
     let leaked: &'static [PciDevice] = Box::leak(devices.into_boxed_slice());
-    unsafe { DEVICES = Some(leaked); }
+    DEVICES.call_once(|| leaked);
 }
 
 fn scan_bus(segment: u16, bus: u8, devices: &mut Vec<PciDevice>) {

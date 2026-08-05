@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
 use crate::filesystems::vfs;
 use crate::filesystems::vfs::error::VfsError;
+use crate::filesystems::vfs::mount::DriveMount;
 
 mod gpt;
 mod mbr;
@@ -123,27 +124,11 @@ pub fn probe(device: Arc<dyn BlockDevice>) -> Result<PartitionTable, &'static st
     Ok(PartitionTable::Mbr(parts))
 }
 
-pub fn mount_partition(
-    device: Arc<dyn BlockDevice>,
-    part_number: u32,
-    fstype: &str,
-    drive: char,
-) -> Result<(), VfsError> {
-    let table = probe(device.clone()).map_err(|_| VfsError::InvalidDevice)?;
-    let info = table
-        .partitions()
-        .iter()
-        .find(|p| p.number == part_number && !p.is_extended)
-        .ok_or(VfsError::NotFound)?;
-    let part_dev = PartitionDevice::new(device, info);
-    vfs::mount(fstype, Some(Arc::new(part_dev)), drive)
-}
-
 pub fn mount_first_partition(
     device: Arc<dyn BlockDevice>,
     fstype: &str,
     drive: char,
-) -> Result<(), VfsError> {
+) -> Result<Arc<DriveMount>, VfsError> {
     let table = probe(device.clone()).map_err(|_| VfsError::InvalidDevice)?;
     let info = table
         .partitions()

@@ -137,6 +137,15 @@ impl UsbPorts {
     }
 
     pub fn handle_port_status_change(&mut self, port_num: u8) -> Result<(), &'static str> {
+        // Port ids are 1-based and must index the ports vector.  A
+        // malformed/foreign event id must never index out of bounds — log
+        // and ignore it.
+        if port_num == 0 || (port_num as usize) > self.ports.len() {
+            SerialPort::puts("[xhci] port ");
+            SerialPort::put_u64(port_num as u64);
+            SerialPort::puts(": out of range, ignoring\n");
+            return Ok(());
+        }
         let idx = self.find_port_idx(port_num).ok_or("invalid port")?;
         let portsc = self.port_regs.read_portsc(port_num);
         let connected = portsc & PORTSC_CCS != 0;

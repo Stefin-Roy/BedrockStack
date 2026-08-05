@@ -22,16 +22,41 @@ macro_rules! fat_trace {
 
 use super::mount::Fat32SuperBlock;
 
+/// Bounds-checked reference to directory entry `i` within a cluster buffer.
+/// Directory data is untrusted disk input, so index/range arithmetic must
+/// never fall back to an unwrap/panic.
+fn entry_at(buf: &[u8], i: usize) -> Result<&[u8; DIR_ENTRY_SIZE], VfsError> {
+    let off = i.checked_mul(DIR_ENTRY_SIZE).ok_or(VfsError::IOError)?;
+    let end = off.checked_add(DIR_ENTRY_SIZE).ok_or(VfsError::IOError)?;
+    if end > buf.len() {
+        return Err(VfsError::IOError);
+    }
+    buf[off..end].try_into().map_err(|_| VfsError::IOError)
+}
+
+/// Bounds-checked mutable reference to directory entry `i` within a cluster
+/// buffer (used by callers that rewrite an entry in place).
+pub(super) fn entry_at_mut(buf: &mut [u8], i: usize) -> Result<&mut [u8; DIR_ENTRY_SIZE], VfsError> {
+    let off = i.checked_mul(DIR_ENTRY_SIZE).ok_or(VfsError::IOError)?;
+    let end = off.checked_add(DIR_ENTRY_SIZE).ok_or(VfsError::IOError)?;
+    if end > buf.len() {
+        return Err(VfsError::IOError);
+    }
+    let entry: &mut [u8; DIR_ENTRY_SIZE] =
+        (&mut buf[off..end]).try_into().map_err(|_| VfsError::IOError)?;
+    Ok(entry)
+}
+
 pub(super) fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<DirEntrySlot>, VfsError> {
     if sb.bpb.byts_per_clus == 0 || sb.bpb.bytes_per_sec == 0 || sb.bpb.sec_per_clus == 0 {
-        crate::drivers::serial::dump_puts("[FAT32] CORRUPT BPB in read_dir_slots!\n");
-        crate::drivers::serial::dump_puts("  byts_per_clus=");
-        crate::drivers::serial::dump_put_hex(sb.bpb.byts_per_clus as u64);
-        crate::drivers::serial::dump_puts(" bytes_per_sec=");
-        crate::drivers::serial::dump_put_hex(sb.bpb.bytes_per_sec as u64);
-        crate::drivers::serial::dump_puts(" sec_per_clus=");
-        crate::drivers::serial::dump_put_hex(sb.bpb.sec_per_clus as u64);
-        crate::drivers::serial::dump_puts("\n");
+        crate::drivers::serial::SerialPort::puts("[FAT32] CORRUPT BPB in read_dir_slots!\n");
+        crate::drivers::serial::SerialPort::puts("  byts_per_clus=");
+        crate::drivers::serial::SerialPort::put_hex(sb.bpb.byts_per_clus as u64);
+        crate::drivers::serial::SerialPort::puts(" bytes_per_sec=");
+        crate::drivers::serial::SerialPort::put_hex(sb.bpb.bytes_per_sec as u64);
+        crate::drivers::serial::SerialPort::puts(" sec_per_clus=");
+        crate::drivers::serial::SerialPort::put_hex(sb.bpb.sec_per_clus as u64);
+        crate::drivers::serial::SerialPort::puts("\n");
         return Err(VfsError::IOError);
     }
     let mut slots: Vec<DirEntrySlot> = Vec::new();
@@ -44,16 +69,15 @@ pub(super) fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<
     let mut end_of_dir = false;
 
     fat_trace!({
-        crate::drivers::serial::dump_puts("[DBG:fat32] read_dir_slots cluster=0x");
-        crate::drivers::serial::dump_put_hex(cluster as u64);
-        crate::drivers::serial::dump_puts("\n");
+        crate::drivers::serial::SerialPort::puts("[DBG:fat32] read_dir_slots cluster=0x");
+        crate::drivers::serial::SerialPort::put_hex(cluster as u64);
+        crate::drivers::serial::SerialPort::puts("\n");
     });
     loop {
         read_cluster(sb, cluster, &mut buf)?;
-        fat_trace!(crate::drivers::serial::dump_puts("[DBG:fat32] read_dir_slots read cluster ok\n"));
+        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] read_dir_slots read cluster ok\n"));
         for i in 0..entries_per_clus {
-            let off = i * DIR_ENTRY_SIZE;
-            let entry: &[u8; DIR_ENTRY_SIZE] = &buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
+            let entry = entry_at(&buf, i)?;
             if entry[0] == DIR_END { vfat_chain.clear(); end_of_dir = true; break; }
             if entry[0] == DIR_DELETED { vfat_chain.clear(); continue; }
             let attr = entry[0x0B];
@@ -194,7 +218,7 @@ where
 
             let mut vfat_buf: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
             for j in chain_start..i {
-                let e: &[u8; DIR_ENTRY_SIZE] = &buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE].try_into().unwrap();
+                let e = entry_at(&buf, j)?;
                 vfat_buf.push(*e);
             }
             let entry_name = if !vfat_buf.is_empty() {
@@ -205,7 +229,7 @@ where
             };
 
             if entry_name.eq_ignore_ascii_case(name) {
-                let mut sfn_entry: [u8; DIR_ENTRY_SIZE] = buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
+                let mut sfn_entry = *entry_at(&buf, i)?;
                 f(&mut sfn_entry);
                 buf[off..off + DIR_ENTRY_SIZE].copy_from_slice(&sfn_entry);
                 write_cluster(sb, cluster, &buf)?;
@@ -262,7 +286,7 @@ pub(super) fn remove_dir_entries(sb: &Fat32SuperBlock, dir_clus: u32, name: &str
 
             let mut vfat_buf: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
             for j in chain_start..i {
-                let e = &buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE].try_into().unwrap();
+                let e = entry_at(&buf, j)?;
                 vfat_buf.push(*e);
             }
             let entry_name = if !vfat_buf.is_empty() {

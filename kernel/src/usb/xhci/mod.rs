@@ -502,7 +502,15 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
                     SerialPort::puts("\n");
                     continue;
                 }
-                let slot = slots.slots.last_mut().expect("enumerated slot missing");
+                let slot = match slots.slots.last_mut() {
+                    Some(s) => s,
+                    None => {
+                        SerialPort::puts("[xhci]  port ");
+                        SerialPort::put_u64(port_id as u64);
+                        SerialPort::puts(" enumerated but no slot recorded\n");
+                        continue;
+                    }
+                };
                 match bind_slot(slot, &mut cmd, ctrl.doorbell_va, ctrl.dma) {
                     Ok(bound) => {
                         for dev in bound {
@@ -695,7 +703,6 @@ fn setup_interrupts(
     dma: DmaClient,
     _ac64: bool,
 ) -> Option<MsixFallback> {
-    use crate::arch::x86_64::idt;
     use crate::pci::caps;
     use crate::drivers::serial::SerialPort;
 
@@ -711,7 +718,7 @@ fn setup_interrupts(
     // Try MSI-X first (more capable: per-vector masking, more entries).
     // Falls back to MSI if MSI-X fails.
     if let Some(cap) = msix_cap {
-        if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
+        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
             let info = crate::pci::msix::table_info(dev, cap);
             SerialPort::puts("[xhci] MSI-X BIR=");
             SerialPort::put_u64(info.bir as u64);
@@ -761,7 +768,7 @@ fn setup_interrupts(
 
     // Fallback: MSI
     if let Some(ref cap) = msi_cap {
-        if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
+        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
             crate::pci::msi::enable(dev, cap, vector, bsp_apic_id);
             crate::drivers::serial::SerialPort::puts("[xhci] MSI enabled\n");
             return None;
@@ -776,7 +783,7 @@ fn setup_interrupts(
     SerialPort::puts("\n");
 
     if dev.interrupt_line != 0 {
-        if let Some(vector) = idt::register_device_handler(event::xhci_irq_handler) {
+        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
             if crate::platform::x86_64_pc::ioapic::enable_irq(
                 dev.interrupt_line as u32,
                 crate::acpi::Polarity::ActiveLow,
@@ -787,7 +794,7 @@ fn setup_interrupts(
                 }
                 crate::drivers::serial::SerialPort::puts("[xhci] INTX enabled\n");
             } else {
-                idt::unregister_device_handler(vector);
+                let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
             }
         }
     }

@@ -63,12 +63,26 @@ The following claims are normative. Every design decision in this document
 and every line of code produced from it must be consistent with them.
 
 **Claim 1 (No ambient authority).** No code path may access a protected
-resource purely because it runs in supervisor mode. Every access to every
-protected resource crosses a capability edge. Position (privilege ring, CPU
-mode, address space membership) grants *nothing* on its own. The trap
-handler, the page-table walker, the heap allocator, and the spinlock are all
-*implementation* — code that runs only behind a hook that the caller was
-authorized to invoke. They are never ambient privileges.
+resource purely because it runs in supervisor mode. The *domain-facing
+service surface* is the protected-resource set: the serial console, IRQ
+binding, block devices, PCI devices, mounts/filesystems, DMA, PCI config
+space, memory/address space, and the registries that name them. Every access
+to that surface crosses a capability edge — an `invoke` on a `CapId` held in
+a domain's table, PERMITed by `resolve` before any hook body runs. Position
+(privilege ring, CPU mode, address space membership) grants *nothing* on its
+own. What remains outside the edge is the *implementation*: a node's own
+`dispatch` and the concrete resource it wraps (e.g. `pci::devices()`,
+`BLOCK_DEVICES`, the xHCI controller state, the `MsiAllocator`/
+`InterruptManager` service impls), the IDT/exception dispatch table, the
+pre-bootstrap boot seed (before the capability graph exists), and the
+single-CPU fault-dump path (`dump_*`). These run only behind a hook the
+caller was authorized to invoke, before the graph exists, or on the
+fail-stop path; they are never ambient privileges. The exact ambient surface
+that remains is enumerated in §8.29 and is mechanically checked by
+`check_ambient.py` (repo root), which fails on any kernel source hit outside
+the whitelisted interior/implementation files. The trap handler, the
+page-table walker, the heap allocator, and the spinlock are likewise
+*implementation* — never ambient privileges.
 
 **Claim 2 (The graph is a projection).** The full graph never exists as an
 addressable object. The kernel maintains an *object store* for bookkeeping
@@ -118,10 +132,11 @@ that frees the node.
 ## 1.3 What Dies With This Design
 
 For clarity, the following Unix-isms are explicitly *not* part of the model
-and will be removed from the system over the migration:
+and are removed from the system as the migration lands (P6-B complete, §10):
 
 - Ambient global namespaces: drive letters (`A>`, `B>`), the drive map
-  (`DRIVE_MAP`), the ambient current-working-directory (`CWD`).
+  (`DRIVE_MAP`, deleted with `vfs/drive.rs`), the ambient
+  current-working-directory (`CWD`).
 - String path resolution inside the kernel (`resolve_path`, `walk_from`,
   `split_drive_path`, `getcwd`, `chdir` by string).
 - The ambient global service accessor `kernel_services()`.
@@ -786,7 +801,7 @@ surface is inert too. The value comes from `Obj::surface_value(name)`
 (`bus`/`device`/`function`/`vendor_id`/`device_id`/`class`); the fs nodes
 advertise surface schemas but do not yet override `surface_value`
 (`NotSupported`). Separation proves the gate: an `INVOKE`-only cap (QUERY
-dropped) is refused `Denied` on any surface read (`separation.rs:335-342`).
+dropped) is refused `Denied` on any surface read.
 
 ## 4.2 Hook
 
@@ -1267,7 +1282,7 @@ Existing modules reworked:
 ```
 kernel/src/services/capability.rs   // → seed of obj/ types (Rights, CapHandle)
 kernel/src/filesystems/vfs/fdtable.rs // → generalized into obj::table
-kernel/src/filesystems/vfs/mod.rs     // → DRIVE_MAP/FD_TABLE/CWD die; readdir gated
+kernel/src/filesystems/vfs/mod.rs     // → DRIVE_MAP deleted, FD_TABLE/CWD die; readdir gated
 kernel/src/services/mod.rs            // → KernelServices becomes endowment; global dies
 kernel/src/kerneldump/                // → + graph projection walker (P5)
 kernel/src/mm/{heap,phys_alloc,vmm}/* // → wrapped as nodes (P3)
@@ -1617,9 +1632,13 @@ kernel/src/filesystems/vfs/mod.rs:32-33   // static FD_TABLE, DRIVE_MAP
 kernel/src/filesystems/vfs/mod.rs:40      // static CWD
 ```
 
-**Change.** `FD_TABLE` dies (per-domain tables replace it, §7.4).
-`DRIVE_MAP` and `CWD` die with the string-path model (§7.11). The `FdTable`
-struct survives as `CapabilityTable`; the ambient statics do not.
+**Change (implemented).** `FD_TABLE` died (per-domain tables replace it,
+§7.4). `DRIVE_MAP` and the `DriveMap` type are deleted; mounts are held in a
+module-private registry behind the capability-native mount node
+(`obj/fs.rs` `MountNode`), and `vfs::mount` / `mount_first_partition` return
+`Result<Arc<DriveMount>, VfsError>` — the mount *is* the returned value, no
+drive map names it. `CWD` died with the string-path model (§7.11). The
+`FdTable` struct survives as `CapabilityTable`; the ambient statics do not.
 
 ### 7.7.3 `vfs::path` — the string resolver
 
@@ -1858,6 +1877,13 @@ hooks gated by the device capability. `pci::enumerate` (today ambient,
 called from `Kernel::run`) becomes the controller materializing its children
 during bring-up — a family fill, not a bus scan.
 
+*(Current state, post-hardening: the `PciForestNode` census root is
+registered in bootstrap and the forest is restored — `materialize_pci_tree`
+runs in `Kernel::run` immediately after `pci::init` and realizes one
+`PciDeviceNode` child per discovered device (ObjId base `0x11_3000`, parent
+edge = the forest root). `pci::devices()`/`enumerate` are the forest's
+interior. The design above is the implementation, not a target.)*
+
 ### 7.11.5 Audio → controller family
 
 `kernel/src/audio/*` (HD Audio) becomes a family root with codec/pin nodes;
@@ -1878,6 +1904,8 @@ capabilities.
 ## 7.12 VFS Rebuild: Pure Capabilities (P4)
 
 ### 7.12.1 What dies
+
+*Status: implemented — the items below are deleted from the current tree.*
 
 ```
 vfs/path.rs        split_drive_path, split_components, walk_from,
@@ -2596,6 +2624,52 @@ node until the hook returns — then the node drops, if that was truly the last
 ref. The reply is still delivered (it was already computed); the next call
 fails. No use-after-free, no torn call.
 
+## 8.29 Ambient authority boundary (post-hardening)
+
+**The claim, made precise.** §1.2's Claim 1 is normative: every access to the
+*domain-facing service surface* — the serial console, IRQ binding, block
+devices, PCI devices, mounts/filesystems, DMA, PCI config space, memory/
+address space, and the registries that name them — crosses a capability edge
+(`invoke` on a `CapId` in a domain table, PERMITed by `resolve`). Concretely,
+in the current tree:
+
+- **Serial console:** `SerialPort::puts/putc/put_hex/put_u64` route through
+  `SerialClient` (the serial cap on the boot domain) once bootstrap completes
+  (`obj/clients.rs`); `KernelSerial` (the node, `obj/adapters.rs`) uses raw
+  primitives. Only pre-bootstrap output, the `IN_CAP` re-entrancy fallback
+  (`drivers/serial.rs`), and the `dump_*` fault path write raw.
+- **IRQ binding:** ps2/ahci/hda/xhci bind handlers via
+  `IrqClient::driver_irq().register(...)` on the driver domain's irq cap
+  (kernel-materialized `IrqHandlerNode` caps; `IRQ_REGISTER` replies
+  `Reply::Data([U64(vector)])`). No code attaches to an interrupt by position.
+  The service-layer `InterruptManager`/`MsiAllocator` impls
+  (`services/x86_64/*`) and the IDT dispatch table remain node/kernel
+  implementation.
+- **Block devices:** `BLOCK_DEVICES` is `pub(crate)`, the interior of
+  `BlockFamilyNode`; registration happens through the `BLOCK_FAMILY_REGISTER`
+  hook (`obj/fs.rs`), and `first`/materialize reads that interior.
+- **Mounts/fs:** reached only through the mount cap; `vfs::mount` /
+  `mount_first_partition` return the mount, and a module-private registry
+  behind the mount node holds it — no `DRIVE_MAP`.
+- **PCI devices:** the forest's per-device `PciDeviceNode` children
+  (`0x11_3000` base) are reached via the `pci:forest` root;
+  `pci::devices()`/`enumerate` are its interior.
+
+**The exact ambient surface that remains is this enumeration:**
+(1) node interiors — a node's own `dispatch` and the concrete resource it
+wraps (`pci::devices()`, `BLOCK_DEVICES`, the xHCI controller state, the
+`MsiAllocator`/`InterruptManager` service impls); (2) the IDT/exception
+dispatch table; (3) the pre-bootstrap boot seed, before the capability graph
+exists; (4) the single-CPU fault-dump path (`dump_*`); and (5) the raw serial
+writes listed above. Everything else is reached through a capability.
+
+**The mechanical gate.** This boundary is not prose-only: `check_ambient.py`
+(repo root) greps `kernel/src` for the ambient blocklist and fails on any hit
+outside the whitelisted interior/implementation files. The inventory above is
+the whitelist, in machine-readable form; a code change that re-introduces an
+ambient access trips the gate. §8.26 ("Does the kernel have any private
+nodes?") is the same boundary viewed from the other side.
+
 ---
 
 # 9. Formal Semantics
@@ -2829,10 +2903,10 @@ note).
 | P1 — Seed + Domains | **Done** (`obj/{mod,rights,cap_handle,table,domain,store,contract,surface,hook,mint}.rs`) |
 | P2 — Trinity Core | **Done** (PERMIT fast path, ContractRegistry, store/registry/tables as nodes) |
 | P3 — Physical World as Nodes | **Done** (physmem/heap/addrspace/cpu/irq nodes; `REGION_POOL_CAPACITY = 64`) |
-| P4 — Device/Service Nodes + Capability VFS | **Done** (`obj/{devices,fs}.rs`; tmpfs + ESP mounts) |
-| P5 — Revocation Modes + Projection | **Done** (`obj/revocation.rs`, `kerneldump/{graph,leak}.rs`) |
-| P6-A — Paged Domain Isolation | **Done** (`obj/paged_isolation.rs`) |
-| P6-B — Capability-system upgrade | **Done** (per-hook contract rights, QUERY surface reads, delegation, real mem:region/PCI/fs nodes) |
+| P4 — Device/Service Nodes + Capability VFS | **Done** (`obj/{devices,fs}.rs`; tmpfs + ESP mounts; IRQ binding, serial console, and block registration are cap-mediated; PCI forest per-device materialization restored) |
+| P5 — Revocation Modes + Projection | **Done** (revoke_cascade/deny in `obj/{table,store}.rs`; `kerneldump/{graph,leak}.rs`; the boot-time revocation gate was removed in 6adbc4e) |
+| P6-A — Paged Domain Isolation | **Done** (clone_high_half/with_addrspace/CR3 switch in `obj/domain.rs` + `mm/vmm`; boot-time proof module removed in 6adbc4e) |
+| P6-B — Capability-system upgrade | **Done** (per-hook contract rights, QUERY surface reads, delegation, real mem:region/PCI/fs nodes; boot-time proof modules remain removed — only the `selftest`-gated kerneldump census runs at boot; the ambient-authority boundary is enforced by `check_ambient.py`) |
 | P6 — User Boundary + Sessions | **Open** (see below) |
 
 ## Phase P0 — The Spec *(implemented)*
@@ -2858,7 +2932,9 @@ numbered I1–I10 distilled into the repo's invariants format).
   turn `KernelServices` into the boot domain's endowment; convert the 10
   call sites (§7.7.1) to `domain.resolve(...)`.
 - Establish the first driver domain (the USB/device bring-up path) with its
-  own disjoint table (§6.2) — the separation proof.
+  own disjoint table (§6.2) — the separation property (disjoint tables +
+  address spaces). The dedicated proof module was removed in 6adbc4e; the
+  property is structural, not boot-asserted.
 - The Principal (acting through the bootstrapper) mints the primitive nodes
   (PhysMem, Heap, AddressSpace, Cpu, Irq, store, registry) as family roots;
   the bootstrapper self-revokes (drop-death) at end of init.
@@ -2866,7 +2942,9 @@ numbered I1–I10 distilled into the repo's invariants format).
 **Incremental conversion of the 10 call sites (do not do it in one commit).**
 P1 is the highest-risk phase, and the call-site conversion is its sharpest
 edge. Convert the ambient `kernel_services()` sites one *service* at a time,
-in dependency order, with a separation test after each:
+in dependency order, with a separation check after each (disjoint tables +
+address spaces; the property is structural, not boot-asserted — the proof
+module was removed in 6adbc4e):
 
 1. **DMA allocator** (used by both USB and AHCI) — the first conversion.
    Every driver domain gets a `dma` cap through endowment; nothing else may
@@ -2875,14 +2953,16 @@ in dependency order, with a separation test after each:
 3. **PCI enumeration** — the PCI forest becomes a node family; the
    enumeration walks it via `TRAVERSE`.
 
-Each conversion is committed with a **separation test** that asserts the
+Each conversion is committed with a **separation check** that asserts the
 negation: a driver domain without the endowed capability *cannot* reach the
 service through any residual global — `kernel_services()` has no second
 entry point, the service node has no un-guarded static, and a `resolve` with
-no matching cap returns `ObjError::NoSuchCapability`. The separation proof
-(§6.2) is not optional; it is the validation that the model works. If the
-USB driver domain can still reach the heap via some residual global, the
-foundation is compromised and the phase has not finished.
+no matching cap returns `ObjError::NoSuchCapability`. The separation
+property (§6.2) is not optional; it is structural — disjoint tables +
+address spaces — and holds by construction, not by a boot-time proof (the
+dedicated proof module was removed in 6adbc4e). If the USB driver domain can
+still reach the heap via some residual global, the foundation is compromised
+and the phase has not finished.
 
 **Gate.** Both targets build (§7.15); x86_64 boots; serial log shows the
 bootstrap self-revoke message. `kerneldump graph` is stubbed (returns the
@@ -2999,12 +3079,14 @@ checked mechanically.
   projection's roots, then SCC analysis on the unreached residue), and **run
   it after every test-suite execution** as part of the CI-equivalent boot
   script — a leaked node fails the run.
-- **Cascade correctness is a snapshot assertion.** The P5 gate already
-  cascade-revokes a test driver domain; the assertion is that its *entire
-  subtree* vanishes from the *next* projection snapshot. If the snapshot
-  shows orphaned descendants — nodes still recorded in the store, still
-  reachable from nothing, or handles still `Live` — the cascade machinery is
-  broken. The gate's comparison (pre-cascade snapshot vs post-cascade
+- **Cascade correctness is a snapshot assertion.** The P5 gate's boot-time
+  assertion cascade-revoked a test driver domain and checked that its *entire
+  subtree* vanished from the *next* projection snapshot. That boot-time gate
+  was removed with the self-test suite in 6adbc4e; the cascade mechanism
+  remains (`revoke_cascade` in `obj/table.rs`). The check is structural: if a
+  snapshot shows orphaned descendants — nodes still recorded in the store,
+  still reachable from nothing, or handles still `Live` — the cascade
+  machinery is broken. The comparison (pre-cascade snapshot vs post-cascade
   snapshot) is the test; a diff showing only the intended subtree is the
   pass.
 - **Cascade latency measurement.** The §8.6 latency budget is profiled here:
@@ -3013,9 +3095,13 @@ checked mechanically.
   whether the lazy-marking or sharded-store work (§8.6, layers 2–3) is
   pulled in. P5 is the phase where that measurement is *made*, not deferred.
 
-**Gate.** Builds; a test driver domain can be cascade-revoked and its whole
-subtree disappears from the next projection; deny-list revocation makes a
-`Revocable` node `Zombie` while caps remain.
+**Gate.** The boot-time revocation gate assertion — cascade-revoke a test
+driver domain and confirm its whole subtree disappears from the next
+projection; deny-list revocation makes a `Revocable` node `Zombie` while
+caps remain — was removed with the self-test suite in 6adbc4e. The
+mechanism remains (`revoke_cascade`/deny in `obj/{table,store}.rs`), and the
+`kerneldump graph`/`leak_detect` walkers (under the `selftest` feature) keep
+the snapshot invariants observable.
 
 ## Phase P6 — User Boundary + Sessions *(open — the only unimplemented phase)*
 

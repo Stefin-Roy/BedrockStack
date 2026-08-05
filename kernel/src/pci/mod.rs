@@ -60,6 +60,14 @@ pub fn init(regions: &PciConfigRegions, root: u64, alloc: *mut BitmapAllocator) 
 }
 
 /// Return a reference to the list of all discovered PCI devices.
+///
+/// This is the INTERIOR of the `pci:forest` family root (`PciForestNode`,
+/// obj/devices.rs §7.11.4): the raw census slice set once by enumeration and
+/// never freed. It is not a public namespace — capability-gated consumers must
+/// enumerate through the forest node's `count`/`children` hooks; the kernel's
+/// own bring-up paths (blockdriver/usb/audio device sweeps) may read it as
+/// the device sweep runs under the driver domain. Backed by
+/// [`enumerate::all`].
 pub fn devices() -> &'static [PciDevice] {
     enumerate::all()
 }

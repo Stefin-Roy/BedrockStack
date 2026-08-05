@@ -1,5 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
@@ -435,8 +435,9 @@ static HEAP: Mutex<HeapInner> = Mutex::new(HeapInner::empty());
 /// The caller must ensure the pointed-to `BitmapAllocator` outlives the
 /// kernel heap (i.e. lives for the entire remaining boot sequence).  This
 /// pointer is set once by `init()`, but may be *updated* after a move with
-/// `set_phys_allocator()`.
-static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
+/// `set_phys_allocator()`.  A single-writer during boot, so plain
+/// Acquire/Release loads and stores suffice.
+static PHYS_ALLOCATOR: AtomicPtr<BitmapAllocator> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Update the physical allocator pointer after a move.
 ///
@@ -445,12 +446,12 @@ static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
 /// once the final location is known so heap growth and DMA allocations
 /// continue to work.
 pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
-    unsafe { PHYS_ALLOCATOR = phys as *mut BitmapAllocator; }
+    PHYS_ALLOCATOR.store(phys as *mut BitmapAllocator, Ordering::Release);
 }
 
 /// Return a raw pointer to the physical allocator (may be null if uninitialised).
 pub fn phys_allocator_raw() -> *mut BitmapAllocator {
-    unsafe { PHYS_ALLOCATOR }
+    PHYS_ALLOCATOR.load(Ordering::Acquire)
 }
 
 /// Return a mutable reference to the physical allocator.
@@ -458,7 +459,7 @@ pub fn phys_allocator_raw() -> *mut BitmapAllocator {
 /// # Panics
 /// Panics if the allocator has not been initialised yet.
 pub fn get_phys_allocator_mut() -> &'static mut BitmapAllocator {
-    let ptr = unsafe { PHYS_ALLOCATOR };
+    let ptr = PHYS_ALLOCATOR.load(Ordering::Acquire);
     if ptr.is_null() {
         SerialPort::puts("[heap] FATAL: no physical allocator\n");
         loop {}
@@ -482,7 +483,7 @@ unsafe fn phys_allocator() -> &'static mut BitmapAllocator {
 pub unsafe fn init(root: u64, phys: &mut BitmapAllocator) {
     SerialPort::puts("[heap] init\n");
 
-    unsafe { PHYS_ALLOCATOR = phys as *mut BitmapAllocator; }
+    PHYS_ALLOCATOR.store(phys as *mut BitmapAllocator, Ordering::Release);
 
     let mut heap = HEAP.lock();
     heap.root = root;

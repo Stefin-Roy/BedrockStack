@@ -436,6 +436,11 @@ impl Kernel {
                 self.page_table_root,
                 &mut self.allocator as *mut _,
             );
+            // Materialize one PciDeviceNode child per discovered device under
+            // the pci:forest root, so the device complex is capability-visible
+            // (count/children hooks, cascade severance) from boot (§3.7.2,
+            // §7.11.4). No-op on riscv64 (the PCI subsystem is x86_64-only).
+            crate::obj::devices::materialize_pci_tree();
         }
 
         // UInputL — the unified input layer.  Must exist before any driver
@@ -466,13 +471,25 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         {
             block_devices.extend(usb_block_devices);
-            *crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock() = block_devices.clone();
         }
 
         // A: tmpfs mount via mount cap (CapabilityVfs step 5, §7.11 — no ambient VFS remaining)
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         {
             crate::filesystems::fstypes::register_all();
+
+            // Bring-up registration: push every discovered block device
+            // (AHCI + the xHCI-attached ones merged above) into the
+            // block-family interior through the `register` hook — the
+            // family node materializes later from its own interior, never an
+            // ambient list (§7.11.4).
+            #[cfg(target_arch = "x86_64")]
+            {
+                for dev in block_devices.iter() {
+                    register_block_device(dev.clone());
+                }
+            }
+
             let table = &crate::obj::bootstrap::boot_domain().table;
             let boot_end = crate::obj::bootstrap::boot_endowment();
             let args = crate::obj::Args {
@@ -579,16 +596,52 @@ impl Kernel {
             #[cfg(target_arch = "x86_64")]
             {
                 // Hot-plug: poll the retained xHCI controller for port
-                // changes and register any newly attached block devices.
+                // changes and register any newly attached block devices
+                // through the block-family register hook.
                 let new_devices = crate::usb::xhci::poll();
                 if !new_devices.is_empty() {
-                    crate::filesystems::blockdriver::driver::BLOCK_DEVICES
-                        .lock()
-                        .extend(new_devices);
+                    for dev in new_devices {
+                        register_block_device(dev);
+                    }
                 }
             }
             self.svc().platform.halt();
         }
+    }
+}
+
+/// Register a block device into the `block:family` interior via the
+/// `register` hook (§7.11.4): wrap the device in a `BlockNode` cap inserted
+/// into the boot table, then invoke the hook with that cap's id. The family
+/// node resolves the cap, downcasts to `BlockNode`, and pushes the device
+/// into its interior — the kernel's own bring-up path, no ambient list.
+#[cfg(target_arch = "x86_64")]
+fn register_block_device(
+    device: alloc::sync::Arc<dyn crate::filesystems::blockdriver::traits::BlockDevice>,
+) {
+    use crate::obj::bootstrap::{boot_domain, boot_endowment};
+    use crate::obj::fs::{BLOCK_FAMILY_CONTRACT, BLOCK_FAMILY_REGISTER, BlockNode};
+    use crate::obj::{
+        invoke, Args, CapHandle, CapId, CapRights, ContractRights, HandleState, Rights, Value,
+    };
+
+    let table = &boot_domain().table;
+    let cap = table.insert(CapHandle {
+        id: CapId(0),
+        node: alloc::sync::Arc::new(BlockNode::new(device)),
+        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
+        state: HandleState::Live,
+    });
+    let args = Args { vals: alloc::vec![Value::U64(cap.0)] };
+    match invoke(
+        table,
+        boot_endowment().block,
+        BLOCK_FAMILY_CONTRACT,
+        BLOCK_FAMILY_REGISTER,
+        &args,
+    ) {
+        Ok(_) => {}
+        Err(e) => log::warn!("block:family register failed: {:?}", e),
     }
 }
 

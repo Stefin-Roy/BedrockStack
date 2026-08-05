@@ -1,67 +1,11 @@
-use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin::Mutex;
 use spin::Once;
 
 use super::clockevent::Clockevent;
 use super::clocksource::Clocksource;
+use super::irqsafe::IrqLock;
+use super::lockorder;
 use super::timer_queue::{TimerEntry, TimerQueue};
-
-// ── Interrupt-safe lock wrapper ───────────────────────────────────
-// Disables local IRQs while the inner Mutex is held, so the timer ISR
-// (which also acquires this lock) cannot re-enter.
-
-struct IrqSafeLock<T> {
-    inner: Mutex<T>,
-}
-
-impl<T> IrqSafeLock<T> {
-    const fn new(val: T) -> Self {
-        IrqSafeLock { inner: Mutex::new(val) }
-    }
-
-    fn lock(&self) -> IrqSafeGuard<'_, T> {
-        let was_enabled = crate::arch::CurrentArch::are_interrupts_enabled();
-        if was_enabled {
-            crate::arch::CurrentArch::disable_interrupts();
-        }
-        IrqSafeGuard { guard: Some(self.inner.lock()), was_enabled }
-    }
-}
-
-struct IrqSafeGuard<'a, T> {
-    guard: Option<spin::MutexGuard<'a, T>>,
-    was_enabled: bool,
-}
-
-impl<'a, T> IrqSafeGuard<'a, T> {
-    fn take_guard(&mut self) -> spin::MutexGuard<'a, T> {
-        self.guard.take().expect("IrqSafeGuard already consumed")
-    }
-}
-
-impl<T> Deref for IrqSafeGuard<'_, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        self.guard.as_ref().unwrap().deref()
-    }
-}
-
-impl<T> DerefMut for IrqSafeGuard<'_, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        self.guard.as_mut().unwrap().deref_mut()
-    }
-}
-
-impl<T> Drop for IrqSafeGuard<'_, T> {
-    fn drop(&mut self) {
-        let g = self.take_guard();
-        drop(g);
-        if self.was_enabled {
-            crate::arch::CurrentArch::enable_interrupts();
-        }
-    }
-}
 
 // ── Exported types ────────────────────────────────────────────────
 
@@ -92,7 +36,7 @@ pub trait UniversalTimer: Send + Sync {
 pub struct UniversalTimerImpl {
     clocksource: &'static dyn Clocksource,
     clockevent: &'static dyn Clockevent,
-    queue: IrqSafeLock<TimerQueue>,
+    queue: IrqLock<TimerQueue>,
     next_id: AtomicU64,
 }
 
@@ -104,7 +48,7 @@ impl UniversalTimerImpl {
         UniversalTimerImpl {
             clocksource,
             clockevent,
-            queue: IrqSafeLock::new(TimerQueue::new()),
+            queue: IrqLock::with_order(TimerQueue::new(), lockorder::TIMER_QUEUE),
             next_id: AtomicU64::new(1),
         }
     }
@@ -122,7 +66,7 @@ impl UniversalTimerImpl {
             if let Some(period) = entry.period {
                 queue.insert(TimerEntry::new(
                     entry.id,
-                    now + period,
+                    now.saturating_add(period),
                     Some(period),
                     entry.callback,
                     entry.context,
@@ -157,7 +101,7 @@ impl UniversalTimer for UniversalTimerImpl {
 
     fn set_periodic(&self, interval_ns: u64, callback: TimerCallback, context: *mut u8) -> TimerId {
         let now = self.clocksource.now_ns();
-        let deadline_ns = now + interval_ns;
+        let deadline_ns = now.saturating_add(interval_ns);
         let id = TimerId(self.next_id.fetch_add(1, Ordering::Relaxed));
         let mut queue = self.queue.lock();
         let old_next = queue.next_deadline();
@@ -292,7 +236,8 @@ pub fn wait_until(deadline_ns: u64) {
 
 /// Block for `ms` milliseconds, yielding the CPU.
 pub fn sleep_ms(ms: u64) {
-    wait_until(universal_timer().now_ns() + ms * 1_000_000);
+    let now = universal_timer().now_ns();
+    wait_until(now.saturating_add(ms.saturating_mul(1_000_000)));
 }
 
 /// Current monotonic time in nanoseconds.

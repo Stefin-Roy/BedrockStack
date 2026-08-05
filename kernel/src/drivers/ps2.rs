@@ -1037,7 +1037,7 @@ fn setup_irq() -> bool {
         SerialPort::puts("[ps2] IOAPIC routing failed — falling back to polled mode\n");
         return false;
     };
-    crate::arch::x86_64::idt::register_device_handler_at(vector, irq_handler);
+    let _ = crate::obj::clients::IrqClient::driver_irq().register(Some(vector), irq_handler);
     IRQ_VECTOR.store(vector, Ordering::Relaxed);
     IRQ_ENABLED.store(true, Ordering::Release);
     SerialPort::puts("[ps2] keyboard IRQ wired (vector ");

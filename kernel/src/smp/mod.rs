@@ -48,7 +48,19 @@ pub const MAX_CPUS: usize = 16;
 
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
-static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
+/// Shared storage for the per-CPU slot table.
+///
+/// The table is written during SMP bring-up (each CPU owns its own slot) and
+/// read via `current_per_cpu` throughout.  Indexed access is routed through
+/// `slot_mut()` so the kernel links without a `static mut`.
+struct SharedSlots(core::cell::UnsafeCell<[PerCpu; MAX_CPUS]>);
+
+// Each CPU only ever mutates its own slot; reads of other slots happen after
+// that slot's owner has finished initialising it.
+unsafe impl Sync for SharedSlots {}
+unsafe impl Send for SharedSlots {}
+
+static PER_CPU_SLOTS: SharedSlots = SharedSlots(core::cell::UnsafeCell::new([
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
@@ -65,7 +77,122 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
     PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+]));
+
+// ── Per-CPU lockdep stacks (debug-only, feature "lockdep") ────────────
+//
+// Kept as separate statics (rather than fields on `PerCpu`) so the `#[repr(C)]`
+// PerCpu layout — whose first field `self_ptr` is addressed via gs/tp — stays
+// untouched.  `order == 0` locks are untracked.
+
+/// Maximum depth of the per-CPU lockdep stack.
+#[cfg(feature = "lockdep")]
+const LOCKDEP_STACK_DEPTH: usize = 16;
+
+#[cfg(feature = "lockdep")]
+struct LockdepStack(core::cell::UnsafeCell<[u8; LOCKDEP_STACK_DEPTH]>);
+
+#[cfg(feature = "lockdep")]
+unsafe impl Sync for LockdepStack {}
+
+#[cfg(feature = "lockdep")]
+unsafe impl Send for LockdepStack {}
+
+#[cfg(feature = "lockdep")]
+const fn empty_lockdep_stack() -> LockdepStack {
+    LockdepStack(core::cell::UnsafeCell::new([0u8; LOCKDEP_STACK_DEPTH]))
+}
+
+#[cfg(feature = "lockdep")]
+static LOCKDEP_STACKS: [LockdepStack; MAX_CPUS] = [
+    empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
+    empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
+    empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
+    empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
 ];
+
+#[cfg(feature = "lockdep")]
+use core::sync::atomic::AtomicU8;
+
+#[cfg(feature = "lockdep")]
+static LOCKDEP_DEPTH: [AtomicU8; MAX_CPUS] = [
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+];
+
+/// Record `order` as the newly-acquired lock on the current CPU.
+///
+/// Asserts the acquire order is strictly greater than the current top of this
+/// CPU's lockdep stack and that the lock is not already held on this CPU
+/// (recursion would otherwise hang the `spin::Mutex` silently).  No-op unless
+/// the `lockdep` feature is enabled; `order == 0` locks are untracked.
+#[allow(unused_variables)]
+pub fn lockdep_push(order: u8) {
+    #[cfg(feature = "lockdep")]
+    {
+        if order == 0 {
+            return;
+        }
+        let cpu = current_cpu_id() as usize;
+        let depth = LOCKDEP_DEPTH[cpu].load(Ordering::Relaxed) as usize;
+        assert!(
+            depth < LOCKDEP_STACK_DEPTH,
+            "lock order violation: lockdep stack overflow (order {order}) on cpu {cpu}"
+        );
+        let stack = unsafe { &mut *LOCKDEP_STACKS[cpu].0.get() };
+        for &held in &stack[..depth] {
+            assert!(
+                held != order,
+                "lock order violation: recursive lock of order {order} on cpu {cpu}"
+            );
+        }
+        if depth > 0 {
+            let top = stack[depth - 1];
+            assert!(
+                order > top,
+                "lock order violation: order {order} acquired after {top} on cpu {cpu}"
+            );
+        }
+        stack[depth] = order;
+        LOCKDEP_DEPTH[cpu].store((depth + 1) as u8, Ordering::Relaxed);
+    }
+}
+
+/// Release `order` on the current CPU's lockdep stack.
+///
+/// Asserts `order` is the current top of this CPU's stack (i.e. released in
+/// strict LIFO order).  No-op unless the `lockdep` feature is enabled;
+/// `order == 0` locks are untracked.
+#[allow(unused_variables)]
+pub fn lockdep_pop(order: u8) {
+    #[cfg(feature = "lockdep")]
+    {
+        if order == 0 {
+            return;
+        }
+        let cpu = current_cpu_id() as usize;
+        let depth = LOCKDEP_DEPTH[cpu].load(Ordering::Relaxed) as usize;
+        assert!(
+            depth > 0,
+            "lock order violation: lockdep pop underflow (order {order}) on cpu {cpu}"
+        );
+        let stack = unsafe { &mut *LOCKDEP_STACKS[cpu].0.get() };
+        let top = stack[depth - 1];
+        assert!(
+            top == order,
+            "lock order violation: releasing order {order}, top is {top} on cpu {cpu}"
+        );
+        LOCKDEP_DEPTH[cpu].store((depth - 1) as u8, Ordering::Relaxed);
+    }
+}
+
+/// Mutable access to one per-CPU slot.
+fn slot_mut(index: usize) -> &'static mut PerCpu {
+    assert!(index < MAX_CPUS, "smp: per-CPU slot {} out of range", index);
+    unsafe { &mut (*PER_CPU_SLOTS.0.get())[index] }
+}
 
 #[cfg(target_arch = "x86_64")]
 pub fn current_per_cpu() -> &'static mut PerCpu {
@@ -87,7 +214,7 @@ pub fn current_per_cpu() -> &'static mut PerCpu {
 
 /// Returns `Some(PerCpu)` if `early_init_bsp` has been called, else `None`.
 pub fn try_current_per_cpu() -> Option<&'static mut PerCpu> {
-    let pc = unsafe { &mut PER_CPU_SLOTS[0] };
+    let pc = slot_mut(0);
     if pc.self_ptr.is_null() {
         None
     } else {
@@ -97,7 +224,7 @@ pub fn try_current_per_cpu() -> Option<&'static mut PerCpu> {
 
 pub fn per_cpu_by_id(cpu_id: u32) -> &'static mut PerCpu {
     assert!((cpu_id as usize) < MAX_CPUS, "per_cpu_by_id: cpu {} out of range", cpu_id);
-    unsafe { &mut PER_CPU_SLOTS[cpu_id as usize] }
+    slot_mut(cpu_id as usize)
 }
 
 pub fn cpu_count() -> u32 {
@@ -113,7 +240,7 @@ pub fn current_cpu_id() -> u32 {
 /// # Safety
 /// Must be called exactly once on the BSP before any SMP operations.
 pub unsafe fn early_init_bsp() {
-    let pc = unsafe { &mut PER_CPU_SLOTS[0] };
+    let pc = slot_mut(0);
     pc.self_ptr = pc as *const PerCpu;
     pc.cpu_id = 0;
     pc.apic_id = 0;
@@ -141,13 +268,13 @@ fn set_tp(pc: *const PerCpu) {
 
 /// Fill in the hardware ID (APIC ID / hart ID) for the BSP.
 pub fn set_bsp_hardware_id(id: u32) {
-    unsafe { PER_CPU_SLOTS[0].apic_id = id; }
+    slot_mut(0).apic_id = id;
 }
 
 /// Find the PerCpu slot and cpu_id matching a hardware (APIC/hart) ID.
 pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)> {
     for i in 0..MAX_CPUS {
-        let pc = unsafe { &mut PER_CPU_SLOTS[i] };
+        let pc = slot_mut(i);
         if pc.apic_id == hw_id {
             return Some((pc, i as u32));
         }
@@ -159,7 +286,7 @@ pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)>
 pub fn started_count() -> u32 {
     let mut n = 0;
     for i in 0..MAX_CPUS {
-        let pc = unsafe { &mut PER_CPU_SLOTS[i] };
+        let pc = slot_mut(i);
         if pc.started.load(Ordering::Relaxed) != 0 {
             n += 1;
         }
@@ -199,7 +326,7 @@ pub unsafe fn init(
         let cpu_id = cpu_id_offset as u32;
         let stack_top = allocate_ap_stack(cpu_id);
 
-        let pc = unsafe { &mut PER_CPU_SLOTS[cpu_id as usize] };
+        let pc = slot_mut(cpu_id as usize);
         pc.self_ptr = pc as *const PerCpu;
         pc.cpu_id = cpu_id;
         pc.apic_id = hardware_id;

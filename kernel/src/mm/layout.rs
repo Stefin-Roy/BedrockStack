@@ -14,6 +14,7 @@
 //! or `DmaAllocator`.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 ///
@@ -122,8 +123,8 @@ pub fn region_reset(name: &str) {
     }
 }
 
-static mut PHYS_MAP_END: u64 = 0;
-static mut PHYS_MAP_ON: bool = false;
+static PHYS_MAP_END: AtomicU64 = AtomicU64::new(0);
+static PHYS_MAP_ON: AtomicBool = AtomicBool::new(false);
 
 /// Enable the private physmap: records how much RAM is mapped at
 /// `[PHYS_MAP_BASE, PHYS_MAP_BASE + end)` and arms the walkers to deref
@@ -135,25 +136,21 @@ static mut PHYS_MAP_ON: bool = false;
 pub fn init_physmap(end: u64) {
     // The DIRECT_MAP grows to cover all of usable RAM; no fixed ceiling.
     let end = (end + 0x1F_FFFF) & !0x1F_FFFF;
-    unsafe {
-        PHYS_MAP_END = end;
-        PHYS_MAP_ON = true;
-    }
+    PHYS_MAP_END.store(end, Ordering::Relaxed);
+    PHYS_MAP_ON.store(true, Ordering::Relaxed);
 }
 pub fn physmap_end() -> u64 {
-    unsafe { PHYS_MAP_END }
+    PHYS_MAP_END.load(Ordering::Relaxed)
 }
 
 /// The physmap offset in effect: `PHYS_MAP_BASE` once the physmap is live and
 /// active, otherwise `0` (identity).  Used by the VMM walkers to translate a
 /// page-table frame's physical address into the VA they deref.
 pub fn phys_offset() -> u64 {
-    unsafe {
-        if PHYS_MAP_ON {
-            PHYS_MAP_BASE
-        } else {
-            0
-        }
+    if PHYS_MAP_ON.load(Ordering::Relaxed) {
+        PHYS_MAP_BASE
+    } else {
+        0
     }
 }
 

@@ -49,7 +49,7 @@ Rust module hierarchy under `kernel/src/`.
 | 23 | `invariants-23-services.md` | Services capability layer | `kernel/src/services/{mod,capability,acpi,cpu,dma,ecam_pci_config,interrupts,pci_config,pci_device,platform,serial,timer,timer_queue,universal_timer,virt_mem,phys_mem,clockevent,clocksource,msi,null_msi,block_device}.rs`, `kernel/src/services/{x86_64,riscv64}/` |
 | 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,xhci/{mod,registers,memory,event,command,device,ports,context},class/mass_storage,usb/{mod,descriptors}}.rs` |
 | 25 | `invariants-25-audio.md` | Audio / HDA driver | `kernel/src/audio/hda.rs` |
-| 26 | `invariants-26-objects.md` | RootGraph objects / capability model (OBJ) | `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver,separation}.rs` |
+| 26 | `invariants-26-objects.md` | RootGraph objects / capability model (OBJ) | `kernel/src/obj/{mod,rights,cap_handle,table,contract,registry,store,mint,bootstrap,driver}.rs` |
 
 ---
 

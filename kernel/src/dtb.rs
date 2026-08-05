@@ -10,7 +10,27 @@ const FDT_PROP: u32 = 0x00000003;
 const FDT_END: u32 = 0x00000009;
 
 const MAX_MEMORY_REGIONS: usize = 8;
-static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { core::mem::zeroed() };
+
+/// Mutable boot-time buffer for parsed memory regions.
+///
+/// Written only during single-threaded boot before any reader is reached;
+/// the raw `UnsafeCell` preserves the old `static mut` semantics.
+struct DtbMemoryRegions(core::cell::UnsafeCell<[MemoryRegion; MAX_MEMORY_REGIONS]>);
+
+// Safety: writes happen only on the boot hart before the buffer is ever read.
+unsafe impl Sync for DtbMemoryRegions {}
+
+impl DtbMemoryRegions {
+    const fn new() -> Self {
+        DtbMemoryRegions(core::cell::UnsafeCell::new(unsafe { core::mem::zeroed() }))
+    }
+
+    fn get(&self) -> *mut [MemoryRegion; MAX_MEMORY_REGIONS] {
+        self.0.get()
+    }
+}
+
+static DTB_MEMORY_REGIONS: DtbMemoryRegions = DtbMemoryRegions::new();
 
 struct FdtHeader {
     magic: u32,
@@ -448,7 +468,7 @@ pub fn parse_memory(dtb: *const u8) -> &'static [MemoryRegion] {
                                 MemoryRegionKind::Usable
                             };
                             unsafe {
-                                DTB_MEMORY_REGIONS[region_count] = MemoryRegion { base: addr, size, kind };
+                                (&mut *DTB_MEMORY_REGIONS.get())[region_count] = MemoryRegion { base: addr, size, kind };
                             }
                             region_count += 1;
                         }
@@ -469,10 +489,26 @@ pub fn parse_memory(dtb: *const u8) -> &'static [MemoryRegion] {
     }
 
     if region_count > 0 {
-        unsafe { &DTB_MEMORY_REGIONS[..region_count] }
+        let regions = unsafe { &mut *DTB_MEMORY_REGIONS.get() };
+        &regions[..region_count]
     } else {
         fallback_memory()
     }
+}
+
+/// Read the CPU timebase frequency from the DTB.
+///
+/// `timebase-frequency` is a single big-endian u32 property of the `/cpus`
+/// node (not per-CPU).  Returns 0 if the DTB is absent, malformed, or the
+/// property is missing.
+pub fn timebase_hz(dtb: *const u8) -> u64 {
+    let mut hz: u64 = 0;
+    walk_dtb_prop_raw(dtb, b"cpus", b"timebase-frequency", |ptr, len| {
+        if len >= 4 {
+            hz = read_be_u32(ptr) as u64;
+        }
+    });
+    hz
 }
 
 pub fn find_rsdp(dtb: *const u8) -> u64 {

@@ -18,7 +18,12 @@ pub trait StorageDriver: Send + Sync {
 
 static REGISTRY: Mutex<Vec<&'static dyn StorageDriver>> = Mutex::new(Vec::new());
 
-pub static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
+/// The block-device registry — INTERIOR of the `block:family` family root
+/// (`BlockFamilyNode`, obj/fs.rs §7.11.4). Reachable only by that node's
+/// `first`/`register` materialize hooks and the kernel bring-up registration
+/// path; consumers must go through the block-family capability, never this
+/// ambient list.
+pub(crate) static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
 
 pub fn register(driver: &'static dyn StorageDriver) {
     REGISTRY.lock().push(driver);

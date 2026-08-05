@@ -152,7 +152,8 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
     // §7.8 — the contract registry is a node, endowed like any provider. Build
     // the registry node, insert it as a capability, and seed the real provider
     // contracts THROUGH that capability (the INVOKE-gated `register` hook), so
-    // the registry carries their definitions before separation proves it.
+    // the registry carries their definitions before the driver domain is
+    // endowed.
     let registry_id = boot.table.insert(CapHandle {
         id: CapId(0),
         node: registry::registry_node(),
@@ -325,8 +326,9 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
 
     // C8 — the first driver domain (§6.2): a second, disjoint table endowed
     // with dma + pci_cfg + physmem + addrspace. Created eagerly alongside the
-    // boot domain so the separation property holds from the first commit and
-    // `separation.rs::run()` can prove it before anything else runs. The driver
+    // boot domain so the separation property holds from the first commit: the
+    // property is structural (disjoint capability tables plus disjoint address
+    // spaces) rather than asserted by a dedicated boot-time proof. The driver
     // domain gets its own address space (paged isolation, §8.14).
     //
     // Pre-populate the device-window PML4 entries in the *kernel* root FIRST,
@@ -351,6 +353,14 @@ pub fn boot_domain() -> &'static Domain {
 /// `.pci_cfg` / `.serial` to `invoke` the real providers.
 pub fn boot_endowment() -> &'static BootEndowment {
     BOOT_ENDOWMENT.get().expect("boot endowment not bootstrapped")
+}
+
+/// Whether bootstrap has completed (the Boot domain exists and the real
+/// providers are endowed).  Lets pre-capability paths (e.g. the serial
+/// console) switch from the raw seed path to the capability-routed sink once
+/// the graph is up.
+pub fn bootstrapped() -> bool {
+    BOOT_ENDOWMENT.is_completed()
 }
 
 /// Register a stable-id boot-era seed node in the ObjectStore under the

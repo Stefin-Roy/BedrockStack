@@ -1,10 +1,13 @@
 //! S6 — Device family nodes: census nodes for PCI, input, and audio (§7.11).
 //!
-//! `PciForestNode` is the PCI controller family root (§7.11.4). Input and
-//! audio remain census-only singletons. Every node exposes a `count` hook that
-//! replies `[U64]`; they are seeded into the Boot domain at bootstrap
-//! (§7.11.3–7.11.6) so a driver domain can probe device families without
-//! ambient enumeration.
+//! The PCI controller forest (§7.11.4) is a *real* family (§2.4):
+//! `PciForestNode` is the family root and `materialize_pci_tree` realizes one
+//! `PciDeviceNode` child per discovered device (parent edge = the forest root)
+//! so cascade revocation can sever the whole complex in one operation
+//! (§3.7.2). Input and audio remain census-only singletons. Every node exposes
+//! a `count` hook that replies `[U64]`; they are seeded into the Boot domain
+//! at bootstrap (§7.11.3–7.11.6) so a driver domain can probe device families
+//! without ambient enumeration.
 
 extern crate alloc;
 
@@ -18,9 +21,12 @@ use spin::Once;
 
 use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
-use super::rights::CapRights;
+use super::rights::{CapRights, ContractRights};
+use super::store::object_store;
 use super::surface::{SurfaceAttr, SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
+
+use crate::services::pci_config::PciConfigSpace;
 
 // ── Audio readiness flag ────────────────────────────────────────────
 
@@ -45,7 +51,7 @@ pub const PCI_FOREST_CHILDREN: HookId = HookId::of("children");
 pub const PCI_FOREST_DOC: &str = "the PCI controller forest family root \
 (§7.11.4): count() replies [U64] = the number of PCI devices discovered at \
 boot; children() replies [U64] = the number of device children materialized \
-under this root.";
+under this root (0 until materialize_pci_tree runs).";
 
 const PCI_FOREST_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "pci:forest",
@@ -140,9 +146,207 @@ const PCI_DEVICE_HOOKS: &[HookSignature] = &[
     HookSignature { name: "irq_line", params: &[], reply: ReplyTag::Data(&[TypeTag::U64]) },
 ];
 
-/// Module-level cache of the materialized PCI children, so the census
-/// `children` hook keeps answering.
+/// Module-level cache of the materialized PCI children, so the census `count`
+/// / `children` hooks keep answering and re-materialization is idempotent.
 static PCI_CHILDREN: Once<Vec<Arc<dyn Obj>>> = Once::new();
+
+// ── PciDeviceNode — a materialized PCI child (§7.11.4) ─────────────────
+
+/// Dynamic child-id base for PCI devices: `0x11_3000 + offset`, where the
+/// offset packs the device's PCI address (segment:bus:device:function) so the
+/// id is deterministic for a given slot (§7.8 stable-identity convention).
+pub const PCI_DEVICE_CHILD_ID_BASE: u64 = 0x11_3000;
+
+pub const PCI_DEVICE_READ8: HookId = HookId::of("read8");
+pub const PCI_DEVICE_READ16: HookId = HookId::of("read16");
+pub const PCI_DEVICE_READ32: HookId = HookId::of("read32");
+pub const PCI_DEVICE_WRITE8: HookId = HookId::of("write8");
+pub const PCI_DEVICE_WRITE16: HookId = HookId::of("write16");
+pub const PCI_DEVICE_WRITE32: HookId = HookId::of("write32");
+pub const PCI_DEVICE_VENDOR_ID: HookId = HookId::of("vendor_id");
+pub const PCI_DEVICE_DEVICE_ID: HookId = HookId::of("device_id");
+pub const PCI_DEVICE_CLASS: HookId = HookId::of("class");
+pub const PCI_DEVICE_BAR: HookId = HookId::of("bar");
+pub const PCI_DEVICE_IRQ_LINE: HookId = HookId::of("irq_line");
+
+static PCI_DEVICE_CONTRACTS: &[ContractId] = &[PCI_DEVICE_CONTRACT];
+
+/// A materialized PCI device child under the `pci:forest` root. Carries a
+/// `Copy` of the discovered `PciDevice`; its `ObjId` is derived from the
+/// device's PCI address so the same slot always names the same child (§2.1,
+/// §7.8). Exposes the `pci:device` contract: config-space read/write plus
+/// identity reads, with per-hook READ/WRITE gating (§3.3). Still a leaf the
+/// cascade test can sever at the trunk (§3.7.2).
+pub struct PciDeviceNode {
+    dev: crate::pci::PciDevice,
+}
+
+impl PciDeviceNode {
+    /// `0x11_3000` plus the device's PCI address (segment:bus:device:function)
+    /// packed into the low 32 bits — deterministic and unique per slot.
+    fn obj_id_of(dev: &crate::pci::PciDevice) -> ObjId {
+        let loc = (u64::from(dev.segment) << 16)
+            | (u64::from(dev.bus) << 8)
+            | (u64::from(dev.device) << 3)
+            | u64::from(dev.function);
+        ObjId(PCI_DEVICE_CHILD_ID_BASE + loc)
+    }
+}
+
+impl Obj for PciDeviceNode {
+    fn obj_id(&self) -> ObjId {
+        Self::obj_id_of(&self.dev)
+    }
+
+    fn kind(&self) -> &'static str {
+        "pci:device"
+    }
+
+    fn surface(&self) -> Option<&'static SurfaceDesc> {
+        Some(&PCI_DEVICE_SURFACE)
+    }
+
+    fn contracts(&self) -> &'static [ContractId] {
+        PCI_DEVICE_CONTRACTS
+    }
+
+    fn dispatch(
+        &self,
+        _caller: &super::table::CapabilityTable,
+        _rights: &CapRights,
+        hook: HookId,
+        args: &Args,
+    ) -> Result<Reply, ObjError> {
+        let ecam = crate::services::ecam_pci_config::ecam_static();
+        let (seg, bus, dev, func) =
+            (self.dev.segment, self.dev.bus, self.dev.device, self.dev.function);
+
+        let offset = |i: usize| -> Result<u16, ObjError> {
+            match args.vals.get(i) {
+                Some(Value::U64(o)) => Ok(*o as u16),
+                _ => Err(ObjError::Denied),
+            }
+        };
+
+        match hook {
+            PCI_DEVICE_READ8 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read8(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_READ16 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read16(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_READ32 => {
+                let off = offset(0)?;
+                Ok(Reply::Data(vec![Value::U64(u64::from(
+                    ecam.read32(seg, bus, dev, func, off),
+                ))]))
+            }
+            PCI_DEVICE_WRITE8 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u8,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write8(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_WRITE16 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u16,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write16(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_WRITE32 => {
+                let off = offset(0)?;
+                let val = match args.vals.get(1) {
+                    Some(Value::U64(v)) => *v as u32,
+                    _ => return Err(ObjError::Denied),
+                };
+                ecam.write32(seg, bus, dev, func, off, val);
+                Ok(Reply::None)
+            }
+            PCI_DEVICE_VENDOR_ID => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.vendor_id))]))
+            }
+            PCI_DEVICE_DEVICE_ID => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.device_id))]))
+            }
+            PCI_DEVICE_CLASS => Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.class))])),
+            PCI_DEVICE_BAR => {
+                let index = match args.vals.first() {
+                    Some(Value::U64(i)) => *i,
+                    _ => return Err(ObjError::Denied),
+                };
+                if index >= 6 {
+                    return Err(ObjError::Denied);
+                }
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.bars[index as usize]))]))
+            }
+            PCI_DEVICE_IRQ_LINE => {
+                Ok(Reply::Data(vec![Value::U64(u64::from(self.dev.interrupt_line))]))
+            }
+            _ => Err(ObjError::NotSupported),
+        }
+    }
+
+    fn hook_contract_right(&self, _contract: ContractId, hook: HookId) -> ContractRights {
+        match hook {
+            PCI_DEVICE_READ8 | PCI_DEVICE_READ16 | PCI_DEVICE_READ32
+            | PCI_DEVICE_VENDOR_ID | PCI_DEVICE_DEVICE_ID | PCI_DEVICE_CLASS
+            | PCI_DEVICE_BAR | PCI_DEVICE_IRQ_LINE => ContractRights::READ,
+            PCI_DEVICE_WRITE8 | PCI_DEVICE_WRITE16 | PCI_DEVICE_WRITE32 => ContractRights::WRITE,
+            _ => ContractRights::CALL,
+        }
+    }
+
+    fn surface_value(&self, name: &str) -> Option<Value> {
+        match name {
+            "bus" => Some(Value::U64(self.dev.bus as u64)),
+            "device" => Some(Value::U64(self.dev.device as u64)),
+            "function" => Some(Value::U64(self.dev.function as u64)),
+            "vendor_id" => Some(Value::U64(self.dev.vendor_id as u64)),
+            "device_id" => Some(Value::U64(self.dev.device_id as u64)),
+            "class" => Some(Value::U64(self.dev.class as u64)),
+            _ => None,
+        }
+    }
+}
+
+/// Materialize one PCI device as a child node under the forest root
+/// `root_id` (§3.5, §7.11.4). Registers it in the store with
+/// `parent = Some(root_id)` so the projection sees the family edge
+/// (§2.1, §7.13); returns the node.
+pub fn materialize_pci_child(root_id: ObjId, dev: &crate::pci::PciDevice) -> Arc<dyn Obj> {
+    let node: Arc<dyn Obj> = Arc::new(PciDeviceNode { dev: *dev });
+    object_store().register_with_id_weak(node.obj_id(), node.kind(), Some(root_id), Some(root_id), &node);
+    node
+}
+
+/// Materialize one child per discovered PCI device under the forest root
+/// (§3.7.2, §7.11.4). Called by the coordinator from the run sequence after
+/// PCI enumeration; no-op on riscv64 (the PCI subsystem is x86_64-concrete).
+/// Idempotent: the first call populates the `PCI_CHILDREN` cache; later calls
+/// return immediately.
+pub fn materialize_pci_tree() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        PCI_CHILDREN.call_once(|| {
+            crate::pci::devices()
+                .iter()
+                .map(|dev| materialize_pci_child(PCI_FOREST_OBJ_ID, dev))
+                .collect::<Vec<Arc<dyn Obj>>>()
+        });
+    }
+}
 
 // ── InputFamilyNode ─────────────────────────────────────────────────
 

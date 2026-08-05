@@ -57,7 +57,10 @@ impl BlockCache {
             self.sectors.insert(lba, CachedSector { data: buf });
             self.clock.push(lba);
         }
-        Ok(&self.sectors.get(&lba).unwrap().data)
+        match self.sectors.get(&lba) {
+            Some(sector) => Ok(&sector.data),
+            None => Err(()),
+        }
     }
 
     fn read_raw(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf_ptr: *mut u8, buf_len: usize) -> Result<(), ()> {

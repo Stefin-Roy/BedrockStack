@@ -112,6 +112,15 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let total_clus = (total_data_sectors / sec_per_clus as u64) as u32;
     let byts_per_clus = (bytes_per_sec as u32) * (sec_per_clus as u32);
 
+    // Sanity ceiling: bytes_per_sec (512) * sec_per_clus (<=128) cannot
+    // overflow u32, but bound byts_per_clus to the max SPC product and
+    // require at least one directory entry per cluster.  Keeps
+    // entries_per_clus = byts_per_clus / DIR_ENTRY_SIZE sane and
+    // non-zero in every consumer.
+    if byts_per_clus > (SECTOR_SIZE as u32) * 128 || byts_per_clus < DIR_ENTRY_SIZE as u32 {
+        return Err(VfsError::InvalidInput);
+    }
+
     // BPB_ExtFlags (offset 0x28): bits 0-3 = active FAT (only meaningful when
     // bit 7 is set), bit 7 set = FAT mirroring disabled, bits 8-15 reserved.
     // Note offset 0x42 is the extended boot signature (0x29), NOT a FAT

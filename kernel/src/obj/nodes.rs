@@ -687,7 +687,7 @@ const IRQ_SURFACE: SurfaceDesc = SurfaceDesc {
 };
 
 const IRQ_HOOKS: &[HookSignature] = &[
-    HookSignature { name: "register_handler", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
+    HookSignature { name: "register_handler", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::Data(&[TypeTag::U64]) },
     HookSignature { name: "unregister", params: &[TypeTag::U64], reply: ReplyTag::None },
     HookSignature { name: "ack", params: &[], reply: ReplyTag::None },
     HookSignature { name: "set_enabled", params: &[TypeTag::U64, TypeTag::U64], reply: ReplyTag::None },
@@ -739,15 +739,17 @@ impl Obj for IrqRootNode {
         if hook == IRQ_REGISTER {
             let handler = resolve_handler(caller, arg_u64(args, 1).ok_or(ObjError::Denied)?)?;
             let vector = match arg_u64(args, 0) {
-                Some(v) => v as u8,
-                // Omitted vector → ask MSI for a free device vector.
-                None => match self.msi.allocate_device_vector(handler) {
+                // An explicit vector, or zero/omitted (the client encodes
+                // `Option::None` as `Value::U64(0)`) → ask MSI for a free
+                // device vector.
+                Some(0) | None => match self.msi.allocate_device_vector(handler) {
                     Some(v) => v,
                     None => return Err(ObjError::Exhausted),
                 },
+                Some(v) => v as u8,
             };
             self.irq.register_handler(vector, handler);
-            return Ok(Reply::None);
+            return Ok(Reply::Data(alloc::vec![Value::U64(vector as u64)]));
         }
         if hook == IRQ_UNREGISTER {
             let vector = arg_u64(args, 0).ok_or(ObjError::Denied)? as u8;
@@ -804,7 +806,7 @@ impl Obj for IrqNode {
         if hook == IRQ_REGISTER {
             let handler = resolve_handler(caller, arg_u64(args, 1).ok_or(ObjError::Denied)?)?;
             self.irq.register_handler(self.vector, handler);
-            return Ok(Reply::None);
+            return Ok(Reply::Data(vec![Value::U64(self.vector as u64)]));
         }
         if hook == IRQ_UNREGISTER {
             self.irq.unregister_handler(self.vector);
@@ -1021,6 +1023,29 @@ pub fn phys_mem_node() -> Arc<dyn Obj> {
 pub fn addr_space_node() -> Arc<dyn Obj> {
     let root = *ADDR_SPACE_ROOT.get().expect("build_physical_nodes must run first");
     Arc::new(AddressSpaceNode::new(root))
+}
+
+/// The interrupt family root, equal to the one `build_physical_nodes`
+/// returned (§6.2). Unlike `PhysMemNode`/`AddressSpaceNode`, the
+/// `IrqRootNode` is not value-constructible — it carries the `&'static dyn`
+/// service references seeded by `build_physical_nodes` — so this is a
+/// `Once` singleton wrapping the same construction bootstrap uses. Callable
+/// after `build_physical_nodes` (starts the driver domain).
+static IRQ_ROOT_NODE: Once<Arc<dyn Obj>> = Once::new();
+
+/// The interrupt family root, equal to the one `build_physical_nodes`
+/// returned (§6.2). Wraps the same `IrqRootNode` construction over the
+/// service references seeded by `build_physical_nodes`.
+pub fn irq_root_node() -> Arc<dyn Obj> {
+    Arc::clone(IRQ_ROOT_NODE.call_once(|| {
+        let irq = *IRQ_SERVICE
+            .get()
+            .expect("build_physical_nodes must run first");
+        let msi = *MSI_SERVICE
+            .get()
+            .expect("build_physical_nodes must run first");
+        Arc::new(IrqRootNode::new(irq, msi))
+    }))
 }
 
 // ── Small helpers (mirror `adapters.rs`) ───────────────────────────────
