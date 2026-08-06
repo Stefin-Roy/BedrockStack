@@ -582,7 +582,7 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     if cpu >= MAX_CPUS || DUMP_IN_PROGRESS[cpu].swap(true, Ordering::SeqCst) {
         dump_puts("\n[DUMP] Nested fault (#");
         dump_put_hex(vector as u64);
-        dump_puts(") while dumping — halting\n");
+        dump_puts(") while dumping -- halting\n");
         loop {
             unsafe { asm!("cli", "hlt", options(nomem, nostack)); }
         }

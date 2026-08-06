@@ -125,7 +125,7 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 
     SerialPort::puts("[ioapic] enabled GSI ");
     SerialPort::put_u64(gsi as u64);
-    SerialPort::puts(" → vector ");
+    SerialPort::puts(" -> vector ");
     SerialPort::put_u64(vector as u64);
     SerialPort::puts("\n");
 

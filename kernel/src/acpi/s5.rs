@@ -123,7 +123,7 @@ pub fn parse_s5_slp_typa(dsdt_phys: u64) -> Option<u8> {
     let vaddr = map_region(dsdt_phys, hdr_len as u64);
     let table = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
     if !checksum(table) {
-        log::warn!("ACPI: DSDT bad checksum — cannot parse \\_S5");
+        log::warn!("ACPI: DSDT bad checksum -- cannot parse \\_S5");
         return None;
     }
 

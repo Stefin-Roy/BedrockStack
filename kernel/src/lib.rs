@@ -338,7 +338,7 @@ impl Kernel {
     /// map physical regions.
     fn init_acpi(&mut self) {
         if self.rsdp_addr == 0 && self.rsdp_data.is_none() {
-            log::info!("No RSDP address provided — ACPI disabled");
+            log::info!("No RSDP address provided -- ACPI disabled");
             return;
         }
         match AcpiSubsystem::new(self.rsdp_addr, self.rsdp_data) {
