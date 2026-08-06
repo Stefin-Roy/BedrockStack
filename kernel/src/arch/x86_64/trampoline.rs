@@ -291,6 +291,7 @@ pub extern "C" fn ap_entry64() -> ! {
     // Signal ready immediately — APs never write to .idt (fixed in Arch::init_ap),
     // so there is no race with protect_idt() on the BSP.
     crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
+    crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
 
     SerialPort::puts("[AP] cpu ");
     SerialPort::put_u64(cpu_id as u64);

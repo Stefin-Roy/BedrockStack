@@ -20,7 +20,7 @@ use core::fmt::Write;
 use crate::obj::cap_handle::HandleState;
 use crate::obj::domain::all_domains;
 use crate::obj::rights::{CapRights, Rights};
-use crate::obj::store::object_store;
+use crate::obj::store::{object_store, ObjRecord};
 use crate::obj::ObjId;
 
 /// Print the node census: one line per store record plus a summary (§7.13).
@@ -79,26 +79,41 @@ pub fn graph_with_flags(w: &mut impl Write, flags: &[&str]) {
     }
 
     // interior: parent edge index — node id -> child ids (§2.1, §7.13).
-    let guard = object_store().lock_records();
-    let mut interior: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
-    for (&id, rec) in guard.iter() {
-        if let Some(p) = rec.parent {
-            interior.entry(p.0).or_default().push(id);
+    // Snapshot records under the lock, then release before checking deny/cascade
+    // to avoid holding OBJECT_RECORDS while acquiring OBJECT_DENY/OBJECT_CASCADE.
+    let (records_snapshot, interior) = {
+        let guard = object_store().lock_records();
+        let mut interior: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+        for (&id, rec) in guard.iter() {
+            if let Some(p) = rec.parent {
+                interior.entry(p.0).or_default().push(id);
+            }
         }
-    }
+        let snapshot: Vec<(u64, ObjRecord)> = guard
+            .iter()
+            .map(|(&id, rec)| (id, ObjRecord {
+                id: rec.id,
+                kind: rec.kind.clone(),
+                parent: rec.parent,
+                family_root: rec.family_root,
+                weak: rec.weak.clone(),
+            }))
+            .collect();
+        (snapshot, interior)
+    };
 
     // §7.13 `--roots`: the family roots / parentless nodes of the projection.
     if show_roots {
-        let roots: Vec<String> = guard
+        let roots: Vec<String> = records_snapshot
             .iter()
             .filter(|(_, r)| r.parent.is_none())
-            .map(|(&id, r)| format!("0x{:04x}({})", id, r.kind))
+            .map(|(id, r)| format!("0x{:04x}({})", id, r.kind))
             .collect();
         let _ = writeln!(w, "roots: [{}]", roots.join(" "));
     }
 
     let mut count = 0usize;
-    for (&id, rec) in guard.iter() {
+    for (id, rec) in &records_snapshot {
         let _ = write!(
             w,
             "node 0x{:04x} kind=\"{}\" parent={}",
@@ -110,7 +125,7 @@ pub fn graph_with_flags(w: &mut impl Write, flags: &[&str]) {
             }
         );
         match rec.family_root {
-            Some(fr) if fr.0 == id => {
+            Some(fr) if fr.0 == *id => {
                 let _ = write!(w, " family=root");
             }
             Some(_) => {
@@ -141,14 +156,14 @@ pub fn graph_with_flags(w: &mut impl Write, flags: &[&str]) {
         }
 
         if show_edges {
-            if let Some(children) = interior.get(&id) {
+            if let Some(children) = interior.get(id) {
                 let kids: Vec<String> = children.iter().map(|c| format!("0x{:04x}", c)).collect();
                 let _ = writeln!(w, "  interior: [{}]", kids.join(" "));
             }
         }
 
         if show_caps {
-            if let Some(entries) = held.get(&id) {
+            if let Some(entries) = held.get(id) {
                 for (dom, cid, rights, state) in entries {
                     let _ = writeln!(
                         w,
@@ -164,8 +179,8 @@ pub fn graph_with_flags(w: &mut impl Write, flags: &[&str]) {
 
         if show_rev {
             let store = object_store();
-            let revoked = store.is_denied(ObjId(id));
-            if rec.family_root.is_none() && store.is_cascade_severed(ObjId(id)) {
+            let revoked = store.is_denied(ObjId(*id));
+            if rec.family_root.is_none() && store.is_cascade_severed(ObjId(*id)) {
                 let _ = writeln!(w, "  revocations: cascade-sealed (deny-list: {})", revoked);
             } else if revoked {
                 let _ = writeln!(w, "  revocations: denied (1)");

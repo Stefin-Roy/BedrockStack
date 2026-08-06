@@ -11,8 +11,10 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use hashbrown::{HashMap, HashSet};
-use spin::Mutex;
 use spin::Once;
+
+use crate::services::irqsafe::IrqLock;
+use crate::services::lockorder::{OBJECT_CASCADE, OBJECT_DENY, OBJECT_RECORDS};
 
 use super::contract::{ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
@@ -38,10 +40,10 @@ pub struct ObjRecord {
 /// deny-list (§3.7.3, R9) that a sealed root populates for its whole family,
 /// deactivating descendants lazily at their next PERMIT (§8.6 layer 2).
 pub struct ObjectStore {
-    records: Mutex<BTreeMap<u64, ObjRecord>>,
+    records: IrqLock<BTreeMap<u64, ObjRecord>>,
     next_id: AtomicU64,
-    cascade: Mutex<HashMap<u64, bool>>,
-    deny: Mutex<HashSet<u64>>,
+    cascade: IrqLock<HashMap<u64, bool>>,
+    deny: IrqLock<HashSet<u64>>,
 }
 
 impl ObjectStore {
@@ -49,10 +51,10 @@ impl ObjectStore {
     // be a `const fn`; the only caller is `Once::call_once` (runtime).
     pub fn new() -> Self {
         ObjectStore {
-            records: Mutex::new(BTreeMap::new()),
+            records: IrqLock::with_order(BTreeMap::new(), OBJECT_RECORDS),
             next_id: AtomicU64::new(1),
-            cascade: Mutex::new(HashMap::new()),
-            deny: Mutex::new(HashSet::new()),
+            cascade: IrqLock::with_order(HashMap::new(), OBJECT_CASCADE),
+            deny: IrqLock::with_order(HashSet::new(), OBJECT_DENY),
         }
     }
 
@@ -122,7 +124,7 @@ impl ObjectStore {
 
     /// Read-only access to the records for the projection tool (§2.8, §7.13).
     /// The store is not a namespace; this is forensics material only.
-    pub fn lock_records(&self) -> spin::MutexGuard<'_, BTreeMap<u64, ObjRecord>> {
+    pub fn lock_records(&self) -> crate::services::irqsafe::IrqGuard<'_, BTreeMap<u64, ObjRecord>> {
         self.records.lock()
     }
 
@@ -146,11 +148,9 @@ impl ObjectStore {
         };
         self.cascade.lock().insert(root.0, true);
 
-        let mut deny = self.deny.lock();
-        let mut severed = if deny.insert(root.0) { 1 } else { 0 };
-
-        // Build a children adjacency over family_root/parent edges, then BFS
-        // from the root. Idempotent: a node already denied is not re-counted.
+        // Build children adjacency BEFORE acquiring deny to avoid holding
+        // OBJECT_DENY while re-acquiring OBJECT_RECORDS (ABBA hazard with
+        // graph_with_flags / StoreNode::dispatch which do records -> deny).
         let children: HashMap<u64, Vec<u64>> = {
             let records = self.records.lock();
             let mut children: HashMap<u64, Vec<u64>> = HashMap::new();
@@ -164,6 +164,11 @@ impl ObjectStore {
             }
             children
         };
+
+        let mut deny = self.deny.lock();
+        let mut severed = if deny.insert(root.0) { 1 } else { 0 };
+
+        // BFS from the root. Idempotent: a node already denied is not re-counted.
         let mut frontier = vec![root.0];
         while let Some(cur) = frontier.pop() {
             for &child in children.get(&cur).into_iter().flatten() {

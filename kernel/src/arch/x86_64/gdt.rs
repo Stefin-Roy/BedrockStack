@@ -24,8 +24,10 @@ const DF_STACK_SIZE: usize = 4096 * 5;
 /// `cpu_id`), so concurrent access is to disjoint slots.
 struct Shared<T>(core::cell::UnsafeCell<T>);
 
-unsafe impl<T> Sync for Shared<T> {}
-unsafe impl<T> Send for Shared<T> {}
+unsafe impl Sync for Shared<[[u8; DF_STACK_SIZE]; MAX_CPUS]> {}
+unsafe impl Sync for Shared<[MaybeUninit<TaskStateSegment>; MAX_CPUS]> {}
+unsafe impl Sync for Shared<[MaybeUninit<GlobalDescriptorTable>; MAX_CPUS]> {}
+unsafe impl<T: Send> Send for Shared<T> {}
 
 /// Per-CPU double-fault stacks.  Each CPU's TSS.IST[0] points into its own
 /// slot so that a simultaneous double fault on two CPUs does not corrupt

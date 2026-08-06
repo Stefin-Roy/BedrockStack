@@ -1,5 +1,55 @@
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::services::KernelServices;
+
+/// SMP initialization guard — prevents double-init which would double-start APs,
+/// leak stacks, and corrupt the CPU counter.
+static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+
+/// Per-CPU online state for future hotplug support.
+///
+/// 0 = Offline, 1 = Starting, 2 = Online.
+/// The BSP transitions 0→2 in `early_init_bsp`; APs transition 0→1 in
+/// `smp::init` then 1→2 in their respective `ap_entry`.
+static CPU_STATES: [AtomicU8; MAX_CPUS] = [
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+];
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum CpuState {
+    Offline,
+    Starting,
+    Online,
+}
+
+impl From<u8> for CpuState {
+    fn from(v: u8) -> Self {
+        match v {
+            1 => CpuState::Starting,
+            2 => CpuState::Online,
+            _ => CpuState::Offline,
+        }
+    }
+}
+
+/// Read the current state of a CPU.
+pub fn cpu_state(cpu_id: u32) -> CpuState {
+    assert!((cpu_id as usize) < MAX_CPUS, "cpu_state: cpu {} out of range", cpu_id);
+    CpuState::from(CPU_STATES[cpu_id as usize].load(Ordering::Acquire))
+}
+
+/// Transition a CPU's online state. Panics in debug if the transition is illegal.
+pub(crate) fn set_cpu_state(cpu_id: u32, new_state: CpuState) {
+    assert!((cpu_id as usize) < MAX_CPUS, "set_cpu_state: cpu {} out of range", cpu_id);
+    let new_val = match new_state {
+        CpuState::Offline => 0,
+        CpuState::Starting => 1,
+        CpuState::Online => 2,
+    };
+    CPU_STATES[cpu_id as usize].store(new_val, Ordering::Release);
+}
 
 /// Cache-line-aligned per-AP ready flag, avoiding false sharing between CPUs.
 #[repr(align(64))]
@@ -56,7 +106,8 @@ static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 struct SharedSlots(core::cell::UnsafeCell<[PerCpu; MAX_CPUS]>);
 
 // Each CPU only ever mutates its own slot; reads of other slots happen after
-// that slot's owner has finished initialising it.
+// that slot's owner has finished initialising it.  Synchronisation is provided
+// by the slot_mut/slot_read/slot_release protocol (see slot_mut).
 unsafe impl Sync for SharedSlots {}
 unsafe impl Send for SharedSlots {}
 
@@ -110,9 +161,6 @@ static LOCKDEP_STACKS: [LockdepStack; MAX_CPUS] = [
     empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
     empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(), empty_lockdep_stack(),
 ];
-
-#[cfg(feature = "lockdep")]
-use core::sync::atomic::AtomicU8;
 
 #[cfg(feature = "lockdep")]
 static LOCKDEP_DEPTH: [AtomicU8; MAX_CPUS] = [
@@ -188,10 +236,41 @@ pub fn lockdep_pop(order: u8) {
     }
 }
 
+#[cfg(debug_assertions)]
+static SLOT_BUSY: [AtomicU32; MAX_CPUS] = [
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+];
+
 /// Mutable access to one per-CPU slot.
+///
+/// # Protocol (debug-asserted)
+/// - Same-slot re-entrancy is forbidden: `SLOT_BUSY` guards against two live
+///   `&mut PerCpu` to the same slot.  Call `slot_release(index)` when done.
 fn slot_mut(index: usize) -> &'static mut PerCpu {
     assert!(index < MAX_CPUS, "smp: per-CPU slot {} out of range", index);
+    #[cfg(debug_assertions)]
+    {
+        let prev = SLOT_BUSY[index].fetch_add(1, Ordering::AcqRel);
+        assert!(prev == 0, "smp: slot {} re-entrant mutable access (missing slot_release)", index);
+    }
     unsafe { &mut (*PER_CPU_SLOTS.0.get())[index] }
+}
+
+/// Read-only access to any per-CPU slot (for cross-CPU observation).
+fn slot_read(index: usize) -> &'static PerCpu {
+    assert!(index < MAX_CPUS, "smp: per-CPU slot {} out of range", index);
+    unsafe { &(*PER_CPU_SLOTS.0.get())[index] }
+}
+
+#[inline]
+fn slot_release(index: usize) {
+    #[cfg(debug_assertions)]
+    {
+        SLOT_BUSY[index].fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -214,7 +293,7 @@ pub fn current_per_cpu() -> &'static mut PerCpu {
 
 /// Returns `Some(PerCpu)` if `early_init_bsp` has been called, else `None`.
 pub fn try_current_per_cpu() -> Option<&'static mut PerCpu> {
-    let pc = slot_mut(0);
+    let pc = slot_read(0);
     if pc.self_ptr.is_null() {
         None
     } else {
@@ -222,9 +301,8 @@ pub fn try_current_per_cpu() -> Option<&'static mut PerCpu> {
     }
 }
 
-pub fn per_cpu_by_id(cpu_id: u32) -> &'static mut PerCpu {
-    assert!((cpu_id as usize) < MAX_CPUS, "per_cpu_by_id: cpu {} out of range", cpu_id);
-    slot_mut(cpu_id as usize)
+pub fn per_cpu_by_id(cpu_id: u32) -> &'static PerCpu {
+    slot_read(cpu_id as usize)
 }
 
 pub fn cpu_count() -> u32 {
@@ -247,11 +325,18 @@ pub unsafe fn early_init_bsp() {
     pc.is_bsp = true;
     pc.started.store(1, Ordering::Relaxed);
 
+    set_cpu_state(0, CpuState::Online);
+
     #[cfg(target_arch = "x86_64")]
     set_gs_base(pc as *const PerCpu as u64);
 
     #[cfg(target_arch = "riscv64")]
     set_tp(pc as *const PerCpu);
+
+    // The BSP's slot is fully initialised; release the debug lease so later
+    // `slot_mut(0)` callers (e.g. `set_bsp_hardware_id`) don't trip the
+    // re-entrancy assert.
+    slot_release(0);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -269,14 +354,22 @@ fn set_tp(pc: *const PerCpu) {
 /// Fill in the hardware ID (APIC ID / hart ID) for the BSP.
 pub fn set_bsp_hardware_id(id: u32) {
     slot_mut(0).apic_id = id;
+    slot_release(0);
 }
 
 /// Find the PerCpu slot and cpu_id matching a hardware (APIC/hart) ID.
+///
+/// The returned `&'static mut PerCpu` stays valid (it aliases the static slot
+/// table); the debug `SLOT_BUSY` lease is released here because the caller
+/// keeps the reference for its own lifetime rather than calling `slot_mut`
+/// again.
 pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)> {
     for i in 0..MAX_CPUS {
-        let pc = slot_mut(i);
+        let pc = slot_read(i);
         if pc.apic_id == hw_id {
-            return Some((pc, i as u32));
+            let slot = slot_mut(i);
+            slot_release(i);
+            return Some((slot, i as u32));
         }
     }
     None
@@ -286,7 +379,7 @@ pub fn find_cpu_by_hardware_id(hw_id: u32) -> Option<(&'static mut PerCpu, u32)>
 pub fn started_count() -> u32 {
     let mut n = 0;
     for i in 0..MAX_CPUS {
-        let pc = slot_mut(i);
+        let pc = slot_read(i);
         if pc.started.load(Ordering::Relaxed) != 0 {
             n += 1;
         }
@@ -313,6 +406,12 @@ pub unsafe fn init(
     services: &KernelServices,
 ) -> u32 {
     use crate::drivers::serial::SerialPort;
+
+    assert!(
+        !SMP_INITIALIZED.swap(true, Ordering::SeqCst),
+        "smp::init() called twice"
+    );
+
     SerialPort::puts("[smp] init\n");
 
     let cpus = services.cpu.discover_cpus(acpi);
@@ -326,6 +425,8 @@ pub unsafe fn init(
         let cpu_id = cpu_id_offset as u32;
         let stack_top = allocate_ap_stack(cpu_id);
 
+        set_cpu_state(cpu_id, CpuState::Starting);
+
         let pc = slot_mut(cpu_id as usize);
         pc.self_ptr = pc as *const PerCpu;
         pc.cpu_id = cpu_id;
@@ -333,6 +434,7 @@ pub unsafe fn init(
         pc.is_bsp = false;
         pc.started.store(0, Ordering::Relaxed);
         pc.stack_top = stack_top;
+        slot_release(cpu_id as usize);
 
         ap_list.push(ApContext { cpu_id, hardware_id, stack_top });
 

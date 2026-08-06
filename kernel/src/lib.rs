@@ -28,6 +28,7 @@ use acpi::AcpiSubsystem;
 use arch::CurrentArch;
 use boot::{FramebufferInfo, MemoryRegion};
 use framebuffer::Framebuffer;
+use services::irqsafe::IrqLock;
 
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
@@ -78,7 +79,7 @@ pub struct KernelLayout {
 }
 
 pub struct Kernel {
-    framebuffer: Framebuffer,
+    framebuffer: IrqLock<Framebuffer>,
     /// Physical address of the boot framebuffer, kept here for paging setup
     /// (which maps it identity).  Drivers access the framebuffer through the
     /// `Framebuffer` VA, never through this raw address.
@@ -194,7 +195,7 @@ impl Kernel {
         SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {
-            framebuffer: display,
+            framebuffer: IrqLock::new(display),
             fb_phys: framebuffer.address,
             allocator,
             layout,
@@ -307,7 +308,7 @@ impl Kernel {
         use crate::obj::nodes::{HEAP_ALLOC, HEAP_CONTRACT};
         use crate::obj::{Args, Reply, Value, invoke};
 
-        let size = self.framebuffer.total_bytes();
+        let size = self.framebuffer.lock().total_bytes();
         let align = 8u64;
         let args = Args { vals: alloc::vec![Value::U64(size as u64), Value::U64(align)] };
         let table = &boot_domain().table;
@@ -341,7 +342,7 @@ impl Kernel {
                 va
             }
         };
-        self.framebuffer.set_shadow_va(va);
+        self.framebuffer.lock().set_shadow_va(va);
     }
 
     /// Parse the ACPI interrupt model and initialise I/O APIC(s).
@@ -364,14 +365,18 @@ impl Kernel {
     /// Build page tables with identity maps + a higher-half kernel alias,
     /// then activate them (switch CR3 / SATP).
     fn switch_to_higher_half(&mut self) {
+        let (height, stride, bpp) = {
+            let fb = self.framebuffer.lock();
+            (fb.height(), fb.stride(), fb.bpp())
+        };
         let vmm = CurrentArch::setup_virt_mem(
             &mut self.allocator,
             &self.layout,
             self.stack_guard,
             self.fb_phys,
-            self.framebuffer.height(),
-            self.framebuffer.stride(),
-            self.framebuffer.bpp(),
+            height,
+            stride,
+            bpp,
         );
         let root = vmm.root();
         unsafe {

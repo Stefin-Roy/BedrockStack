@@ -11,13 +11,17 @@
 
 use crate::boot::{MemoryRegion, MemoryRegionKind};
 
+struct BitmapAllocatorInner {
+    next_free: usize,
+}
+
 pub struct BitmapAllocator {
     bitmap: *mut u8,
     total_frames: usize,
     alloc_end: u64,
-    next_free: usize,
     kernel_start: u64,
     kernel_end: u64,
+    inner: spin::Mutex<BitmapAllocatorInner>,
 }
 
 unsafe impl Send for BitmapAllocator {}
@@ -139,9 +143,11 @@ impl BitmapAllocator {
             bitmap,
             total_frames,
             alloc_end: max_addr,
-            next_free: (base / 4096) as usize,
             kernel_start,
             kernel_end,
+            inner: spin::Mutex::new(BitmapAllocatorInner {
+                next_free: (base / 4096) as usize,
+            }),
         }
     }
 
@@ -164,20 +170,21 @@ impl BitmapAllocator {
     /// `alloc_contiguous()` will start probing). Read-only; `dma_trace` uses it
     /// to report allocator state on a frame-alloc failure.
     pub fn next_free(&self) -> usize {
-        self.next_free
+        self.inner.lock().next_free
     }
 
     /// Allocate a physical frame.
     ///
     /// Returns physical address of allocated frame, or None if no frames available.
-    pub fn alloc(&mut self) -> Option<u64> {
+    pub fn alloc(&self) -> Option<u64> {
+        let mut inner = self.inner.lock();
         // INV-PA-02: linear scan, find first free frame
         // Scan 64 bits (one u64 word) at a time for ~64× throughput.
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
 
-        let start_word = self.next_free / 64;
-        let start_bit = self.next_free % 64;
+        let start_word = inner.next_free / 64;
+        let start_bit = inner.next_free % 64;
 
         // First pass: start_word .. total_words
         for wi in start_word..total_words {
@@ -200,7 +207,7 @@ impl BitmapAllocator {
                 let bit = candidates.trailing_zeros() as usize;
                 let idx = wi * 64 + bit;
                 self.set_used(idx);
-                self.next_free = idx + 1;
+                inner.next_free = idx + 1;
                 let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
@@ -224,7 +231,7 @@ impl BitmapAllocator {
                 let bit = candidates.trailing_zeros() as usize;
                 let idx = wi * 64 + bit;
                 self.set_used(idx);
-                self.next_free = idx + 1;
+                inner.next_free = idx + 1;
                 let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
@@ -241,13 +248,15 @@ impl BitmapAllocator {
     ///
     /// Returns the physical address of the first frame, or `None` if
     /// insufficient contiguous frames are available.
-    pub fn alloc_contiguous(&mut self, count: usize) -> Option<u64> {
+    pub fn alloc_contiguous(&self, count: usize) -> Option<u64> {
+        let mut inner = self.inner.lock();
         if count == 0 || count > self.total_frames {
             return None;
         }
+        let next_free = inner.next_free;
         // Scan from next_free to end-of-bitmap, then wrap around from 0.
-        for offset in [self.next_free, 0] {
-            let end = if offset == 0 { self.next_free } else { self.total_frames };
+        for offset in [next_free, 0] {
+            let end = if offset == 0 { next_free } else { self.total_frames };
             let mut run_start = offset;
             let mut run_len = 0;
             for i in offset..end {
@@ -258,7 +267,7 @@ impl BitmapAllocator {
                         for j in run_start..run_start + count {
                             self.set_used(j);
                         }
-                        self.next_free = run_start + count;
+                        inner.next_free = run_start + count;
                         let addr = (run_start as u64) * 4096;
                         let end_addr = addr + (count as u64) * 4096;
                         debug_assert!(
@@ -280,7 +289,8 @@ impl BitmapAllocator {
     ///
     /// Used to prevent the allocator from handing out frames that contain
     /// critical data (kernel image, page tables, etc.).
-    pub fn reserve_region(&mut self, start: u64, end: u64) {
+    pub fn reserve_region(&self, start: u64, end: u64) {
+        let _guard = self.inner.lock();
         debug_assert!(start <= end, "reserve_region: start > end");
         let start_frame = (start / 4096) as usize;
         let end_frame = if end == u64::MAX {
@@ -306,15 +316,16 @@ impl BitmapAllocator {
     /// # Safety
     /// - addr must be a frame previously allocated by this allocator
     /// - addr must not be in use by any other component
-    pub unsafe fn free(&mut self, addr: u64) {
+    pub unsafe fn free(&self, addr: u64) {
+        let mut inner = self.inner.lock();
         let idx = (addr / 4096) as usize;
         if idx >= self.total_frames {
             return;
         }
         // INV-PA-03: clear bit
         self.set_free(idx);
-        if idx < self.next_free {
-            self.next_free = idx;
+        if idx < inner.next_free {
+            inner.next_free = idx;
         }
     }
 
@@ -322,11 +333,11 @@ impl BitmapAllocator {
         unsafe { *self.bitmap_ptr().add(idx / 8) & (1 << (idx % 8)) == 0 }
     }
 
-    fn set_used(&mut self, idx: usize) {
+    fn set_used(&self, idx: usize) {
         unsafe { *self.bitmap_ptr().add(idx / 8) |= 1 << (idx % 8); }
     }
 
-    fn set_free(&mut self, idx: usize) {
+    fn set_free(&self, idx: usize) {
         unsafe { *self.bitmap_ptr().add(idx / 8) &= !(1 << (idx % 8)); }
     }
 }
@@ -369,7 +380,7 @@ impl PhysicalMemoryAllocator for BitmapAllocator {
     }
 
     fn reserve_region(&mut self, start: u64, end: u64) {
-        self.reserve_region(start, end);
+        Self::reserve_region(self, start, end);
     }
 
     fn total_frames(&self) -> usize {

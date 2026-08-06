@@ -148,6 +148,7 @@ impl Fat32Inode {
 
 impl InodeOps for Fat32Inode {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+        let _write_lock = self.write_lock.lock();
         self.check_not_degraded()?;
         if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
         let file_size = self.size.load(Ordering::Relaxed) as u64;

@@ -1,4 +1,4 @@
-//! Lock-order keys for the VFS hierarchy.
+//! Lock-order keys for the VFS and object-store hierarchies.
 //!
 //! Values are used as the `order` argument of `IrqLock::with_order` and are
 //! asserted to be strictly increasing on a per-CPU lockdep stack
@@ -22,3 +22,9 @@ pub const FAT_CACHE: u8 = 6;
 pub const BLOCK_CACHE: u8 = 7;
 /// Universal-timer queue lock.
 pub const TIMER_QUEUE: u8 = 8;
+/// Object-store records map.
+pub const OBJECT_RECORDS: u8 = 9;
+/// Object-store cascade-seal map.
+pub const OBJECT_CASCADE: u8 = 10;
+/// Object-store deny-set.
+pub const OBJECT_DENY: u8 = 11;
