@@ -272,7 +272,7 @@ fn parse_bitmask(bm: &PixelBitmask) -> (PixelFormat, u8) {
         SerialPort::put_hex(bm.blue as u64);
         SerialPort::puts(" reserved=0x");
         SerialPort::put_hex(bm.reserved as u64);
-        SerialPort::puts(") — using BGR 32bpp fallback\n");
+        SerialPort::puts(") -- using BGR 32bpp fallback\n");
         return (PixelFormat::Bgr, 4);
     }
 
@@ -307,7 +307,7 @@ fn get_framebuffer_info() -> FramebufferInfo {
     let handle = match uefi::boot::get_handle_for_protocol::<GraphicsOutput>() {
         Ok(h) => h,
         Err(_) => {
-            SerialPort::puts("[boot] GOP not available — continuing without framebuffer\n");
+            SerialPort::puts("[boot] GOP not available -- continuing without framebuffer\n");
             return FramebufferInfo::zeroed();
         }
     };
@@ -315,7 +315,7 @@ fn get_framebuffer_info() -> FramebufferInfo {
     let mut gop = match uefi::boot::open_protocol_exclusive::<GraphicsOutput>(handle) {
         Ok(g) => g,
         Err(_) => {
-            SerialPort::puts("[boot] GOP open failed — continuing without framebuffer\n");
+            SerialPort::puts("[boot] GOP open failed -- continuing without framebuffer\n");
             return FramebufferInfo::zeroed();
         }
     };
@@ -333,14 +333,14 @@ fn get_framebuffer_info() -> FramebufferInfo {
             if let Some(ref bm) = mode.pixel_bitmask() {
                 parse_bitmask(bm)
             } else {
-                SerialPort::puts("[boot] WARNING: GOP Bitmask without pixel_bitmask() — using BGR 32bpp\n");
+                SerialPort::puts("[boot] WARNING: GOP Bitmask without pixel_bitmask() -- using BGR 32bpp\n");
                 (PixelFormat::Bgr, 4)
             }
         }
         // BltOnly provides NO linear framebuffer address — let the kernel
         // run without a framebuffer rather than crashing at boot time.
         UefiPixelFormat::BltOnly => {
-            SerialPort::puts("[boot] GOP is BltOnly (no linear framebuffer) — continuing without framebuffer\n");
+            SerialPort::puts("[boot] GOP is BltOnly (no linear framebuffer) -- continuing without framebuffer\n");
             return FramebufferInfo::zeroed();
         }
     };

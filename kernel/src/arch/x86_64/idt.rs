@@ -27,7 +27,7 @@ static IDT_GUARD: core::sync::atomic::AtomicU64 =
 pub fn verify_integrity() {
     let g = IDT_GUARD.load(core::sync::atomic::Ordering::Relaxed);
     if g != IDT_GUARD_MAGIC {
-        SerialPort::puts("\n[IDT] INTEGRITY CHECK FAILED — canary overwritten (0x");
+        SerialPort::puts("\n[IDT] INTEGRITY CHECK FAILED -- canary overwritten (0x");
         SerialPort::put_hex(g);
         SerialPort::puts(")\n");
         loop { unsafe { core::arch::asm!("cli; hlt"); } }

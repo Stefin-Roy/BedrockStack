@@ -868,13 +868,13 @@ fn do_init() -> bool {
     flush_output();
 
     let Some(original_cb) = read_command_byte() else {
-        SerialPort::puts("[ps2] cannot read controller command byte — no 8042?\n");
+        SerialPort::puts("[ps2] cannot read controller command byte -- no 8042?\n");
         return false;
     };
 
     // Disable both interfaces so no data interleaves during configuration.
     if !write_controller(CMD_DISABLE_KBD) {
-        SerialPort::puts("[ps2] controller busy (disable refused) — keyboard unavailable\n");
+        SerialPort::puts("[ps2] controller busy (disable refused) -- keyboard unavailable\n");
         restore_command_byte(original_cb);
         return false;
     }
@@ -883,7 +883,7 @@ fn do_init() -> bool {
 
     // Controller self-test.
     if !write_controller(CMD_SELF_TEST) {
-        SerialPort::puts("[ps2] self-test command refused — no 8042 controller\n");
+        SerialPort::puts("[ps2] self-test command refused -- no 8042 controller\n");
         restore_command_byte(original_cb);
         return false;
     }
@@ -897,7 +897,7 @@ fn do_init() -> bool {
             return false;
         }
         None => {
-            SerialPort::puts("[ps2] controller self-test timeout — no 8042 controller\n");
+            SerialPort::puts("[ps2] controller self-test timeout -- no 8042 controller\n");
             restore_command_byte(original_cb);
             return false;
         }
@@ -957,13 +957,13 @@ fn do_init() -> bool {
     // configure/scan commands below will catch a permanently dead keyboard.
     match reset_device() {
         ResetOutcome::Ok => SerialPort::puts("[ps2] keyboard reset OK\n"),
-        ResetOutcome::Failed => SerialPort::puts("[ps2] keyboard reset failed — continuing\n"),
-        ResetOutcome::Timeout => SerialPort::puts("[ps2] keyboard reset timeout — continuing\n"),
+        ResetOutcome::Failed => SerialPort::puts("[ps2] keyboard reset failed -- continuing\n"),
+        ResetOutcome::Timeout => SerialPort::puts("[ps2] keyboard reset timeout -- continuing\n"),
     }
 
     // Disable scanning so command responses cannot interleave with scancodes.
     if !dev_command(&[DEV_DISABLE_SCAN]) {
-        SerialPort::puts("[ps2] keyboard did not ACK disable-scan — aborting init\n");
+        SerialPort::puts("[ps2] keyboard did not ACK disable-scan -- aborting init\n");
         restore_command_byte(original_cb);
         return false;
     }
@@ -980,18 +980,18 @@ fn do_init() -> bool {
 
     // Typematic: 250 ms delay, 30 Hz repeat.
     if !dev_command(&[DEV_SET_TYPEMATIC, 0x00]) {
-        SerialPort::puts("[ps2] typematic config not ACKed — continuing\n");
+        SerialPort::puts("[ps2] typematic config not ACKed -- continuing\n");
     }
 
     // Request the keyboard's native Set 2; the controller translates it to
     // Set 1 at the output.
     if !dev_command(&[DEV_SET_SCANCODE_SET, 0x02]) {
-        SerialPort::puts("[ps2] scancode-set command not ACKed — relying on default Set 2\n");
+        SerialPort::puts("[ps2] scancode-set command not ACKed -- relying on default Set 2\n");
     }
 
     // Re-enable scanning.
     if !dev_command(&[DEV_ENABLE_SCAN]) {
-        SerialPort::puts("[ps2] keyboard did not ACK enable-scan — aborting init\n");
+        SerialPort::puts("[ps2] keyboard did not ACK enable-scan -- aborting init\n");
         restore_command_byte(original_cb);
         return false;
     }
@@ -1001,18 +1001,21 @@ fn do_init() -> bool {
     let irq_ok = setup_irq();
     flush_output(); // drain anything that arrived while scanning was on
 
+    let mut irq_active = irq_ok;
     if irq_ok {
         let final_cb = (cfg & !CB_KBD_IRQ) | CB_KBD_IRQ;
         if write_command_byte_verified(final_cb) {
             SerialPort::puts("[ps2] keyboard IRQ enabled\n");
         } else {
-            SerialPort::puts("[ps2] could not enable keyboard IRQ — polled mode\n");
+            SerialPort::puts("[ps2] could not enable keyboard IRQ -- polled mode\n");
+            irq_active = false;
+            IRQ_ENABLED.store(false, Ordering::Release);
         }
     }
 
     PRESENT.store(true, Ordering::Release);
     SerialPort::puts("[ps2] keyboard driver ready (");
-    SerialPort::puts(if irq_ok { "IRQ" } else { "polled" });
+    SerialPort::puts(if irq_active { "IRQ" } else { "polled" });
     SerialPort::puts(")\n");
     true
 }
@@ -1034,7 +1037,7 @@ fn resolve_gsi() -> (u32, crate::acpi::Polarity, crate::acpi::TriggerMode) {
 fn setup_irq() -> bool {
     let (gsi, polarity, trigger) = resolve_gsi();
     let Some(vector) = crate::platform::x86_64_pc::ioapic::enable_irq(gsi, polarity, trigger) else {
-        SerialPort::puts("[ps2] IOAPIC routing failed — falling back to polled mode\n");
+        SerialPort::puts("[ps2] IOAPIC routing failed -- falling back to polled mode\n");
         return false;
     };
     let _ = crate::obj::clients::IrqClient::driver_irq().register(Some(vector), irq_handler);

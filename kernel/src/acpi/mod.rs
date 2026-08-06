@@ -120,11 +120,11 @@ impl AcpiSubsystem {
                 let slp = s5::parse_s5_slp_typa(fadt_fields.dsdt_addr as u64);
                 match slp {
                     Some(t) => log::info!("ACPI: \\_S5 SLP_TYP = 0x{:02x}", t),
-                    None => log::warn!("ACPI: \\_S5 not decodable — ACPI PM1 shutdown disabled"),
+                    None => log::warn!("ACPI: \\_S5 not decodable -- ACPI PM1 shutdown disabled"),
                 }
                 slp
             } else {
-                log::warn!("ACPI: FADT has no DSDT address — ACPI PM1 shutdown disabled");
+                log::warn!("ACPI: FADT has no DSDT address -- ACPI PM1 shutdown disabled");
                 None
             },
         };
@@ -163,7 +163,7 @@ impl AcpiSubsystem {
 
         #[cfg(target_arch = "x86_64")]
         {
-            log::error!("ACPI: reset failed — halting");
+            log::error!("ACPI: reset failed -- halting");
             loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
         }
     }
@@ -188,13 +188,13 @@ impl AcpiSubsystem {
                 }
             }
             None => {
-                log::error!("ACPI: \\_S5 unknown — refusing to write a guessed SLP_TYP");
+                log::error!("ACPI: \\_S5 unknown -- refusing to write a guessed SLP_TYP");
             }
         }
 
         #[cfg(target_arch = "x86_64")]
         {
-            log::info!("ACPI: shutdown fallback — QEMU PM IO port");
+            log::info!("ACPI: shutdown fallback -- QEMU PM IO port");
             let pm1a_port = self.platform_info.pm1_control.pm1a.address as u16;
             let val: u16 = (0x00u16 << 10) | (1u16 << 13);
             unsafe { core::arch::asm!("out dx, ax", in("dx") pm1a_port, in("ax") val, options(nomem, nostack, preserves_flags)); }
@@ -205,7 +205,7 @@ impl AcpiSubsystem {
 
         #[cfg(target_arch = "x86_64")]
         {
-            log::error!("ACPI: shutdown failed — halting");
+            log::error!("ACPI: shutdown failed -- halting");
             loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
         }
     }
