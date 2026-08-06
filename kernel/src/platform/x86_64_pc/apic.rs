@@ -280,9 +280,10 @@ pub fn send_ipi_all_except_self(vector: u8) {
 pub const IPI_RESCHEDULE: u8 = 49;
 pub const IPI_TLB_SHOOTDOWN: u8 = 50;
 pub const IPI_HALT: u8 = 51;
+pub const IPI_TIMER: u8 = 52;
 
 pub fn send_resched(cpu_id: u8) {
-    send_ipi(cpu_id as u32, IPI_RESCHEDULE);
+    send_ipi(crate::smp::per_cpu_by_id(cpu_id as u32).apic_id, IPI_RESCHEDULE);
 }
 
 pub fn send_tlb_shootdown(cpu_id: u8) {

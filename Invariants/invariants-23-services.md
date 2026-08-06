@@ -72,7 +72,7 @@ AHCI and xHCI both share this allocator via `kernel_services().dma`.
 
 | Trait | Provider(s) | Notes |
 |---|---|---|
-| `UniversalTimer` | `UniversalTimerImpl` (x86 + riscv wiring; riscv path currently unwired) | one-shot deadlines over a min-heap queue + clocksource; see `invariants-13` |
+| `UniversalTimer` | `UniversalTimerImpl` (x86 + riscv wiring) | one-shot deadlines over a min-heap queue + clocksource; **one queue per CPU** (`bases: [TimerBase; MAX_CPUS]`) with `migrate()` to move a timer between bases; see `invariants-13` |
 | `InterruptManager` | `X86Interrupts` (x86), `RiscvInterrupts` (riscv) | x86 wraps `idt::register_device_handler_at` + `apic_eoi`; riscv has its own `PLIC_HANDLERS[127]` |
 | `SerialConsole` | `KernelSerial` (shared) | delegates to `drivers::serial::SerialPort` |
 | `PlatformControl` | `X86Platform`, `RiscvPlatform` | shutdown/reset/halt/interrupt flag control |
@@ -155,11 +155,13 @@ code routes through `kernel_services().pci_cfg`.
   `riscv_interrupts::init()` → shared `serial::init()` → `riscv_platform::init()`
   → `riscv_cpu::init()` → `ecam_pci_config::init()` → `null_msi::init()` →
   `riscv_acpi::init()` → `init_dma_allocator()`.
-- **riscv64 caveat:** `Riscv64::init()` never calls
-  `universal_timer::early_init`, yet `riscv_services()` calls
-  `universal_timer()` which `expect`s the `Once`. The riscv64 path is
-  currently unwired and would panic if reached; riscv64 still runs the legacy
-  periodic SBI 100 Hz trap timer.
+- The universal timer is wired on **both** arches: `X86_64::init()` and
+  `Riscv64::init()` each call `universal_timer::early_init` (riscv with the
+  DTB-derived timebase). On riscv the trap handler drives `tick()` directly;
+  on x86 the vector-32 ISR and vector-52 reschedule IPI both run it.
+- The universal timer is now per-CPU: `set`/`set_periodic` pin to the
+  calling CPU's base, each CPU's ISR processes its own base, and `migrate`
+  moves a timer between bases (returning a fresh `TimerId`).
 - DMA is a single allocator: `services::dma::KernelDma` (exposed as
   `KernelServices.dma`), shared by AHCI (`blockdriver`) and xHCI (`usb`).
   All three formerly-separate allocators (`services::dma::KernelDma`,

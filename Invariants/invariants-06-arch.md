@@ -99,6 +99,5 @@ Builds identity + higher-half page tables (see `invariants-07` / `invariants-08`
 - All arch-specific modules live under `kernel/src/arch/<arch>/`. The
   x86_64 impl calls: `gdt::init()` → `idt::init()` → `apic::init()` →
   `universal_timer::early_init(...)`.
-- The RISC-V impl calls: `trap::init()` → PLIC init → enable `sie`; it does
-  **not** call `universal_timer::early_init` (riscv64 still runs the legacy
-  periodic SBI 100 Hz trap timer — see `invariants-08`).
+- The RISC-V impl calls: `trap::init()` → PLIC init →
+  `universal_timer::early_init(...)` → enable `sie` (see `invariants-08`).

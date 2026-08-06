@@ -125,11 +125,20 @@ pages read-only so corruption faults instead of corrupting silently.
 then writes EOI.
 - Location: `kernel/src/arch/x86_64/idt.rs:43-52,57-115`
 
-**IDT-005 — Timer ISR is BSP-only, driven by `TIMER_CALLBACK`:**
-Vector 32's `timer_handler` returns immediately (EOI only) on APs;
-on the BSP it invokes `TIMER_CALLBACK` (set via `set_timer_callback()` by
-`UniversalTimer` for queue processing + clockevent reprogramming) then EOI.
-- Location: `kernel/src/arch/x86_64/idt.rs:95-103,203-216`
+**IDT-005 — Timer ISR is per-CPU, driven by `TIMER_CALLBACK`:**
+Vector 32's `timer_handler` runs on whichever CPU's LAPIC fired. It invokes
+`TIMER_CALLBACK` (set via `set_timer_callback()` by `UniversalTimer` for
+per-CPU queue processing + clockevent reprogramming) then EOI. There is no
+BSP-only shortcut: every CPU processes its own timer base.
+- Location: `kernel/src/arch/x86_64/idt.rs:133-152,208-260`
+
+**IDT-007 — Timer-reschedule IPI at vector 52, driven by `TIMER_IPI_CALLBACK`:**
+`ipi_timer_handler` (registered at `idt[52]`) runs the same tick routine
+(`set_timer_ipi_callback`) as the LAPIC timer, then EOI. It lets a remote
+CPU re-arm its own base after a cross-CPU earliest-deadline change. The IPI
+is a hint only — a missed one re-times, never loses, a deadline (the owner's
+LAPIC re-arms after its next fire).
+- Location: `kernel/src/arch/x86_64/idt.rs:144-152,210-213,258-262`
 
 **IDT-006 — All exception handlers (including breakpoint) log and halt:**
 Each delegates to `kerneldump::dump_full_fault()` with vector and error
@@ -189,9 +198,11 @@ Called from `X86_64::init()` (BSP) and `X86_64::init_ap()` (APs).
 Must be called after `gdt::init()`. Loads the IDT via `lidt`.
 Called once on BSP; APs call `idt::init_ap()`.
 
-**IDT-API-002 — `idt::set_timer_callback(cb: fn())`:**
-Wires the UniversalTimer's tick routine into the vector-32 ISR. Called by
-`universal_timer::early_init`.
+**IDT-API-002 — `idt::set_timer_callback(cb: fn())` / `idt::set_timer_ipi_callback(cb: fn())`:**
+`set_timer_callback` wires the UniversalTimer's tick routine into the
+vector-32 ISR; `set_timer_ipi_callback` wires the same routine into the
+vector-52 reschedule IPI ISR. Both are called by `universal_timer::early_init`.
+Each CPU's ISR then processes that CPU's own timer base.
 
 **IDT-API-003 — `idt::register_device_handler(handler) → Option<u8>` / `register_device_handler_at(vector, handler)` / `unregister_device_handler(vector)`:**
 Driver interrupt registration over vectors 33-48. Slots are atomic; only

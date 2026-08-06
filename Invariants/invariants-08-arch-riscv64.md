@@ -49,13 +49,14 @@ and are covered automatically.
 Same 4 KiB hole-punching as x86_64 in the identity map loop.
 - Location: `kernel/src/arch/riscv64/paging.rs:43-51`
 
-**RISCV-010 — `Riscv64::init()` does NOT wire the UniversalTimer:**
-Unlike x86_64, `Riscv64::init()` never calls `universal_timer::early_init`.
-The legacy periodic SBI 100 Hz trap timer remains active, and the
-`UniversalTimer` service is unwired on riscv64 (would panic if its `Once`
-is accessed). `SbiTimer`/`ApicTimer` (`services/*/sbi_timer.rs`,
-`apic_timer.rs`) are orphaned.
-- Location: `kernel/src/arch/riscv64/mod.rs:16-31`, `kernel/src/services/riscv64/mod.rs`
+**RISCV-010 — `Riscv64::init()` wires the UniversalTimer:**
+Like x86_64, `Riscv64::init()` calls `universal_timer::early_init` with the
+SBI clockevent and the DTB-derived timebase clocksource. The trap handler
+drives `tick()` directly from `SUPV_TIMER` (and from `SUPV_SOFTWARE` for
+cross-hart reschedule IPIs), so the legacy periodic re-arm only runs before
+the universal timer is ready. `SbiTimer`/`ApicTimer`
+(`services/*/sbi_timer.rs`, `apic_timer.rs`) are orphaned.
+- Location: `kernel/src/arch/riscv64/mod.rs:16-48`, `kernel/src/arch/riscv64/trap.rs:116-147`, `kernel/src/services/riscv64/mod.rs`
 
 ---
 
@@ -109,6 +110,7 @@ can resolve the BSP.
   The `sie` register enables: SEIE (external), SSIE (software), STIE (timer).
 - **CLINT is not compiled** — only PLIC and SBI timer are used.
 - The `tp` register holds the per-CPU pointer (equivalent to x86 GS.base).
-- riscv64's timer story is transitional: the periodic SBI 100 Hz trap timer
-  still drives scheduling; the UniversalTimer path is defined but unwired
-  (see RISCV-010 and `invariants-23-services.md`).
+- riscv64 uses the per-CPU universal timer: `SUPV_TIMER` drives `tick()` on
+  the current hart's base, and `SUPV_SOFTWARE` (SBI reschedule IPI) re-runs
+  it when a remote hart moves the earliest deadline earlier (see RISCV-010
+  and `invariants-23-services.md`).

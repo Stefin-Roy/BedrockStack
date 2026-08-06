@@ -40,12 +40,13 @@ MSR range causes #GP regardless. Bit 10 is cleared and `X2APIC_MODE` stays
 `false`; all access goes through MMIO (`LAPIC_BASE + reg`).
 - Location: `kernel/src/platform/x86_64_pc/apic.rs:426-433`
 
-**APIC-005 — APs leave the timer masked; count shared but not started:**
+**APIC-005 — APs arm their own timer on demand; count shared:**
 The calibrated count is stored in `BSP_TIMER_COUNT` (global `AtomicU32`).
 `init_ap()` skips PIT calibration, does **not** write `IA32_APIC_BASE` (may
 #GP on many CPUs), and programs its LVT timer as masked one-shot with init
-count 0 — it never fires until the clockevent arms it.
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:377-404`
+count 0. Once the per-CPU universal timer arms it (a timer pinned to that
+AP's base), the AP's own LAPIC fires and its own ISR processes the base.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:401-429`
 
 **APIC-006 — PIT calibration has a 1,000,000-ticks fallback:**
 If PIT times out, yields zero elapsed ticks, or the derived count is 0, the
@@ -59,8 +60,11 @@ before a new IPI is sent. Broadcast-to-all-except-self uses ICR
 destination shorthand (bits 18:16 = 11).
 - Location: `kernel/src/platform/x86_64_pc/apic.rs:37-51,238-254`
 
-**APIC-008 — IPI vectors are fixed: 49 (resched), 50 (TLB shootdown), 51 (halt):**
-- Location: `kernel/src/platform/x86_64_pc/apic.rs:256-266`
+**APIC-008 — IPI vectors are fixed: 49 (resched), 50 (TLB shootdown), 51 (halt), 52 (timer reschedule):**
+Vector 52 (`IPI_TIMER`) is the cross-CPU timer-reschedule hint: `UniversalTimer`
+sends it to a target CPU when a remote set/migrate moves that CPU's earliest
+deadline earlier; the target re-runs `tick()` on its own base.
+- Location: `kernel/src/platform/x86_64_pc/apic.rs:280-292`
 
 **APIC-009 — `PollTimeout` is TSC-backed, replacing the old APIC-counter `ApicTimeout`:**
 Works after `apic::init()` calibration completes, with no dependency on a
@@ -183,5 +187,9 @@ Returns true when the one-shot countdown has completed.
   backend (one-shot deadlines), not a periodic tick source. `TIMER_HZ = 1000`
   is retained only as the calibration target for the count value. See
   `invariants-23-services.md`.
+- Each CPU's LAPIC timer is armed on demand by that CPU's own timer base;
+  `apic::oneshot_timer_set`/`timer_stop` always program the *current* CPU's
+  LAPIC (shared MMIO VA), so the clockevent only ever runs while on the CPU
+  whose base it serves.
 - `PollTimeout` (TSC-backed) is the driver polling primitive; the old
   APIC-counter `ApicTimeout` was removed in commit `8c515c4`.
