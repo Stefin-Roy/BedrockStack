@@ -100,7 +100,23 @@ echo boot build OK >> "%LOG_FILE%"
 echo [fullrun] Boot built successfully.
 echo.
 
-echo [3/4] Creating FAT32 disk image...
+echo [3/5] Building init (x86_64-init, debug)...
+echo --- init build --- >> "%LOG_FILE%"
+echo %date% %time% >> "%LOG_FILE%"
+pushd "%SCRIPT_DIR%init"
+cargo build --target x86_64-init.json --profile dev -Zbuild-std=core -Zjson-target-spec 2>&1
+set INIT_RESULT=%errorlevel%
+popd
+if %INIT_RESULT% neq 0 (
+    echo [fullrun] ERROR: init build failed with exit code %INIT_RESULT%
+    echo init build FAILED: exit %INIT_RESULT% >> "%LOG_FILE%"
+    exit /b 1
+)
+echo init build OK >> "%LOG_FILE%"
+echo [fullrun] Init built successfully.
+echo.
+
+echo [4/5] Creating FAT32 disk image...
 echo --- image creation --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 python "%SCRIPT_DIR%create_image.py" 2>&1
@@ -118,7 +134,7 @@ echo image creation OK >> "%LOG_FILE%"
 echo [fullrun] Disk image created.
 echo.
 
-echo [4/4] Launching QEMU (x86_64)...
+echo [5/5] Launching QEMU (x86_64)...
 echo --- QEMU launch --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 if not exist "%OVMF_VARS_SOURCE%" (
@@ -268,7 +284,7 @@ if not exist "%OVMF_PATH%" (
     )
 )
 
-echo [1/3] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
+echo [1/5] Building kernel (x86_64-unknown-none, debug, kernelmb2)...
 echo --- kernel build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 set BASE_FEATURES=kernelmb2
@@ -285,7 +301,7 @@ echo kernel build OK >> "%LOG_FILE%"
 echo [fullrun] Kernel built successfully.
 echo.
 
-echo [2/3] Creating GRUB standalone image via WSL...
+echo [2/5] Creating GRUB standalone image via WSL...
 echo --- grub-mkstandalone --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 
@@ -363,7 +379,23 @@ if %GRUB_SKIP% equ 1 (
 echo [fullrun] GRUB standalone image ready.
 echo.
 
-echo [3/3] Creating disk image...
+echo [3/5] Building init (x86_64-init, debug)...
+echo --- init build --- >> "%LOG_FILE%"
+echo %date% %time% >> "%LOG_FILE%"
+pushd "%SCRIPT_DIR%init"
+cargo build --target x86_64-init.json --profile dev -Zbuild-std=core -Zjson-target-spec 2>&1
+set INIT_RESULT=%errorlevel%
+popd
+if %INIT_RESULT% neq 0 (
+    echo [fullrun] ERROR: init build failed with exit code %INIT_RESULT%
+    echo init build FAILED: exit %INIT_RESULT% >> "%LOG_FILE%"
+    exit /b 1
+)
+echo init build OK >> "%LOG_FILE%"
+echo [fullrun] Init built successfully.
+echo.
+
+echo [4/5] Creating disk image...
 echo --- image creation --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 
@@ -386,7 +418,7 @@ echo image creation OK >> "%LOG_FILE%"
 echo [fullrun] Disk image created.
 echo.
 
-echo [4/4] Launching QEMU (x86_64)...
+echo [5/5] Launching QEMU (x86_64)...
 echo --- QEMU launch --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 if not exist "%OVMF_VARS_SOURCE%" (

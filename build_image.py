@@ -56,6 +56,48 @@ def build(target, profile, packages=None, features=None):
     run(cmd)
 
 
+def build_init(profile):
+    """Build the `init` userspace crate.
+
+    Runs inside `init/` (its own workspace) so cargo picks up the crate-local
+    `.cargo/config.toml` and `-Zbuild-std` builds `core` for the custom
+    `x86_64-init` target. The root workspace's rustflags (which force the
+    kernel linker script onto `x86_64-unknown-none`) never apply.
+    """
+    init_dir = os.path.join(WORKSPACE, "init")
+    cmd = [
+        "cargo",
+        "build",
+        "--target",
+        "x86_64-init.json",
+        "--profile",
+        profile,
+        "-Zbuild-std=core",
+        "-Zjson-target-spec",
+    ]
+    print(f"  {' '.join(cmd)}  (in init/)")
+    result = subprocess.run(cmd, cwd=init_dir)
+    if result.returncode != 0:
+        print(f"  ERROR: init build failed with exit code {result.returncode}")
+        sys.exit(1)
+
+
+def find_init(profile):
+    """Locate the built init binary (target/x86_64-init/<profile>/init)."""
+    candidate = os.path.join(TARGET_DIR, "x86_64-init", profile_dir(profile), "init")
+    if os.path.exists(candidate):
+        return candidate
+    for alt in ("debug", "release"):
+        candidate = os.path.join(TARGET_DIR, "x86_64-init", alt, "init")
+        if os.path.exists(candidate):
+            return candidate
+    # Fall back to a workspace-level init.elf
+    candidate = os.path.join(WORKSPACE, "init.elf")
+    if os.path.exists(candidate):
+        return candidate
+    return None
+
+
 def create_fat32_image(efi_binary_path, profile):
     """Create a minimal FAT32 image with the EFI binary."""
     # Prefer mtools, then mkfs.fat; only fall back to a raw copy when neither
@@ -103,6 +145,12 @@ def create_fat32_with_mtools(efi_binary_path, profile):
         print(f"  Kernel copied: {kernel_path}")
     else:
         print("  WARNING: Kernel binary not found")
+    init_path = find_init(profile)
+    if init_path:
+        run(["mcopy", "-i", OUTPUT_IMG, init_path, "::/EFI/BEDROCK/INIT"])
+        print(f"  Init copied: {init_path}")
+    else:
+        print("  WARNING: Init binary not found")
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
         run(["mcopy", "-i", OUTPUT_IMG, wav_path, "::/EFI/BEDROCK/STARTUP.WAV"])
@@ -130,6 +178,11 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
     if kernel_path:
         shutil.copy2(kernel_path, os.path.join(efi_bedrock_dir, "KERNEL"))
         print(f"  Kernel copied: {kernel_path}")
+
+    init_path = find_init(profile)
+    if init_path:
+        shutil.copy2(init_path, os.path.join(efi_bedrock_dir, "INIT"))
+        print(f"  Init copied: {init_path}")
 
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
@@ -235,7 +288,7 @@ def write_gpt(disk, disk_sectors, esp_first, esp_last):
     disk[(disk_sectors - 1) * SECTOR:disk_sectors * SECTOR] = backup_hdr
 
 
-def create_gpt_image(boot_path, kernel_path):
+def create_gpt_image(boot_path, kernel_path, init_path=None):
     """Create a GPT-partitioned FAT32 disk image using WSL."""
     os.makedirs(TARGET_DIR, exist_ok=True)
 
@@ -246,6 +299,10 @@ def create_gpt_image(boot_path, kernel_path):
 
     print(f"  boot.efi: {os.path.getsize(boot_path)} bytes")
     print(f"  kernel:   {os.path.getsize(kernel_path)} bytes")
+    if init_path and os.path.exists(init_path):
+        print(f"  init:     {os.path.getsize(init_path)} bytes")
+    elif init_path:
+        print(f"  WARNING: init not found at {init_path}")
 
     esp_sectors = ESP_MB * 1024 * 1024 // SECTOR
     disk_sectors = DISK_MB * 1024 * 1024 // SECTOR
@@ -274,6 +331,11 @@ def create_gpt_image(boot_path, kernel_path):
         print("  WARNING: Sounds/startup.wav not found - no startup chime on ESP")
         wav_copy = ""
 
+    init_copy = ""
+    if init_path and os.path.exists(init_path):
+        init_wsl = to_wsl(init_path)
+        init_copy = f"mcopy -i '{esp_img_wsl}' '{init_wsl}' ::/EFI/BEDROCK/INIT; "
+
     run_wsl(
         "set -euo pipefail; "
         f"dd if=/dev/zero of='{esp_img_wsl}' bs=1M count={ESP_MB}; "
@@ -283,6 +345,7 @@ def create_gpt_image(boot_path, kernel_path):
         f"mmd -i '{esp_img_wsl}' ::/EFI/BEDROCK; "
         f"mcopy -i '{esp_img_wsl}' '{boot_wsl}' ::/EFI/BOOT/BOOTX64.EFI; "
         f"mcopy -i '{esp_img_wsl}' '{kernel_wsl}' ::/EFI/BEDROCK/KERNEL; "
+        + init_copy
         + wav_copy
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BEDROCK"
@@ -312,11 +375,17 @@ def main():
     uefi_bin = os.path.join(TARGET_DIR, "x86_64-unknown-uefi", profile_dir(profile), "boot.efi")
     kernel_bin = os.path.join(TARGET_DIR, "x86_64-unknown-none", profile_dir(profile), "kernel")
 
+    # Look for an init binary (bare-metal ELF64 userspace program).
+    # Expected at target/x86_64-init/<profile>/init if built separately.
+    init_bin = find_init(profile)
+
     if not args.skip_build:
         print("Building boot crate (UEFI)...")
         build("x86_64-unknown-uefi", profile, ["boot"], features="cpu_slow")
         print("Building kernel crate...")
         build("x86_64-unknown-none", profile, ["kernel"])
+        print("Building init crate (userspace)...")
+        build_init(profile)
 
     if not os.path.exists(uefi_bin):
         print(f"ERROR: UEFI binary not found at {uefi_bin}")
@@ -324,7 +393,7 @@ def main():
 
     if args.gpt:
         print("Creating GPT disk image...")
-        create_gpt_image(uefi_bin, kernel_bin)
+        create_gpt_image(uefi_bin, kernel_bin, init_path=init_bin)
     else:
         print("Creating FAT32 disk image...")
         create_fat32_image(uefi_bin, profile)

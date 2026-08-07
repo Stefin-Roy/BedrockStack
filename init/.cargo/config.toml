@@ -1,0 +1,17 @@
+[build]
+# Drop artifacts into the shared workspace target/ dir so image scripts can
+# find them at target/x86_64-init/<profile>/init.
+target-dir = "../target"
+
+[target.x86_64-init]
+# Flat user-space ELF64 (fixed ET_EXEC, no PIE), placed at 0x400000 with the
+# crate-local linker script. The kernel ELF loader maps PT_LOAD segments and
+# jumps to e_entry (_start), so the binary must not be position-independent.
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-e",
+    "-C", "link-arg=_start",
+    "-C", "linker=rust-lld",
+]

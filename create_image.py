@@ -35,13 +35,19 @@ def main():
     if not os.path.exists(kernel_path):
         kernel_path = os.path.join(TARGET_DIR, "x86_64-unknown-none", "release", "kernel")
 
+    init_path = os.path.join(TARGET_DIR, "x86_64-init", "debug", "init")
+    if not os.path.exists(init_path):
+        init_path = os.path.join(TARGET_DIR, "x86_64-init", "release", "init")
+    if not os.path.exists(init_path):
+        init_path = None
+
     for name, path in [("boot.efi", boot_path), ("kernel", kernel_path)]:
         if not os.path.exists(path):
             print(f"ERROR: {name} not found at {path}")
             sys.exit(1)
 
     from build_image import create_gpt_image, TARGET_DIR as _td
-    create_gpt_image(boot_path, kernel_path)
+    create_gpt_image(boot_path, kernel_path, init_path=init_path)
 
 
 if __name__ == "__main__":

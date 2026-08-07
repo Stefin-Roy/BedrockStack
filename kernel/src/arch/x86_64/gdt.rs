@@ -16,6 +16,15 @@ use crate::smp::{MAX_CPUS, current_cpu_id};
 /// IST slot used by the double-fault handler.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
 
+/// Kernel code segment selector (ring 0).
+pub const KERNEL_CS_SELECTOR: u16 = 0x08;
+/// Kernel data segment selector (ring 0).
+pub const KERNEL_DS_SELECTOR: u16 = 0x10;
+/// User data segment selector (ring 3) — GDT index 3, RPL 3.
+pub const USER_DS_SELECTOR: u16 = 0x1B;
+/// User code segment selector (ring 3) — GDT index 4, RPL 3.
+pub const USER_CS_SELECTOR: u16 = 0x23;
+
 /// Size of the dedicated double-fault stack (20 KB).
 const DF_STACK_SIZE: usize = 4096 * 5;
 
@@ -82,8 +91,23 @@ pub fn init() {
         VirtAddr::from_ptr(df_stack.as_ptr()) + DF_STACK_SIZE as u64
     };
 
+    // RSP0 — the kernel stack the CPU switches to when an interrupt or
+    // exception arrives from ring 3. The BSP uses the top of the kernel's
+    // high `.stack`; APs use their own AP stack. Needed for user-mode
+    // faults/interrupts to have a valid kernel stack.
+    let rsp0 = {
+        let ap_top = crate::smp::per_cpu_by_id(cpu_id as u32).stack_top;
+        if ap_top != 0 {
+            VirtAddr::new(ap_top)
+        } else {
+            let stack_end = unsafe { &crate::__stack_end as *const u8 };
+            VirtAddr::from_ptr(stack_end)
+        }
+    };
+
     let mut tss = TaskStateSegment::new();
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
+    tss.privilege_stack_table[0] = rsp0;
 
     // Store TSS at a stable address *before* creating the GDT descriptor.
     cpu_tss()[cpu_id].write(tss);
@@ -93,6 +117,8 @@ pub fn init() {
     let mut gdt = GlobalDescriptorTable::new();
     let code_sel = gdt.append(Descriptor::kernel_code_segment());
     let data_sel = gdt.append(Descriptor::kernel_data_segment());
+    let _user_data_sel = gdt.append(Descriptor::user_data_segment());
+    let _user_code_sel = gdt.append(Descriptor::user_code_segment());
     let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
 
     unsafe {

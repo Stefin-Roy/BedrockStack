@@ -1,3 +1,4 @@
+pub mod elf;
 pub mod heap;
 pub mod layout;
 pub mod phys_alloc;

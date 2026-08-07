@@ -91,6 +91,12 @@ pub struct PerCpu {
     pub stack_top: u64,
     pub serial_locked: AtomicU64,
     pub current_domain: *const crate::obj::domain::Domain,
+    /// User RSP saved on `syscall` entry (ring 3 → ring 0). Only meaningful on
+    /// the BSP, which is the only CPU that runs user code.
+    pub syscall_user_rsp: u64,
+    /// Kernel stack the syscall entry switches to. Points at the top of the
+    /// BSP's dedicated syscall stack, set up by `arch::x86_64::syscall::init`.
+    pub syscall_stack: u64,
 }
 
 /// Max supported CPUs.
@@ -112,22 +118,22 @@ unsafe impl Sync for SharedSlots {}
 unsafe impl Send for SharedSlots {}
 
 static PER_CPU_SLOTS: SharedSlots = SharedSlots(core::cell::UnsafeCell::new([
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 3, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 4, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 5, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 6, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 7, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 8, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 9, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 10, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 11, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 12, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null() },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 3, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 4, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 5, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 6, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 7, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 8, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 9, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 10, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 11, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 12, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
+    PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), current_domain: core::ptr::null(), syscall_user_rsp: 0, syscall_stack: 0 },
 ]));
 
 // ── Per-CPU lockdep stacks (debug-only, feature "lockdep") ────────────

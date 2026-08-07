@@ -74,5 +74,16 @@ pub fn init_all(
             }
         }
     }
+    // Store in the global list for direct access (e.g., reading init from ESP).
+    {
+        let mut block_devs = BLOCK_DEVICES.lock();
+        block_devs.extend(all_devices.clone());
+    }
+
     all_devices
+}
+
+/// Return the first block device (typically the ESP on boot).
+pub fn first_block_device() -> Option<Arc<dyn BlockDevice>> {
+    BLOCK_DEVICES.lock().first().cloned()
 }

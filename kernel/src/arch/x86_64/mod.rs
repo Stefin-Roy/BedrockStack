@@ -4,6 +4,7 @@ pub mod idt;
 pub mod limiter;
 pub mod paging;
 pub mod serial;
+pub mod syscall;
 pub mod trampoline;
 #[cfg(feature = "kernelmb2")]
 mod multiboot2;

@@ -77,8 +77,15 @@ pub fn init_pat_wc() {
 }
 
 #[inline]
-fn table_flags() -> PageTableFlags {
-    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED
+fn table_flags(leaf: PageFlags) -> PageTableFlags {
+    let mut f = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED;
+    // Intermediate tables must carry the USER bit too: a user-mode access is
+    // gated at EVERY level of the walk, so a supervisor-only PD/PDPT/PML4
+    // entry faults even if the leaf PTE is user-accessible.
+    if leaf.contains(PageFlags::USER) {
+        f |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    f
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -99,7 +106,7 @@ pub fn map_4k(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags(), &mut frame_alloc)
+            .map_to_with_table_flags(page, frame, x86_flags, table_flags(flags), &mut frame_alloc)
             .expect("x86_64 4KiB map failed")
             .flush();
     }
@@ -121,7 +128,7 @@ pub fn map_2m(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags(), &mut frame_alloc)
+            .map_to_with_table_flags(page, frame, x86_flags, table_flags(flags), &mut frame_alloc)
             .expect("x86_64 2MiB map failed")
             .flush();
     }

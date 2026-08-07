@@ -20,9 +20,13 @@ pub mod obj;
 pub mod pci;
 pub mod platform;
 #[cfg(target_arch = "x86_64")]
+pub mod proc;
+#[cfg(target_arch = "x86_64")]
 pub mod usb;
 pub mod smp;
 pub mod services;
+#[cfg(target_arch = "x86_64")]
+pub mod syscall;
 
 use acpi::AcpiSubsystem;
 use arch::CurrentArch;
@@ -581,6 +585,21 @@ impl Kernel {
         // is on the stack here.
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Phys, 32);
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Heap, 32);
+
+        // Initialize syscall MSRs and run init from the ESP.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::syscall::init();
+
+            // Load and run init from B:\EFI\BEDROCK\INIT.
+            // If init exits, we fall through to the idle loop.
+            if let Err(e) = crate::proc::run_init(&mut self.allocator, self.page_table_root) {
+                log::warn!("run_init failed: {}", e);
+                crate::drivers::serial::SerialPort::puts("[kernel] run_init failed: ");
+                crate::drivers::serial::SerialPort::puts(e);
+                crate::drivers::serial::SerialPort::puts("\n");
+            }
+        }
 
         // Boot-time test-suite output: the §8.7 leak detector plus graph and
         // fs census dumps. x86_64-only (`kerneldump` is not built on riscv64);
