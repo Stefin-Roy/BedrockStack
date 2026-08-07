@@ -19,6 +19,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use spin::Once;
 
+use super::cap_handle::RevocationPolicy;
 use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::{CapRights, ContractRights};
@@ -69,6 +70,10 @@ static PCI_FOREST_CONTRACTS: &[ContractId] = &[PCI_FOREST_CONTRACT];
 impl Obj for PciForestNode {
     fn obj_id(&self) -> ObjId {
         PCI_FOREST_OBJ_ID
+    }
+
+    fn revocation(&self) -> RevocationPolicy {
+        RevocationPolicy::Revocable
     }
 
     fn kind(&self) -> &'static str {
@@ -196,6 +201,10 @@ impl PciDeviceNode {
 impl Obj for PciDeviceNode {
     fn obj_id(&self) -> ObjId {
         Self::obj_id_of(&self.dev)
+    }
+
+    fn revocation(&self) -> RevocationPolicy {
+        RevocationPolicy::Revocable
     }
 
     fn kind(&self) -> &'static str {

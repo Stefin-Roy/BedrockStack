@@ -22,6 +22,7 @@ use super::cap_handle::{CapHandle, CapId, HandleState};
 use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::{CapRights, ContractRights, Rights};
+use super::store::object_store;
 use super::surface::{SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoRequest};
@@ -40,6 +41,7 @@ const FILE_OBJ_ID: ObjId = ObjId(0x10_0006);
 
 /// A single block device, handed out by the block-family root (§7.11.4).
 pub struct BlockNode {
+    id: ObjId,
     device: Arc<dyn BlockDevice>,
     model: String,
 }
@@ -47,7 +49,7 @@ pub struct BlockNode {
 impl BlockNode {
     pub fn new(device: Arc<dyn BlockDevice>) -> Self {
         let model = device.model_string().to_string();
-        BlockNode { device, model }
+        BlockNode { id: next_fs_id(), device, model }
     }
 
     pub fn device(&self) -> Arc<dyn BlockDevice> {
@@ -92,9 +94,15 @@ static BLOCK_CONTRACTS: &[ContractId] = &[BLOCK_CONTRACT];
 
 static NEXT_CHILD_ID: AtomicU64 = AtomicU64::new(0x10_1000);
 
+/// Issue a fresh, stable per-node fs id. Captured once at construction so
+/// `obj_id()` is deterministic for the node's whole life.
+fn next_fs_id() -> ObjId {
+    ObjId(NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed))
+}
+
 impl Obj for BlockNode {
     fn obj_id(&self) -> ObjId {
-        ObjId(NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed))
+        self.id
     }
 
     fn kind(&self) -> &'static str {
@@ -267,9 +275,10 @@ impl Obj for BlockFamilyNode {
             return match dev {
                 Some(dev) => {
                     let node = Arc::new(BlockNode::new(dev));
+                    object_store().register_with_id(node.obj_id(), node.kind(), None);
                     let rights = rights
-                        .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
-                        .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
+                        .attune(Rights::INVOKE.or(Rights::TRAVERSE), rights.contract)
+                        .unwrap_or(CapRights::new(Rights::INVOKE, rights.contract));
                     Ok(Reply::Caps(vec![CapHandle {
                         id: CapId(0),
                         node,
@@ -394,9 +403,10 @@ impl Obj for MountNode {
             if fstype == "tmpfs" && id == 0 {
                 let mount = mount_into('A', || crate::filesystems::vfs::mount("tmpfs", None, 'A'))?;
                 let node: Arc<dyn Obj> = Arc::new(DirNode::new(mount.root.clone()));
+                object_store().register_with_id(node.obj_id(), node.kind(), None);
                 let child_rights = rights
-                    .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
-                    .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
+                    .attune(Rights::INVOKE.or(Rights::TRAVERSE), rights.contract)
+                    .unwrap_or(CapRights::new(Rights::INVOKE, rights.contract));
                 return Ok(Reply::Caps(vec![CapHandle {
                     id: CapId(0),
                     node,
@@ -417,9 +427,10 @@ impl Obj for MountNode {
                 crate::filesystems::partition::mount_first_partition(device, fstype, 'B')
             })?;
             let node = Arc::new(DirNode::new(mount.root.clone()));
+            object_store().register_with_id(node.obj_id(), node.kind(), None);
             let rights = rights
-                .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
-                .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
+                .attune(Rights::INVOKE.or(Rights::TRAVERSE), rights.contract)
+                .unwrap_or(CapRights::new(Rights::INVOKE, rights.contract));
             return Ok(Reply::Caps(vec![CapHandle {
                 id: CapId(0),
                 node,
@@ -442,6 +453,7 @@ pub fn mount_node() -> Arc<dyn Obj> {
 /// resolves a child and returns a DirNode or FileNode cap; `readdir()` lists
 /// child caps; `label()` returns the directory name.
 pub struct DirNode {
+    id: ObjId,
     root: Arc<Dentry>,
     label: String,
 }
@@ -449,7 +461,7 @@ pub struct DirNode {
 impl DirNode {
     pub fn new(root: Arc<Dentry>) -> Self {
         let label = root.name.lock().clone();
-        DirNode { root, label }
+        DirNode { id: next_fs_id(), root, label }
     }
 
     pub fn root(&self) -> Arc<Dentry> {
@@ -493,20 +505,22 @@ impl DirNode {
         rights: &CapRights,
     ) -> Result<CapHandle, ObjError> {
         let child_rights = rights
-            .attune(Rights::INVOKE.or(Rights::TRAVERSE), ContractRights::empty())
-            .unwrap_or(CapRights::new(Rights::INVOKE, ContractRights::empty()));
+            .attune(Rights::INVOKE.or(Rights::TRAVERSE), rights.contract)
+            .unwrap_or(CapRights::new(Rights::INVOKE, rights.contract));
         let lock = child.inode.lock();
         let inode = lock.as_ref().ok_or(ObjError::Denied)?;
         match inode.file_type {
             FileType::Directory => {
                 drop(lock);
                 let node: Arc<dyn Obj> = Arc::new(DirNode::new(child));
+                object_store().register_with_id(node.obj_id(), node.kind(), None);
                 Ok(CapHandle { id: CapId(0), node, rights: child_rights, state: HandleState::Live })
             }
             FileType::Regular => {
                 let inode = lock.clone().unwrap();
                 drop(lock);
                 let node: Arc<dyn Obj> = Arc::new(FileNode::new(String::from(name), inode));
+                object_store().register_with_id(node.obj_id(), node.kind(), None);
                 Ok(CapHandle { id: CapId(0), node, rights: child_rights, state: HandleState::Live })
             }
         }
@@ -557,7 +571,7 @@ static DIR_CONTRACTS: &[ContractId] = &[DIR_CONTRACT];
 
 impl Obj for DirNode {
     fn obj_id(&self) -> ObjId {
-        ObjId(NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed))
+        self.id
     }
 
     fn kind(&self) -> &'static str {
@@ -658,13 +672,14 @@ impl Obj for DirNode {
 /// A file node wrapping an `Inode`. Exposes read/write/size/getattr/label
 /// hooks so file operations go through capabilities.
 pub struct FileNode {
+    id: ObjId,
     name: String,
     inode: Arc<crate::filesystems::vfs::inode::Inode>,
 }
 
 impl FileNode {
     pub fn new(name: String, inode: Arc<crate::filesystems::vfs::inode::Inode>) -> Self {
-        FileNode { name, inode }
+        FileNode { id: next_fs_id(), name, inode }
     }
 }
 
@@ -675,9 +690,10 @@ pub const FILE_SIZE: HookId = HookId::of("size");
 pub const FILE_GETATTR: HookId = HookId::of("getattr");
 pub const FILE_LABEL: HookId = HookId::of("label");
 
-pub const FILE_DOC: &str = "read_at(offset, buf) reads bytes from the file; \
-write_at(offset, data) writes bytes; size() returns the file size in bytes; \
-getattr() returns (ino, size, file_type); label() returns the file name.";
+pub const FILE_DOC: &str = "read_at(offset, buf) reads bytes from the file and \
+replies (bytes_read, data); write_at(offset, data) writes bytes and replies the \
+count; size() returns the file size in bytes; getattr() returns (ino, size, \
+file_type); label() returns the file name.";
 
 const FILE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "fs:file",
@@ -689,7 +705,7 @@ const FILE_HOOKS: &[HookSignature] = &[
     HookSignature {
         name: "read_at",
         params: &[TypeTag::U64, TypeTag::Buf],
-        reply: ReplyTag::Data(&[TypeTag::U64]),
+        reply: ReplyTag::Data(&[TypeTag::U64, TypeTag::Buf]),
     },
     HookSignature {
         name: "write_at",
@@ -717,7 +733,7 @@ static FILE_CONTRACTS: &[ContractId] = &[FILE_CONTRACT];
 
 impl Obj for FileNode {
     fn obj_id(&self) -> ObjId {
-        ObjId(NEXT_CHILD_ID.fetch_add(1, Ordering::Relaxed))
+        self.id
     }
 
     fn kind(&self) -> &'static str {

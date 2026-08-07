@@ -67,7 +67,7 @@ pub fn registry_contract_def() -> &'static Contract {
 }
 
 /// Stable identity for the registry node (§7.8).
-const REGISTRY_OBJ_ID: ObjId = ObjId(0x10_0010);
+const REGISTRY_OBJ_ID: ObjId = ObjId(0x10_0007);
 
 /// The node adapter over the process-global [`ContractRegistry`]. A unit
 /// struct: the interior lives in `contract_registry()`, reached through

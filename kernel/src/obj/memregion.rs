@@ -24,7 +24,8 @@
 //! **and** reclaims the pooled `Arc`. Freeing is thus revoking the capability —
 //! the caller drops / invokes `free` on the region cap it holds, and the
 //! wrapper is recycled for reuse without any allocation. A second `free` on the
-//! same (stale) cap is a no-op: the release zeroes `base`/`size` first.
+//! same (stale) cap is denied: the release zeroes `base`/`size` first and the
+//! `base == 0` guard rejects recycling the same pooled wrapper twice.
 //!
 //! The provider `PhysMem`/`Heap` `free(region)` hooks are thin gateways: they
 //! take the region's `CapId` from the caller's table, verify it names a
@@ -240,9 +241,14 @@ impl Obj for MemRegionNode {
             return Ok(Reply::Data(vec![Value::U64(self.size.load(Ordering::Relaxed))]));
         }
         if hook == MEM_REGION_FREE {
-            // Return the backing to its allocator, zero the identity so a
-            // second `free` on a stale cap is a no-op, then reclaim the pooled
-            // Arc so the wrapper can be handed out again without allocating.
+            // A second `free` on the same (stale) cap sees base == 0 and is
+            // denied, so the pooled Arc is never pushed twice (double free of
+            // the same capability stays safe). Otherwise return the backing to
+            // its allocator, zero the identity, and reclaim the pooled Arc so
+            // the wrapper can be handed out again without allocating.
+            if self.base.load(Ordering::Relaxed) == 0 {
+                return Err(ObjError::Denied);
+            }
             self.release_backing();
             self.base.store(0, Ordering::Relaxed);
             self.size.store(0, Ordering::Relaxed);

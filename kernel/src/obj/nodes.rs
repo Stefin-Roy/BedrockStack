@@ -40,7 +40,7 @@ use crate::services::interrupts::InterruptManager;
 use crate::services::msi::MsiAllocator;
 use crate::services::KernelServices;
 
-use super::cap_handle::{CapHandle, CapId, HandleState};
+use super::cap_handle::{CapHandle, CapId, HandleState, RevocationPolicy};
 use super::contract::{ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::memregion::{
@@ -119,6 +119,7 @@ impl PhysMemNode {
 
 impl Obj for PhysMemNode {
     fn obj_id(&self) -> ObjId { Self::OBJ_ID }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "physmem:node" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&PHYSMEM_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { PHYSMEM_CONTRACTS }
@@ -305,6 +306,7 @@ impl HeapNode {
 
 impl Obj for HeapNode {
     fn obj_id(&self) -> ObjId { Self::OBJ_ID }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "heap:node" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&HEAP_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { HEAP_CONTRACTS }
@@ -421,6 +423,7 @@ impl AddressSpaceNode {
 
 impl Obj for AddressSpaceNode {
     fn obj_id(&self) -> ObjId { Self::OBJ_ID }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "mm:addrspace" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&ADDRSPACE_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { ADDRSPACE_CONTRACTS }
@@ -538,6 +541,7 @@ impl CpuRootNode {
 
 impl Obj for CpuRootNode {
     fn obj_id(&self) -> ObjId { Self::OBJ_ID }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "cpu:family" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
@@ -606,6 +610,7 @@ pub struct CpuNode {
 
 impl Obj for CpuNode {
     fn obj_id(&self) -> ObjId { ObjId(CPU_CHILD_ID_BASE + self.cpu_id as u64) }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "cpu:node" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
@@ -717,6 +722,7 @@ impl IrqRootNode {
 
 impl Obj for IrqRootNode {
     fn obj_id(&self) -> ObjId { Self::OBJ_ID }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "irq:family" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&IRQ_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { IRQ_CONTRACTS }
@@ -784,6 +790,7 @@ pub struct IrqNode {
 
 impl Obj for IrqNode {
     fn obj_id(&self) -> ObjId { ObjId(IRQ_CHILD_ID_BASE + self.vector as u64) }
+    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
     fn kind(&self) -> &'static str { "irq:node" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&IRQ_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { IRQ_CONTRACTS }
@@ -856,9 +863,11 @@ const IRQ_HANDLER_HOOKS: &[HookSignature] = &[HookSignature {
 
 static IRQ_HANDLER_CONTRACTS: &[ContractId] = &[IRQ_HANDLER_CONTRACT];
 
-/// Dynamic id base for handler nodes (`0x11_3000` upward, above the per-vector
-/// children at `0x11_2000`).
-pub const IRQ_HANDLER_ID_BASE: u64 = 0x11_3000;
+/// Dynamic id base for handler nodes (`0x13_0000` upward). These are
+/// infrastructure leaves (parent = none), not family children, so they live in
+/// the dynamic band above the family-child ranges (`0x11_1000` CPU, `0x11_2000`
+/// IRQ, `0x11_3000` PCI) and above the `mem:region` pool at `0x12_0000`.
+pub const IRQ_HANDLER_ID_BASE: u64 = 0x13_0000;
 static IRQ_HANDLER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A kernel-materialized interrupt entry point. Only these nodes implement

@@ -117,9 +117,15 @@ impl ObjectStore {
         family_root: Option<ObjId>,
         weak: Weak<dyn Obj>,
     ) {
-        self.records
-            .lock()
-            .insert(id.0, ObjRecord { id, kind: String::from(kind), parent, family_root, weak });
+        let mut records = self.records.lock();
+        if let Some(existing) = records.get(&id.0) {
+            assert!(
+                existing.kind == kind,
+                "object store ObjId collision: id {:#x} already registered as '{}'; cannot re-register as '{}'",
+                id.0, existing.kind, kind
+            );
+        }
+        records.insert(id.0, ObjRecord { id, kind: String::from(kind), parent, family_root, weak });
     }
 
     /// Read-only access to the records for the projection tool (§2.8, §7.13).
@@ -254,7 +260,7 @@ const STORE_HOOKS: &[HookSignature] = &[
 static STORE_CONTRACTS: &[ContractId] = &[STORE_CONTRACT];
 
 /// Stable identity for the store node (§7.8).
-const STORE_OBJ_ID: ObjId = ObjId(0x10_0011);
+const STORE_OBJ_ID: ObjId = ObjId(0x10_0008);
 
 /// A thin `Obj` node adapter over the [`ObjectStore`] singleton (§2.4, §7.8).
 /// Exposes the store's weak registry as read-only forensics hooks (`count`,

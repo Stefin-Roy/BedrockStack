@@ -376,7 +376,7 @@ pub fn table_contract_def() -> &'static Contract {
 }
 
 /// Stable identity for a table node (§7.8).
-const TABLE_OBJ_ID: ObjId = ObjId(0x10_0012);
+const TABLE_OBJ_ID: ObjId = ObjId(0x10_0009);
 
 /// A thin `Obj` node adapter wrapping a [`CapabilityTable`] reference (§2.4,
 /// §7.8). Exposes the table's introspection hooks (`count`, `snapshot_size`)

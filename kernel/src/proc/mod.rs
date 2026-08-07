@@ -15,8 +15,9 @@ use crate::drivers::serial::SerialPort;
 use crate::mm::elf::{self, ElfError};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
-use crate::obj::cap_handle::CapId;
+use crate::obj::cap_handle::{CapHandle, CapId, HandleState};
 use crate::obj::domain::{self, Domain};
+use crate::obj::rights::{CapRights, ContractRights, Rights};
 
 /// User stack: 8 KB, located near the top of the low canonical half.
 const USER_STACK_SIZE: usize = 8 * 1024;
@@ -32,6 +33,10 @@ static INIT_EXIT_CODE: AtomicI64 = AtomicI64::new(0);
 /// The process ABI is positional: the first eight slots of the user domain's
 /// table are these capabilities, in insertion order (0=serial, 1=mount,
 /// 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table).
+///
+/// Slot 7 is a `TableNode` over the process's OWN table, endowed with
+/// INVOKE|QUERY only (no REVOKE), so `delegate` moves the process's own caps
+/// and family cascade-revocation is unreachable from ring 3.
 #[derive(Clone, Copy)]
 pub struct ProcessEndowment {
     pub serial: CapId,
@@ -70,7 +75,9 @@ pub fn run_init(alloc: &mut BitmapAllocator, kernel_root: u64) -> Result<(), &'s
     // (`find_domain(100)` resolves it), then endow it with the eight process
     // capabilities from the boot table. Delegation order is the documented
     // process ABI: the CapIds become 0..7 in insertion order (0=serial,
-    // 1=mount, 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table).
+    // 1=mount, 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table,
+    // where 7 is the process's own table node rather than a delegated boot
+    // table cap).
     domain::register_domain(user_domain);
     let serial = crate::obj::bootstrap::boot_domain()
         .table
@@ -100,10 +107,18 @@ pub fn run_init(alloc: &mut BitmapAllocator, kernel_root: u64) -> Result<(), &'s
         .table
         .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().block)
         .map_err(|_| "process endowment failed")?;
-    let table = crate::obj::bootstrap::boot_domain()
-        .table
-        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().table)
-        .map_err(|_| "process endowment failed")?;
+    // The process's own table node (not boot's): `delegate` operates on the
+    // process's own caps, and no REVOKE is granted, so a ring-3 process can
+    // never cascade-sever a family or re-delegate boot's capabilities.
+    let table = user_domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: crate::obj::table::table_node(&user_domain.table),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY),
+            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+        ),
+        state: HandleState::Live,
+    });
     PROCESS_ENDOWMENT.call_once(|| ProcessEndowment {
         serial,
         mount,
