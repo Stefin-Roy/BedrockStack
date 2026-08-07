@@ -14,21 +14,30 @@ use crate::mm::vmm::Vmm;
 use crate::obj::adapters;
 use crate::obj::contract::ContractId;
 use crate::obj::hook::{HookId, SURFACE_READ};
+use crate::obj::rights::{ContractRights, Rights};
 use crate::obj::table::{CapabilityTable, TABLE_CONTRACT, TABLE_DELEGATE};
 use crate::obj::{Args, CapId, ObjError, Reply, Value};
 
 /// Syscall function type: (num, arg0, arg1, arg2) -> return value.
 pub type SyscallFn = fn(u64, u64, u64, u64) -> u64;
 
-/// Version 1 syscall table: write, exit, and the P6 capability syscalls.
-const TABLE_V1: [SyscallFn; 7] = [
-    sys_write,         // 0
-    sys_exit,          // 1
-    sys_invoke,        // 2
-    sys_contract_id,   // 3
-    sys_cap_dup,       // 4
-    sys_cap_query,     // 5
-    sys_cap_delegate,  // 6
+/// Version 1 syscall table: write, exit, the P6 capability syscalls, and the
+/// v2 user-boundary extensions (dup_limited, revoke, domain id, clock, sleep,
+/// and the tagged surface read).
+const TABLE_V1: [SyscallFn; 13] = [
+    sys_write,              // 0
+    sys_exit,               // 1
+    sys_invoke,             // 2
+    sys_contract_id,        // 3
+    sys_cap_dup,            // 4
+    sys_cap_query,          // 5
+    sys_cap_delegate,       // 6
+    sys_cap_dup_limited,    // 7
+    sys_cap_revoke,         // 8
+    sys_get_domain_id,      // 9
+    sys_clock,              // 10
+    sys_sleep,              // 11
+    sys_cap_read,           // 12
 ];
 
 /// Dispatch a syscall by (version, number, args).
@@ -559,4 +568,138 @@ fn sys_cap_delegate(_num: u64, cap_id: u64, target_id: u64, _a2: u64) -> u64 {
         },
         _ => u64::MAX,
     }
+}
+
+// ── v2 user-boundary extensions ─────────────────────────────────────────
+
+/// Syscall 7: cap_dup_limited(cap_id, keep_uni_bits, keep_contract_bits)
+/// -> new CapId or -1.
+///
+/// Duplicates `cap_id` into a fresh slot attuned to a subset of the original's
+/// rights (§7.4 item 2). Rights are monotone: the copy never gains a bit the
+/// source lacked. The two masks are the raw `Rights`/`ContractRights` bit
+/// fields (bit0=QUERY, bit1=INVOKE, bit2=TRAVERSE, bit3=MINT, bit4=REVOKE;
+/// and bit0=READ, bit1=WRITE, bit2=CALL). A zero contract mask is the
+/// transitional "not yet narrowed" state and keeps the full held mask; to
+/// actually narrow, pass the exact mask to keep (e.g. READ alone).
+fn sys_cap_dup_limited(_num: u64, cap_id: u64, keep_uni: u64, keep_contract: u64) -> u64 {
+    let table = match current_table() {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    match table.dup_limited(
+        CapId(cap_id),
+        Rights::from_bits(keep_uni as u32),
+        ContractRights::from_bits(keep_contract as u32),
+    ) {
+        Ok(id) => id.0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Syscall 8: cap_revoke(cap_id) -> 0 or -1.
+///
+/// Marks the caller's own handle `Revoked` (§3.7): the slot and its strong
+/// reference are retained, but any later resolve through this cap fails with
+/// `ObjError::Revoked`. Cascade/family revocation stays kernel-only.
+fn sys_cap_revoke(_num: u64, cap_id: u64, _a1: u64, _a2: u64) -> u64 {
+    let table = match current_table() {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    match table.revoke(CapId(cap_id)) {
+        Ok(()) => 0,
+        Err(_) => u64::MAX,
+    }
+}
+
+/// Syscall 9: get_domain_id() -> the caller's domain id or -1.
+///
+/// A pure information syscall; the id is what `cap_delegate`'s `target_id`
+/// argument names (§6). Returns -1 if not running in a user domain.
+fn sys_get_domain_id(_num: u64, _a0: u64, _a1: u64, _a2: u64) -> u64 {
+    match crate::obj::domain::current_domain() {
+        Some(d) => d.id as u64,
+        None => u64::MAX,
+    }
+}
+
+/// Syscall 10: clock(which) -> time.
+///
+///   which = 0: wall-clock seconds since the Unix epoch (falls back to
+///              monotonic seconds on riscv64, which has no RTC).
+///   which = 1: monotonic nanoseconds since boot.
+fn sys_clock(_num: u64, which: u64, _a1: u64, _a2: u64) -> u64 {
+    match which {
+        0 => crate::services::wallclock::now_secs(),
+        _ => crate::services::universal_timer::now_ns(),
+    }
+}
+
+/// Syscall 11: sleep(ms) -> 0.
+///
+/// Blocks the calling task for `ms` milliseconds. The syscall entry clears IF
+/// (IA32_FMASK), so interrupts are re-enabled around the wait — the universal
+/// timer wakes the `halt()` inside `sleep_ms` via the LAPIC IRQ — and
+/// re-disabled before returning (`sysretq` restores the user's RFLAGS
+/// regardless).
+fn sys_sleep(_num: u64, ms: u64, _a1: u64, _a2: u64) -> u64 {
+    crate::arch::CurrentArch::enable_interrupts();
+    crate::services::universal_timer::sleep_ms(ms);
+    crate::arch::CurrentArch::disable_interrupts();
+    0
+}
+
+/// Fixed reply-buffer capacity for `cap_read` (all surface attrs are
+/// kernel-bounded well below this).
+const CAP_READ_CAP: usize = 4096;
+
+/// Syscall 12: cap_read(cap_id, attr_name_ptr, reply_ptr) -> 0 or -1.
+///
+/// Reads one typed attribute off the cap's node surface (`SURFACE_READ`) and
+/// marshals the value into `reply_ptr` as a tagged reply:
+///   u64 tag (0=U64, 1=Buf, 2=Str); U64: 8-byte value; Buf/Str: u64 len, bytes.
+/// The reply capacity is fixed at [`CAP_READ_CAP`] bytes. On overflow only the
+/// 0xFFFF marker is written (mirroring `sys_invoke`). This is the
+/// full-featured sibling of the U64-only `cap_query` fast path.
+fn sys_cap_read(_num: u64, cap_id: u64, name_ptr: u64, reply_ptr: u64) -> u64 {
+    if reply_ptr >= USER_LIMIT {
+        return u64::MAX;
+    }
+    let bytes = match read_user_str(name_ptr, 256) {
+        Some(b) => b,
+        None => return u64::MAX,
+    };
+    let name = match core::str::from_utf8(&bytes) {
+        Ok(n) => n,
+        Err(_) => return u64::MAX,
+    };
+    let table = match current_table() {
+        Some(t) => t,
+        None => return u64::MAX,
+    };
+    let args = Args {
+        vals: vec![Value::Str(name)],
+    };
+    let value = match crate::obj::invoke(table, CapId(cap_id), ContractId(0), SURFACE_READ, &args) {
+        Ok(Reply::Data(v)) => match v.into_iter().next() {
+            Some(val) => val,
+            None => return u64::MAX,
+        },
+        _ => return u64::MAX,
+    };
+
+    let mut out: Vec<u8> = Vec::new();
+    marshal_value(&mut out, &value);
+    if out.len() > CAP_READ_CAP {
+        // Would not fit: write only the 0xFFFF overflow marker.
+        if !copy_to_user(reply_ptr, &0xFFFFu64.to_le_bytes()) {
+            return u64::MAX;
+        }
+        return 0;
+    }
+    if !copy_to_user(reply_ptr, &out) {
+        return u64::MAX;
+    }
+    0
 }

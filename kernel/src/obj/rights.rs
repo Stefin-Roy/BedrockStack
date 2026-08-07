@@ -26,6 +26,14 @@ impl Rights {
         self.0
     }
 
+    /// Build a right set from a raw bit mask (bit0=QUERY, bit1=INVOKE,
+    /// bit2=TRAVERSE, bit3=MINT, bit4=REVOKE). Bits outside the five are
+    /// ignored so a caller-supplied mask can never smuggle an undefined right
+    /// into a handle.
+    pub const fn from_bits(bits: u32) -> Self {
+        Rights(bits & 0x1F)
+    }
+
     pub fn contains(&self, r: Rights) -> bool {
         self.0 & r.0 == r.0
     }
@@ -95,6 +103,13 @@ impl ContractRights {
 
     pub const fn bits(self) -> u32 {
         self.0
+    }
+
+    /// Build a contract-right mask from raw bits (bit0=READ, bit1=WRITE,
+    /// bit2=CALL). Bits outside the three are ignored. A zero mask keeps the
+    /// transitional "not yet narrowed" meaning (see the type docs).
+    pub const fn from_bits(bits: u32) -> Self {
+        ContractRights(bits & 0x7)
     }
 
     pub fn contains(&self, r: ContractRights) -> bool {

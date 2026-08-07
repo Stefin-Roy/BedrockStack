@@ -19,6 +19,12 @@ const SYS_CONTRACT_ID: u64 = 3;
 const SYS_CAP_DUP: u64 = 4;
 const SYS_CAP_QUERY: u64 = 5;
 const SYS_CAP_DELEGATE: u64 = 6;
+const SYS_CAP_DUP_LIMITED: u64 = 7;
+const SYS_CAP_REVOKE: u64 = 8;
+const SYS_GET_DOMAIN_ID: u64 = 9;
+const SYS_CLOCK: u64 = 10;
+const SYS_SLEEP: u64 = 11;
+const SYS_CAP_READ: u64 = 12;
 
 /// Table version passed in R10 on every syscall.
 const TABLE_VERSION: u64 = 1;
@@ -30,6 +36,23 @@ const REPLY_OK: u64 = 0;
 const TAG_U64: u64 = 0;
 const TAG_BUF: u64 = 1;
 const TAG_STR: u64 = 2;
+
+/// Universal right bits (kernel `Rights`). QUERY/TRAVERSE/MINT/REVOKE are
+/// part of the ABI but not exercised by this demo.
+#[allow(dead_code)]
+const RIGHT_QUERY: u64 = 1 << 0;
+const RIGHT_INVOKE: u64 = 1 << 1;
+#[allow(dead_code)]
+const RIGHT_TRAVERSE: u64 = 1 << 2;
+#[allow(dead_code)]
+const RIGHT_MINT: u64 = 1 << 3;
+#[allow(dead_code)]
+const RIGHT_REVOKE: u64 = 1 << 4;
+
+/// Contract-right bits (kernel `ContractRights`).
+const CR_READ: u64 = 1 << 0;
+const CR_WRITE: u64 = 1 << 1;
+const CR_CALL: u64 = 1 << 2;
 
 /// Endowed capability ids (insertion order — process ABI, not resolved).
 const CAP_SERIAL: u64 = 0;
@@ -148,7 +171,65 @@ pub extern "C" fn _start() -> ! {
         i += 1;
     }
 
-    // 9. Exit back into the kernel idle loop.
+    // 9. v2 user-boundary syscalls: domain id, clock, sleep.
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] domain id: ");
+    print_u64(CAP_SERIAL, cid_serial, get_domain_id());
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] wallclock secs: ");
+    print_u64(CAP_SERIAL, cid_serial, clock(0));
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] monotonic ns: ");
+    print_u64(CAP_SERIAL, cid_serial, clock(1));
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] sleeping 50ms...\n");
+    sleep(50);
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] woke up\n");
+
+    // 10. cap_dup_limited: a full-mask copy writes; a READ-only copy is
+    // denied on a CALL hook (puts).
+    let full_dup = cap_dup_limited(CAP_SERIAL, RIGHT_INVOKE, CR_READ | CR_WRITE | CR_CALL);
+    if full_dup == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_dup_limited(full) failed\n");
+    }
+    puts_cap(full_dup, cid_serial, b"[init] via full-mask dup_limited cap\n");
+
+    let ro_dup = cap_dup_limited(CAP_SERIAL, RIGHT_INVOKE, CR_READ);
+    if ro_dup == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_dup_limited(ro) failed\n");
+    }
+    let mut d2 = [0u8; 512];
+    let r2 = [0u8; 64];
+    let _ = build_desc(&mut d2, ro_dup, cid_serial, hook_id("puts"), &[DescArg::Buf(b"x\n")]);
+    let ret = invoke(d2.as_ptr() as u64, r2.as_ptr() as u64, 64);
+    if ret == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] READ-only invoke: bad ptr\n");
+    }
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] READ-only puts status: ");
+    print_u64(CAP_SERIAL, cid_serial, read_u64(&r2, &mut 0));
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] (expect 2 = Denied)\n");
+
+    // 11. cap_revoke: a revoked dup answers -1 on query.
+    let pm_dup = cap_dup(CAP_PHYSMEM);
+    if pm_dup == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_dup(physmem) failed\n");
+    }
+    if cap_revoke(pm_dup) == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_revoke failed\n");
+    }
+    let q = cap_query(pm_dup, query.as_ptr() as u64);
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] query on revoked cap: ");
+    print_u64(CAP_SERIAL, cid_serial, q);
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] (expect 18446744073709551615)\n");
+
+    // 12. cap_read: full tagged read of total_frames.
+    let rbuf = [0u8; 64];
+    if cap_read(CAP_PHYSMEM, query.as_ptr() as u64, rbuf.as_ptr() as u64) == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_read failed\n");
+    }
+    if read_u64(&rbuf, &mut 0) != TAG_U64 {
+        die(CAP_SERIAL, cid_serial, b"[init] cap_read: expected U64\n");
+    }
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] cap_read(total_frames): ");
+    print_u64(CAP_SERIAL, cid_serial, read_u64(&rbuf, &mut 8));
+
+    // 13. Exit back into the kernel idle loop.
     unsafe {
         syscall(SYS_EXIT, 0, 0, 0);
     }
@@ -214,6 +295,30 @@ fn cap_dup(id: u64) -> u64 {
 
 fn cap_query(id: u64, name_ptr: u64) -> u64 {
     unsafe { syscall(SYS_CAP_QUERY, id, name_ptr, 0) }
+}
+
+fn cap_dup_limited(id: u64, keep_uni: u64, keep_contract: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_DUP_LIMITED, id, keep_uni, keep_contract) }
+}
+
+fn cap_revoke(id: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_REVOKE, id, 0, 0) }
+}
+
+fn get_domain_id() -> u64 {
+    unsafe { syscall(SYS_GET_DOMAIN_ID, 0, 0, 0) }
+}
+
+fn clock(which: u64) -> u64 {
+    unsafe { syscall(SYS_CLOCK, which, 0, 0) }
+}
+
+fn sleep(ms: u64) -> u64 {
+    unsafe { syscall(SYS_SLEEP, ms, 0, 0) }
+}
+
+fn cap_read(id: u64, name_ptr: u64, reply_ptr: u64) -> u64 {
+    unsafe { syscall(SYS_CAP_READ, id, name_ptr, reply_ptr) }
 }
 
 /// Not exercised by this demo; kept for the P6 delegation story.
