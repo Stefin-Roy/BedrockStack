@@ -8,11 +8,14 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+use spin::Once;
+
 use crate::arch::x86_64::gdt;
 use crate::drivers::serial::SerialPort;
 use crate::mm::elf::{self, ElfError};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
+use crate::obj::cap_handle::CapId;
 use crate::obj::domain::{self, Domain};
 
 /// User stack: 8 KB, located near the top of the low canonical half.
@@ -23,6 +26,30 @@ const USER_STACK_TOP: u64 = 0x7FFF_FFFF_F000;
 static INIT_EXITED: AtomicBool = AtomicBool::new(false);
 /// Init exit code.
 static INIT_EXIT_CODE: AtomicI64 = AtomicI64::new(0);
+
+/// The capability endowment handed to the ring-3 init process at creation.
+///
+/// The process ABI is positional: the first eight slots of the user domain's
+/// table are these capabilities, in insertion order (0=serial, 1=mount,
+/// 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table).
+#[derive(Clone, Copy)]
+pub struct ProcessEndowment {
+    pub serial: CapId,
+    pub mount: CapId,
+    pub registry: CapId,
+    pub physmem: CapId,
+    pub heap: CapId,
+    pub addrspace: CapId,
+    pub block: CapId,
+    pub table: CapId,
+}
+
+static PROCESS_ENDOWMENT: Once<ProcessEndowment> = Once::new();
+
+/// The init process's capability endowment, once `run_init` has endowed it.
+pub fn process_endowment() -> &'static ProcessEndowment {
+    PROCESS_ENDOWMENT.get().expect("process endowment not set")
+}
 
 /// Load and run the init program from the ESP.
 ///
@@ -38,6 +65,56 @@ pub fn run_init(alloc: &mut BitmapAllocator, kernel_root: u64) -> Result<(), &'s
 
     // Create user domain with its own address space (clone high half, empty low).
     let user_domain = Domain::with_addrspace(100, kernel_root);
+
+    // Register the user domain so the projection tool and leak detector see it
+    // (`find_domain(100)` resolves it), then endow it with the eight process
+    // capabilities from the boot table. Delegation order is the documented
+    // process ABI: the CapIds become 0..7 in insertion order (0=serial,
+    // 1=mount, 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table).
+    domain::register_domain(user_domain);
+    let serial = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().serial)
+        .map_err(|_| "process endowment failed")?;
+    let mount = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().mount)
+        .map_err(|_| "process endowment failed")?;
+    let registry = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().registry)
+        .map_err(|_| "process endowment failed")?;
+    let physmem = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().physmem)
+        .map_err(|_| "process endowment failed")?;
+    let heap = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().heap)
+        .map_err(|_| "process endowment failed")?;
+    let addrspace = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().addrspace)
+        .map_err(|_| "process endowment failed")?;
+    let block = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().block)
+        .map_err(|_| "process endowment failed")?;
+    let table = crate::obj::bootstrap::boot_domain()
+        .table
+        .delegate(&user_domain.table, crate::obj::bootstrap::boot_endowment().table)
+        .map_err(|_| "process endowment failed")?;
+    PROCESS_ENDOWMENT.call_once(|| ProcessEndowment {
+        serial,
+        mount,
+        registry,
+        physmem,
+        heap,
+        addrspace,
+        block,
+        table,
+    });
+
     let root = user_domain.page_root().ok_or("no addrspace")?;
     // A handle to the same page-table root; the loader maps into it and
     // `set_current_domain` below activates it (via CR3 switch).

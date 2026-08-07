@@ -15,7 +15,7 @@ use alloc::sync::Arc;
 use alloc::vec;
 
 use super::adapters;
-use super::contract::{self, ContractId, HookSignature, ReplyTag};
+use super::contract::{self, Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::CapRights;
 use super::surface::{SurfaceDesc, TypeTag};
@@ -27,6 +27,10 @@ pub const REGISTRY_CONTRACT: ContractId =
     ContractId::of("infra:registry", &REGISTRY_SURFACE, &REGISTRY_HOOKS);
 pub const REGISTRY_REGISTER: HookId = HookId::of("register");
 pub const REGISTRY_LOOKUP: HookId = HookId::of("lookup");
+
+pub const REGISTRY_DOC: &str = "if you register(name), this node records the canonical \
+definition of that contract; lookup(id) reports its name and doc. Discovery by \
+owned capability, never ambient.";
 
 const REGISTRY_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "infra:registry",
@@ -48,6 +52,19 @@ const REGISTRY_HOOKS: &[HookSignature] = &[
 ];
 
 static REGISTRY_CONTRACTS: &[ContractId] = &[REGISTRY_CONTRACT];
+
+static REGISTRY_CONTRACT_DEF: Contract = Contract {
+    id: REGISTRY_CONTRACT,
+    name: "infra:registry",
+    surface: &REGISTRY_SURFACE,
+    hooks: REGISTRY_HOOKS,
+    doc: REGISTRY_DOC,
+};
+
+/// The canonical definition of the infra:registry contract (§7.8).
+pub fn registry_contract_def() -> &'static Contract {
+    &REGISTRY_CONTRACT_DEF
+}
 
 /// Stable identity for the registry node (§7.8).
 const REGISTRY_OBJ_ID: ObjId = ObjId(0x10_0010);

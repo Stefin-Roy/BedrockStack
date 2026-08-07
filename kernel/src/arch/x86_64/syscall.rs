@@ -184,8 +184,7 @@ pub extern "C" fn syscall_handler(frame: *const UserFrame) -> u64 {
     let arg2 = frame.rdx;
     let table_ver = frame.r10;
 
-    match table_ver {
-        1 => crate::syscall::dispatch(num, arg0, arg1, arg2),
-        _ => u64::MAX,
-    }
+    // Route by the table version the caller passed in R10; dispatch selects
+    // the right table and rejects unknown versions.
+    crate::syscall::dispatch(table_ver, num, arg0, arg1, arg2)
 }

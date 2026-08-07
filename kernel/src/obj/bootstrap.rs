@@ -201,6 +201,22 @@ pub fn bootstrap(page_table_root: u64, svc: &'static crate::services::KernelServ
         )
         .expect("bootstrap: register fs contract");
     }
+    // §7.8 — the infra contracts (`infra:registry`, `infra:table`) join the
+    // registry the same way. `adapters::contract_def` resolves their names to
+    // the canonical defs added alongside the fs/device families, so the
+    // registry can answer "what does `infra:table` promise?" once the driver
+    // domain is endowed.
+    for def in [registry::registry_contract_def(), table::table_contract_def()] {
+        let args = Args { vals: vec![Value::Str(def.name)] };
+        invoke(
+            &boot.table,
+            registry_id,
+            registry::REGISTRY_CONTRACT,
+            registry::REGISTRY_REGISTER,
+            &args,
+        )
+        .expect("bootstrap: register infra contract");
+    }
     // §7.8 — the `mem:region` contract joins the registry through the owned
     // capability, exactly like the fs/device families above. Its canonical def
     // lives in `obj/memregion.rs`; `adapters::contract_def` resolves the name.

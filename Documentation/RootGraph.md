@@ -2,7 +2,7 @@
 
 **Document:** Documentation/RootGraph.md
 **Canonical companion:** `Invariants/invariants-26-objects.md` (numbered invariants distilled from this document)
-**Status:** Design Specification — normative for implementation phases P0–P6; phases **P0–P5 and P6-A/B are implemented** in the tree (see §10 for per-phase status). Remaining future work: P6 user boundary + sessions.
+**Status:** Design Specification — normative for implementation phases P0–P6; phases **P0–P5, P6-A/B, and the P6 kernel-side user boundary are implemented** in the tree (see §10 for per-phase status). Remaining future work: user sessions (F6, §6.6).
 **Version:** 1.1.0
 **Date:** 2026-08-05
 **Target repository state:** post capability-system upgrade (P6-B)
@@ -2907,7 +2907,7 @@ note).
 | P5 — Revocation Modes + Projection | **Done** (revoke_cascade/deny in `obj/{table,store}.rs`; `kerneldump/{graph,leak}.rs`; the boot-time revocation gate was removed in 6adbc4e) |
 | P6-A — Paged Domain Isolation | **Done** (clone_high_half/with_addrspace/CR3 switch in `obj/domain.rs` + `mm/vmm`; boot-time proof module removed in 6adbc4e) |
 | P6-B — Capability-system upgrade | **Done** (per-hook contract rights, QUERY surface reads, delegation, real mem:region/PCI/fs nodes; boot-time proof modules remain removed — only the `selftest`-gated kerneldump census runs at boot; the ambient-authority boundary is enforced by `check_ambient.py`) |
-| P6 — User Boundary + Sessions | **Open** (see below) |
+| P6 — User Boundary + Sessions | **Done** (kernel side: init runs as registered `Domain` id 100 with a delegated 8-cap endowment, and the version-1 syscall ABI `invoke`/`contract_id`/`cap_dup`/`cap_query`/`cap_delegate`; user sessions (F6) remain future work) |
 
 ## Phase P0 — The Spec *(implemented)*
 
@@ -3103,7 +3103,7 @@ mechanism remains (`revoke_cascade`/deny in `obj/{table,store}.rs`), and the
 `kerneldump graph`/`leak_detect` walkers (under the `selftest` feature) keep
 the snapshot invariants observable.
 
-## Phase P6 — User Boundary + Sessions *(open — the only unimplemented phase)*
+## Phase P6 — User Boundary + Sessions *(kernel side implemented; sessions open)*
 
 **Scope.** §7.14, §6.6.
 

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::cap_handle::{CapHandle, CapId, HandleState, RevocationPolicy};
-use super::contract::{ContractId, HookSignature, ReplyTag};
+use super::contract::{Contract, ContractId, HookSignature, ReplyTag};
 use super::hook::HookId;
 use super::rights::{CapRights, ContractRights, Rights};
 use super::store::object_store;
@@ -327,6 +327,10 @@ pub const TABLE_SNAPSHOT_SIZE: HookId = HookId::of("snapshot_size");
 pub const TABLE_REVOKE_CASCADE: HookId = HookId::of("revoke_cascade");
 pub const TABLE_DELEGATE: HookId = HookId::of("delegate");
 
+pub const TABLE_DOC: &str = "if you count(), you get the number of occupied slots; \
+snapshot_size() reports high-water capacity; revoke_cascade(id) severs a family \
+subtree; delegate(id, target) copies a handle into another domain's table.";
+
 const TABLE_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "infra:table",
     attrs: &[SurfaceAttr { name: "slots", ty: TypeTag::U64 }],
@@ -357,6 +361,19 @@ const TABLE_HOOKS: &[HookSignature] = &[
 ];
 
 static TABLE_CONTRACTS: &[ContractId] = &[TABLE_CONTRACT];
+
+static TABLE_CONTRACT_DEF: Contract = Contract {
+    id: TABLE_CONTRACT,
+    name: "infra:table",
+    surface: &TABLE_SURFACE,
+    hooks: TABLE_HOOKS,
+    doc: TABLE_DOC,
+};
+
+/// The canonical definition of the infra:table contract (§7.8).
+pub fn table_contract_def() -> &'static Contract {
+    &TABLE_CONTRACT_DEF
+}
 
 /// Stable identity for a table node (§7.8).
 const TABLE_OBJ_ID: ObjId = ObjId(0x10_0012);

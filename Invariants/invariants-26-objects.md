@@ -114,6 +114,17 @@
 > and capability-mediated delegation was removed in commit 6adbc4e; the
 > underlying mechanism (resolve_with_rights, hook_contract_right, delegate,
 > surface_value) is implemented and live.
+>
+> P6 user boundary — the ring-3 init process is a registered non-kernel
+> `Domain` (id 100) whose table is endowed by delegation with eight caps:
+> CapId 0=serial, 1=mount, 2=registry, 3=physmem, 4=heap, 5=addrspace,
+> 6=block, 7=table. The syscall ABI is a single version-1 table —
+> `invoke(desc_ptr,
+> reply_ptr, reply_cap)`, `contract_id(name_ptr)`, `cap_dup(cap_id)`,
+> `cap_query(cap_id, attr_ptr)`, `cap_delegate(cap_id, target_id)`. PERMIT
+> still runs in-kernel (I1); tables stay kernel-owned, so user-facing
+> capability operations resolve through the process's own table with no
+> amplification (I15). Sessions (F6) remain future work.
 
 ---
 

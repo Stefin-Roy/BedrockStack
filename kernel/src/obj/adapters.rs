@@ -886,6 +886,10 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
         Some(devices::audio_family_contract_def())
     } else if name == memregion::MEM_REGION_CONTRACT_DEF.name {
         Some(&memregion::MEM_REGION_CONTRACT_DEF)
+    } else if name == super::registry::registry_contract_def().name {
+        Some(super::registry::registry_contract_def())
+    } else if name == super::table::table_contract_def().name {
+        Some(super::table::table_contract_def())
     } else {
         None
     }
