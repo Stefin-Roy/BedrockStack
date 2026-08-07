@@ -28,11 +28,11 @@ impl FatCache {
         }
     }
 
-    pub fn get_or_read(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&[u8; SECTOR_SIZE], VfsError> {
+    pub fn get_or_read(&mut self, device: &dyn BlockDevice, bpb: &Bpb, lba: u64) -> Result<&[u8; SECTOR_SIZE], VfsError> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
-            self.maybe_evict();
+            self.maybe_evict(device, bpb)?;
             self.sectors.insert(lba, buf);
             self.clock.push(lba);
         }
@@ -42,11 +42,11 @@ impl FatCache {
         }
     }
 
-    pub fn get_or_read_mut(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&mut [u8; SECTOR_SIZE], VfsError> {
+    pub fn get_or_read_mut(&mut self, device: &dyn BlockDevice, bpb: &Bpb, lba: u64) -> Result<&mut [u8; SECTOR_SIZE], VfsError> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
-            self.maybe_evict();
+            self.maybe_evict(device, bpb)?;
             self.sectors.insert(lba, buf);
             self.clock.push(lba);
         }
@@ -58,27 +58,32 @@ impl FatCache {
     }
 
     pub fn flush(&mut self, device: &dyn BlockDevice, bpb: &Bpb) -> Result<(), VfsError> {
-        let is_mirrored = bpb.ext_flags & 0x80 == 0;
-        for &lba in self.dirty.iter() {
-            let data = match self.sectors.get(&lba) {
-                Some(sector) => sector,
-                None => return Err(VfsError::IOError),
-            };
-            write_sectors(device, lba, 1, data)?;
-            if is_mirrored {
-                for fat_num in 1..bpb.num_fats {
-                    let local_idx = (lba - bpb.fat_sector_lba(0, 0)) % bpb.fat_sz32 as u64;
-                    write_sectors(device, bpb.fat_sector_lba(fat_num, local_idx as u32), 1, data)?;
-                }
-            }
+        for lba in self.dirty.iter().copied().collect::<Vec<u64>>() {
+            self.flush_one(device, bpb, lba)?;
         }
         self.dirty.clear();
         Ok(())
     }
 
-    fn maybe_evict(&mut self) {
+    fn flush_one(&mut self, device: &dyn BlockDevice, bpb: &Bpb, lba: u64) -> Result<(), VfsError> {
+        let is_mirrored = bpb.ext_flags & 0x80 == 0;
+        let data = match self.sectors.get(&lba) {
+            Some(sector) => sector,
+            None => return Err(VfsError::IOError),
+        };
+        write_sectors(device, lba, 1, data)?;
+        if is_mirrored {
+            for fat_num in 1..bpb.num_fats {
+                let local_idx = (lba - bpb.fat_sector_lba(0, 0)) % bpb.fat_sz32 as u64;
+                write_sectors(device, bpb.fat_sector_lba(fat_num, local_idx as u32), 1, data)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_evict(&mut self, device: &dyn BlockDevice, bpb: &Bpb) -> Result<(), VfsError> {
         if self.sectors.len() < MAX_FAT_CACHE_ENTRIES {
-            return;
+            return Ok(());
         }
         let target = MAX_FAT_CACHE_ENTRIES - MAX_FAT_CACHE_ENTRIES / 4;
         while self.sectors.len() > target {
@@ -87,12 +92,13 @@ impl FatCache {
                 self.clock_hand = 0;
             }
             let lba = self.clock[self.clock_hand];
-            if !self.dirty.contains(&lba) {
-                self.sectors.remove(&lba);
-                self.clock.swap_remove(self.clock_hand);
-            } else {
-                self.clock_hand += 1;
+            if self.dirty.contains(&lba) {
+                self.flush_one(device, bpb, lba)?;
+                self.dirty.remove(&lba);
             }
+            self.sectors.remove(&lba);
+            self.clock.swap_remove(self.clock_hand);
         }
+        Ok(())
     }
 }

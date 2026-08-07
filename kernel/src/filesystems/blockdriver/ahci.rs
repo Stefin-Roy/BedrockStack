@@ -368,6 +368,9 @@ impl AhciPort {
 
     /// Prepare a command in the given slot.
     fn prepare_cmd(&self, tag: u8, lba: u64, count: u32, buf_vaddr: u64, size: usize, is_write: bool) -> Result<(), &'static str> {
+        if size == 0 {
+            return Err("zero-length DMA request");
+        }
         let ct_va = self.slots[tag as usize].ct_vaddr;
 
         unsafe {
@@ -582,7 +585,11 @@ impl AhciPort {
 impl BlockDevice for AhciPort {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
         let _guard = self.submit_lock.lock();
-        let n = reqs.len().min(if self.ncq { self.n_slots as usize } else { 1 });
+        let cap = if self.ncq { self.n_slots as usize } else { 1 };
+        if reqs.len() > cap {
+            return Err("too many requests for AHCI slots");
+        }
+        let n = reqs.len();
         if n == 0 {
             return Ok(IoCompletions { completed: 0, errors: 0 });
         }
@@ -601,6 +608,12 @@ impl BlockDevice for AhciPort {
                     tag_of[idx] = tag;
                     let req = &reqs[idx];
                     let bytes = (req.count as usize) * 512;
+                    if req.count == 0 {
+                        err_mask |= 1 << tag;
+                        buf_ranges[idx] = (0, 0);
+                        idx += 1;
+                        continue;
+                    }
                     // SAFETY: The buffer virtual address is extracted for
                     // DMA translation. The caller guarantees the buffer
                     // lives until submit() returns (synchronous submit).
@@ -609,12 +622,14 @@ impl BlockDevice for AhciPort {
                         IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
                         IoBuffer::Phys(pa, sz) => (*pa, *sz),
                     };
-                    if buf_size < bytes {
+                    if buf_size < bytes
+                        || self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err()
+                    {
                         err_mask |= 1 << tag;
-                    } else if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
-                        err_mask |= 1 << tag;
+                        buf_ranges[idx] = (0, 0);
+                    } else {
+                        buf_ranges[idx] = (buf_vaddr, bytes as u64);
                     }
-                    buf_ranges[idx] = (buf_vaddr, bytes as u64);
                     idx += 1;
                 }
             }
@@ -624,21 +639,20 @@ impl BlockDevice for AhciPort {
         let ok_mask = tag_mask & !err_mask;
         if ok_mask == 0 {
             self.free_slots(tag_mask);
-            return Ok(IoCompletions { completed: 0, errors: tag_mask });
+            return Ok(IoCompletions { completed: 0, errors: tag_mask.count_ones() });
         }
 
         // Flush the CPU cache for write buffers before DMA submission.
         // Without this the HBA may read stale data from RAM.
-        if reqs[0].is_write {
-            for i in 0..n {
-                let (va, sz) = buf_ranges[i];
-                if va == 0 || sz == 0 { continue; }
-                let end = va + sz;
-                let mut cl = va & !63u64;
-                while cl < end {
-                    cache_flush_line(cl as *const u8);
-                    cl += 64;
-                }
+        for i in 0..n {
+            let (va, sz) = buf_ranges[i];
+            if va == 0 || sz == 0 { continue; }
+            if !reqs[i].is_write { continue; }
+            let end = va + sz;
+            let mut cl = va & !63u64;
+            while cl < end {
+                cache_flush_line(cl as *const u8);
+                cl += 64;
             }
         }
 
@@ -648,21 +662,22 @@ impl BlockDevice for AhciPort {
                 // Invalidate the CPU cache for read buffers after DMA
                 // completes.  Without this the CPU may read stale cache
                 // lines instead of the data the HBA wrote to RAM.
-                if !reqs[0].is_write {
-                    for i in 0..n {
-                        let (va, sz) = buf_ranges[i];
-                        if va == 0 || sz == 0 { continue; }
-                        let end = va + sz;
-                        let mut cl = va & !63u64;
-                        while cl < end {
-                            cache_flush_line(cl as *const u8);
-                            cl += 64;
-                        }
+                for i in 0..n {
+                    let (va, sz) = buf_ranges[i];
+                    if va == 0 || sz == 0 { continue; }
+                    if reqs[i].is_write { continue; }
+                    let end = va + sz;
+                    let mut cl = va & !63u64;
+                    while cl < end {
+                        cache_flush_line(cl as *const u8);
+                        cl += 64;
                     }
-                    core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 self.free_slots(tag_mask);
-                Ok(IoCompletions { completed: ok_mask, errors: err_mask })
+                let completed_count = ok_mask.count_ones();
+                let error_count = err_mask.count_ones();
+                Ok(IoCompletions { completed: completed_count, errors: error_count })
             }
             Err(e) => {
                 use crate::drivers::serial::SerialPort;
@@ -698,12 +713,12 @@ impl BlockDevice for AhciPort {
                 }
                 if retry_ok == 0 {
                     self.free_slots(tag_mask);
-                    return Ok(IoCompletions { completed: 0, errors: tag_mask });
+                    return Ok(IoCompletions { completed: 0, errors: tag_mask.count_ones() });
                 }
                 match self.submit_batch(retry_ok) {
                     Ok(()) => {
                         self.free_slots(tag_mask);
-                        Ok(IoCompletions { completed: ok_mask, errors: err_mask })
+                        Ok(IoCompletions { completed: retry_ok.count_ones(), errors: err_mask.count_ones() })
                     }
                     Err(e2) => {
                         self.free_slots(tag_mask);

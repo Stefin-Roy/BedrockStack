@@ -65,7 +65,7 @@ impl InodeOps for TmpfsInode {
             TmpfsEntry::File { data } => {
                 let mut data = data.lock();
                 let old_len = data.len() as u64;
-                let end = offset as usize + buf.len();
+                let end = (offset as usize).checked_add(buf.len()).ok_or(VfsError::FileTooLarge)?;
                 if end > data.len() {
                     data.resize(end, 0);
                 }
@@ -124,7 +124,10 @@ impl InodeOps for TmpfsInode {
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
-                children.remove(name).ok_or(VfsError::NotFound)?;
+                let removed = children.remove(name).ok_or(VfsError::NotFound)?;
+                if let TmpfsEntry::File { data } = &removed.entry {
+                    self.used.fetch_sub(data.lock().len() as u64, Ordering::Relaxed);
+                }
                 Ok(())
             }
             _ => Err(VfsError::NotADirectory),
@@ -228,7 +231,11 @@ impl InodeOps for TmpfsInode {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
                 let child = children.remove(old_name).ok_or(VfsError::NotFound)?;
-                children.insert(String::from(new_name), child);
+                if let Some(replaced) = children.insert(String::from(new_name), child) {
+                    if let TmpfsEntry::File { data } = &replaced.entry {
+                        self.used.fetch_sub(data.lock().len() as u64, Ordering::Relaxed);
+                    }
+                }
                 Ok(())
             }
             _ => Err(VfsError::NotADirectory),

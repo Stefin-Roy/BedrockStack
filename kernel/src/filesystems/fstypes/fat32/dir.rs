@@ -59,6 +59,9 @@ pub(super) fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<
         crate::drivers::serial::SerialPort::puts("\n");
         return Err(VfsError::IOError);
     }
+    // Upper bound on directory slot count: a real directory with this many
+    // live entries is treated as corrupt rather than allocating unboundedly.
+    const MAX_DIR_SLOTS: usize = 1_048_576;
     let mut slots: Vec<DirEntrySlot> = Vec::new();
     let clus_bytes = sb.bpb.byts_per_clus as usize;
     let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
@@ -84,8 +87,14 @@ pub(super) fn read_dir_slots(sb: &Fat32SuperBlock, dir_clus: u32) -> Result<Vec<
             if attr == ATTR_LONG_NAME { vfat_chain.push(*entry); continue; }
             if attr & ATTR_VOLUME_ID != 0 {
                 vfat_chain.clear();
+                if slots.len() >= MAX_DIR_SLOTS {
+                    return Err(VfsError::IOError);
+                }
                 slots.push(DirEntrySlot { vfat_entries: Vec::new(), sfn_entry: *entry });
                 continue;
+            }
+            if slots.len() >= MAX_DIR_SLOTS {
+                return Err(VfsError::IOError);
             }
             slots.push(DirEntrySlot { vfat_entries: mem::take(&mut vfat_chain), sfn_entry: *entry });
         }
@@ -171,16 +180,20 @@ pub(super) fn write_dir_entries(sb: &Fat32SuperBlock, dir_clus: &u32,
         }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER {
-            let new_clus = sb.alloc_cluster()?;
-            zero_cluster(sb, new_clus)?;
-            sb.write_fat_entry(cluster, new_clus)?;
-            cluster = new_clus;
-            let mut new_buf = alloc::vec![0u8; clus_bytes];
-            for j in 0..(total - placed) {
-                new_buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE]
-                    .copy_from_slice(&entries[placed + j]);
+            while placed < total {
+                let new_clus = sb.alloc_cluster()?;
+                zero_cluster(sb, new_clus)?;
+                sb.write_fat_entry(cluster, new_clus)?;
+                let take = (total - placed).min(entries_per_clus);
+                let mut new_buf = alloc::vec![0u8; clus_bytes];
+                for j in 0..take {
+                    new_buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE]
+                        .copy_from_slice(&entries[placed + j]);
+                }
+                write_cluster(sb, cluster, &new_buf)?;
+                placed += take;
+                cluster = new_clus;
             }
-            write_cluster(sb, cluster, &new_buf)?;
             return Ok(());
         }
         cluster = next;

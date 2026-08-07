@@ -69,10 +69,12 @@ impl BlockDevice for PartitionDevice {
             return Ok(IoCompletions { completed: 0, errors: 0 });
         }
 
+        let part_end = self.start_lba.checked_add(self.sector_count).ok_or("partition bounds overflow")?;
         let mut adjusted: Vec<IoRequest> = Vec::with_capacity(n);
         for r in reqs.iter() {
-            let lba = self.start_lba + r.lba;
-            if lba >= self.start_lba + self.sector_count {
+            let start = self.start_lba.checked_add(r.lba).ok_or("partition LBA overflow")?;
+            let end = start.checked_add(r.count as u64).ok_or("partition request overflow")?;
+            if start < self.start_lba || end > part_end {
                 return Err("partition LBA out of range");
             }
             let buffer = match &r.buffer {
@@ -85,7 +87,7 @@ impl BlockDevice for PartitionDevice {
                 IoBuffer::Phys(pa, sz) => IoBuffer::Phys(*pa, *sz),
             };
             adjusted.push(IoRequest {
-                lba,
+                lba: start,
                 count: r.count,
                 buffer,
                 is_write: r.is_write,

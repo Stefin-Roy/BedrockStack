@@ -6,6 +6,8 @@ use crate::filesystems::blockdriver::traits::BlockDevice;
 
 use super::{crc32, read_sector, read_sectors, PartitionInfo, SECTOR_SIZE};
 
+const MAX_GPT_ENTRIES: u32 = 4096;
+
 #[repr(C, packed)]
 struct GptHeader {
     signature: [u8; 8],
@@ -60,12 +62,21 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
     let entry_lba = u64::from_le(hdr.partition_entry_lba);
     let num_entries = u32::from_le(hdr.num_partition_entries);
     let entry_size = u32::from_le(hdr.partition_entry_size) as usize;
-    if entry_size < 128 {
-        return Err("GPT entry size too small");
+    if !(128..=4096).contains(&entry_size) {
+        return Err("GPT entry size out of range");
+    }
+    if num_entries == 0 || num_entries > MAX_GPT_ENTRIES {
+        return Err("GPT entry count out of range");
     }
 
     let total_bytes = num_entries as usize * entry_size;
     let sector_count = (total_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    if entry_lba
+        .checked_add(sector_count as u64)
+        .map_or(true, |end| end > device.sector_count())
+    {
+        return Err("GPT partition table out of device range");
+    }
     let mut entries_buf = alloc::vec![0u8; sector_count * SECTOR_SIZE];
     read_sectors(&*device, entry_lba, sector_count as u32, &mut entries_buf)?;
 
@@ -84,6 +95,12 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
 
         let start_lba = u64::from_le(entry.starting_lba);
         let end_lba = u64::from_le(entry.ending_lba);
+        if end_lba < start_lba {
+            return Err("GPT entry end before start");
+        }
+        if end_lba >= device.sector_count() {
+            return Err("GPT entry out of device range");
+        }
         let size_sectors = end_lba - start_lba + 1;
 
         let name_units = entry.name;

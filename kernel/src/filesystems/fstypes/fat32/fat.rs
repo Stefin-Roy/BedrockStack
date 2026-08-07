@@ -19,7 +19,7 @@ impl Fat32SuperBlock {
         let fat_idx = self.bpb.active_fat_idx();
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
-        let sector = cache.get_or_read(&*self.device, lba)?;
+        let sector = cache.get_or_read(&*self.device, &self.bpb, lba)?;
         let off = offset as usize;
         if off + 4 > sector.len() {
             return Err(VfsError::IOError);
@@ -33,7 +33,7 @@ impl Fat32SuperBlock {
         let fat_idx = self.bpb.active_fat_idx();
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
-        let sector = cache.get_or_read_mut(&*self.device, lba)?;
+        let sector = cache.get_or_read_mut(&*self.device, &self.bpb, lba)?;
         let off = offset as usize;
         if off + 4 > sector.len() {
             return Err(VfsError::IOError);

@@ -111,6 +111,21 @@ impl Fat32Inode {
         self.chain_cache_dirty.store(true, Ordering::Relaxed);
     }
 
+    /// Free a cluster chain now, unless a live VFS handle still references
+    /// `name` in this directory — then defer the free to the last close.
+    fn release_chain(&self, name: &str, first: u32) -> Result<(), VfsError> {
+        if first < 2 || first >= EOC_MARKER {
+            return Ok(());
+        }
+        if let Some(d) = crate::filesystems::vfs::dentry::dcache().lookup(self.ino, name) {
+            if let Some(inode) = d.inode.lock().clone() {
+                inode.ops.on_unlink();
+                return Ok(());
+            }
+        }
+        self.sb.free_chain(first)
+    }
+
     /// Refuse every data path on a volume whose root directory failed to
     /// read at mount (see `Fat32SuperBlock::degraded`).
     fn check_not_degraded(&self) -> Result<(), VfsError> {
@@ -133,11 +148,16 @@ impl Fat32Inode {
         let mut v = Vec::new();
         if first >= 2 && first < super::fat::EOC_MARKER {
             let mut c = first;
+            let mut _iters = 0u32;
             loop {
                 v.push(c);
                 let next = self.sb.read_fat_entry(c)?;
                 if next >= super::fat::EOC_MARKER { break; }
                 c = next;
+                _iters += 1;
+                if _iters > self.sb.bpb.total_clus + 2 {
+                    return Err(VfsError::IOError);
+                }
             }
         }
         let arc = Arc::new(v);
@@ -408,12 +428,14 @@ impl InodeOps for Fat32Inode {
 
         let slots = self.get_dir_slots()?;
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink got slots\n"));
+        let mut target_clus = 0u32;
         let mut found = false;
         for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 if slot.sfn_entry[0x0B] & ATTR_DIRECTORY != 0 {
                     return Err(VfsError::IsADirectory);
                 }
+                target_clus = first_clus_from_entry(&slot.sfn_entry);
                 found = true;
                 break;
             }
@@ -426,6 +448,8 @@ impl InodeOps for Fat32Inode {
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink flush\n"));
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
+        self.release_chain(name, target_clus)?;
+        self.sb.flush_fat_cache()?;
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink done\n"));
         Ok(())
     }
@@ -594,9 +618,7 @@ impl InodeOps for Fat32Inode {
             let existing_clus = first_clus_from_entry(&existing.sfn_entry);
             remove_dir_entries(&self.sb, self.first_clus.load(Ordering::Relaxed), new_name)?;
             self.sb.flush_fat_cache()?;
-            if existing_clus >= 2 && existing_clus < EOC_MARKER {
-                self.sb.free_chain(existing_clus)?;
-            }
+            self.release_chain(new_name, existing_clus)?;
             self.sb.flush_fat_cache()?;
             self.invalidate_dir_cache();
         }
