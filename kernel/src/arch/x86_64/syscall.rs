@@ -51,6 +51,7 @@ pub struct UserFrame {
 /// Per-CPU syscall stacks (16 KiB each). Live for kernel lifetime, in the
 /// higher half, so they stay reachable under every cloned domain's page
 /// tables (the syscall handler runs with the user domain's CR3 active).
+#[repr(align(16))]
 struct Shared<T>(UnsafeCell<T>);
 
 unsafe impl Sync for Shared<[[u8; SYSCALL_STACK_SIZE]; MAX_CPUS]> {}
@@ -91,11 +92,13 @@ pub fn init() {
         Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
     }
 
-    // Point the BSP's per-CPU syscall stack at the top of its dedicated slot.
+    // Point the BSP's per-CPU syscall stack at the top of its dedicated slot,
+    // rounded down to 16 bytes then back 8, so the pre-call RSP (after the 13
+    // pushes in `syscall_entry` = 104 bytes ≡ 8 mod 16) lands 16-aligned.
     // (Only the BSP runs user code in this stage; APs keep `syscall_stack` 0.)
     let pc = current_per_cpu();
-    pc.syscall_stack =
-        (&syscall_stacks()[0] as *const u8 as u64) + SYSCALL_STACK_SIZE as u64;
+    let base = &syscall_stacks()[0] as *const u8 as u64;
+    pc.syscall_stack = ((base + SYSCALL_STACK_SIZE as u64) & !0xF) - 8;
     pc.syscall_user_rsp = 0;
 
     crate::drivers::serial::SerialPort::puts("[syscall] MSRs initialized\n");
@@ -155,6 +158,11 @@ pub unsafe extern "C" fn syscall_entry() {
         "pop rbp",
         "pop rcx",
         "pop r11",
+        // Mask user RFLAGS before sysret: keep the arithmetic flags (CF PF AF
+        // ZF SF OF), force bit 1 + IF, and clear TF DF NT IOPL AC RF ID so a
+        // malicious ring-3 program cannot arm #DB traps with no IDT handler.
+        "and r11, 0x8D5",
+        "or r11, 0x202",
         "pop rax",                   // return value
         "pop rdi",
         "pop rsi",

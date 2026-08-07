@@ -55,7 +55,7 @@ pub trait Obj: Send + Sync {
     /// and the surface read answers `NotSupported`. Overridden by nodes that
     /// want live surface values reachable through a `QUERY`-bearing cap (the
     /// `SURFACE_READ` hook is handled centrally in `invoke`).
-    fn surface_value(&self, _name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, _name: &str) -> Option<Value<'a>> {
         None
     }
 
@@ -107,13 +107,13 @@ pub trait Obj: Send + Sync {
     /// exact rights the caller held (S1). It is a *check* handle only: the
     /// invocation already passed PERMIT, and no amplification is possible
     /// through this reference.
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError>;
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError>;
 }
 
 /// Errors returned by the capability machinery (§7.2, §8).
@@ -150,25 +150,25 @@ impl core::fmt::Display for ObjError {
 }
 
 /// A hook's reply: data, capabilities, or nothing (§7.9).
-pub enum Reply {
+pub enum Reply<'a> {
     None,
-    Data(Vec<Value>),
+    Data(Vec<Value<'a>>),
     Caps(Vec<CapHandle>),
 }
 
 /// A hook argument value: a scalar, a label, or a buffer.
-pub enum Value {
+pub enum Value<'a> {
     U64(u64),
-    Str(&'static str),
+    Str(&'a str),
     Buf(Vec<u8>),
 }
 
 /// Hook arguments.
-pub struct Args {
-    pub vals: Vec<Value>,
+pub struct Args<'a> {
+    pub vals: Vec<Value<'a>>,
 }
 
-impl Args {
+impl<'a> Args<'a> {
     pub fn none() -> Self {
         Args { vals: Vec::new() }
     }
@@ -177,13 +177,13 @@ impl Args {
 /// The single dispatch entry point (§7.9): PERMIT via `resolve`, then the
 /// node's hook body. Capabilities in the reply are inserted into the caller's
 /// table (getting real `CapId`s) before the reply is returned.
-pub fn invoke(
+pub fn invoke<'a>(
     table: &CapabilityTable,
     id: CapId,
     contract: ContractId,
     hook: HookId,
-    args: &Args,
-) -> Result<Reply, ObjError> {
+    args: &Args<'a>,
+) -> Result<Reply<'a>, ObjError> {
     // §4.1 surface reads: node-level, gated by the universal `QUERY` right, and
     // exempt from contract membership — a surface is not a contract hook. The
     // attribute name is the sole argument; the value comes from

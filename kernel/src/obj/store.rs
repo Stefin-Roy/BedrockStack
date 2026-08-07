@@ -275,7 +275,7 @@ impl Obj for StoreNode {
         Some(&STORE_SURFACE)
     }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "records" => Some(Value::U64(object_store().lock_records().len() as u64)),
             _ => None,
@@ -286,13 +286,13 @@ impl Obj for StoreNode {
         STORE_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         let store = object_store();
         if hook == STORE_COUNT {
             return Ok(Reply::Data(vec![Value::U64(

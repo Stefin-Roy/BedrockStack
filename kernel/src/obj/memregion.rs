@@ -210,7 +210,7 @@ impl Obj for MemRegionNode {
         MEM_REGION_CONTRACTS
     }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "base" => Some(Value::U64(self.base.load(Ordering::Relaxed))),
             "size" => Some(Value::U64(self.size.load(Ordering::Relaxed))),
@@ -226,13 +226,13 @@ impl Obj for MemRegionNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        _args: &Args,
-    ) -> Result<Reply, ObjError> {
+        _args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == MEM_REGION_BASE {
             return Ok(Reply::Data(vec![Value::U64(self.base.load(Ordering::Relaxed))]));
         }

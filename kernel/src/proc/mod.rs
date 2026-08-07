@@ -144,7 +144,7 @@ pub fn run_init(alloc: &mut BitmapAllocator, kernel_root: u64) -> Result<(), &'s
         vmm.map_4k(alloc, page, frame, PageFlags::READ | PageFlags::WRITE | PageFlags::USER);
     }
 
-    let user_rsp = USER_STACK_TOP - 16;
+    let user_rsp = USER_STACK_TOP - 8;
 
     // Switch to the user domain (CR3 switch). The kernel high half is shared,
     // so the syscall stacks, per-CPU data and current kernel stack stay

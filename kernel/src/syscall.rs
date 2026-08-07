@@ -6,8 +6,6 @@
 //! (pointers, sizes, wire-format descriptors) is validated up front and
 //! never `.unwrap()`/`.expect()`ed — a malformed call returns `u64::MAX`.
 
-use alloc::boxed::Box;
-use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -239,7 +237,7 @@ fn push_u64(out: &mut Vec<u8>, v: u64) {
 }
 
 /// Append one `Value` to a reply buffer: tag (0=U64, 1=Buf, 2=Str) + payload.
-fn marshal_value(out: &mut Vec<u8>, v: &Value) {
+fn marshal_value(out: &mut Vec<u8>, v: &Value<'_>) {
     match v {
         Value::U64(x) => {
             push_u64(out, 0);
@@ -353,7 +351,13 @@ fn sys_invoke(_num: u64, desc_ptr: u64, reply_ptr: u64, reply_cap: u64) -> u64 {
         return u64::MAX;
     }
 
-    let mut vals: Vec<Value> = Vec::new();
+    let mut arena: Vec<Vec<u8>> = Vec::new();
+    enum Tok {
+        U64(u64),
+        Buf(Vec<u8>),
+        Str(usize),
+    }
+    let mut toks: Vec<Tok> = Vec::with_capacity(nargs as usize);
     for _ in 0..nargs {
         let tag = match r.take_u64() {
             Some(v) => v,
@@ -365,7 +369,7 @@ fn sys_invoke(_num: u64, desc_ptr: u64, reply_ptr: u64, reply_cap: u64) -> u64 {
                     Some(v) => v,
                     None => return u64::MAX,
                 };
-                vals.push(Value::U64(v));
+                toks.push(Tok::U64(v));
             }
             1 => {
                 let len = match r.take_u64() {
@@ -379,7 +383,7 @@ fn sys_invoke(_num: u64, desc_ptr: u64, reply_ptr: u64, reply_cap: u64) -> u64 {
                     Some(b) => b,
                     None => return u64::MAX,
                 };
-                vals.push(Value::Buf(bytes));
+                toks.push(Tok::Buf(bytes));
             }
             2 => {
                 let len = match r.take_u64() {
@@ -393,24 +397,34 @@ fn sys_invoke(_num: u64, desc_ptr: u64, reply_ptr: u64, reply_cap: u64) -> u64 {
                     Some(b) => b,
                     None => return u64::MAX,
                 };
-                // Reject invalid UTF-8, then leak to `&'static str`.
-                let s = match core::str::from_utf8(&bytes) {
-                    Ok(s) => s,
-                    Err(_) => return u64::MAX,
-                };
-                let leaked: &'static str = Box::leak(String::from(s).into_boxed_str());
-                vals.push(Value::Str(leaked));
+                if core::str::from_utf8(&bytes).is_err() {
+                    return u64::MAX;
+                }
+                arena.push(bytes);
+                toks.push(Tok::Str(arena.len() - 1));
             }
             _ => return u64::MAX,
         }
     }
+
+    let mut vals: Vec<Value> = Vec::with_capacity(toks.len());
+    for t in toks {
+        match t {
+            Tok::U64(v) => vals.push(Value::U64(v)),
+            Tok::Buf(b) => vals.push(Value::Buf(b)),
+            Tok::Str(i) => vals.push(Value::Str(
+                core::str::from_utf8(&arena[i]).expect("validated"),
+            )),
+        }
+    }
+
+    let args = Args { vals };
 
     let table = match current_table() {
         Some(t) => t,
         None => return u64::MAX,
     };
 
-    let args = Args { vals };
     let result =
         crate::obj::invoke(table, CapId(cap_id), ContractId(contract_id), HookId(hook_id), &args);
 
@@ -501,8 +515,8 @@ fn sys_cap_query(_num: u64, cap_id: u64, name_ptr: u64, _a2: u64) -> u64 {
         Some(b) => b,
         None => return u64::MAX,
     };
-    let leaked: &'static str = match String::from_utf8(bytes) {
-        Ok(s) => Box::leak(s.into_boxed_str()),
+    let name = match core::str::from_utf8(&bytes) {
+        Ok(n) => n,
         Err(_) => return u64::MAX,
     };
     let table = match current_table() {
@@ -510,7 +524,7 @@ fn sys_cap_query(_num: u64, cap_id: u64, name_ptr: u64, _a2: u64) -> u64 {
         None => return u64::MAX,
     };
     let args = Args {
-        vals: vec![Value::Str(leaked)],
+        vals: vec![Value::Str(name)],
     };
     match crate::obj::invoke(table, CapId(cap_id), ContractId(0), SURFACE_READ, &args) {
         Ok(Reply::Data(v)) => match v.first() {

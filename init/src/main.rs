@@ -98,8 +98,8 @@ pub extern "C" fn _start() -> ! {
         die(CAP_SERIAL, cid_serial, b"[init] label: expected a value\n");
     }
     let tag = read_u64(&reply, &mut cur);
-    if tag != TAG_STR {
-        die(CAP_SERIAL, cid_serial, b"[init] label: expected a Str value\n");
+    if tag != TAG_STR && tag != TAG_BUF {
+        die(CAP_SERIAL, cid_serial, b"[init] label: expected a Str or Buf value\n");
     }
     let slen = read_u64(&reply, &mut cur) as usize;
     puts_cap(CAP_SERIAL, cid_serial, b"[init] label: ");
@@ -187,6 +187,12 @@ unsafe fn syscall(num: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
             lateout("rax") ret,
             lateout("rcx") _,
             lateout("r11") _,
+            lateout("rdi") _,
+            lateout("rsi") _,
+            lateout("rdx") _,
+            lateout("r10") _,
+            lateout("r8") _,
+            lateout("r9") _,
             options(nostack),
         );
     }

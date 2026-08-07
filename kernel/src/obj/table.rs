@@ -413,7 +413,7 @@ impl Obj for TableNode {
         Some(&TABLE_SURFACE)
     }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "slots" => Some(Value::U64(self.table.count() as u64)),
             _ => None,
@@ -424,13 +424,13 @@ impl Obj for TableNode {
         TABLE_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == TABLE_COUNT {
             return Ok(Reply::Data(vec![Value::U64(self.table.count() as u64)]));
         }

@@ -224,7 +224,7 @@ impl PciCfgClient {
 
 /// Argument prefix shared by every PCI hook: `[seg, bus, dev, func, off]`
 /// (§ adapters).
-fn read_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Args {
+fn read_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Args<'static> {
     Args {
         vals: Vec::from([
             Value::U64(seg as u64),
@@ -237,7 +237,7 @@ fn read_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> Args {
 }
 
 /// `[seg, bus, dev, func, off, val]` for the write hooks.
-fn write_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u64) -> Args {
+fn write_args(seg: u16, bus: u8, dev: u8, func: u8, off: u16, val: u64) -> Args<'static> {
     Args {
         vals: Vec::from([
             Value::U64(seg as u64),

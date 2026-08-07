@@ -39,7 +39,7 @@ struct Elf64Ehdr {
 const PT_LOAD: u32 = 1;
 
 /// Read a little-endian u16 from a byte slice at the given offset.
-fn read_u16(data: &[u8], offset: usize) -> u16 {
+pub(crate) fn read_u16(data: &[u8], offset: usize) -> u16 {
     debug_assert!(offset + 1 < data.len(), "read_u16 out of bounds");
     u16::from_le_bytes([data[offset], data[offset + 1]])
 }
@@ -56,7 +56,7 @@ fn read_u32(data: &[u8], offset: usize) -> u32 {
 }
 
 /// Read a little-endian u64 from a byte slice at the given offset.
-fn read_u64(data: &[u8], offset: usize) -> u64 {
+pub(crate) fn read_u64(data: &[u8], offset: usize) -> u64 {
     debug_assert!(offset + 7 < data.len(), "read_u64 out of bounds");
     u64::from_le_bytes([
         data[offset],
@@ -70,15 +70,17 @@ fn read_u64(data: &[u8], offset: usize) -> u64 {
     ])
 }
 
-/// Parse and load an ELF64 binary into physical memory.
+/// Parse and validate an ELF64 header and its program headers, and compute the
+/// page-aligned physical load span `(base, top)` covering every PT_LOAD
+/// segment.
 ///
-/// Returns the entry point address on success.
+/// This is a read-only validation pass — no memory is touched. The caller must
+/// reserve the returned span via [`reserve_span`] before allocating the full
+/// kernel file, so UEFI pool allocations can never land inside the region the
+/// segments will later be copied into.
 ///
-/// # Safety
-/// - `elf_data` must point to a valid ELF64 binary.
-/// - LOAD segments will be copied to their physical addresses (p_paddr).
-/// - Caller must ensure target memory is writable and not overlapping critical regions.
-pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
+/// `elf_data` must contain the ELF header followed by the program headers.
+pub fn parse_load_span(elf_data: &[u8]) -> Result<(u64, u64), &'static str> {
     // Validate minimum size
     if elf_data.len() < core::mem::size_of::<Elf64Ehdr>() {
         return Err("ELF too small");
@@ -99,7 +101,6 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
 
     let e_type = read_u16(elf_data, 16);
     let e_machine = read_u16(elf_data, 18);
-    let e_entry = read_u64(elf_data, 24);
     let e_phoff = read_u64(elf_data, 32) as usize;
     let e_phentsize = read_u16(elf_data, 54) as usize;
     let e_phnum = read_u16(elf_data, 56) as usize;
@@ -166,13 +167,38 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
         return Err("No loadable segments");
     }
 
-    // Reserve the whole physical span (page aligned) as LOADER_DATA so UEFI will
-    // not place anything there and the kernel later treats it as reserved.
+    // Return the whole physical span, page aligned.
     let base = span_lo & !(PAGE_SIZE - 1);
     let top = (span_hi + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    Ok((base, top))
+}
+
+/// Reserve the page-aligned physical load span `(base, top)` as LOADER_DATA so
+/// UEFI will not place anything there and the kernel later treats it as
+/// reserved. Must be called before any large pool allocation (e.g. the full
+/// kernel file buffer).
+pub fn reserve_span(base: u64, top: u64) -> Result<(), &'static str> {
     let pages = ((top - base) / PAGE_SIZE) as usize;
     boot::allocate_pages(AllocateType::Address(base), MemoryType::LOADER_DATA, pages)
-        .map_err(|_| "Failed to reserve kernel load region")?;
+        .map(|_| ())
+        .map_err(|_| "Failed to reserve kernel load region")
+}
+
+/// Copy the PT_LOAD segments of a validated ELF64 binary into the reserved
+/// physical span `(base, top)`.
+///
+/// Returns the entry point address on success.
+///
+/// # Safety
+/// - `elf_data` must point to a valid ELF64 binary whose load span was
+///   reserved via [`parse_load_span`] + [`reserve_span`].
+/// - LOAD segments will be copied to their physical addresses (p_paddr).
+/// - Caller must ensure target memory is writable and not overlapping critical regions.
+pub unsafe fn load_segments(elf_data: &[u8], base: u64, top: u64) -> Result<u64, &'static str> {
+    let e_entry = read_u64(elf_data, 24);
+    let e_phoff = read_u64(elf_data, 32) as usize;
+    let e_phentsize = read_u16(elf_data, 54) as usize;
+    let e_phnum = read_u16(elf_data, 56) as usize;
 
     // Second pass: copy each PT_LOAD segment into the reserved region.
     for i in 0..e_phnum {

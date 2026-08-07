@@ -42,6 +42,7 @@ pub fn fs_walk(w: &mut impl Write) {
                 ) {
                     Ok(Reply::Data(vals)) if !vals.is_empty() => match &vals[0] {
                         Value::Str(s) => s.to_string(),
+                        Value::Buf(b) => String::from_utf8_lossy(b).into_owned(),
                         _ => String::from("?"),
                     },
                     _ => String::from("(no label)"),

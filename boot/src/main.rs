@@ -10,13 +10,15 @@ use uefi::CStr16;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
 use uefi::proto::console::gop::{GraphicsOutput, PixelBitmask, PixelFormat as UefiPixelFormat};
 use uefi::proto::console::text::Output;
-use uefi::fs::FileSystem;
+use uefi::proto::media::file::FileInfo as UefiFileInfo;
+use uefi::proto::media::file::{File, FileAttribute, FileMode, RegularFile};
 
 mod allocator;
 mod elf;
 
 use common::serial::x86_64::SerialPort;
 use common::types::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
+use elf::{read_u16, read_u64};
 use uefi::table::cfg::ConfigTableEntry;
 
 #[global_allocator]
@@ -87,17 +89,106 @@ fn main() -> Status {
     SerialPort::puts("\n");
     log_msg(&mut output, "[boot] Framebuffer OK\n");
 
-    // 3. Load kernel ELF from disk (allocates a large OS_DATA buffer).
+    // 3. Load kernel ELF from disk. Read the headers first and reserve the
+    //    kernel's load span, then read the whole file — the file buffer is a
+    //    large pool allocation that must never land inside the span reserved
+    //    for the kernel segments.
     log_msg(&mut output, "[boot] Reading kernel from disk: \\EFI\\BEDROCK\\KERNEL\n");
 
-    let kernel_data = load_file_from_disk(cstr16!(r"\EFI\BEDROCK\KERNEL").into());
+    let mut ss = match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
+        Ok(s) => s,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: ESP file system protocol unavailable\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    let mut volume = match ss.open_volume() {
+        Ok(v) => v,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: cannot open ESP volume\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    let handle = match volume.open(
+        cstr16!(r"\EFI\BEDROCK\KERNEL"),
+        FileMode::Read,
+        FileAttribute::empty(),
+    ) {
+        Ok(h) => h,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: kernel not found at \\EFI\\BEDROCK\\KERNEL\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    let mut file = match handle.into_regular_file() {
+        Some(f) => f,
+        None => {
+            SerialPort::puts("[boot] FATAL: kernel path is not a regular file\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    let info = match file.get_boxed_info::<UefiFileInfo>() {
+        Ok(i) => i,
+        Err(_) => {
+            SerialPort::puts("[boot] FATAL: cannot query kernel file info\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    let file_size = info.file_size() as usize;
+
+    // 1) ELF header (64 B).
+    let mut ehdr = [0u8; 64];
+    seek_file(&mut file, 0);
+    read_file_full(&mut file, &mut ehdr);
+    let e_phoff = read_u64(&ehdr, 32);
+    let e_phentsize = read_u16(&ehdr, 54);
+    let e_phnum = read_u16(&ehdr, 56);
+    let hdr_len = e_phoff + (e_phnum as u64) * (e_phentsize as u64);
+
+    // 2) Program headers (small pool allocation).
+    let mut hdr = alloc::vec![0u8; hdr_len as usize];
+    seek_file(&mut file, 0);
+    read_file_full(&mut file, &mut hdr);
+
+    // 3) Compute + reserve the load span BEFORE any large pool allocation.
+    let (base, top) = match elf::parse_load_span(&hdr) {
+        Ok(span) => span,
+        Err(msg) => {
+            SerialPort::puts("[boot] FATAL: kernel ELF corrupt or invalid: ");
+            SerialPort::puts(msg);
+            SerialPort::puts("\n");
+            loop { core::hint::spin_loop() }
+        }
+    };
+    if let Err(msg) = elf::reserve_span(base, top) {
+        SerialPort::puts("[boot] FATAL: ");
+        SerialPort::puts(msg);
+        SerialPort::puts("\n");
+        loop { core::hint::spin_loop() }
+    }
+
+    // 4) Read the full file — now guaranteed outside the reserved span.
+    let mut kernel_data = alloc::vec![0u8; file_size];
+    seek_file(&mut file, 0);
+    read_file_full(&mut file, &mut kernel_data);
     SerialPort::puts("[boot] Kernel file read: ");
     SerialPort::put_u64(kernel_data.len() as u64);
     SerialPort::puts(" bytes\n");
     log_msg(&mut output, "[boot] Kernel read from disk\n");
 
+    // 5) Load the segments into the reserved span.
     log_msg(&mut output, "[boot] Parsing ELF and loading segments...\n");
-    let entry = unsafe { elf::load_elf(&kernel_data).expect("FATAL: kernel ELF corrupt or invalid") };
+    let entry = unsafe {
+        match elf::load_segments(&kernel_data, base, top) {
+            Ok(e) => e,
+            Err(msg) => {
+                SerialPort::puts("[boot] FATAL: kernel ELF corrupt or invalid: ");
+                SerialPort::puts(msg);
+                SerialPort::puts("\n");
+                loop { core::hint::spin_loop() }
+            }
+        }
+    };
     SerialPort::puts("[boot] Kernel entry: 0x");
     SerialPort::put_hex(entry);
     SerialPort::puts("\n");
@@ -110,15 +201,6 @@ fn main() -> Status {
     //    hold its own stack / hand-off data.
     log_msg(&mut output, "[boot] Allocating transfer buffers (OS_DATA)...\n");
 
-    // Estimate capacity for the region list from the current map, with generous
-    // slack for entries added/split by our own allocations before
-    // exit_boot_services. This buffer CANNOT be grown after exit (the allocator
-    // is gone), so we over-provision and hard-fail on overflow rather than
-    // silently truncating the map.
-    let est_entries = uefi::boot::memory_map(MemoryType::LOADER_DATA)
-        .map(|m| m.len())
-        .unwrap_or(0);
-    let mut regions_buf: Vec<MemoryRegion> = Vec::with_capacity(est_entries * 2 + 256);
     let fb_buf: Vec<FramebufferInfo> = alloc::vec![fb_info];
 
     let fb_ptr = fb_buf.as_ptr();
@@ -146,10 +228,25 @@ fn main() -> Status {
     // 5. Find ACPI RSDP in the UEFI configuration table (before exit_boot_services).
     let rsdp_addr = find_rsdp(&mut output);
 
-    // 6. Print final message before exiting boot services.
+    // 6. Estimate capacity for the region list from the current map. Measure
+    //    twice and take the max — the map grows between calls (each memory-map
+    //    buffer appears in the next map) — with generous slack for entries
+    //    added/split by our own allocations before exit_boot_services. This
+    //    buffer CANNOT be grown after exit (the allocator is gone), so we
+    //    over-provision and hard-fail on overflow rather than silently
+    //    truncating the map.
+    let est1 = uefi::boot::memory_map(MemoryType::LOADER_DATA)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let est2 = uefi::boot::memory_map(MemoryType::LOADER_DATA)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let mut regions_buf: Vec<MemoryRegion> = Vec::with_capacity(est1.max(est2) * 2 + 512);
+
+    // 7. Print final message before exiting boot services.
     log_msg(&mut output, "[boot] Jumping to kernel...\n");
 
-    // 7. Exit boot services — after this, only runtime services remain.
+    // 8. Exit boot services — after this, only runtime services remain.
     //    The returned map is the authoritative post-exit memory map.
     //    uefi-rs handles the memory-map-key dance internally; if the
     //    firmware refuses the transition the library logs a warning and
@@ -157,7 +254,7 @@ fn main() -> Status {
     //    than returning an error.
     let mmap = unsafe { uefi::boot::exit_boot_services(Some(allocator::OS_DATA)) };
 
-    // 8. Build the region list from the FINAL map into the pre-allocated buffer.
+    // 9. Build the region list from the FINAL map into the pre-allocated buffer.
     //    No allocation happens here (we stay within reserved capacity), which is
     //    required since boot services (and thus the allocator) are gone.
     //    NOTE: UEFI console is gone after exit_boot_services —
@@ -190,7 +287,7 @@ fn main() -> Status {
     core::mem::forget(regions_buf);
     core::mem::forget(fb_buf);
 
-    // 9. We are now bare metal. Jump to kernel.
+    // 10. We are now bare metal. Jump to kernel.
     // NOTE: Serial I/O still works after exit_boot_services (bare metal port I/O).
     SerialPort::puts("[boot] Boot services exited. Jumping to kernel...\n");
 
@@ -358,22 +455,30 @@ fn get_framebuffer_info() -> FramebufferInfo {
     }
 }
 
-/// Load a file from the boot partition's FAT32 filesystem.
-/// Halts with a clear message on failure instead of panicking.
-fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
-    let ss = match uefi::boot::get_image_file_system(uefi::boot::image_handle()) {
-        Ok(s) => s,
-        Err(_) => {
-            SerialPort::puts("[boot] FATAL: ESP file system protocol unavailable\n");
-            loop { core::hint::spin_loop() }
-        }
-    };
-    let mut fs = FileSystem::new(ss);
-    match fs.read(path) {
-        Ok(data) => data,
-        Err(_) => {
-            SerialPort::puts("[boot] FATAL: kernel not found at \\EFI\\BEDROCK\\KERNEL\n");
-            loop { core::hint::spin_loop() }
+/// Seek a file to `position`, halting with a clear message instead of panicking.
+fn seek_file(file: &mut RegularFile, position: u64) {
+    if file.set_position(position).is_err() {
+        SerialPort::puts("[boot] FATAL: kernel file seek failed\n");
+        loop { core::hint::spin_loop() }
+    }
+}
+
+/// Read exactly `buf.len()` bytes from `file` at the current position, looping
+/// until the buffer is full (UEFI reads may return short). Halts with a clear
+/// message instead of panicking.
+fn read_file_full(file: &mut RegularFile, buf: &mut [u8]) {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..]) {
+            Ok(0) => {
+                SerialPort::puts("[boot] FATAL: unexpected end of kernel file\n");
+                loop { core::hint::spin_loop() }
+            }
+            Ok(n) => filled += n,
+            Err(_) => {
+                SerialPort::puts("[boot] FATAL: kernel file read error\n");
+                loop { core::hint::spin_loop() }
+            }
         }
     }
 }

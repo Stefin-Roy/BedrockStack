@@ -91,13 +91,13 @@ impl Obj for RegistryNode {
         REGISTRY_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         let registry = contract::contract_registry();
         if hook == REGISTRY_REGISTER {
             let name = match args.vals.first() {

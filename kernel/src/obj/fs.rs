@@ -11,7 +11,6 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -42,12 +41,12 @@ const FILE_OBJ_ID: ObjId = ObjId(0x10_0006);
 /// A single block device, handed out by the block-family root (§7.11.4).
 pub struct BlockNode {
     device: Arc<dyn BlockDevice>,
-    model: &'static str,
+    model: String,
 }
 
 impl BlockNode {
     pub fn new(device: Arc<dyn BlockDevice>) -> Self {
-        let model = Box::leak(device.model_string().to_string().into_boxed_str());
+        let model = device.model_string().to_string();
         BlockNode { device, model }
     }
 
@@ -123,13 +122,13 @@ impl Obj for BlockNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == BLOCK_SUBMIT {
             let lba = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let count = arg_u64(args, 1).ok_or(ObjError::Denied)?;
@@ -153,20 +152,20 @@ impl Obj for BlockNode {
             return Ok(Reply::Data(vec![Value::U64(self.device.sector_count())]));
         }
         if hook == BLOCK_MODEL_STRING {
-            return Ok(Reply::Data(vec![Value::Str(self.model)]));
+            return Ok(Reply::Data(vec![Value::Buf(self.model.as_bytes().to_vec())]));
         }
         Err(ObjError::NotSupported)
     }
 }
 
-fn arg_u64(args: &Args, i: usize) -> Option<u64> {
+fn arg_u64(args: &Args<'_>, i: usize) -> Option<u64> {
     match args.vals.get(i) {
         Some(Value::U64(v)) => Some(*v),
         _ => None,
     }
 }
 
-fn arg_buf(args: &Args, i: usize) -> Option<&Vec<u8>> {
+fn arg_buf<'x>(args: &'x Args<'_>, i: usize) -> Option<&'x Vec<u8>> {
     match args.vals.get(i) {
         Some(Value::Buf(b)) => Some(b),
         _ => None,
@@ -235,13 +234,13 @@ impl Obj for BlockFamilyNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &super::table::CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == BLOCK_FAMILY_REGISTER {
             // Bring-up registration: the caller passes the id of a
             // `block:storage` cap it inserted into its own table; resolve it
@@ -375,13 +374,13 @@ impl Obj for MountNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &super::table::CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == MOUNT_HOOK {
             let fstype = match args.vals.get(0) {
                 Some(Value::Str(s)) => *s,
@@ -444,11 +443,13 @@ pub fn mount_node() -> Arc<dyn Obj> {
 /// child caps; `label()` returns the directory name.
 pub struct DirNode {
     root: Arc<Dentry>,
+    label: String,
 }
 
 impl DirNode {
     pub fn new(root: Arc<Dentry>) -> Self {
-        DirNode { root }
+        let label = root.name.lock().clone();
+        DirNode { root, label }
     }
 
     pub fn root(&self) -> Arc<Dentry> {
@@ -584,13 +585,13 @@ impl Obj for DirNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         // Navigation (traverse/readdir) hands out capabilities into the tree,
         // so it is gated on the universal TRAVERSE right in addition to the
         // INVOKE that PERMIT already demanded.
@@ -630,9 +631,7 @@ impl Obj for DirNode {
             return Ok(Reply::Caps(caps));
         }
         if hook == DIR_LABEL {
-            let name = self.root.name.lock().clone();
-            let name_ref: &'static str = Box::leak(name.into_boxed_str());
-            return Ok(Reply::Data(vec![Value::Str(name_ref)]));
+            return Ok(Reply::Data(vec![Value::Buf(self.label.as_bytes().to_vec())]));
         }
         if hook == DIR_MKDIR {
             let name = match args.vals.get(0) {
@@ -746,13 +745,13 @@ impl Obj for FileNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == FILE_READ_AT {
             let offset = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let data = arg_buf(args, 1).ok_or(ObjError::Denied)?;
@@ -787,8 +786,7 @@ impl Obj for FileNode {
             ]));
         }
         if hook == FILE_LABEL {
-            let name_ref: &'static str = Box::leak(self.name.clone().into_boxed_str());
-            return Ok(Reply::Data(vec![Value::Str(name_ref)]));
+            return Ok(Reply::Data(vec![Value::Buf(self.name.as_bytes().to_vec())]));
         }
         Err(ObjError::NotSupported)
     }

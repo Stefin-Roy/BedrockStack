@@ -83,13 +83,13 @@ impl Obj for PciForestNode {
         PCI_FOREST_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        _args: &Args,
-    ) -> Result<Reply, ObjError> {
+        _args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == PCI_FOREST_COUNT {
             let n = crate::pci::devices().len() as u64;
             return Ok(Reply::Data(vec![Value::U64(n)]));
@@ -210,13 +210,13 @@ impl Obj for PciDeviceNode {
         PCI_DEVICE_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         let ecam = crate::services::ecam_pci_config::ecam_static();
         let (seg, bus, dev, func) =
             (self.dev.segment, self.dev.bus, self.dev.device, self.dev.function);
@@ -308,7 +308,7 @@ impl Obj for PciDeviceNode {
         }
     }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "bus" => Some(Value::U64(self.dev.bus as u64)),
             "device" => Some(Value::U64(self.dev.device as u64)),
@@ -392,13 +392,13 @@ impl Obj for InputFamilyNode {
         INPUT_FAMILY_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        _args: &Args,
-    ) -> Result<Reply, ObjError> {
+        _args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == INPUT_FAMILY_COUNT {
             let n = crate::input::device_count() as u64;
             return Ok(Reply::Data(vec![Value::U64(n)]));
@@ -456,13 +456,13 @@ impl Obj for AudioFamilyNode {
         AUDIO_FAMILY_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &super::table::CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        _args: &Args,
-    ) -> Result<Reply, ObjError> {
+        _args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == AUDIO_FAMILY_COUNT {
             let n = if AUDIO_READY.load(Ordering::Acquire) { 1 } else { 0 };
             return Ok(Reply::Data(vec![Value::U64(n)]));

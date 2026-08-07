@@ -92,8 +92,10 @@ _start:
     // [KERNEL_VMA, +256 MiB) window RW, and `.stack` (ending at `__kernel_end`)
     // lies inside it, so it is reachable the moment CR3 is loaded.  The low
     // `.bootstack` is dead from here on; the kernel runs its entire life on
-    // this high stack, which every domain's cloned high half maps.
+    // this high stack, which every domain's cloned high half maps.  `__stack_end`
+    // is page-aligned, so back off 8 to give the sysv64 entry an RSP ≡ 8 (mod 16).
     movabs rax, offset __stack_end
+    sub rax, 8
     mov rsp, rax
 
     // Far-into-high jump: `kernel_main` is a kernel-region symbol (high VMA)

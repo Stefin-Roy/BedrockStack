@@ -123,7 +123,7 @@ impl Obj for PhysMemNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&PHYSMEM_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { PHYSMEM_CONTRACTS }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "total_frames" => Some(Value::U64(heap::get_phys_allocator_mut().total_frames() as u64)),
             _ => None,
@@ -139,13 +139,13 @@ impl Obj for PhysMemNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == PHYSMEM_ALLOC_FRAMES {
             return self.alloc_frames(arg_u64(args, 0).unwrap_or(1) as usize);
         }
@@ -179,7 +179,7 @@ impl PhysMemNode {
     /// single `base`+`size`, so the `count` frames must be a contiguous run
     /// (the bitmap's run allocator); `alloc_frames(n)` is then `n` contiguous
     /// frames, indistinguishable in shape from `alloc_contiguous(n)`.
-    fn alloc_frames(&self, count: usize) -> Result<Reply, ObjError> {
+    fn alloc_frames(&self, count: usize) -> Result<Reply<'static>, ObjError> {
         let pool = mem_region_pool(RegionKind::Phys);
         dma_trace!({
             use crate::drivers::serial::SerialPort;
@@ -223,7 +223,7 @@ impl PhysMemNode {
 
     /// Allocate one contiguous run of `count` frames; wrapped as a single
     /// `MemRegion`. OOM recycles the pre-built wrapper and reports OOM.
-    fn alloc_contiguous(&self, count: usize) -> Result<Reply, ObjError> {
+    fn alloc_contiguous(&self, count: usize) -> Result<Reply<'static>, ObjError> {
         let pool = mem_region_pool(RegionKind::Phys);
         dma_trace!({
             use crate::drivers::serial::SerialPort;
@@ -309,7 +309,7 @@ impl Obj for HeapNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&HEAP_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { HEAP_CONTRACTS }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "arena" => Some(Value::U64(crate::mm::heap::stats().1)),
             _ => None,
@@ -325,13 +325,13 @@ impl Obj for HeapNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == HEAP_ALLOC {
             let size = arg_u64(args, 0).unwrap_or(1) as usize;
             let align = arg_u64(args, 1).unwrap_or(8) as usize;
@@ -354,7 +354,7 @@ impl Obj for HeapNode {
 }
 
 impl HeapNode {
-    fn heap_alloc(&self, size: usize, align: usize) -> Result<Reply, ObjError> {
+    fn heap_alloc(&self, size: usize, align: usize) -> Result<Reply<'static>, ObjError> {
         let Some(node) = mem_region_pool(RegionKind::Heap).take() else {
             return Err(ObjError::OutOfMemory);
         };
@@ -425,7 +425,7 @@ impl Obj for AddressSpaceNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&ADDRSPACE_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { ADDRSPACE_CONTRACTS }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "root" => Some(Value::U64(self.root)),
             _ => None,
@@ -441,13 +441,13 @@ impl Obj for AddressSpaceNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == ADDRSPACE_MAP {
             let va = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let pa = arg_u64(args, 1).ok_or(ObjError::Denied)?;
@@ -542,7 +542,7 @@ impl Obj for CpuRootNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "cpus" => Some(Value::U64(self.cpu.cpu_count() as u64)),
             _ => None,
@@ -557,13 +557,13 @@ impl Obj for CpuRootNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == CPU_WAKE {
             // The ApContext list is built by `smp::init`; a capability hook cannot
             // reconstruct it from scalar args, so the real AP bring-up stays the
@@ -610,7 +610,7 @@ impl Obj for CpuNode {
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&CPU_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { CPU_CONTRACTS }
 
-    fn surface_value(&self, name: &str) -> Option<Value> {
+    fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
             "cpus" => Some(Value::U64(self.cpu_id as u64)),
             _ => None,
@@ -625,13 +625,13 @@ impl Obj for CpuNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == CPU_WAKE {
             // Same limitation as the family root: the real AP bring-up is the
             // `materialize_cpu_child` path. Acknowledge the online set.
@@ -729,13 +729,13 @@ impl Obj for IrqRootNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == IRQ_REGISTER {
             let handler = resolve_handler(caller, arg_u64(args, 1).ok_or(ObjError::Denied)?)?;
             let vector = match arg_u64(args, 0) {
@@ -796,13 +796,13 @@ impl Obj for IrqNode {
         }
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == IRQ_REGISTER {
             let handler = resolve_handler(caller, arg_u64(args, 1).ok_or(ObjError::Denied)?)?;
             self.irq.register_handler(self.vector, handler);
@@ -880,13 +880,13 @@ impl Obj for IrqHandlerNode {
         Some(self.entry)
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        _args: &Args,
-    ) -> Result<Reply, ObjError> {
+        _args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == IRQ_HANDLER_ENTRY {
             return Ok(Reply::Data(vec![Value::U64(self.entry as usize as u64)]));
         }
@@ -1051,7 +1051,7 @@ pub fn irq_root_node() -> Arc<dyn Obj> {
 // ── Small helpers (mirror `adapters.rs`) ───────────────────────────────
 
 /// Read a `Value::U64` hook argument, or `None`.
-fn arg_u64(args: &Args, i: usize) -> Option<u64> {
+fn arg_u64(args: &Args<'_>, i: usize) -> Option<u64> {
     match args.vals.get(i) {
         Some(Value::U64(v)) => Some(*v),
         _ => None,
@@ -1064,7 +1064,7 @@ fn arg_u64(args: &Args, i: usize) -> Option<u64> {
 /// pooled wrapper (§ `memregion.rs`). The `get` is PERMIT-less by design (§7.4
 /// item 3: our own dispatch already passed PERMIT), but the contract-membership
 /// check keeps a caller from pointing `free` at a foreign node.
-fn release_region(caller: &CapabilityTable, cap_id: u64) -> Result<Reply, ObjError> {
+fn release_region(caller: &CapabilityTable, cap_id: u64) -> Result<Reply<'static>, ObjError> {
     let id = CapId(cap_id);
     let node = caller.get(id).map_err(|_| ObjError::NoSuchCap)?;
     if !node.contracts().contains(&MEM_REGION_CONTRACT) {

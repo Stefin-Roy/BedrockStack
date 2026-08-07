@@ -140,6 +140,7 @@ _start_64:
     // cloned high half maps.  (`offset` is required so this assembles to an
     // absolute load, not the `48 a1` moffs memory-load form.)
     movabs rax, offset __stack_end
+    sub rax, 8
     mov rsp, rax
     xor rbp, rbp
 

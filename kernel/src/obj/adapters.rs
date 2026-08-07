@@ -73,13 +73,13 @@ impl<T: Obj + ?Sized> Obj for NodeRef<T> {
         self.0.revocation()
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         self.0.dispatch(caller, rights, hook, args)
     }
 }
@@ -160,13 +160,13 @@ impl Obj for KernelDma {
         DMA_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == DMA_ALLOC_PAGE {
             return dma_alloc(caller, nodes::PHYSMEM_ALLOC_FRAMES, 1);
         }
@@ -238,7 +238,7 @@ impl Obj for KernelDma {
     }
 }
 
-fn arg_u64(args: &Args, i: usize) -> Option<u64> {
+fn arg_u64(args: &Args<'_>, i: usize) -> Option<u64> {
     match args.vals.get(i) {
         Some(Value::U64(v)) => Some(*v),
         _ => None,
@@ -262,7 +262,7 @@ fn dma_alloc(
     caller: &CapabilityTable,
     alloc_hook: HookId,
     count: usize,
-) -> Result<Reply, ObjError> {
+) -> Result<Reply<'static>, ObjError> {
     let size = (count as u64) * 4096;
     dma_trace!({
         use crate::drivers::serial::SerialPort;
@@ -549,13 +549,13 @@ impl Obj for EcamPciConfig {
         PCI_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         let seg = arg_u64(args, 0).unwrap_or(0) as u16;
         let bus = arg_u64(args, 1).unwrap_or(0) as u8;
         let dev = arg_u64(args, 2).unwrap_or(0) as u8;
@@ -637,13 +637,13 @@ impl Obj for KernelSerial {
         SERIAL_CONTRACTS
     }
 
-    fn dispatch(
+    fn dispatch<'a>(
         &self,
         _caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
-        args: &Args,
-    ) -> Result<Reply, ObjError> {
+        args: &Args<'a>,
+    ) -> Result<Reply<'a>, ObjError> {
         if hook == SERIAL_PUTC {
             if let Some(Value::U64(c)) = args.vals.first() {
                 self.putc(*c as u8);
@@ -653,10 +653,8 @@ impl Obj for KernelSerial {
         if hook == SERIAL_PUTS {
             for v in &args.vals {
                 match v {
-                    // `&'static str` labels (the classic form).
+                    // `&'a str` labels (borrowed from the caller's arena).
                     Value::Str(s) => self.puts(s),
-                    // Runtime `&str` payloads marshalled by `SerialClient`
-                    // (`Value::Str` cannot carry a non-static string).
                     Value::Buf(b) => self.puts(core::str::from_utf8(b).unwrap_or("")),
                     _ => {}
                 }
