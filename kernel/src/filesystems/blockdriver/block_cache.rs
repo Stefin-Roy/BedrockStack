@@ -61,20 +61,11 @@ impl BlockCache {
     }
 
     fn read_raw(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf_ptr: *mut u8, buf_len: usize) -> Result<(), ()> {
-        if count <= 1 {
-            let data = self.read(device, lba)?;
-            unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, data.len()); }
-            Ok(())
-        } else {
-            let total = (count as usize) * 512;
-            let mut tmp = alloc::vec![0u8; total];
-            let req = IoRequest { lba, count, buffer: IoBuffer::Buf(&mut tmp), is_write: false };
-            let c = device.submit(&[req]).map_err(|_| ())?;
-            if !c.all_ok() { return Err(()); }
-            let copy_len = total.min(buf_len);
-            unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf_ptr, copy_len); }
-            Ok(())
-        }
+        debug_assert!(count <= 1, "multi-sector reads bypass the cache in read_io");
+        let data = self.read(device, lba)?;
+        let copy_len = 512usize.min(buf_len);
+        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
+        Ok(())
     }
 
     fn write(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), ()> {
@@ -106,6 +97,23 @@ impl CachedDevice {
     }
 
     fn read_io(&self, cache: &mut BlockCache, r: &IoRequest) -> Result<(), ()> {
+        if r.count > 1 {
+            // Multi-sector reads bypass the sector cache: forward the
+            // caller's buffer straight to the backing device so drivers with
+            // direct DMA (AHCI PRDT) can write zero-copy.  A temp Vec + copy
+            // here just burns an alloc and a memcpy for no coherence benefit.
+            let buffer = match &r.buffer {
+                IoBuffer::Buf(buf) => {
+                    let ptr = buf.as_ptr() as *mut u8;
+                    let len = buf.len();
+                    IoBuffer::Buf(unsafe { &mut *core::ptr::slice_from_raw_parts_mut(ptr, len) })
+                }
+                _ => return Err(()),
+            };
+            let req = IoRequest { lba: r.lba, count: r.count, buffer, is_write: false };
+            let c = self.inner.submit(core::slice::from_ref(&req)).map_err(|_| ())?;
+            return if c.all_ok() { Ok(()) } else { Err(()) };
+        }
         let (buf_ptr, buf_len) = match &r.buffer {
             IoBuffer::Buf(buf) => (buf.as_ptr() as *mut u8, buf.len()),
             _ => return Err(()),
