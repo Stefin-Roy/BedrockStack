@@ -13,7 +13,10 @@ const CSW_SIGNATURE: u32 = 0x53425355;
 const DIR_IN: u8 = 0x80;
 const DIR_OUT: u8 = 0x00;
 
-const CBW_OFFSET: u64 = 512;
+/// The xHCI layer caps a bulk transfer at 64 KiB per TRB (`device.rs`), so a
+/// single SCSI command may carry at most this many sectors.
+const MAX_SCSI_SECTORS: u32 = 64 * 1024 / 512;
+const DATA_BUFFER_PAGES: usize = 16;
 
 #[repr(C, packed)]
 struct Cbw {
@@ -85,10 +88,15 @@ struct UsbMassStorageInner {
     bulk_out_ring: TrbRing,
     bulk_in_ring: TrbRing,
     tag: u32,
-    data_page_phys: u64,
-    data_page_va: u64,
-    csw_page_phys: u64,
-    csw_page_va: u64,
+    /// Large contiguous DMA bounce buffer for bulk data (CBW/CSW live in
+    /// their own pages so they never collide with multi-sector data).
+    data_phys: u64,
+    data_va: u64,
+    data_size: usize,
+    cbw_phys: u64,
+    cbw_va: u64,
+    csw_phys: u64,
+    csw_va: u64,
 }
 
 impl UsbMassStorageInner {
@@ -96,7 +104,7 @@ impl UsbMassStorageInner {
         unsafe {
             core::ptr::copy_nonoverlapping(
                 cbw_bytes.as_ptr(),
-                (self.data_page_va + CBW_OFFSET) as *mut u8,
+                self.cbw_va as *mut u8,
                 31,
             );
         }
@@ -105,7 +113,7 @@ impl UsbMassStorageInner {
             self.doorbell_va,
             self.slot_id,
             self.bulk_out_dci,
-            self.data_page_phys + CBW_OFFSET,
+            self.cbw_phys,
             31,
         )
     }
@@ -116,10 +124,10 @@ impl UsbMassStorageInner {
             self.doorbell_va,
             self.slot_id,
             self.bulk_in_dci,
-            self.csw_page_phys,
+            self.csw_phys,
             13,
         )?;
-        let csw_bytes = unsafe { core::slice::from_raw_parts(self.csw_page_va as *const u8, 13) };
+        let csw_bytes = unsafe { core::slice::from_raw_parts(self.csw_va as *const u8, 13) };
         unsafe {
             core::ptr::copy_nonoverlapping(csw_bytes.as_ptr(), csw as *mut Csw as *mut u8, 13);
         }
@@ -207,7 +215,8 @@ impl UsbMassStorageDevice {
         bulk_in_ring: TrbRing,
         dma: DmaClient,
     ) -> Result<Arc<Self>, &'static str> {
-        let data_page = dma.alloc_page().ok_or("OOM for USB MSD data page")?;
+        let data_buf = dma.alloc_contiguous(DATA_BUFFER_PAGES).ok_or("OOM for USB MSD data buffer")?;
+        let cbw_page = dma.alloc_page().ok_or("OOM for USB MSD CBW page")?;
         let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;
 
         let inner = Mutex::new(UsbMassStorageInner {
@@ -218,10 +227,13 @@ impl UsbMassStorageDevice {
             bulk_out_ring,
             bulk_in_ring,
             tag: 1,
-            data_page_phys: data_page.phys,
-            data_page_va: data_page.virt,
-            csw_page_phys: csw_page.phys,
-            csw_page_va: csw_page.virt,
+            data_phys: data_buf.phys,
+            data_va: data_buf.virt,
+            data_size: data_buf.size,
+            cbw_phys: cbw_page.phys,
+            cbw_va: cbw_page.virt,
+            csw_phys: csw_page.phys,
+            csw_va: csw_page.virt,
         });
 
         let mut model = [0u8; 32];
@@ -229,8 +241,8 @@ impl UsbMassStorageDevice {
 
         {
             let mut inner_ref = inner.lock();
-            let dp = inner_ref.data_page_phys;
-            let dv = inner_ref.data_page_va;
+            let dp = inner_ref.data_phys;
+            let dv = inner_ref.data_va;
 
             inner_ref.do_scsi_command(&scsi_inquiry_cdb(), dp, 36, true)?;
             let inquiry = unsafe { core::slice::from_raw_parts(dv as *const u8, 36) };
@@ -328,26 +340,36 @@ impl BlockDevice for UsbMassStorageDevice {
                 continue;
             }
 
-            let page_phys = inner.data_page_phys;
-            let page_va = inner.data_page_va;
+            let max_sectors = ((inner.data_size / 512) as u32).min(MAX_SCSI_SECTORS);
+            let data_phys = inner.data_phys;
+            let data_va = inner.data_va;
 
             if req.is_write {
-                for i in 0..count {
+                let mut i = 0u32;
+                while i < count {
+                    let chunk = (count - i).min(max_sectors);
+                    let chunk_bytes = (chunk as usize) * 512;
                     let lba = req.lba + i as u64;
                     let src = buf_vaddr + (i as usize * 512) as u64;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(src as *const u8, page_va as *mut u8, 512);
+                        core::ptr::copy_nonoverlapping(src as *const u8, data_va as *mut u8, chunk_bytes);
                     }
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    inner.do_scsi_command(&scsi_write10_cdb(lba as u32, 1), page_phys, 512, false)?;
+                    inner.do_scsi_command(&scsi_write10_cdb(lba as u32, chunk as u16), data_phys, chunk_bytes as u32, false)?;
+                    i += chunk;
                 }
             } else {
-                for i in 0..count {
+                let mut i = 0u32;
+                while i < count {
+                    let chunk = (count - i).min(max_sectors);
+                    let chunk_bytes = (chunk as usize) * 512;
                     let lba = req.lba + i as u64;
-                    inner.do_scsi_command(&scsi_read10_cdb(lba as u32, 1), page_phys, 512, true)?;
+                    inner.do_scsi_command(&scsi_read10_cdb(lba as u32, chunk as u16), data_phys, chunk_bytes as u32, true)?;
+                    let dst = buf_vaddr + (i as usize * 512) as u64;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(page_va as *const u8, (buf_vaddr + (i as usize * 512) as u64) as *mut u8, 512);
+                        core::ptr::copy_nonoverlapping(data_va as *const u8, dst as *mut u8, chunk_bytes);
                     }
+                    i += chunk;
                 }
             }
             completed += 1;

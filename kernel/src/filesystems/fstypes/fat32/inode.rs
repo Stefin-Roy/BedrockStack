@@ -20,6 +20,7 @@ use super::dirent::{
     ATTR_ARCHIVE,
 };
 use super::cluster::{read_cluster, write_cluster, zero_cluster};
+use super::io::read_sectors;
 use super::dir::{
     read_dir_slots, write_dir_entries,
     update_entry_cluster_and_size, remove_dir_entries, decode_entry_name,
@@ -161,24 +162,50 @@ impl InodeOps for Fat32Inode {
 
         let chain = self.ensure_chain_cache()?;
         if chain.is_empty() { return Ok(0); }
-        let mut ci = start_idx as usize;
-        let mut current = if ci < chain.len() { chain[ci] } else { return Ok(0); };
 
         let clus_bytes = clus_size as usize;
-        let mut cluster_buf = alloc::vec![0u8; clus_bytes];
+        // Cap a single read request at 252 KiB so it always fits the AHCI
+        // PRDT (64 entries x 4 KiB) even when the caller's buffer starts
+        // mid-page and would otherwise need one extra entry.
+        const MAX_RUN_BYTES: usize = 252 * 1024;
+
+        let mut ci = start_idx as usize;
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
 
-        while done < total {
-            read_cluster(&self.sb, current, &mut cluster_buf)?;
-            let avail = clus_bytes - clus_off;
+        while done < total && ci < chain.len() {
+            // Grow a contiguous run while clusters are physically adjacent.
+            let run_start = ci;
+            let mut run_len = 1usize;
+            while ci + run_len < chain.len()
+                && chain[ci + run_len] == chain[ci + run_len - 1] + 1
+            {
+                run_len += 1;
+            }
+            // Cap the run to the clusters we still need and to MAX_RUN_BYTES.
+            let clusters_needed = (total - done + clus_off + clus_bytes - 1) / clus_bytes;
+            run_len = run_len.min(clusters_needed.max(1));
+            run_len = run_len.min((MAX_RUN_BYTES / clus_bytes).max(1));
+
+            let run_bytes = run_len * clus_bytes;
+            let avail = run_bytes - clus_off;
             let want = (total - done).min(avail);
-            buf[done..done + want].copy_from_slice(&cluster_buf[clus_off..clus_off + want]);
+            let run_lba = self.sb.bpb.cluster_to_lba(chain[run_start]);
+
+            if clus_off == 0 && want == run_bytes {
+                // Whole-run, sector-aligned: DMA straight into the caller's
+                // buffer, no intermediate copy.
+                read_sectors(&*self.sb.device, run_lba, (want / 512) as u32, &mut buf[done..done + want])?;
+            } else {
+                // Misaligned start or a partial tail run: read whole sectors
+                // into a run-sized buffer, then copy the requested window.
+                let mut run_buf = alloc::vec![0u8; run_bytes];
+                read_sectors(&*self.sb.device, run_lba, (run_bytes / 512) as u32, &mut run_buf)?;
+                buf[done..done + want].copy_from_slice(&run_buf[clus_off..clus_off + want]);
+            }
             done += want;
             if done >= total { break; }
-            ci += 1;
-            if ci >= chain.len() { break; }
-            current = chain[ci];
+            ci += run_len;
             clus_off = 0;
         }
         Ok(done)
