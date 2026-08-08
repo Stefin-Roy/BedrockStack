@@ -2,6 +2,11 @@
 members = ["boot", "kernel", "common", "graphics/Framebuffer"]
 resolver = "2"
 
+# aml 0.16.4 is vendored (third_party/aml) with loop-progress hardening so the
+# interpreter can't hang forever on pathological tables (e.g. QEMU's q35 DSDT).
+[patch.crates-io]
+aml = { path = "third_party/aml" }
+
 [profile.dev]
 panic = "abort"
 

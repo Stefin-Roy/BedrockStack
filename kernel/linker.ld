@@ -832,7 +832,10 @@ SECTIONS
 
     .stack (NOLOAD) : AT(. + __phys_delta) {
         __stack_start = .;
-        . += 0x8000;
+        /* AML parsing is recursive and can retain several parser frames while
+         * executing control methods.  Keep the downward-growing kernel stack
+         * well clear of the preceding .bss (which contains allocator state). */
+        . += 0x40000;
         __stack_end = .;
     }
     . = ALIGN(4096);

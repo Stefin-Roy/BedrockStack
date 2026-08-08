@@ -578,15 +578,6 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8) -> ! {
     let cpu = current_cpu_id() as usize;
 
-    // ── Per-CPU re-entrancy guard ────────────────────────────────
-    if cpu >= MAX_CPUS || DUMP_IN_PROGRESS[cpu].swap(true, Ordering::SeqCst) {
-        dump_puts("\n[DUMP] Nested fault (#");
-        dump_put_hex(vector as u64);
-        dump_puts(") while dumping -- halting\n");
-        loop {
-            unsafe { asm!("cli", "hlt", options(nomem, nostack)); }
-        }
-    }
 
     // ── Extract frame values ──────────────────────────────────────
     let fault_rip  = frame.instruction_pointer.as_u64();

@@ -19,6 +19,7 @@ log = "0.4"
 common = { path = "../common" }
 framebuffer = { path = "../graphics/Framebuffer" }
 hashbrown = "0.14"
+aml = "0.16.4"
 
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 x86_64 = "0.15"

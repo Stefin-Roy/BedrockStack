@@ -10,7 +10,8 @@ mod mcfg;
 mod fadt;
 mod gas;
 mod madt;
-mod s5;
+mod handler;
+mod aml_ctx;
 pub mod platform;
 
 pub use platform::{
@@ -65,6 +66,9 @@ pub struct AcpiSubsystem {
     pub cpus: Vec<(u32, bool)>,
     pub pci_config_regions: PciConfigRegions,
     pub platform_info: PlatformInfo,
+    /// Persistent AML interpreter over the DSDT + SSDTs. `None` when no DSDT
+    /// was found or the tables could not be parsed.
+    pub aml: Option<spin::Mutex<::aml::AmlContext>>,
 }
 
 impl AcpiSubsystem {
@@ -111,27 +115,69 @@ impl AcpiSubsystem {
             }
         }
 
+        let (aml, slp_typ_s5) = Self::aml_boot(&entries, fadt_fields.dsdt_addr as u64);
+
         let platform_info = PlatformInfo {
             reset_gas: fadt_fields.reset_gas,
             reset_value: fadt_fields.reset_value,
             reset_supported: fadt_fields.reset_supported,
             pm1_control: fadt_fields.pm1_control,
-            slp_typ_s5: if fadt_fields.dsdt_addr != 0 {
-                let slp = s5::parse_s5_slp_typa(fadt_fields.dsdt_addr as u64);
-                match slp {
-                    Some(t) => log::info!("ACPI: \\_S5 SLP_TYP = 0x{:02x}", t),
-                    None => log::warn!("ACPI: \\_S5 not decodable -- ACPI PM1 shutdown disabled"),
-                }
-                slp
-            } else {
-                log::warn!("ACPI: FADT has no DSDT address -- ACPI PM1 shutdown disabled");
-                None
-            },
+            slp_typ_s5,
         };
 
         log::info!("ACPI: platform info parsed (interrupt model: {:?})", interrupt_model);
 
-        Ok(Self { interrupt_model, processor_info, cpus, pci_config_regions, platform_info })
+        Ok(Self { interrupt_model, processor_info, cpus, pci_config_regions, platform_info, aml })
+    }
+
+    /// Initialise the AML interpreter over the DSDT + SSDTs and decode `\_S5`.
+    ///
+    /// The interpreter is always used. A DSDT parse failure disables the ACPI
+    /// PM1 shutdown path loudly rather than guessing. The vendored `aml` crate
+    /// (`third_party/aml`) carries loop-progress hardening so a pathological
+    /// firmware table (e.g. QEMU's q35 DSDT) fails fast instead of hanging.
+    fn aml_boot(
+        entries: &[tables::SdtEntry],
+        dsdt_fallback: u64,
+    ) -> (Option<spin::Mutex<::aml::AmlContext>>, Option<u8>) {
+        if dsdt_fallback == 0 && !entries.iter().any(|e| e.signature == sig(b"DSDT")) {
+            log::warn!("ACPI: no DSDT -- ACPI PM1 shutdown disabled");
+            return (None, None);
+        }
+
+        match aml_ctx::init_aml_ctx(entries, dsdt_fallback) {
+            Ok(mut ctx) => {
+                match ctx.initialize_objects() {
+                    Ok(()) => log::info!("ACPI: AML _INI sweep complete"),
+                    Err(e) => log::error!("ACPI: AML _INI sweep failed: {:?}", e),
+                }
+
+                let slp = aml_ctx::s5_slp_typa(&mut ctx);
+                match slp {
+                    Some(t) => log::info!("ACPI: \\_S5 SLP_TYP = 0x{:02x}", t),
+                    None => log::warn!("ACPI: \\_S5 not decodable -- ACPI PM1 shutdown disabled"),
+                }
+                (Some(spin::Mutex::new(ctx)), slp)
+            }
+            Err(e) => {
+                log::error!("ACPI: AML interpreter init failed: {:?} -- ACPI PM1 shutdown disabled", e);
+                (None, None)
+            }
+        }
+    }
+
+    /// Invoke an AML control method on the persistent interpreter. Returns
+    /// `Err` when no interpreter is available (default build) or the method
+    /// fails.
+    pub fn aml_invoke(
+        &self,
+        path: &str,
+        args: ::aml::value::Args,
+    ) -> Result<::aml::AmlValue, ::aml::AmlError> {
+        let ctx = self.aml.as_ref().ok_or(::aml::AmlError::Unimplemented)?;
+        let name = ::aml::AmlName::from_str(path)?;
+        let mut guard = ctx.lock();
+        guard.invoke_method(&name, args)
     }
 
     /// Attempt a system reset via the FADT reset register, with fallbacks.

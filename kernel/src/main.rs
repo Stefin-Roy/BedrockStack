@@ -31,6 +31,7 @@ pub extern "sysv64" fn kernel_main(
     // ── Kernel arrived ──
 
     // Reinit COM1 — boot already did this, but be safe
+    // The high stack is deliberately oversized for recursive AML parsing.
     SerialPort::init();
     SerialPort::puts("[kernel] _start entered\n");
 

@@ -36,7 +36,7 @@ fn mmio_write(addr: u64, value: u64, width: u8) -> Result<(), AcpiError> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn port_in(port: u16, width: u8) -> Result<u32, AcpiError> {
+pub(crate) fn port_in(port: u16, width: u8) -> Result<u32, AcpiError> {
     unsafe {
         match width {
             8  => { let v: u8; core::arch::asm!("in al, dx", in("dx") port, out("al") v, options(nomem, nostack, preserves_flags)); Ok(v as u32) }
@@ -48,7 +48,7 @@ fn port_in(port: u16, width: u8) -> Result<u32, AcpiError> {
 }
 
 #[cfg(target_arch = "x86_64")]
-fn port_out(port: u16, value: u32, width: u8) -> Result<(), AcpiError> {
+pub(crate) fn port_out(port: u16, value: u32, width: u8) -> Result<(), AcpiError> {
     unsafe {
         match width {
             8  => core::arch::asm!("out dx, al", in("dx") port, in("al") value as u8, options(nomem, nostack, preserves_flags)),
@@ -61,7 +61,7 @@ fn port_out(port: u16, value: u32, width: u8) -> Result<(), AcpiError> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn port_in(_port: u16, width: u8) -> Result<u32, AcpiError> {
+pub(crate) fn port_in(_port: u16, width: u8) -> Result<u32, AcpiError> {
     if width == 8 || width == 16 || width == 32 {
         Ok(0)
     } else {
@@ -70,7 +70,7 @@ fn port_in(_port: u16, width: u8) -> Result<u32, AcpiError> {
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn port_out(_port: u16, _value: u32, width: u8) -> Result<(), AcpiError> {
+pub(crate) fn port_out(_port: u16, _value: u32, width: u8) -> Result<(), AcpiError> {
     if width == 8 || width == 16 || width == 32 {
         Ok(())
     } else {

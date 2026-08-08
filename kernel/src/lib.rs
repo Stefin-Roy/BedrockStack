@@ -238,15 +238,6 @@ impl Kernel {
         // Parse ACPI tables (needs VMM live for mapped physical regions).
         self.init_acpi();
 
-        // NOTE: AML interpreter init (DSDT/SSDT parse) hangs on QEMU;
-        // AML is only used for SLP_TYP detection on shutdown, and the
-        // default (0x00) works fine on virtual hardware — skip for now.
-        // if let Some(ref mut acpi) = self.acpi {
-        //     if let Err(e) = acpi.init_aml() {
-        //         log::warn!("ACPI AML init failed: {:?}", e);
-        //     }
-        // }
-
         // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();

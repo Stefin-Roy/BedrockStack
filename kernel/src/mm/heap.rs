@@ -565,6 +565,68 @@ struct PerCpuCache {
 unsafe impl Send for PerCpuCache {}
 unsafe impl Sync for PerCpuCache {}
 
+/// Diagnostic canary stored in the second 8 bytes of a cached block's payload
+/// (bytes [8..16)).  Only written when the block genuinely has room for it
+/// (`usable >= 16`), so an 8-byte `MIN_ALLOC` block is never written past its
+/// end.  Catches UAF writes that hit the payload body (the [0..8) next-link
+/// region is covered separately by the link check).
+const CACHE_MAGIC: u64 = 0xCACE_CAFE_DEAD_BEEF;
+
+/// Stop immediately: the allocator's cache state is inconsistent, so the
+/// kernel must not continue (it would just fault or corrupt more memory).
+/// Dump a small stack so the caller can be addr2line'd.
+fn cache_halt() -> ! {
+    SerialPort::puts("[heap] CACHE DIAGNOSTIC HALT\n");
+    let mut sp: usize;
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack)); }
+    for i in 0..16usize {
+        SerialPort::puts("  ");
+        SerialPort::put_hex((sp + i * 8) as u64);
+        SerialPort::puts(": ");
+        SerialPort::put_hex(
+            unsafe { core::ptr::read_volatile((sp + i * 8) as *const usize) as u64 },
+        );
+        SerialPort::puts("\n");
+    }
+    loop {
+        unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)); }
+    }
+}
+
+/// Validate a cached payload pointer *before touching it*.  Returns the
+/// usable payload size of its block, or halts on the first inconsistency.
+/// This catches (in order): a pointer outside the arena / misaligned, a
+/// corrupted back-pointer, or an implausible header size.
+fn cache_validate(payload: *mut u8) -> usize {
+    let p = payload as usize;
+    if p < HEAP_FLOOR as usize || p >= HEAP_TOP as usize || p % BLOCK_ALIGN != 0 {
+        SerialPort::puts("[heap] CACHE BAD POINTER: ");
+        SerialPort::put_hex(p as u64);
+        SerialPort::puts("\n");
+        cache_halt();
+    }
+    let header = unsafe { BlockHeader::from_payload(payload) };
+    let h = header as usize;
+    if h < HEAP_FLOOR as usize || h >= HEAP_TOP as usize || h % BLOCK_ALIGN != 0 {
+        SerialPort::puts("[heap] CACHE BAD BACKPTR: p=");
+        SerialPort::put_hex(p as u64);
+        SerialPort::puts(" header=");
+        SerialPort::put_hex(h as u64);
+        SerialPort::puts("\n");
+        cache_halt();
+    }
+    let size = unsafe { (*header).size };
+    if size < MIN_BLOCK_SIZE || size > HEAP_TOP as usize - h {
+        SerialPort::puts("[heap] CACHE BAD SIZE: header=");
+        SerialPort::put_hex(h as u64);
+        SerialPort::puts(" size=");
+        SerialPort::put_hex(size as u64);
+        SerialPort::puts("\n");
+        cache_halt();
+    }
+    h + size - p
+}
+
 impl PerCpuCache {
     const fn const_empty() -> Self {
         PerCpuCache { head: core::ptr::null_mut(), count: 0 }
@@ -575,7 +637,17 @@ impl PerCpuCache {
     }
 
     fn push(&mut self, payload: *mut u8) {
-        unsafe { *(payload as *mut *mut u8) = self.head; }
+        let old_head = self.head;
+        // Validate before writing: a bogus `dealloc` (e.g. of ACPI table
+        // memory) is caught here and logged with its old_head context.
+        let usable = cache_validate(payload);
+
+        unsafe {
+            *(payload as *mut *mut u8) = old_head;
+            if usable >= 16 {
+                *(payload.add(8) as *mut u64) = CACHE_MAGIC;
+            }
+        }
         self.head = payload;
         self.count += 1;
     }
@@ -585,7 +657,40 @@ impl PerCpuCache {
         if p.is_null() {
             return core::ptr::null_mut();
         }
-        unsafe { self.head = *(p as *mut *mut u8); }
+
+        // Validate the head before touching it.  If the head itself is
+        // garbage (e.g. the DSDT stream pointer), this halts immediately with
+        // a stack dump instead of dereferencing it.
+        let usable = cache_validate(p);
+
+        unsafe {
+            if usable >= 16 {
+                let magic = *(p.add(8) as *const u64);
+                if magic != CACHE_MAGIC {
+                    SerialPort::puts("[heap] CACHE CANARY VIOLATED: p=");
+                    SerialPort::put_hex(p as u64);
+                    SerialPort::puts(" magic=");
+                    SerialPort::put_hex(magic);
+                    SerialPort::puts("\n");
+                    cache_halt();
+                }
+            }
+
+            let next = *(p as *mut *mut u8);
+            if !next.is_null()
+                && ((next as usize) < HEAP_FLOOR as usize
+                    || (next as usize) >= HEAP_TOP as usize
+                    || (next as usize) % BLOCK_ALIGN != 0)
+            {
+                SerialPort::puts("[heap] CACHE LINK CORRUPT: popped=");
+                SerialPort::put_hex(p as u64);
+                SerialPort::puts(" next=");
+                SerialPort::put_hex(next as u64);
+                SerialPort::puts("\n");
+                cache_halt();
+            }
+            self.head = next;
+        }
         self.count -= 1;
         p
     }
@@ -690,6 +795,22 @@ unsafe impl GlobalAlloc for HeapAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
+        }
+        let mut caller: usize;
+        unsafe {
+            core::arch::asm!("mov {}, [rsp]", out(reg) caller, options(nomem, nostack, preserves_flags));
+        }
+        if (ptr as usize) < HEAP_FLOOR as usize || (ptr as usize) >= HEAP_TOP as usize {
+            SerialPort::puts("[heap] INVALID DEALLOC ptr=");
+            SerialPort::put_hex(ptr as u64);
+            SerialPort::puts(" size=");
+            SerialPort::put_hex(_layout.size() as u64);
+            SerialPort::puts(" align=");
+            SerialPort::put_hex(_layout.align() as u64);
+            SerialPort::puts(" caller=");
+            SerialPort::put_hex(caller as u64);
+            SerialPort::puts("\n");
+            cache_halt();
         }
         // Park the block in the current CPU's cache when there is room.  The
         // live-accounting for chunk reclamation is updated immediately (the
