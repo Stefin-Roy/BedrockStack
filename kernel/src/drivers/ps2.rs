@@ -353,7 +353,8 @@ fn identify_device() -> [u8; 2] {
     id
 }
 
-/// Send a device command from poll context (`ED` LED updates).
+/// Send a device command from poll/init context (`ED` LED updates, the
+/// init-time enable-scan once the IRQ path is armed).
 ///
 /// The keyboard IRQ line is masked via the command byte and IF is cleared so
 /// no ISR can steal a command response or interleave a live scancode into the
@@ -989,28 +990,44 @@ fn do_init() -> bool {
         SerialPort::puts("[ps2] scancode-set command not ACKed -- relying on default Set 2\n");
     }
 
-    // Re-enable scanning.
-    if !dev_command(&[DEV_ENABLE_SCAN]) {
-        SerialPort::puts("[ps2] keyboard did not ACK enable-scan -- aborting init\n");
-        restore_command_byte(original_cb);
-        return false;
-    }
+    // Keep scanning OFF until the interrupt path is fully armed, so no device
+    // byte can interleave with the command-byte read-back below.
 
     // Wire the interrupt path before unmasking the 8042's keyboard IRQ line,
     // so the first keypress after this point is caught.
     let irq_ok = setup_irq();
-    flush_output(); // drain anything that arrived while scanning was on
+    flush_output(); // drain anything that arrived while the device was silent
 
     let mut irq_active = irq_ok;
     if irq_ok {
         let final_cb = (cfg & !CB_KBD_IRQ) | CB_KBD_IRQ;
-        if write_command_byte_verified(final_cb) {
+        // Arming KBD_IRQ makes the 8042 raise IRQ1 the instant it queues the
+        // CMD_READ_CMD_BYTE response, so the ISR would steal the byte and this
+        // read-back would time out -- a spurious "polled mode" fallback.  Mask
+        // IF so the response cannot be consumed under us (same discipline as
+        // runtime_dev_command).
+        let prev_if = interrupts::are_enabled();
+        interrupts::disable();
+        let verified = write_command_byte_verified(final_cb);
+        if prev_if {
+            interrupts::enable();
+        }
+        if verified {
             SerialPort::puts("[ps2] keyboard IRQ enabled\n");
         } else {
             SerialPort::puts("[ps2] could not enable keyboard IRQ -- polled mode\n");
             irq_active = false;
             IRQ_ENABLED.store(false, Ordering::Release);
         }
+    }
+
+    // Re-enable scanning now that the IRQ path is live.  runtime_dev_command
+    // masks the IRQ line and IF around the exchange so the ACK cannot be
+    // stolen by the armed ISR.
+    if !runtime_dev_command(&[DEV_ENABLE_SCAN]) {
+        SerialPort::puts("[ps2] keyboard did not ACK enable-scan -- aborting init\n");
+        restore_command_byte(original_cb);
+        return false;
     }
 
     PRESENT.store(true, Ordering::Release);
