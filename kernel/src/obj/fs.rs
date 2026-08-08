@@ -11,6 +11,8 @@ extern crate alloc;
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(target_arch = "x86_64")]
+use alloc::boxed::Box;
 use alloc::string::{String, ToString};
 use alloc::sync::Arc;
 use alloc::vec;
@@ -25,6 +27,8 @@ use super::rights::{CapRights, ContractRights, Rights};
 use super::store::object_store;
 use super::surface::{SurfaceDesc, TypeTag};
 use super::{Args, Obj, ObjError, ObjId, Reply, Value};
+#[cfg(target_arch = "x86_64")]
+use crate::filesystems::blockdriver::traits::IoCompletions;
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoRequest};
 use crate::filesystems::vfs::dentry::{Dentry, dcache};
 use crate::filesystems::vfs::error::VfsError;
@@ -138,6 +142,80 @@ impl Obj for BlockNode {
         args: &Args<'a>,
     ) -> Result<Reply<'a>, ObjError> {
         if hook == BLOCK_SUBMIT {
+            // When a ring-3 task is live and the device supports async, suspend
+            // the syscall mid-invoke instead of spinning the BSP. x86_64-only:
+            // the scheduler (`proc`) and syscall continuation live only there.
+            #[cfg(target_arch = "x86_64")]
+            {
+                if let Some(task) = crate::proc::current_task() {
+                    let state = task.io_state.lock();
+                    match &*state {
+                        crate::proc::IoState::Done(outcome) => {
+                            let (c, e) = (outcome.completed, outcome.errors);
+                            drop(state);
+                            *task.io_state.lock() = crate::proc::IoState::Idle;
+                            return Ok(Reply::Data(vec![Value::U64(c as u64), Value::U64(e as u64)]));
+                        }
+                        crate::proc::IoState::InFlight => {
+                            // Premature wake (should not happen: async parks
+                            // Sleeping and only the completion wakes it).
+                            // Re-park to wait for the IRQ.
+                            drop(state);
+                            crate::proc::park_async_retry(
+                                crate::syscall::syscall_retry_continuation(),
+                            );
+                        }
+                        crate::proc::IoState::Idle => {
+                            drop(state);
+                            // Issue. Own the request buffer in the completion
+                            // closure so it survives the DMA window; use
+                            // IoBuffer::Phys so the request does not borrow the
+                            // boxed buffer.
+                            let lba = arg_u64(args, 0).ok_or(ObjError::Denied)?;
+                            let count = arg_u64(args, 1).ok_or(ObjError::Denied)?;
+                            let is_write = arg_u64(args, 2).ok_or(ObjError::Denied)? != 0;
+                            let data = arg_buf(args, 3).ok_or(ObjError::Denied)?.clone();
+                            let buf = Box::new(data);
+                            let vaddr = buf.as_ptr() as u64;
+                            let len = buf.len();
+                            let req = IoRequest {
+                                lba,
+                                count: count as u32,
+                                buffer: IoBuffer::Phys(vaddr, len),
+                                is_write,
+                            };
+                            let waiter_task = Arc::clone(&task);
+                            let on_done = Box::new(move |c: IoCompletions| {
+                                let _ = &buf; // keep the DMA buffer alive until completion
+                                crate::proc::wake_io_complete(
+                                    &waiter_task,
+                                    crate::proc::IoOutcome {
+                                        completed: c.completed,
+                                        errors: c.errors,
+                                    },
+                                );
+                            });
+                            match self.device.submit_async(&[req], on_done) {
+                                Ok(true) => {
+                                    // Completed synchronously; nothing was queued.
+                                    return Ok(Reply::Data(vec![
+                                        Value::U64(count),
+                                        Value::U64(0),
+                                    ]));
+                                }
+                                Ok(false) => {
+                                    *task.io_state.lock() = crate::proc::IoState::InFlight;
+                                    crate::proc::park_async_retry(
+                                        crate::syscall::syscall_retry_continuation(),
+                                    );
+                                }
+                                Err(_) => return Err(ObjError::Denied),
+                            }
+                        }
+                    }
+                }
+            }
+            // Boot / pre-scheduler fallback: the existing synchronous submit.
             let lba = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let count = arg_u64(args, 1).ok_or(ObjError::Denied)?;
             let is_write = arg_u64(args, 2).ok_or(ObjError::Denied)?;

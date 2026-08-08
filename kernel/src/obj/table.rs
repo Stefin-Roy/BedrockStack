@@ -55,6 +55,16 @@ impl CapabilityTable {
         self.insert(h)
     }
 
+    /// Drop every handle, releasing all node references (§7.4). Used when a
+    /// task's domain is torn down so its delegated capabilities stop keeping
+    /// objects alive. The slot store itself is retained (the table stays
+    /// allocated for the kernel lifetime).
+    pub fn clear(&self) {
+        let mut inner = self.slots.lock();
+        inner.slots.clear();
+        inner.free_list.clear();
+    }
+
     /// Raw fetch without PERMIT (used by an object's own dispatch, which has
     /// already passed PERMIT; §7.4 item 3).
     pub fn get(&self, id: CapId) -> Result<Arc<dyn Obj>, ObjError> {

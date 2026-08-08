@@ -254,6 +254,75 @@ fn reclaim_empty_tables(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) {
     }
 }
 
+/// Walk the low (user) canonical half of `root` (PML4 indices 0..=255), free
+/// every mapped leaf frame back to `alloc`, zero the entries, and reclaim the
+/// now-empty intermediate tables. The high half (256..=511) is shared with the
+/// kernel root and is never touched.
+///
+/// Used at task teardown to fully reclaim a user address space (ELF segments
+/// + stack) without disturbing the kernel's higher-half mappings that every
+/// cloned domain shares.
+pub fn teardown_low_half(root: u64, alloc: &mut BitmapAllocator) {
+    unsafe {
+        let pml4 = pte_deref(root);
+        for i_pml4 in 0..256usize {
+            let pml4e = read_pte(pml4, i_pml4);
+            if pml4e & PTE_PRESENT == 0 {
+                continue;
+            }
+            let pdpt = pte_deref(pte_frame(pml4e));
+            for i_pdpt in 0..512usize {
+                let pdpte = read_pte(pdpt, i_pdpt);
+                if pdpte & PTE_PRESENT == 0 {
+                    continue;
+                }
+                // 1 GiB leaf (PDPT PS bit 7) — not produced by this kernel,
+                // but free it defensively rather than leaking it.
+                if pdpte & (1u64 << 7) != 0 {
+                    alloc.free(pte_frame(pdpte));
+                    write_pte(pdpt, i_pdpt, 0);
+                    continue;
+                }
+                let pd = pte_deref(pte_frame(pdpte));
+                for i_pd in 0..512usize {
+                    let pde = read_pte(pd, i_pd);
+                    if pde & PTE_PRESENT == 0 {
+                        continue;
+                    }
+                    // 2 MiB leaf (PD PS bit 7).
+                    if pde & (1u64 << 7) != 0 {
+                        alloc.free(pte_frame(pde));
+                        write_pte(pd, i_pd, 0);
+                        continue;
+                    }
+                    let pt = pte_deref(pte_frame(pde));
+                    for i_pt in 0..512usize {
+                        let pte = read_pte(pt, i_pt);
+                        if pte & PTE_PRESENT == 0 {
+                            continue;
+                        }
+                        alloc.free(pte_frame(pte));
+                        write_pte(pt, i_pt, 0);
+                    }
+                    if table_is_empty(pte_frame(pde)) {
+                        alloc.free(pte_frame(pde));
+                        write_pte(pd, i_pd, 0);
+                    }
+                }
+                if table_is_empty(pte_frame(pdpte)) {
+                    alloc.free(pte_frame(pdpte));
+                    write_pte(pdpt, i_pdpt, 0);
+                }
+            }
+            if table_is_empty(pte_frame(pml4e)) {
+                alloc.free(pte_frame(pml4e));
+                write_pte(pml4, i_pml4, 0);
+            }
+        }
+    }
+    crate::mm::vmm::flush_tlb();
+}
+
 pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     let mapper = mapper_at(root);
     mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())

@@ -316,9 +316,10 @@ pub extern "C" fn ap_entry64() -> ! {
     // Now safe to enable interrupts — GDT, TSS, and IDT are all set.
     crate::arch::CurrentArch::enable_interrupts();
 
-    loop {
-        crate::arch::CurrentArch::halt();
-    }
+    // Per-CPU syscall MSRs + stack: this AP may run ring-3 tasks.
+    crate::arch::x86_64::syscall::init_ap();
+
+    crate::proc::ap_main(cpu_id);
 }
 
 fn apic_delay_ms(ms: u64) {

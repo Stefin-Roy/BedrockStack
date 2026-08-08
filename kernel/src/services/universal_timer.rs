@@ -122,6 +122,26 @@ impl UniversalTimerImpl {
             self.clockevent.stop();
         }
     }
+
+    /// Remove a pending timer by id and return its opaque context pointer, or
+    /// `None` if it already fired, was migrated, or never existed.
+    ///
+    /// Mirrors `cancel`, but returns the entry's `context` instead of a bool so
+    /// the caller can reclaim the context (e.g. `Box::from_raw` + drop) when a
+    /// sleeping task is killed or exits before its deadline. Re-arms the local
+    /// clockevent if the earliest pending deadline changed.
+    pub fn remove_context(&self, id: TimerId) -> Option<*mut u8> {
+        let mut queue = self.bases[id.cpu as usize].queue.lock();
+        let old_next = queue.next_deadline();
+        let removed = queue.remove(id);
+        if removed.is_some()
+            && old_next != queue.next_deadline()
+            && id.cpu == crate::smp::current_cpu_id()
+        {
+            self.reprogram(&mut queue);
+        }
+        removed.map(|e| e.context)
+    }
 }
 
 impl UniversalTimer for UniversalTimerImpl {

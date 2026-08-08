@@ -91,11 +91,13 @@ pub struct PerCpu {
     pub stack_top: u64,
     pub serial_locked: AtomicU64,
     pub current_domain: *const crate::obj::domain::Domain,
-    /// User RSP saved on `syscall` entry (ring 3 → ring 0). Only meaningful on
-    /// the BSP, which is the only CPU that runs user code.
+    /// User RSP saved on `syscall` entry (ring 3 → ring 0). Per-CPU: any CPU
+    /// may run user code, and this is written before each `resume_user` on the
+    /// CPU that picked the task.
     pub syscall_user_rsp: u64,
-    /// Kernel stack the syscall entry switches to. Points at the top of the
-    /// BSP's dedicated syscall stack, set up by `arch::x86_64::syscall::init`.
+    /// Kernel stack the syscall entry switches to. Points at the top of this
+    /// CPU's dedicated syscall stack, set up by
+    /// `arch::x86_64::syscall::{init,init_ap}`.
     pub syscall_stack: u64,
 }
 

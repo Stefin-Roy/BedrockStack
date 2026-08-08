@@ -889,6 +889,15 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
     } else if name == super::table::table_contract_def().name {
         Some(super::table::table_contract_def())
     } else {
+        // The proc:task contract lives in the x86_64-gated `proc` module;
+        // this branch does not exist on riscv64 (which has no userspace).
+        #[cfg(target_arch = "x86_64")]
+        {
+            let proc_def = crate::proc::contracts::proc_contract_def();
+            if name == proc_def.name {
+                return Some(proc_def);
+            }
+        }
         None
     }
 }

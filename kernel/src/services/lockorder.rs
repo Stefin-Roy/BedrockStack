@@ -28,3 +28,14 @@ pub const OBJECT_RECORDS: u8 = 9;
 pub const OBJECT_CASCADE: u8 = 10;
 /// Object-store deny-set.
 pub const OBJECT_DENY: u8 = 11;
+/// Scheduler run queue (the per-scheduler 3-level priority pool of parked
+/// runnable tasks). Above the timer queue: the wake callback re-queues a
+/// sleeping task while the timer ISR still holds the timer queue.
+pub const RUN_QUEUE: u8 = 12;
+/// Scheduler task registry (every task ever spawned, for cap resolution and
+/// forensics).
+pub const ALL_TASKS: u8 = 13;
+/// Scheduler current-task slot (the running task's strong ref).
+pub const CURRENT_TASK: u8 = 14;
+/// Scheduler join-wait list on a task (tasks parked waiting for its death).
+pub const JOINERS: u8 = 15;

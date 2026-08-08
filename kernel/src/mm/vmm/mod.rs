@@ -20,6 +20,8 @@ pub use self::x86_64::make_read_only;
 pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::protect;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::teardown_low_half;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
 #[cfg(target_arch = "riscv64")]

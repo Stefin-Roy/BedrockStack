@@ -21,6 +21,7 @@
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -148,6 +149,16 @@ unsafe impl Sync for PortPtr {}
 
 static IRQ_PORTS: Mutex<Vec<PortPtr>> = Mutex::new(Vec::new());
 
+/// One outstanding async request: its tag mask, the DMA buffer range (kept
+/// for post-DMA cache invalidation) and the completion callback.
+struct AsyncWaiter {
+    tag_mask: u32,
+    buf_vaddr: u64,
+    buf_bytes: usize,
+    is_write: bool,
+    on_done: Box<dyn Fn(IoCompletions) + Send>,
+}
+
 struct AhciPort {
     hba: Hba,
     port: u8,
@@ -168,6 +179,7 @@ struct AhciPort {
     slot_alloc: core::sync::atomic::AtomicU32,
     irq_completed: AtomicU32,
     submit_lock: spin::Mutex<()>,
+    async_waiter: spin::Mutex<Option<AsyncWaiter>>,
 }
 
 unsafe impl Sync for AhciPort {}
@@ -184,9 +196,45 @@ fn handle_ahci_irq() {
     for pptr in ports.iter() {
         let port = unsafe { &*pptr.0 };
         let is = port.hba.pr32(port.port, port_off::IS);
-        if is != 0 {
-            port.hba.pw32(port.port, port_off::IS, is);
-            port.irq_completed.store(1, core::sync::atomic::Ordering::Release);
+        if is == 0 {
+            continue;
+        }
+        port.hba.pw32(port.port, port_off::IS, is);
+        port.irq_completed.store(1, core::sync::atomic::Ordering::Release);
+
+        // Async path: if a waiter is armed for this port, only fire its
+        // completion callback once the tag's command has actually completed
+        // (CI/SACT clear). An early/spurious interrupt leaves it armed for
+        // the next IRQ.
+        let waiter = { port.async_waiter.lock().take() };
+        if let Some(w) = waiter {
+            let ci = port.hba.pr32(port.port, port_off::CI);
+            let sact = port.hba.pr32(port.port, port_off::SACT);
+            if ci & w.tag_mask != 0 || sact & w.tag_mask != 0 {
+                // Not done yet; put it back and wait for the next IRQ.
+                *port.async_waiter.lock() = Some(w);
+                continue;
+            }
+            // Decode TFD error like `wait_slots` does.
+            let tfd = port.hba.pr32(port.port, port_off::TFD);
+            let (completed, errors) = if tfd & TFD_ERR != 0 {
+                (0u32, w.tag_mask.count_ones())
+            } else {
+                (w.tag_mask.count_ones(), 0u32)
+            };
+            port.free_slots(w.tag_mask);
+            // Invalidate the CPU cache for read buffers after DMA completes
+            // (mirror `submit`'s post-DMA invalidate).
+            if !w.is_write {
+                let end = w.buf_vaddr + w.buf_bytes as u64;
+                let mut cl = w.buf_vaddr & !63u64;
+                while cl < end {
+                    cache_flush_line(cl as *const u8);
+                    cl += 64;
+                }
+                core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            (w.on_done)(IoCompletions { completed, errors });
         }
     }
 }
@@ -729,6 +777,88 @@ impl BlockDevice for AhciPort {
         }
     }
 
+    fn submit_async(
+        &self,
+        reqs: &[IoRequest],
+        on_done: Box<dyn Fn(IoCompletions) + Send>,
+    ) -> Result<bool, &'static str> {
+        if reqs.is_empty() {
+            return Ok(true);
+        }
+        if reqs.len() != 1 {
+            return Err("async: one request at a time");
+        }
+        let _guard = self.submit_lock.lock();
+        let req = &reqs[0];
+        let bytes = (req.count as usize) * 512;
+        if req.count == 0 {
+            return Err("async: zero-length request");
+        }
+        // The caller owns the buffer through the `on_done` closure, which it
+        // keeps alive until the completion callback fires; the DMA window ends
+        // before `on_done` runs (CI/SACT clear), so the pointer stays valid.
+        let (buf_vaddr, buf_size) = match &req.buffer {
+            IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
+            IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
+            IoBuffer::Phys(pa, sz) => (*pa, *sz),
+        };
+        if buf_size < bytes {
+            return Err("async: buffer too small");
+        }
+
+        // Allocate a single tag.
+        let tag_mask = self.alloc_slots(1)?;
+        let tag = tag_mask.trailing_zeros() as u8;
+
+        if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
+            self.free_slots(tag_mask);
+            return Err("async: prepare failed");
+        }
+
+        // Flush the CPU cache for write buffers before DMA submission.
+        if req.is_write {
+            let end = buf_vaddr + bytes as u64;
+            let mut cl = buf_vaddr & !63u64;
+            while cl < end {
+                cache_flush_line(cl as *const u8);
+                cl += 64;
+            }
+        }
+
+        // Store the waiter BEFORE writing CI: the completion IRQ (processed
+        // once the syscall path parks and schedule() enables interrupts) must
+        // find the waiter armed.
+        {
+            let mut w = self.async_waiter.lock();
+            debug_assert!(w.is_none(), "async: already in flight");
+            *w = Some(AsyncWaiter {
+                tag_mask,
+                buf_vaddr,
+                buf_bytes: bytes,
+                is_write: req.is_write,
+                on_done,
+            });
+        }
+
+        // Ring the doorbell WITHOUT waiting (unlike `submit_batch`, which ends
+        // in `wait_slots`): the completion IRQ handler fires `on_done` once
+        // CI/SACT clear, waking the parked task. A slot that never clears
+        // leaves the waiter armed for the next IRQ (safe, never double-fired).
+        if self.hba.pr32(self.port, port_off::CI) & tag_mask != 0
+            || self.hba.pr32(self.port, port_off::SACT) & tag_mask != 0
+        {
+            self.free_slots(tag_mask);
+            *self.async_waiter.lock() = None;
+            return Err("async: slot still active");
+        }
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+        if self.ncq {
+            self.hba.pw32(self.port, port_off::SACT, tag_mask);
+        }
+        self.hba.pw32(self.port, port_off::CI, tag_mask);
+        Ok(false)
+    }
+
     fn sector_count(&self) -> u64 {
         self.sector_count
     }
@@ -921,6 +1051,7 @@ fn init_one(p: u8, hba: &Hba, dma: DmaClient, max_prdt: usize, n_slots_raw: u32)
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),
         submit_lock: spin::Mutex::new(()),
+        async_waiter: spin::Mutex::new(None),
     };
 
     port.identify()?;

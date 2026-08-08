@@ -32,6 +32,7 @@ const SYSCALL_STACK_SIZE: usize = 16 * 1024;
 /// Field order matches the push sequence in `syscall_entry`: r15 is pushed
 /// last, so it lands at the lowest address (`UserFrame` offset 0).
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserFrame {
     pub r15: u64,
     pub r14: u64,
@@ -61,13 +62,33 @@ static SYSCALL_STACKS: Shared<[[u8; SYSCALL_STACK_SIZE]; MAX_CPUS]> =
     Shared(UnsafeCell::new([[0; SYSCALL_STACK_SIZE]; MAX_CPUS]));
 
 fn syscall_stacks() -> &'static mut [[u8; SYSCALL_STACK_SIZE]; MAX_CPUS] {
-    // SAFETY: each CPU only ever touches its own slot, and only the BSP's
-    // slot is written (in `init`) / read (by the syscall entry).
+    // SAFETY: each CPU only ever touches its own slot; the current CPU's slot
+    // is written (in `init`/`init_ap`) and read (by the syscall entry).
     unsafe { &mut *SYSCALL_STACKS.0.get() }
 }
 
-/// Initialize the syscall MSRs and the BSP's syscall stack for the current CPU.
+/// Initialize the syscall MSRs and the current CPU's syscall stack.
 pub fn init() {
+    unsafe { write_syscall_msrs(); }
+    set_syscall_stack_for_current_cpu();
+
+    crate::drivers::serial::SerialPort::puts("[syscall] MSRs initialized\n");
+}
+
+/// Initialize syscall state for an Application Processor: the same MSRs plus
+/// this CPU's own syscall-stack slot. Every CPU that may run ring-3 tasks
+/// programs its own.
+pub fn init_ap() {
+    unsafe { write_syscall_msrs(); }
+    set_syscall_stack_for_current_cpu();
+}
+
+/// Write the syscall/sysret MSRs (STAR/LSTAR/FMASK/EFER). The values are
+/// software-global, so every CPU programs them identically.
+///
+/// # Safety
+/// Must be called with no concurrent MSR writes on this CPU.
+unsafe fn write_syscall_msrs() {
     unsafe {
         // IA32_STAR MSR layout:
         //   bits 47:32 = Syscall CS (loaded directly, SS = CS + 8)
@@ -91,17 +112,17 @@ pub fn init() {
         // Enable syscall/sysret in EFER.
         Efer::update(|flags| flags.insert(EferFlags::SYSTEM_CALL_EXTENSIONS));
     }
+}
 
-    // Point the BSP's per-CPU syscall stack at the top of its dedicated slot,
-    // rounded down to 16 bytes then back 8, so the pre-call RSP (after the 13
-    // pushes in `syscall_entry` = 104 bytes ≡ 8 mod 16) lands 16-aligned.
-    // (Only the BSP runs user code in this stage; APs keep `syscall_stack` 0.)
+/// Point the current CPU's per-CPU syscall stack at the top of its dedicated
+/// slot, rounded down to 16 bytes then back 8, so the pre-call RSP (after the
+/// 13 pushes in `syscall_entry` = 104 bytes ≡ 8 mod 16) lands 16-aligned.
+fn set_syscall_stack_for_current_cpu() {
     let pc = current_per_cpu();
-    let base = &syscall_stacks()[0] as *const u8 as u64;
+    let slot = pc.cpu_id as usize;
+    let base = &syscall_stacks()[slot] as *const u8 as u64;
     pc.syscall_stack = ((base + SYSCALL_STACK_SIZE as u64) & !0xF) - 8;
     pc.syscall_user_rsp = 0;
-
-    crate::drivers::serial::SerialPort::puts("[syscall] MSRs initialized\n");
 }
 
 /// Syscall entry point — called by `syscall` instruction from ring 3.
@@ -180,11 +201,14 @@ pub unsafe extern "C" fn syscall_entry() {
 
 /// Rust syscall dispatcher.
 ///
-/// Receives a pointer to the saved user register frame. Reads syscall
-/// number and args from the frame, dispatches, and writes the return
-/// value back to the frame (in rax).
+/// Receives a pointer to the saved user register frame. Parks a copy of it in
+/// the current task's TCB (blocking syscalls — yield/sleep/join/exit — resume
+/// from that copy; non-blocking syscalls return through the asm epilogue and
+/// ignore it), reads syscall number and args, dispatches, and writes the
+/// return value back to the frame (in rax).
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(frame: *const UserFrame) -> u64 {
+    crate::proc::park_current_frame(frame);
     let frame = unsafe { &*frame };
     let num = frame.rax;
     let arg0 = frame.rdi;

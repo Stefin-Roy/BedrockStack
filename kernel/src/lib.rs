@@ -586,24 +586,10 @@ impl Kernel {
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Phys, 32);
         crate::obj::memregion::replenish(crate::obj::memregion::RegionKind::Heap, 32);
 
-        // Initialize syscall MSRs and run init from the ESP.
-        #[cfg(target_arch = "x86_64")]
-        {
-            crate::arch::x86_64::syscall::init();
-
-            // Load and run init from B:\EFI\BEDROCK\INIT.
-            // If init exits, we fall through to the idle loop.
-            if let Err(e) = crate::proc::run_init(&mut self.allocator, self.page_table_root) {
-                log::warn!("run_init failed: {}", e);
-                crate::drivers::serial::SerialPort::puts("[kernel] run_init failed: ");
-                crate::drivers::serial::SerialPort::puts(e);
-                crate::drivers::serial::SerialPort::puts("\n");
-            }
-        }
-
         // Boot-time test-suite output: the §8.7 leak detector plus graph and
         // fs census dumps. x86_64-only (`kerneldump` is not built on riscv64);
-        // gated under the `selftest` feature, off by default.
+        // gated under the `selftest` feature, off by default. Runs before the
+        // scheduler takes over (the scheduler never returns).
         #[cfg(all(target_arch = "x86_64", feature = "selftest"))]
         {
             let mut w = crate::drivers::serial::SerialPort;
@@ -616,20 +602,21 @@ impl Kernel {
             crate::kerneldump::fs_walk(&mut w);
         }
 
+        // Initialize syscall MSRs and hand the BSP to the multitask scheduler.
+        // The scheduler spawns the two boot tasks from B:\EFI\BEDROCK\INIT and
+        // owns the BSP forever; its idle path (xHCI hot-plug poll + halt)
+        // replaces the old post-init idle loop, so this never returns.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::syscall::init();
+            crate::proc::run(&mut self.allocator, self.page_table_root);
+        }
+        // riscv64 has no userspace scheduler: idle (halt with IRQs enabled)
+        // forever. `proc::run` is x86_64-only.
+        #[cfg(target_arch = "riscv64")]
         loop {
-            #[cfg(target_arch = "x86_64")]
-            {
-                // Hot-plug: poll the retained xHCI controller for port
-                // changes and register any newly attached block devices
-                // through the block-family register hook.
-                let new_devices = crate::usb::xhci::poll();
-                if !new_devices.is_empty() {
-                    for dev in new_devices {
-                        register_block_device(dev);
-                    }
-                }
-            }
-            self.svc().platform.halt();
+            crate::arch::CurrentArch::enable_interrupts();
+            crate::arch::CurrentArch::halt();
         }
     }
 }
@@ -640,7 +627,7 @@ impl Kernel {
 /// node resolves the cap, downcasts to `BlockNode`, and pushes the device
 /// into its interior — the kernel's own bring-up path, no ambient list.
 #[cfg(target_arch = "x86_64")]
-fn register_block_device(
+pub(crate) fn register_block_device(
     device: alloc::sync::Arc<dyn crate::filesystems::blockdriver::traits::BlockDevice>,
 ) {
     use crate::obj::bootstrap::{boot_domain, boot_endowment};

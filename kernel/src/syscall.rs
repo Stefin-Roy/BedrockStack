@@ -52,6 +52,22 @@ pub fn dispatch(ver: u64, num: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     table[num as usize](num, arg0, arg1, arg2)
 }
 
+/// Continuation for an async syscall park: re-dispatches the syscall the task
+/// was parked inside using the args still in its parked `UserFrame`. For
+/// `invoke` this re-runs `sys_invoke`, whose re-entry now finds the task's
+/// `IoState::Done` and marshals the real reply. Defined as a plain fn so it
+/// can be stored in `Task::parked.continuation`.
+fn retry_current_syscall(frame: &mut crate::arch::x86_64::syscall::UserFrame) -> u64 {
+    crate::syscall::dispatch(frame.r10, frame.rax, frame.rdi, frame.rsi, frame.rdx)
+}
+
+/// The continuation handed to `park_async_retry` by the block layer's async
+/// submit path: on resume, re-runs the parked syscall (see
+/// [`retry_current_syscall`]), which now collects the completed I/O result.
+pub fn syscall_retry_continuation() -> crate::proc::Continuation {
+    retry_current_syscall
+}
+
 /// Top of the x86_64 low (user) canonical half — user pointers must stay below.
 const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
 
@@ -206,8 +222,17 @@ fn sys_write(_num: u64, fd: u64, buf_ptr: u64, len: u64) -> u64 {
 }
 
 /// Syscall 1: exit(code) → never returns.
+///
+/// With the scheduler live this tears the current task down and hands the CPU
+/// to the scheduler (which idles when the queue is empty). Defensive fallback
+/// for the pre-scheduler window halts forever.
 fn sys_exit(_num: u64, code: u64, _arg1: u64, _arg2: u64) -> u64 {
-    crate::proc::exit_process(code as i64)
+    if crate::proc::scheduler_active() {
+        crate::proc::exit_process(code as i64);
+    }
+    loop {
+        crate::arch::CurrentArch::halt();
+    }
 }
 
 // ── Version 2: the P6 capability boundary ────────────────────────────────
@@ -638,12 +663,13 @@ fn sys_clock(_num: u64, which: u64, _a1: u64, _a2: u64) -> u64 {
 
 /// Syscall 11: sleep(ms) -> 0.
 ///
-/// Blocks the calling task for `ms` milliseconds. The syscall entry clears IF
-/// (IA32_FMASK), so interrupts are re-enabled around the wait — the universal
-/// timer wakes the `halt()` inside `sleep_ms` via the LAPIC IRQ — and
-/// re-disabled before returning (`sysretq` restores the user's RFLAGS
-/// regardless).
+/// With the scheduler live this parks the calling task on the universal timer
+/// (the ISR wake re-queues it); the old HLT-based wait is the defensive
+/// fallback for the pre-scheduler window.
 fn sys_sleep(_num: u64, ms: u64, _a1: u64, _a2: u64) -> u64 {
+    if crate::proc::scheduler_active() {
+        crate::proc::sleep_current(ms);
+    }
     crate::arch::CurrentArch::enable_interrupts();
     crate::services::universal_timer::sleep_ms(ms);
     crate::arch::CurrentArch::disable_interrupts();

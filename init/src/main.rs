@@ -59,6 +59,7 @@ const CAP_SERIAL: u64 = 0;
 const CAP_MOUNT: u64 = 1;
 const CAP_REGISTRY: u64 = 2;
 const CAP_PHYSMEM: u64 = 3;
+const CAP_PROC: u64 = 8;
 
 /// FNV-1a constants, mirroring `kernel/src/obj/hook.rs`.
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -87,9 +88,29 @@ pub extern "C" fn _start() -> ! {
     let cid_dir = resolve(b"fs:dir\0");
     let _cid_physmem = resolve(b"physmem:allocation\0");
     let cid_registry = resolve(b"infra:registry\0");
+    let cid_proc = resolve(b"proc:task\0");
+
+    // Concurrency: any domain other than 100 is a worker (or a ring-3-spawned
+    // child); domain 100 falls through to the demo body below.
+    let domain_id = get_domain_id();
+    if domain_id != 100 {
+        worker(domain_id, cid_serial, cid_proc);
+    }
 
     // 1. Serial via cap (replaces ambient write).
     puts_cap(CAP_SERIAL, cid_serial, b"Hello from ring 3 via serial cap!\n");
+
+    // Yield through the proc:task node: parks this task; the scheduler runs
+    // domain 101, then resumes us. The reply buffer is not written by a
+    // blocking yield — only the syscall return value is meaningful.
+    let mut ydesc = [0u8; 512];
+    let yreply = [0u8; 64];
+    let _ = build_desc(&mut ydesc, CAP_PROC, cid_proc, hook_id("yield"), &[]);
+    let yret = invoke(ydesc.as_ptr() as u64, yreply.as_ptr() as u64, 64);
+    if yret == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] proc:task yield failed\n");
+    }
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] yielded via proc:task, resumed\n");
 
     let mut desc = [0u8; 512];
     let mut reply = [0u8; 4096];
@@ -230,6 +251,7 @@ pub extern "C" fn _start() -> ! {
     print_u64(CAP_SERIAL, cid_serial, read_u64(&rbuf, &mut 8));
 
     // 13. Exit back into the kernel idle loop.
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] domain 100 done, exiting\n");
     unsafe {
         syscall(SYS_EXIT, 0, 0, 0);
     }
@@ -447,6 +469,37 @@ fn die(serial_cap: u64, cid_serial: u64, msg: &[u8]) -> ! {
         syscall(SYS_EXIT, 1, 0, 0);
     }
     unreachable!()
+}
+
+/// Concurrency worker: runs as domain 101 (and any ring-3-spawned child). One
+/// cooperative yield via the proc:task node at startup (safe: the main task is
+/// alive and queued), then a bounded sleep loop. Sleeps are always safe even if
+/// this is the last live task (the timer re-queues us).
+fn worker(domain_id: u64, cid_serial: u64, cid_proc: u64) -> ! {
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker task, domain id: ");
+    print_u64(CAP_SERIAL, cid_serial, domain_id);
+
+    let mut wdesc = [0u8; 512];
+    let wreply = [0u8; 64];
+    let _ = build_desc(&mut wdesc, CAP_PROC, cid_proc, hook_id("yield"), &[]);
+    let wret = invoke(wdesc.as_ptr() as u64, wreply.as_ptr() as u64, 64);
+    if wret == u64::MAX {
+        die(CAP_SERIAL, cid_serial, b"[init] worker: yield failed\n");
+    }
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker: yielded, resumed\n");
+
+    let mut ticks: u64 = 0;
+    while ticks < 30 {
+        puts_cap(CAP_SERIAL, cid_serial, b"[init] worker tick: ");
+        print_u64(CAP_SERIAL, cid_serial, ticks);
+        sleep(20);
+        ticks += 1;
+    }
+    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker done, exiting\n");
+    unsafe {
+        syscall(SYS_EXIT, 0, 0, 0);
+    }
+    unreachable!("sys_exit never returns")
 }
 
 /// Panic handler — ring 3 has no unwind; just halt.

@@ -212,6 +212,9 @@ pub fn init() {
         // Register the timer-reschedule IPI at vector 52 (interrupt gate).
         idt[52].set_handler_fn(ipi_timer_handler).disable_interrupts(true);
 
+        // Register the scheduler-wake IPI at vector 53 (interrupt gate).
+        idt[53].set_handler_fn(sched_ipi_handler).disable_interrupts(true);
+
         // Register device interrupt vectors 33-48 (interrupt gates, clears IF).
         idt[33].set_handler_fn(irq_33).disable_interrupts(true);
         idt[34].set_handler_fn(irq_34).disable_interrupts(true);
@@ -257,6 +260,12 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// the previous earliest and `tick()` re-arms after it fires.
 extern "x86-interrupt" fn ipi_timer_handler(_stack_frame: InterruptStackFrame) {
     load_handler(&TIMER_IPI_CALLBACK)();
+    apic::apic_eoi();
+}
+
+/// Scheduler-wake IPI (vector 53): nudges an idle CPU's `halt` so its
+/// scheduler loop re-checks its run queue. Nothing else to do.
+extern "x86-interrupt" fn sched_ipi_handler(_stack_frame: InterruptStackFrame) {
     apic::apic_eoi();
 }
 
