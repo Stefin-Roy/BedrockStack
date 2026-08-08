@@ -1,6 +1,9 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::services::KernelServices;
 
+#[cfg(target_arch = "x86_64")]
+pub mod work;
+
 /// SMP initialization guard — prevents double-init which would double-start APs,
 /// leak stacks, and corrupt the CPU counter.
 static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);

@@ -316,7 +316,13 @@ pub fn run(alloc: &mut BitmapAllocator, kernel_root: u64) -> ! {
 /// AP scheduler entry: wait for the scheduler to come up (boot_tasks on the
 /// BSP), then run this CPU's scheduler loop forever. Called from `ap_entry64`.
 pub fn ap_main(cpu: u32) -> ! {
-    while !SCHEDULER_ACTIVE.load(Ordering::Acquire) {
+    loop {
+        // Drain any boot-time work posted before the scheduler comes up (the
+        // BSP's parallel device sweep), then wait for the scheduler.
+        crate::smp::work::drain(cpu);
+        if SCHEDULER_ACTIVE.load(Ordering::Acquire) {
+            break;
+        }
         crate::arch::CurrentArch::halt();
     }
     schedule_cpu(cpu)

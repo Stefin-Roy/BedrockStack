@@ -136,9 +136,20 @@ struct Slot {
 
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
     use crate::services::universal_timer::{now_ns, wait_until_cond};
-    if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+    let det = || hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK;
+    if det() == SSTS_DET_ESTAB { return true; }
+
+    // Fast empty-port path: a present device raises DET off 0 within a few ms
+    // of SUD|POD, whereas an empty port reads DET == 0 forever.  Waiting the
+    // full establishment window per empty port cost ~1s of boot time across
+    // the two Q35 controllers (11 empty ports x 100 ms).
+    let grace = now_ns() + 5_000_000;
+    wait_until_cond(grace, &|| det() != 0);
+    if det() == 0 { return false; }
+
+    // A link is negotiating; give it the full establishment window.
     let deadline = now_ns() + 100_000_000;
-    wait_until_cond(deadline, &|| hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB)
+    wait_until_cond(deadline, &|| det() == SSTS_DET_ESTAB)
 }
 
 // ── Port state ──────────────────────────────────────────────────

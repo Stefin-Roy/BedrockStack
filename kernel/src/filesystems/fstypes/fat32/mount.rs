@@ -115,13 +115,15 @@ impl FileSystem for Fat32FileSystem {
         let cached = CachedDevice::new(dev.clone());
         let bpb = parse_bpb(&*cached)?;
 
-        {
+        let dirty = {
             let mut sector = [0u8; SECTOR_SIZE];
             read_sectors(&*cached, 0, 1, &mut sector)?;
-            if sector[0x41] & 1 != 0 {
+            let d = sector[0x41] & 1 != 0;
+            if d {
                 log::warn!("FAT32: volume was not cleanly unmounted (dirty bit set)");
             }
-        }
+            d
+        };
 
         let sb = Arc::new(Fat32SuperBlock {
             device: cached,
@@ -139,22 +141,33 @@ impl FileSystem for Fat32FileSystem {
         // (crash/power loss) leaves the flag set for detection at next mount.
         sb.set_volume_dirty_flag()?;
 
-        if bpb.fsinfo_is_valid() {
+        let fsinfo_free = if bpb.fsinfo_is_valid() {
             let mut sector = [0u8; SECTOR_SIZE];
             if read_sectors(&*sb.device, bpb.fsinfo_sec as u64, 1, &mut sector).is_ok() {
                 use super::fat::FSINFO_STRUCT_SIG;
                 if sector[0..4] == FSINFO_LEAD_SIG.to_le_bytes()
                     && sector[484..488] == FSINFO_STRUCT_SIG.to_le_bytes()
                 {
+                    let free_count = u32::from_le_bytes([sector[488], sector[489], sector[490], sector[491]]);
                     let hint = u32::from_le_bytes([sector[492], sector[493], sector[494], sector[495]]);
                     if hint >= 2 && hint < 2 + bpb.total_clus {
                         *sb.next_alloc_hint.lock() = hint;
                     }
+                    if free_count <= bpb.total_clus { Some(free_count) } else { None }
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
-        let free = sb.scan_free_clusters()?;
+        let free = match fsinfo_free {
+            Some(f) if !dirty => f,
+            _ => sb.scan_free_clusters()?,
+        };
         sb.free_clus_count.store(free, Ordering::Relaxed);
 
         let root_clus = sb.bpb.root_clus;

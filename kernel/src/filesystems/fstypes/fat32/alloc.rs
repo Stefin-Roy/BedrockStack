@@ -48,31 +48,39 @@ impl Fat32SuperBlock {
     }
 
     pub fn scan_free_clusters(&self) -> Result<u32, VfsError> {
+        const SCAN_CHUNK_SECTORS: u64 = 256;
         let fat_idx = self.bpb.active_fat_idx();
         let first_lba = self.bpb.fat_sector_lba(fat_idx, 0);
-        let nsec = self.bpb.fat_sz32;
+        let nsec = self.bpb.fat_sz32 as u64;
         let total_clus = self.bpb.total_clus as u64;
         let mut count = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
+        let mut buf = alloc::vec![0u8; (SCAN_CHUNK_SECTORS * SECTOR_SIZE as u64) as usize];
         let first_valid = 2u64;
         let last_valid = first_valid + total_clus - 1;
-        for sec in 0..nsec as u64 {
-            read_sectors(&*self.device, first_lba + sec, 1, &mut buf)?;
-            let entry_base = sec * 128;
-            for i in 0..128 {
-                let entry_idx = entry_base + i;
-                if entry_idx < first_valid || entry_idx > last_valid {
-                    continue;
-                }
-                let off = (i * 4) as usize;
-                if off + 4 > buf.len() {
-                    return Err(VfsError::IOError);
-                }
-                let val = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
-                if val & 0x0FFFFFFF == FREE_CLUSTER {
-                    count += 1;
+        let mut sec = 0u64;
+        while sec < nsec {
+            let chunk = core::cmp::min(SCAN_CHUNK_SECTORS, nsec - sec);
+            let chunk_bytes = (chunk * SECTOR_SIZE as u64) as usize;
+            read_sectors(&*self.device, first_lba + sec, chunk as u32, &mut buf[..chunk_bytes])?;
+            for s in 0..chunk {
+                let entry_base = (sec + s) * 128;
+                let off0 = (s * SECTOR_SIZE as u64) as usize;
+                for i in 0..128 {
+                    let entry_idx = entry_base + i;
+                    if entry_idx < first_valid || entry_idx > last_valid {
+                        continue;
+                    }
+                    let off = off0 + (i * 4) as usize;
+                    if off + 4 > chunk_bytes {
+                        return Err(VfsError::IOError);
+                    }
+                    let val = u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]);
+                    if val & 0x0FFFFFFF == FREE_CLUSTER {
+                        count += 1;
+                    }
                 }
             }
+            sec += chunk;
         }
         Ok(count)
     }

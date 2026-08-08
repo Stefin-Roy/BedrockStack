@@ -39,3 +39,11 @@ pub const ALL_TASKS: u8 = 13;
 pub const CURRENT_TASK: u8 = 14;
 /// Scheduler join-wait list on a task (tasks parked waiting for its death).
 pub const JOINERS: u8 = 15;
+/// Boot-time SMP work-dispatcher queue (jobs posted before the scheduler runs).
+pub const BOOT_WORK: u8 = 16;
+
+/// Kernel page-table mutation (VMM map/unmap/protect/translate) on the shared
+/// kernel root. The outermost guard: parallel probe jobs (smp::work) map into
+/// the shared root on different APs, so intermediate-table allocation must be
+/// serialized. Acquired with no other lockdep-tracked lock held.
+pub const PAGE_TABLE: u8 = 17;

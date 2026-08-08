@@ -6,6 +6,8 @@
 //! `x86_64` and `riscv64`.
 
 use crate::mm::phys_alloc::BitmapAllocator;
+use crate::services::irqsafe::IrqLock;
+use crate::services::lockorder;
 
 // Re-export arch-specific activation helpers so callers can switch tables.
 #[cfg(target_arch = "x86_64")]
@@ -92,6 +94,15 @@ impl core::ops::BitAndAssign for PageFlags {
 /// compiled addresses.
 pub const KERNEL_VMA_BASE: u64 = crate::mm::layout::KERNEL_VMA_BASE;
 
+/// Global lock serializing mutation (and translation) of the shared kernel
+/// page-table root. Every `Vmm` map/unmap/protect/translate takes it so the
+/// x86_64 mapper's check-then-act allocation of intermediate tables never runs
+/// concurrently on two CPUs (a lost update orphans a page table and faults the
+/// next MMIO access). Parallel boot-time probe jobs (smp::work) map into the
+/// shared root on different APs, and drivers map MMIO through the addrspace
+/// capability, so this single choke point covers all of them.
+static PAGE_TABLE_LOCK: IrqLock<()> = IrqLock::with_order((), lockorder::PAGE_TABLE);
+
 // ── Vmm ─────────────────────────────────────────────────────────────
 
 /// A page table root object that can be queried and modified at run time.
@@ -153,6 +164,7 @@ impl Vmm {
     ) {
         assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not 4K aligned");
         assert_eq!(paddr & 0xFFF, 0, "VMM: paddr not 4K aligned");
+        let _guard = PAGE_TABLE_LOCK.lock();
         #[cfg(target_arch = "x86_64")]
         x86_64::map_4k(self.root, alloc, vaddr, paddr, flags);
         #[cfg(target_arch = "riscv64")]
@@ -174,6 +186,7 @@ impl Vmm {
     ) {
         assert_eq!(vaddr & 0x1F_FFFF, 0, "VMM: vaddr not 2M aligned");
         assert_eq!(paddr & 0x1F_FFFF, 0, "VMM: paddr not 2M aligned");
+        let _guard = PAGE_TABLE_LOCK.lock();
         #[cfg(target_arch = "x86_64")]
         x86_64::map_2m(self.root, alloc, vaddr, paddr, flags);
         #[cfg(target_arch = "riscv64")]
@@ -229,6 +242,7 @@ impl Vmm {
     /// Returns `false` if the page was not mapped.
     pub fn unmap_4k(&mut self, alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
         assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not 4K aligned");
+        let _guard = PAGE_TABLE_LOCK.lock();
         #[cfg(target_arch = "x86_64")]
         return x86_64::unmap_4k(self.root, alloc, vaddr);
         #[cfg(target_arch = "riscv64")]
@@ -238,6 +252,7 @@ impl Vmm {
     /// Retag the permissions of the 4 KiB page at `vaddr` (§7.10.3).
     pub fn protect(&mut self, vaddr: u64, flags: PageFlags) {
         assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not 4K aligned");
+        let _guard = PAGE_TABLE_LOCK.lock();
         #[cfg(target_arch = "x86_64")]
         x86_64::protect(self.root, vaddr, flags);
         #[cfg(target_arch = "riscv64")]
@@ -260,6 +275,7 @@ impl Vmm {
     /// Translate a virtual address to the physical address it maps to.
     /// Returns `None` if the address is not mapped.
     pub fn translate(&self, vaddr: u64) -> Option<u64> {
+        let _guard = PAGE_TABLE_LOCK.lock();
         #[cfg(target_arch = "x86_64")]
         return x86_64::translate(self.root, vaddr);
         #[cfg(target_arch = "riscv64")]

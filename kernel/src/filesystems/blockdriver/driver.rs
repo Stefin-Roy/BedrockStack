@@ -1,3 +1,4 @@
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -42,7 +43,15 @@ pub fn init_all(
     register_all();
 
     let dma = DmaClient::driver_dma();
-    let mut all_devices = Vec::new();
+
+    #[cfg(target_arch = "x86_64")]
+    let results: Arc<spin::Mutex<Vec<Arc<dyn BlockDevice>>>> =
+        Arc::new(spin::Mutex::new(Vec::new()));
+    #[cfg(target_arch = "x86_64")]
+    let mut jobs: Vec<crate::smp::work::Job> = Vec::new();
+    #[cfg(not(target_arch = "x86_64"))]
+    let mut all_devices: Vec<Arc<dyn BlockDevice>> = Vec::new();
+
     let registry = REGISTRY.lock();
 
     for dev in pci_devices {
@@ -57,30 +66,77 @@ pub fn init_all(
                 SerialPort::puts(":");
                 SerialPort::put_u64(dev.function as u64);
                 SerialPort::puts("\n");
-                match driver.init_controller(dev, dma) {
-                    Ok(devices) => {
-                        let n = devices.len();
-                        SerialPort::puts("[storage] ");
-                        SerialPort::put_u64(n as u64);
-                        SerialPort::puts(" device(s) ready\n");
-                        all_devices.extend(devices);
-                    }
-                    Err(e) => {
-                        SerialPort::puts("[storage] init error: ");
-                        SerialPort::puts(e);
-                        SerialPort::puts("\n");
+
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // Each controller is probed as a separate job so the
+                    // storage sweep fans out across the idle APs (smp::work).
+                    let dev = *dev;
+                    let driver = *driver;
+                    let dma = dma;
+                    let results = results.clone();
+                    jobs.push(Box::new(move || {
+                        match driver.init_controller(&dev, dma) {
+                            Ok(devices) => {
+                                let n = devices.len();
+                                SerialPort::puts("[storage] ");
+                                SerialPort::put_u64(n as u64);
+                                SerialPort::puts(" device(s) ready\n");
+                                results.lock().extend(devices);
+                            }
+                            Err(e) => {
+                                SerialPort::puts("[storage] init error: ");
+                                SerialPort::puts(e);
+                                SerialPort::puts("\n");
+                            }
+                        }
+                    }));
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    match driver.init_controller(dev, dma) {
+                        Ok(devices) => {
+                            let n = devices.len();
+                            SerialPort::puts("[storage] ");
+                            SerialPort::put_u64(n as u64);
+                            SerialPort::puts(" device(s) ready\n");
+                            all_devices.extend(devices);
+                        }
+                        Err(e) => {
+                            SerialPort::puts("[storage] init error: ");
+                            SerialPort::puts(e);
+                            SerialPort::puts("\n");
+                        }
                     }
                 }
             }
         }
     }
-    // Store in the global list for direct access (e.g., reading init from ESP).
-    {
-        let mut block_devs = BLOCK_DEVICES.lock();
-        block_devs.extend(all_devices.clone());
-    }
+    drop(registry);
 
-    all_devices
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Probe the storage controllers in parallel across the APs, then
+        // collect every registered device.
+        crate::smp::work::run_parallel(jobs);
+        let all_devices = results.lock().clone();
+
+        // Store in the global list for direct access (e.g., reading init from ESP).
+        {
+            let mut block_devs = BLOCK_DEVICES.lock();
+            block_devs.extend(all_devices.clone());
+        }
+        all_devices
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        // Store in the global list for direct access (e.g., reading init from ESP).
+        {
+            let mut block_devs = BLOCK_DEVICES.lock();
+            block_devs.extend(all_devices.clone());
+        }
+        all_devices
+    }
 }
 
 /// Return the first block device (typically the ESP on boot).
