@@ -325,6 +325,24 @@ impl CapabilityTable {
             })
             .collect()
     }
+
+    /// Clone every occupied handle's node reference: `(CapId, node, rights,
+    /// state)`. One lock acquire, all strong `Arc`s cloned up front, so a
+    /// provider hook can inspect what the caller holds (e.g. the addrspace
+    /// `map` PA check enumerates the caller's `mem:region` caps) without
+    /// re-locking the table per slot.
+    pub fn handles(&self) -> Vec<(CapId, Arc<dyn Obj>, CapRights, HandleState)> {
+        let inner = self.slots.lock();
+        inner
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| {
+                s.as_ref()
+                    .map(|h| (CapId(i as u64), Arc::clone(&h.node), h.rights, h.state))
+            })
+            .collect()
+    }
 }
 
 // ── The table as a node (§2.4, §7.8: "infrastructure is also nodes") ──────

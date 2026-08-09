@@ -30,11 +30,12 @@
 use alloc::alloc::{alloc as alloc_bytes, Layout};
 use alloc::sync::Arc;
 use alloc::vec;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Once;
 
 use crate::mm::heap;
-use crate::mm::vmm::{PageFlags, Vmm};
+use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 use crate::services::cpu::CpuManager;
 use crate::services::interrupts::InterruptManager;
 use crate::services::msi::MsiAllocator;
@@ -405,32 +406,106 @@ const ADDRSPACE_HOOKS: &[HookSignature] = &[
 
 static ADDRSPACE_CONTRACTS: &[ContractId] = &[ADDRSPACE_CONTRACT];
 
-/// The address-space node: wraps the page tables of the (shared) root captured
-/// at construction. The page-walk itself is reached via `Vmm::from_root`;
-/// intermediate-table frames come from `get_phys_allocator_mut` at map/unmap.
+/// Base of the dynamic per-task address-space node id space (above the
+/// `0x11_0002` family-root id, so a per-task node never collides with the
+/// addrspace family root in the store).
+pub const ADDRSPACE_CHILD_ID_BASE: u64 = 0x11_4000;
+
+/// Next dynamic per-task address-space node id.
+static NEXT_ADDRSPACE_ID: AtomicU64 = AtomicU64::new(ADDRSPACE_CHILD_ID_BASE);
+
+fn next_addrspace_id() -> ObjId {
+    ObjId(NEXT_ADDRSPACE_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+/// Physical-frame policy of an address-space capability: what physical
+/// addresses its `map` hook may name.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PaPolicy {
+    /// Any physical address may be mapped (kernel/driver caps: device MMIO,
+    /// ECAM, and DMA windows are not covered by `mem:region` caps).
+    Any,
+    /// Each mapped physical page must be covered by a `mem:region` cap the
+    /// caller holds with `WRITE` — a ring-3 task may only map frames it was
+    /// actually granted.
+    OwnedRegions,
+}
+
+/// The authority carried by an address-space capability. A cap names a page
+/// table root *and* the policy under which it may be operated: a bare root
+/// pointer would conflate naming with power. Every hook consults this bundle.
+#[derive(Clone, Copy)]
+pub struct AddrspaceAuthority {
+    /// The page tables this cap may operate.
+    pub root: u64,
+    /// `map`/`unmap`/`protect`/`translate` may only touch VAs strictly below
+    /// this bound; `u64::MAX` means unbounded. Per-task caps bound at
+    /// [`KERNEL_VMA_BASE`] because the higher half is SHARED with the kernel
+    /// root — a user cap must never mutate the shared subtrees.
+    pub va_limit: u64,
+    /// What physical addresses `map` may name.
+    pub pa_policy: PaPolicy,
+}
+
+impl AddrspaceAuthority {
+    /// The kernel/driver authority: any VA, any PA (device windows, MMIO).
+    pub const fn kernel(root: u64) -> Self {
+        AddrspaceAuthority { root, va_limit: u64::MAX, pa_policy: PaPolicy::Any }
+    }
+
+    /// A ring-3 task's authority: its own cloned root, the low half only, and
+    /// only frames covered by `mem:region` caps it holds.
+    pub const fn task(root: u64) -> Self {
+        AddrspaceAuthority { root, va_limit: KERNEL_VMA_BASE, pa_policy: PaPolicy::OwnedRegions }
+    }
+}
+
+/// The address-space node: wraps the page tables named by its authority. The
+/// page-walk itself is reached via `Vmm::from_root`; intermediate-table frames
+/// come from `get_phys_allocator_mut` at map/unmap. A kernel/driver cap carries
+/// `AddrspaceAuthority::kernel` (any VA, any PA); a per-task cap carries
+/// `AddrspaceAuthority::task` (own root, low half, owned frames only).
 pub struct AddressSpaceNode {
-    root: u64,
+    id: ObjId,
+    authority: AddrspaceAuthority,
 }
 
 impl AddressSpaceNode {
     /// Stable identity of the address-space family root (§7.10.3).
     pub const OBJ_ID: ObjId = ObjId(0x11_0002);
 
+    /// The address-space family root over the kernel's page tables: any VA,
+    /// any PA (privileged — device MMIO is not region-backed).
     pub const fn new(root: u64) -> Self {
-        AddressSpaceNode { root }
+        AddressSpaceNode { id: Self::OBJ_ID, authority: AddrspaceAuthority::kernel(root) }
+    }
+
+    /// A per-task address-space node over the task's OWN cloned root, confined
+    /// to the low half and to frames the caller holds `mem:region` caps for.
+    /// Not a family root: `DropDeath` (lifetime = reachability) and a dynamic
+    /// id, so it never collides with the `0x11_0002` family root in the store.
+    pub fn task(root: u64) -> Self {
+        AddressSpaceNode { id: next_addrspace_id(), authority: AddrspaceAuthority::task(root) }
+    }
+
+    /// The authority this cap carries.
+    pub fn authority(&self) -> &AddrspaceAuthority {
+        &self.authority
     }
 }
 
 impl Obj for AddressSpaceNode {
-    fn obj_id(&self) -> ObjId { Self::OBJ_ID }
-    fn revocation(&self) -> RevocationPolicy { RevocationPolicy::Revocable }
+    fn obj_id(&self) -> ObjId { self.id }
+    fn revocation(&self) -> RevocationPolicy {
+        if self.id == Self::OBJ_ID { RevocationPolicy::Revocable } else { RevocationPolicy::DropDeath }
+    }
     fn kind(&self) -> &'static str { "mm:addrspace" }
     fn surface(&self) -> Option<&'static SurfaceDesc> { Some(&ADDRSPACE_SURFACE) }
     fn contracts(&self) -> &'static [ContractId] { ADDRSPACE_CONTRACTS }
 
     fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         match name {
-            "root" => Some(Value::U64(self.root)),
+            "root" => Some(Value::U64(self.authority.root)),
             _ => None,
         }
     }
@@ -446,7 +521,7 @@ impl Obj for AddressSpaceNode {
 
     fn dispatch<'a>(
         &self,
-        _caller: &CapabilityTable,
+        caller: &CapabilityTable,
         _rights: &CapRights,
         hook: HookId,
         args: &Args<'a>,
@@ -456,21 +531,34 @@ impl Obj for AddressSpaceNode {
             let pa = arg_u64(args, 1).ok_or(ObjError::Denied)?;
             let size = arg_u64(args, 2).ok_or(ObjError::Denied)?;
             let flags = arg_u64(args, 3).unwrap_or(0);
-            let mut vmm = Vmm::from_root(self.root);
+            // Authority check: the whole range must stay inside this cap's VA
+            // bound (per-task caps: the low half — the higher half is shared
+            // with the kernel root) and every physical page must be one the
+            // caller is authorized to map (per-task caps: owned regions).
+            if !self.in_va_range(va, size) || !self.phys_allowed(caller, pa, size) {
+                return Err(ObjError::Denied);
+            }
+            let mut vmm = Vmm::from_root(self.authority.root);
             vmm.map(heap::get_phys_allocator_mut(), va, pa, size, page_flags(flags));
             return Ok(Reply::None);
         }
         if hook == ADDRSPACE_UNMAP {
             let va = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let size = arg_u64(args, 1).ok_or(ObjError::Denied)?;
-            let mut vmm = Vmm::from_root(self.root);
+            if !self.in_va_range(va, size) {
+                return Err(ObjError::Denied);
+            }
+            let mut vmm = Vmm::from_root(self.authority.root);
             vmm.unmap(heap::get_phys_allocator_mut(), va, size);
             return Ok(Reply::None);
         }
         if hook == ADDRSPACE_PROTECT {
             let va = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let flags = arg_u64(args, 1).unwrap_or(0);
-            let mut vmm = Vmm::from_root(self.root);
+            if !self.in_va_range(va, 4096) {
+                return Err(ObjError::Denied);
+            }
+            let mut vmm = Vmm::from_root(self.authority.root);
             vmm.protect(va, page_flags(flags));
             return Ok(Reply::None);
         }
@@ -482,16 +570,61 @@ impl Obj for AddressSpaceNode {
         }
         if hook == ADDRSPACE_TRANSLATE {
             let va = arg_u64(args, 0).ok_or(ObjError::Denied)?;
-            let vmm = Vmm::from_root(self.root);
+            // Confined to this cap's VA bound so a per-task cap cannot use the
+            // shared higher half as a kernel-physical-address oracle.
+            if !self.in_va_range(va, 1) {
+                return Err(ObjError::Denied);
+            }
+            let vmm = Vmm::from_root(self.authority.root);
             return match vmm.translate(va) {
                 Some(pa) => Ok(Reply::Data(vec![Value::U64(pa)])),
                 None => Err(ObjError::Denied),
             };
         }
         if hook == ADDRSPACE_ROOT {
-            return Ok(Reply::Data(vec![Value::U64(self.root)]));
+            return Ok(Reply::Data(vec![Value::U64(self.authority.root)]));
         }
         Err(ObjError::NotSupported)
+    }
+}
+
+impl AddressSpaceNode {
+    /// Whether `[va, va + size)` lies within this cap's VA authority. A
+    /// `u64::MAX` limit (kernel/driver caps) is unbounded.
+    fn in_va_range(&self, va: u64, size: u64) -> bool {
+        if self.authority.va_limit == u64::MAX {
+            return true;
+        }
+        match va.checked_add(size) {
+            Some(end) => end <= self.authority.va_limit,
+            None => false,
+        }
+    }
+
+    /// Whether every physical page of `[pa, pa + size)` is authorized under
+    /// this cap's PA policy. `Any` allows any PA (kernel/driver MMIO);
+    /// `OwnedRegions` requires each page to be covered by a `mem:region` cap
+    /// the caller holds with WRITE.
+    fn phys_allowed(&self, caller: &CapabilityTable, pa: u64, size: u64) -> bool {
+        match self.authority.pa_policy {
+            PaPolicy::Any => true,
+            PaPolicy::OwnedRegions => {
+                let end = match pa.checked_add(size) {
+                    Some(e) => e,
+                    None => return false,
+                };
+                let ranges = authorized_phys_ranges(caller);
+                let mut page = pa;
+                while page < end {
+                    let covered = ranges.iter().any(|&(base, len)| page >= base && page < base + len);
+                    if !covered {
+                        return false;
+                    }
+                    page += 4096;
+                }
+                true
+            }
+        }
     }
 }
 
@@ -1093,6 +1226,160 @@ fn region_cap(node: Arc<MemRegionNode>) -> CapHandle {
         rights: CapRights::new(Rights::INVOKE.or(Rights::QUERY), ContractRights::READ.or(ContractRights::WRITE)),
         state: HandleState::Live,
     }
+}
+
+/// The physical ranges the caller is authorized to map: the union of every
+/// `Live` `mem:region` cap it holds whose contract mask carries WRITE. Each
+/// range is `(base, size)` of a `RegionKind::Phys` region that still has a
+/// live identity (`phys_range()` returns `None` for freed/recycled wrappers).
+/// Consulted by the per-task addrspace `map` hook (PA policy `OwnedRegions`)
+/// so a ring-3 task can only map frames it was actually granted.
+fn authorized_phys_ranges(caller: &CapabilityTable) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for (_, node, rights, state) in caller.handles() {
+        if state != HandleState::Live || !rights.contract.contains(ContractRights::WRITE) {
+            continue;
+        }
+        let Some(region) = node.as_any().and_then(|a| a.downcast_ref::<MemRegionNode>()) else {
+            continue;
+        };
+        if let Some((base, len)) = region.phys_range() {
+            out.push((base, len));
+        }
+    }
+    out
+}
+
+/// selftest (x86_64, `selftest` feature): prove the address-space hardening.
+/// A per-task addrspace cap must name the task's OWN cloned root (never the
+/// kernel root), be confined to the low half, and only map frames the caller
+/// holds `mem:region` caps for; and a ring-3-attuned physmem cap must not
+/// reach `reserve`. Returns `Err` on the first failure so the boot-time
+/// test-suite can fail the run loudly.
+#[cfg(all(target_arch = "x86_64", feature = "selftest"))]
+pub fn selftest_addrspace_authority() -> Result<(), &'static str> {
+    use crate::drivers::serial::SerialPort;
+    use crate::obj::bootstrap::boot_domain;
+    use crate::obj::domain::Domain;
+    use crate::obj::memregion::{MEM_REGION_BASE, MEM_REGION_CONTRACT, MEM_REGION_FREE};
+
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    let kernel_root = boot_domain().page_root().ok_or("selftest: no kernel root")?;
+    let root = crate::mm::vmm::clone_high_half(alloc, kernel_root);
+
+    // A fresh task domain with its own cloned root, exactly as `endow_task`
+    // builds for a ring-3 process.
+    let domain: &'static Domain = Domain::with_addrspace(0xBEEF, kernel_root);
+    let task_root = domain.page_root().ok_or("selftest: no task root")?;
+
+    // 1. The per-task node carries task authority: own root, low-half bound,
+    //    owned-PA policy.
+    let node = AddressSpaceNode::task(task_root);
+    let a = node.authority();
+    if a.root != task_root {
+        return Err("selftest: addrspace node root != task root");
+    }
+    if a.root == kernel_root {
+        return Err("selftest: addrspace node wraps the kernel root");
+    }
+    if a.va_limit != crate::mm::vmm::KERNEL_VMA_BASE {
+        return Err("selftest: addrspace task va_limit != KERNEL_VMA_BASE");
+    }
+    if a.pa_policy != PaPolicy::OwnedRegions {
+        return Err("selftest: addrspace task pa_policy != OwnedRegions");
+    }
+
+    let table = &domain.table;
+    let addrspace = table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::new(node),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY),
+            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+        ),
+        state: HandleState::Live,
+    });
+    let physmem = table.insert(CapHandle {
+        id: CapId(0),
+        node: phys_mem_node(),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY),
+            ContractRights::READ.or(ContractRights::CALL),
+        ),
+        state: HandleState::Live,
+    });
+
+    let map_args = |va: u64, pa: u64| crate::obj::Args {
+        vals: alloc::vec![Value::U64(va), Value::U64(pa), Value::U64(4096), Value::U64(1 | 2)],
+    };
+
+    // 2. Mapping into the kernel half (shared with the kernel root) is denied.
+    let kh = crate::mm::vmm::KERNEL_VMA_BASE + 0x1000;
+    if !matches!(
+        invoke(table, addrspace, ADDRSPACE_CONTRACT, ADDRSPACE_MAP, &map_args(kh, kernel_root)),
+        Err(ObjError::Denied)
+    ) {
+        return Err("selftest: kernel-half map was not denied");
+    }
+
+    // 3. Mapping an unowned physical page (the kernel root frame) is denied.
+    if !matches!(
+        invoke(table, addrspace, ADDRSPACE_CONTRACT, ADDRSPACE_MAP, &map_args(0x1000, kernel_root)),
+        Err(ObjError::Denied)
+    ) {
+        return Err("selftest: unowned-PA map was not denied");
+    }
+
+    // 4. physmem `reserve` (WRITE-gated) is denied from the attuned cap.
+    let reserve_args = crate::obj::Args {
+        vals: alloc::vec![Value::U64(kernel_root), Value::U64(4096)],
+    };
+    if !matches!(
+        invoke(table, physmem, PHYSMEM_CONTRACT, PHYSMEM_RESERVE, &reserve_args),
+        Err(ObjError::Denied)
+    ) {
+        return Err("selftest: physmem reserve from ring-3-attuned cap was not denied");
+    }
+
+    // 5. A frame the caller actually holds CAN be mapped into its own low
+    //    half, then unmapped and freed.
+    let alloc_reply = invoke(table, physmem, PHYSMEM_CONTRACT, PHYSMEM_ALLOC_FRAMES, &crate::obj::Args::none())
+        .map_err(|_| "selftest: physmem alloc_frames denied")?;
+    let region_cap_id = match alloc_reply {
+        crate::obj::Reply::Caps(caps) => caps[0].id,
+        _ => return Err("selftest: alloc_frames returned no region cap"),
+    };
+    let base = match invoke(table, region_cap_id, MEM_REGION_CONTRACT, MEM_REGION_BASE, &crate::obj::Args::none()) {
+        Ok(crate::obj::Reply::Data(v)) => match v.first() {
+            Some(Value::U64(b)) => *b,
+            _ => return Err("selftest: region base not a u64"),
+        },
+        _ => return Err("selftest: region base read failed"),
+    };
+    if !matches!(
+        invoke(table, addrspace, ADDRSPACE_CONTRACT, ADDRSPACE_MAP, &map_args(0x2000, base)),
+        Ok(crate::obj::Reply::None)
+    ) {
+        return Err("selftest: owned-region map was denied");
+    }
+    let unmap_args = crate::obj::Args {
+        vals: alloc::vec![Value::U64(0x2000), Value::U64(4096)],
+    };
+    if !matches!(
+        invoke(table, addrspace, ADDRSPACE_CONTRACT, ADDRSPACE_UNMAP, &unmap_args),
+        Ok(crate::obj::Reply::None)
+    ) {
+        return Err("selftest: unmap of owned-region map failed");
+    }
+    if !matches!(
+        invoke(table, region_cap_id, MEM_REGION_CONTRACT, MEM_REGION_FREE, &crate::obj::Args::none()),
+        Ok(crate::obj::Reply::None)
+    ) {
+        return Err("selftest: region free failed");
+    }
+
+    SerialPort::puts("[selftest] addrspace authority: OK\n");
+    Ok(())
 }
 
 /// Rebuild a `PageFlags` from the raw bits passed through a hook, using only

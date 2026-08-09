@@ -898,6 +898,13 @@ pub fn contract_def(name: &str) -> Option<&'static Contract> {
                 return Some(proc_def);
             }
         }
+        #[cfg(target_arch = "x86_64")]
+        {
+            let stream_def = crate::proc::stream::stream_contract_def();
+            if name == stream_def.name {
+                return Some(stream_def);
+            }
+        }
         None
     }
 }

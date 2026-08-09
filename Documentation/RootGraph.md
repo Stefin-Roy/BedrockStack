@@ -1783,6 +1783,33 @@ channel: `shootdown` is a hook that the address-space node invokes against
 the **Cpu** nodes (§7.10.4) via the capabilities it holds — a cross-edge
 call, visible in the projection like any other.
 
+**Address-space capabilities carry authority, not a bare root pointer.**
+The node wraps an [`AddrspaceAuthority`](`kernel/src/obj/nodes.rs`): the
+root it may operate, a VA bound (`va_limit`; `map`/`unmap`/`protect`/
+`translate` only touch VAs below it), and a physical-frame policy
+(`pa_policy`). Two authority profiles exist:
+
+- **Kernel/driver** (`AddrspaceAuthority::kernel`, the `0x11_0002` family
+  root the boot and driver domains hold): `va_limit = ∞`, `pa_policy = Any`.
+  The boot domain maps device windows (ACPI/ECAM/DMA) and DMA buffers at
+  higher-half VAs through it; device MMIO is not `mem:region`-backed, so raw
+  physical addresses stay allowed.
+- **Ring-3 task** (`AddrspaceAuthority::task`, a per-task node built in
+  `proc::endow_task` over the task's *own* cloned root, §8.14):
+  `va_limit = KERNEL_VMA_BASE` and `pa_policy = OwnedRegions`. A task may
+  only touch its own low half — the higher half is **shared** with the
+  kernel root, so it must never be mutated — and `map` may only name
+  physical pages covered by a `mem:region` cap the caller holds with WRITE
+  (frames it allocated via `physmem:alloc_*`). The same endowment attunes
+  the task's `physmem` cap to `READ|CALL`, removing the provider-level
+  `free`/`reserve` (WRITE-gated) from ring 3; a task still frees its own
+  regions through the region cap's own `free` hook.
+
+Per-task address-space nodes carry a dynamic `ObjId` (≥ `0x11_4000`, so they
+never collide with the `0x11_0002` family root) and are `DropDeath` — they
+are not family members, so cascade semantics do not apply; lifetime is
+reachability (I4).
+
 ### 7.10.4 `Cpu` — one per vCPU
 
 Wraps `kernel/src/smp/*` (`MAX_CPUS`, per-CPU state, AP wake).

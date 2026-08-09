@@ -198,6 +198,10 @@ fn read_user_str(ptr: u64, max: usize) -> Option<Vec<u8>> {
 }
 
 /// Syscall 0: write(fd, buf_ptr, len) -> bytes_written or -1.
+///
+/// fds 0/1/2 route through the current task's standard streams (stdin/stdout/
+/// stderr); a Serial-kind stdout/stderr also echoes to the console. Any other
+/// fd fails with -1.
 fn sys_write(_num: u64, fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let len = len as usize;
     if len == 0 {
@@ -212,12 +216,22 @@ fn sys_write(_num: u64, fd: u64, buf_ptr: u64, len: u64) -> u64 {
         None => return u64::MAX, // -1: invalid user buffer
     };
 
-    // Output to serial (COM1) — fd is ignored for now, all writes go to serial.
-    let _ = fd;
+    // fds 0/1/2 route through the current task's streams; any other fd fails.
+    if let Some(task) = crate::proc::current_task() {
+        let stream = match fd {
+            0 => &task.stdin,
+            1 => &task.stdout,
+            2 => &task.stderr,
+            _ => return u64::MAX,
+        };
+        stream.write(&buf);
+        return len as u64;
+    }
+
+    // Pre-scheduler fallback: raw serial console.
     for &byte in &buf {
         SerialPort::putc(byte);
     }
-
     len as u64
 }
 

@@ -125,6 +125,26 @@
 > still runs in-kernel (I1); tables stay kernel-owned, so user-facing
 > capability operations resolve through the process's own table with no
 > amplification (I15). Sessions (F6) remain future work.
+>
+> P6-C hardening of the 3/5 endowment pair (addrspace-carry-authority):
+> slot 3 (`physmem`) is endowed *attuned* — a `PhysMemNode` cap carrying
+> `ContractRights::READ|CALL`, not a delegation of the boot domain's full
+> mask — so a ring-3 process can `alloc_frames`/`alloc_contiguous` (CALL)
+> and `stats` (READ) but never reaches the WRITE-gated provider-level
+> `free`/`reserve` hooks. Slot 5 (`addrspace`) is **not** a delegation of the
+> boot domain's cap (which wraps the shared kernel root); it is a per-task
+> `AddressSpaceNode` built over the task's *own* cloned root
+> (`Domain::with_addrspace`), carrying `AddrspaceAuthority::task`: a
+> `va_limit` of `KERNEL_VMA_BASE` (the higher half is shared with the kernel
+> root, so a user cap must never touch it) and a `PaPolicy::OwnedRegions`
+> map rule (every mapped physical page must be covered by a `mem:region` cap
+> the caller holds with WRITE). Per-task nodes carry a dynamic ObjId
+> (≥ `0x11_4000`) and are `DropDeath`, so they never collide with the
+> `0x11_0002` family root and are not family-cascade members. The boot and
+> driver domains keep the kernel authority profile
+> (`AddrspaceAuthority::kernel`, `va_limit = ∞`, `PaPolicy::Any`) so device
+> MMIO/ECAM/DMA mappings are unaffected. Verified at boot under the
+> `selftest` feature by `obj/nodes.rs::selftest_addrspace_authority`.
 
 ---
 
@@ -265,6 +285,18 @@ switch) is implemented in `obj/domain.rs` and `mm/vmm`; no boot-time proof
 runs — the paged-isolation self-test module was removed in commit 6adbc4e.
 - Location: `mm/vmm/{x86_64,riscv64}.rs::clone_high_half` and `::prepopulate_window` (mm/vmm/mod.rs re-export), `obj/domain.rs::{with_addrspace,set_kernel_addrspace,page_root,set_current_domain}`, `obj/bootstrap.rs::bootstrap` (pre-populate + `set_kernel_addrspace`), `obj/driver.rs::create` (with_addrspace)
 
+Because the higher half is **shared** with the kernel root, a non-kernel
+domain must never be allowed to mutate it through an address-space cap. The
+capability model enforces this by construction: the ring-3 addrspace cap is
+a per-task `AddressSpaceNode` (not the boot domain's kernel-root cap) over
+the task's own clone, and its `AddrspaceAuthority::task` bounds every
+hook — `map`/`unmap`/`protect`/`translate` refuse VAs ≥ `KERNEL_VMA_BASE`
+and `map` additionally refuses physical pages not covered by a `mem:region`
+cap the caller holds with WRITE (`obj/nodes.rs` `AddrspaceAuthority`,
+`AddressSpaceNode::in_va_range`/`phys_allowed`). A kernel/driver cap carries
+`AddrspaceAuthority::kernel` (`va_limit = ∞`, `PaPolicy::Any`), so the boot
+domain's device-window and DMA mappings and the driver sweep are unchanged.
+
 **I12 (per-hook contract-right enforcement) — a hook is invoked only if the
 handle's contract-right mask contains the hook's required right:**
 `resolve_with_rights` folds the per-hook contract right into the third bit-test
@@ -278,6 +310,10 @@ right a hook needs (`PhysMemNode`: `free`/`reserve` → `WRITE`, `stats` → `RE
 held contract mask must contain that right or the invocation fails `Denied`
 (§3.3, I8). The provider also receives the caller's exact rights through
 `dispatch(…, rights: &CapRights)` and may gate its hook body further (S1).
+`AddressSpaceNode` additionally gates its hook body on the cap's own
+authority (`AddrspaceAuthority`): a per-task cap refuses kernel-half VAs and
+unowned physical pages even when the handle passes the WRITE bit-test
+(`obj/nodes.rs::AddressSpaceNode::in_va_range`/`phys_allowed`).
 - Location: `obj/table.rs::resolve_with_rights` step 5 (obj/table.rs:115-119), `obj/mod.rs::Obj::hook_contract_right` default `CALL` (obj/mod.rs:82-85), per-node overrides in `obj/nodes.rs` (PhysMem 133-140, Heap 319-326, Addrspace 435-442, Cpu 552-558/620-626, Irq 724-730/789-795), `obj/memregion.rs` (214-220), `obj/fs.rs` (114-121, 217-223, 306-312, 526-533, 688-695)
 
 **I13 (transitional empty contract mask) — an `empty()` contract-right mask

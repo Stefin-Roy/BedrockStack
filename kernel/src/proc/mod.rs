@@ -4,8 +4,8 @@
 //! urgent): the scheduler picks the highest non-empty level and round-robins
 //! within it, so a priority-2 task always runs ahead of a priority-1/0 one.
 //! Each task is a ring-3 program loaded into its own address space (a
-//! higher-half clone with an empty low half, §8.14) and endowed with a
-//! positional capability table. The scheduler loop (`schedule_cpu`, one per
+//! higher-half clone with an empty low half, §8.14) and endowed with eleven
+//! positional process capabilities. The scheduler loop (`schedule_cpu`, one per
 //! CPU) picks a Runnable task, restores its parked `UserFrame` and sysrets
 //! into it; when the task yields, sleeps, joins or exits inside a syscall, it
 //! re-parks its frame in its TCB and control returns to the same loop. With
@@ -63,7 +63,10 @@ use crate::services::universal_timer::{
 use crate::smp::{CpuState, MAX_CPUS, cpu_count, current_cpu_id, per_cpu_by_id};
 
 pub(crate) mod contracts;
+pub(crate) mod stream;
 mod task;
+
+use stream::{StreamKind, StreamNode, StreamRole};
 
 pub use task::{Continuation, Task, TASK_RUNNABLE, TASK_SLEEPING, TASK_ZOMBIE};
 
@@ -104,17 +107,31 @@ fn next_task_id() -> u32 {
 
 /// The capability endowment handed to a task at creation.
 ///
-/// The process ABI is positional: the first nine slots of the task domain's
-/// table are these capabilities, in insertion order (0=serial, 1=mount,
-/// 2=registry, 3=physmem, 4=heap, 5=addrspace, 6=block, 7=table, 8=proc).
+/// The process ABI is positional: the first eleven slots of the task domain's
+/// table are these capabilities, in insertion order (0=stdin, 1=stdout,
+/// 2=stderr, 3=mount, 4=registry, 5=physmem, 6=heap, 7=addrspace, 8=block,
+/// 9=table, 10=proc).
 ///
-/// Slot 7 is a `TableNode` over the process's OWN table, endowed with
+/// Slots 0/1/2 are fresh per-task `io:stream` nodes: stdin is an `Input`-kind
+/// stream, stdout/stderr are `Serial`-kind streams that echo writes to the
+/// console. The fd 0/1/2 write path in `sys_write` routes through them.
+///
+/// Slot 9 is a `TableNode` over the process's OWN table, endowed with
 /// INVOKE|QUERY only (no REVOKE), so `delegate` moves the process's own caps
-/// and family cascade-revocation is unreachable from ring 3. Slot 8 is the
+/// and family cascade-revocation is unreachable from ring 3. Slot 10 is the
 /// `proc:task` root node (spawn/yield/kill/join), the Phase A multitask seam.
+///
+/// The 5/7 pair is hardened: slot 5 (physmem) is attuned to READ|CALL only
+/// (no provider `free`/`reserve`), and slot 7 (addrspace) is NOT a copy of the
+/// boot domain's kernel-root cap — it is a per-task `AddressSpaceNode` over
+/// the task's own cloned root, confined to the low half and to physical frames
+/// the task holds `mem:region` caps for. A ring-3 process can never map into,
+/// protect, or unmap the kernel's page tables.
 #[derive(Clone, Copy)]
 pub struct ProcessEndowment {
-    pub serial: CapId,
+    pub stdin: CapId,
+    pub stdout: CapId,
+    pub stderr: CapId,
     pub mount: CapId,
     pub registry: CapId,
     pub physmem: CapId,
@@ -278,6 +295,7 @@ pub fn boot_tasks(alloc: &mut BitmapAllocator, kernel_root: u64) -> Result<(), &
     SCHEDULER.call_once(|| sched);
 
     contracts::register_proc_contract();
+    stream::register_stream_contract();
 
     // Affinity: init is affine to CPU 0 (it runs there after boot), the worker
     // to CPU 1 — CPU 1's idle scheduler steals it from the BSP's queue.
@@ -328,16 +346,74 @@ pub fn ap_main(cpu: u32) -> ! {
     schedule_cpu(cpu)
 }
 
-/// Endow a fresh task domain with the nine positional process capabilities.
-fn endow_task(domain: &'static Domain) -> Result<ProcessEndowment, ()> {
+/// Endow a fresh task domain with the eleven positional process capabilities.
+fn endow_task(
+    domain: &'static Domain,
+) -> Result<(ProcessEndowment, Arc<StreamNode>, Arc<StreamNode>, Arc<StreamNode>), ()> {
     let boot = crate::obj::bootstrap::boot_domain();
     let boot_end = crate::obj::bootstrap::boot_endowment();
-    let serial = boot.table.delegate(&domain.table, boot_end.serial).map_err(|_| ())?;
+
+    // Stream slots 0/1/2: fresh per-task io:stream nodes. stdin is an
+    // Input-kind stream; stdout/stderr are Serial-kind streams that echo
+    // writes to the console.
+    let stdin = StreamNode::new(StreamRole::Stdin, StreamKind::Input);
+    let stdout = StreamNode::new(StreamRole::Stdout, StreamKind::Serial);
+    let stderr = StreamNode::new(StreamRole::Stderr, StreamKind::Serial);
+    let stream_rights = CapRights::new(
+        Rights::INVOKE.or(Rights::QUERY),
+        ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+    );
+    let stdin_cap = domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stdin) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+    let stdout_cap = domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stdout) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+    let stderr_cap = domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stderr) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+
     let mount = boot.table.delegate(&domain.table, boot_end.mount).map_err(|_| ())?;
     let registry = boot.table.delegate(&domain.table, boot_end.registry).map_err(|_| ())?;
-    let physmem = boot.table.delegate(&domain.table, boot_end.physmem).map_err(|_| ())?;
+    // physmem: attuned to READ|CALL only — no WRITE, so a ring-3 process can
+    // never reach the provider-level `free`/`reserve` hooks (both WRITE-gated);
+    // it keeps alloc_frames/alloc_contiguous (CALL) and stats (READ). The
+    // frames it allocates come back as mem:region caps (READ|WRITE) that it
+    // can still free through the region's own `free` hook.
+    let physmem = domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: crate::obj::nodes::phys_mem_node(),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY),
+            ContractRights::READ.or(ContractRights::CALL),
+        ),
+        state: HandleState::Live,
+    });
     let heap_cap = boot.table.delegate(&domain.table, boot_end.heap).map_err(|_| ())?;
-    let addrspace = boot.table.delegate(&domain.table, boot_end.addrspace).map_err(|_| ())?;
+    // addrspace: NOT a delegation of the boot domain's cap (which wraps the
+    // SHARED KERNEL root). Each task gets an AddressSpaceNode over its OWN
+    // cloned root, confined to the low half and to frames it holds mem:region
+    // caps for — a ring-3 process can never map into the kernel's page tables.
+    let addrspace = domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::new(crate::obj::nodes::AddressSpaceNode::task(
+            domain.page_root().ok_or(())?,
+        )),
+        rights: CapRights::new(
+            Rights::INVOKE.or(Rights::QUERY),
+            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+        ),
+        state: HandleState::Live,
+    });
     let block = boot.table.delegate(&domain.table, boot_end.block).map_err(|_| ())?;
     // The process's own table node (not boot's): `delegate` operates on the
     // process's own caps, and no REVOKE is granted, so a ring-3 process can
@@ -361,17 +437,24 @@ fn endow_task(domain: &'static Domain) -> Result<ProcessEndowment, ()> {
         ),
         state: HandleState::Live,
     });
-    Ok(ProcessEndowment {
-        serial,
-        mount,
-        registry,
-        physmem,
-        heap: heap_cap,
-        addrspace,
-        block,
-        table,
-        proc,
-    })
+    Ok((
+        ProcessEndowment {
+            stdin: stdin_cap,
+            stdout: stdout_cap,
+            stderr: stderr_cap,
+            mount,
+            registry,
+            physmem,
+            heap: heap_cap,
+            addrspace,
+            block,
+            table,
+            proc,
+        },
+        stdin,
+        stdout,
+        stderr,
+    ))
 }
 
 /// Spawn a boot task (init or worker) from the same init binary.
@@ -384,12 +467,12 @@ fn spawn_task(
     let domain = Domain::with_addrspace(id, kernel_root);
     domain::register_domain(domain);
 
-    let endowment = endow_task(domain).map_err(|_| "endowment failed")?;
+    let (endowment, stdin, stdout, stderr) = endow_task(domain).map_err(|_| "endowment failed")?;
 
     // Boot priorities differ so the level-2 and level-1 paths are both
     // exercised: init (the demo) runs at 2, the worker at 1.
     let priority = if id == TASK_INIT_ID { 2 } else { 1 };
-    let task = build_task(id, priority, domain, data, alloc)?;
+    let task = build_task(id, priority, domain, data, alloc, stdin, stdout, stderr)?;
 
     if id == TASK_INIT_ID {
         PROCESS_ENDOWMENT.call_once(|| endowment);
@@ -404,6 +487,9 @@ fn build_task(
     domain: &'static Domain,
     data: &[u8],
     alloc: &mut BitmapAllocator,
+    stdin: Arc<StreamNode>,
+    stdout: Arc<StreamNode>,
+    stderr: Arc<StreamNode>,
 ) -> Result<Arc<Task>, &'static str> {
     let root = domain.page_root().ok_or("no addrspace")?;
     let mut vmm = Vmm::from_root(root);
@@ -428,7 +514,7 @@ fn build_task(
     }
     let user_rsp = USER_STACK_TOP - 8;
 
-    let task = Arc::new(Task::new(id, priority, domain, entry, user_rsp));
+    let task = Arc::new(Task::new(id, priority, domain, entry, user_rsp, stdin, stdout, stderr));
 
     push_task(Arc::clone(&task));
     {
@@ -855,10 +941,14 @@ pub fn wake_io_complete(task: &Arc<Task>, outcome: IoOutcome) {
 
 // ── Ring-3 spawn (proc:task `spawn` hook) ──────────────────────────────
 
-/// Spawn a child task from an ELF image. The child inherits exactly what the
-/// parent held: every live cap handle is delegated into the child's table, and
-/// the child gets its own address space (fresh higher-half clone) and stack.
-pub(crate) fn spawn_child(elf_data: &[u8]) -> Result<Arc<Task>, crate::obj::ObjError> {
+/// Spawn a child task from an ELF image. The child inherits what the parent
+/// held: every live cap handle except the parent's own standard streams is
+/// delegated into the child's table, and the child gets its own address space
+/// (fresh higher-half clone), stack, and three fresh `io:stream` nodes at
+/// slots 0/1/2.
+pub(crate) fn spawn_child(
+    elf_data: &[u8],
+) -> Result<(Arc<Task>, Arc<StreamNode>, Arc<StreamNode>, Arc<StreamNode>), crate::obj::ObjError> {
     let kernel_root = *KERNEL_ROOT.get().ok_or(crate::obj::ObjError::NotSupported)?;
     let id = next_task_id();
     let parent = current_task_arc("spawn");
@@ -866,10 +956,43 @@ pub(crate) fn spawn_child(elf_data: &[u8]) -> Result<Arc<Task>, crate::obj::ObjE
     let domain = Domain::with_addrspace(id, kernel_root);
     domain::register_domain(domain);
 
+    // The child's fresh standard streams land at slots 0/1/2 before the
+    // parent-cap delegation below fills slots 3..N (same positional ABI as a
+    // boot task).
+    let stdin = StreamNode::new(StreamRole::Stdin, StreamKind::Input);
+    let stdout = StreamNode::new(StreamRole::Stdout, StreamKind::Serial);
+    let stderr = StreamNode::new(StreamRole::Stderr, StreamKind::Serial);
+    let stream_rights = CapRights::new(
+        Rights::INVOKE.or(Rights::QUERY),
+        ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+    );
+    domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stdin) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+    domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stdout) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+    domain.table.insert(CapHandle {
+        id: CapId(0),
+        node: Arc::clone(&stderr) as Arc<dyn crate::obj::Obj>,
+        rights: stream_rights,
+        state: HandleState::Live,
+    });
+
     // Inherit the parent's capability table: clone every live handle, in slot
-    // order (the child's slots 0..N mirror the parent's). No amplification —
-    // delegation copies the held rights and state.
+    // order (the child's slots 3..N mirror the parent's slots 3..N). No
+    // amplification — delegation copies the held rights and state. The
+    // parent's own stream slots (0/1/2) are skipped: the child's are fresh.
     for (cap_id, _, _, _) in parent.domain.table.snapshot() {
+        if cap_id.0 <= 2 {
+            continue;
+        }
         parent
             .domain
             .table
@@ -877,10 +1000,19 @@ pub(crate) fn spawn_child(elf_data: &[u8]) -> Result<Arc<Task>, crate::obj::ObjE
             .map_err(|_| crate::obj::ObjError::OutOfMemory)?;
     }
 
-    let task = build_task(id, parent.priority, domain, elf_data, heap::get_phys_allocator_mut())
-        .map_err(|_| crate::obj::ObjError::OutOfMemory)?;
+    let task = build_task(
+        id,
+        parent.priority,
+        domain,
+        elf_data,
+        heap::get_phys_allocator_mut(),
+        Arc::clone(&stdin),
+        Arc::clone(&stdout),
+        Arc::clone(&stderr),
+    )
+    .map_err(|_| crate::obj::ObjError::OutOfMemory)?;
     task.cpu.store(current_cpu_id(), Ordering::Relaxed);
-    Ok(task)
+    Ok((task, stdin, stdout, stderr))
 }
 
 /// Read the init binary from the mounted ESP (B:\EFI\BEDROCK\INIT).

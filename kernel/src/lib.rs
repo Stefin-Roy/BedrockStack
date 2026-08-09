@@ -591,6 +591,11 @@ impl Kernel {
                 crate::drivers::serial::SerialPort::puts("kerneldump leak_detect: FAIL\n");
             }
             crate::kerneldump::fs_walk(&mut w);
+            if let Err(e) = crate::obj::nodes::selftest_addrspace_authority() {
+                crate::drivers::serial::SerialPort::puts("selftest addrspace authority: FAIL: ");
+                crate::drivers::serial::SerialPort::puts(e);
+                crate::drivers::serial::SerialPort::puts("\n");
+            }
         }
 
         // Initialize syscall MSRs and hand the BSP to the multitask scheduler.

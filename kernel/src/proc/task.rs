@@ -5,6 +5,7 @@ use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use crate::arch::x86_64::syscall::UserFrame;
 use crate::obj::domain::Domain;
+use crate::proc::stream::StreamNode;
 use crate::services::irqsafe::IrqLock;
 use crate::services::lockorder;
 use crate::services::universal_timer::TimerId;
@@ -68,6 +69,13 @@ pub struct Task {
     pub parked: IrqLock<Parked>,
     /// The task's address space + capability table.
     pub domain: &'static Domain,
+    /// The task's standard streams (`io:stream` nodes), also endowed at cap
+    /// slots 0/1/2. `sys_write` fds 0/1/2 route through them; stdout/stderr
+    /// echo to the console. They are fresh per task (never shared with the
+    /// parent) and stay alive as long as the task or a stream cap does.
+    pub stdin: Arc<StreamNode>,
+    pub stdout: Arc<StreamNode>,
+    pub stderr: Arc<StreamNode>,
     /// Pending one-shot sleep timer, while the task is `Sleeping`. Cleared on
     /// resume and on teardown (via `remove_context`).
     pub sleep_timer: IrqLock<Option<TimerId>>,
@@ -91,8 +99,19 @@ pub struct Parked {
 }
 
 impl Task {
-    /// Build a fresh, never-run task with a synthetic first-entry frame.
-    pub fn new(id: u32, priority: u8, domain: &'static Domain, entry: u64, user_rsp: u64) -> Self {
+    /// Build a fresh, never-run task with a synthetic first-entry frame. `stdin`/
+    /// `stdout`/`stderr` are the task's standard streams (endowed at cap slots
+    /// 0/1/2); the task keeps a strong reference to each.
+    pub fn new(
+        id: u32,
+        priority: u8,
+        domain: &'static Domain,
+        entry: u64,
+        user_rsp: u64,
+        stdin: Arc<StreamNode>,
+        stdout: Arc<StreamNode>,
+        stderr: Arc<StreamNode>,
+    ) -> Self {
         Task {
             id,
             priority,
@@ -121,6 +140,9 @@ impl Task {
                 continuation: None,
             }),
             domain,
+            stdin,
+            stdout,
+            stderr,
             sleep_timer: IrqLock::new(None),
             joiners: IrqLock::with_order(alloc::vec::Vec::new(), lockorder::JOINERS),
             io_state: IrqLock::new(super::IoState::Idle),

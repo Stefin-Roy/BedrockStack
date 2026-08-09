@@ -1,12 +1,13 @@
 //! The `proc:task` contract — the capability node that makes multitasking
 //! reachable from ring 3 (x86_64).
 //!
-//! Every task is endowed with a root node at cap slot 8 exposing
+//! Every task is endowed with a root node at cap slot 10 exposing
 //! `spawn`/`yield`/`kill`/`join`; `spawn` returns a child node cap (wrapping
-//! the child's TCB) so the parent can `kill`/`join` it and read its live
-//! surface (`state`, `id`, `domain_id`). The contract is registered in the
-//! contract registry like any other provider, so `resolve(b"proc:task\0")`
-//! answers from ring 3.
+//! the child's TCB) plus the child's stdin/stdout/stderr stream caps, so the
+//! parent can `kill`/`join` it and read its live surface (`state`, `id`,
+//! `domain_id`, and the three streams' content/kinds). The contract is
+//! registered in the contract registry like any other provider, so
+//! `resolve(b"proc:task\0")` answers from ring 3.
 
 extern crate alloc;
 
@@ -30,15 +31,25 @@ pub const PROC_KILL: HookId = HookId::of("kill");
 pub const PROC_JOIN: HookId = HookId::of("join");
 
 pub const PROC_DOC: &str = "if you spawn(elf), a child task inheriting your \
-capabilities is created and its node cap is returned; yield() parks your task \
-until the scheduler cycles; kill(child) tears a child down; join(child) blocks \
-until the child exits.";
+capabilities is created and its node cap plus the child's stdin/stdout/stderr \
+stream caps are returned; yield() parks your task until the scheduler cycles; \
+kill(child) tears a child down; join(child) blocks until the child exits.";
 
 const PROC_SURFACE: SurfaceDesc = SurfaceDesc {
     kind: "proc:task",
     attrs: &[
-        SurfaceAttr { name: "domain_id", ty: TypeTag::U64 },
         SurfaceAttr { name: "task_id", ty: TypeTag::U64 },
+        SurfaceAttr { name: "domain_id", ty: TypeTag::U64 },
+        SurfaceAttr { name: "state", ty: TypeTag::U64 },
+        SurfaceAttr { name: "stdin", ty: TypeTag::Buf },
+        SurfaceAttr { name: "stdout", ty: TypeTag::Buf },
+        SurfaceAttr { name: "stderr", ty: TypeTag::Buf },
+        SurfaceAttr { name: "stdin_kind", ty: TypeTag::Str },
+        SurfaceAttr { name: "stdout_kind", ty: TypeTag::Str },
+        SurfaceAttr { name: "stderr_kind", ty: TypeTag::Str },
+        SurfaceAttr { name: "stdin_cap", ty: TypeTag::U64 },
+        SurfaceAttr { name: "stdout_cap", ty: TypeTag::U64 },
+        SurfaceAttr { name: "stderr_cap", ty: TypeTag::U64 },
     ],
     events: &[],
 };
@@ -80,7 +91,27 @@ pub fn register_proc_contract() {
 const PROC_OBJ_ID: ObjId = ObjId(0x10_000A);
 const TASK_NODE_OBJ_ID: ObjId = ObjId(0x10_000B);
 
-/// The root node endowed to every task at slot 8. A unit node: `yield` and
+/// Unified process surface: task id/domain/state plus the task's three live
+/// streams (full accumulated content, kind labels, and their fixed ABI slots).
+fn proc_surface_value(task: &Arc<Task>, name: &str) -> Option<Value<'static>> {
+    match name {
+        "task_id" => Some(Value::U64(task.id as u64)),
+        "domain_id" => Some(Value::U64(task.domain.id as u64)),
+        "state" => Some(Value::U64(task.state() as u64)),
+        "stdin" => Some(Value::Buf(task.stdin.content())),
+        "stdout" => Some(Value::Buf(task.stdout.content())),
+        "stderr" => Some(Value::Buf(task.stderr.content())),
+        "stdin_kind" => Some(Value::Str(task.stdin.kind_label())),
+        "stdout_kind" => Some(Value::Str(task.stdout.kind_label())),
+        "stderr_kind" => Some(Value::Str(task.stderr.kind_label())),
+        "stdin_cap" => Some(Value::U64(0)),
+        "stdout_cap" => Some(Value::U64(1)),
+        "stderr_cap" => Some(Value::U64(2)),
+        _ => None,
+    }
+}
+
+/// The root node endowed to every task at slot 10. A unit node: `yield` and
 /// `spawn` operate on the *current* task (the cap holder); `kill`/`join`
 /// resolve a child node cap in the caller's own table, so there is no ambient
 /// authority — a task can only manage tasks it holds a cap to.
@@ -101,11 +132,7 @@ impl Obj for ProcRootNode {
 
     fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
         let task = current_task()?;
-        match name {
-            "domain_id" => Some(Value::U64(task.domain.id as u64)),
-            "task_id" => Some(Value::U64(task.id as u64)),
-            _ => None,
-        }
+        proc_surface_value(&task, name)
     }
 
     fn contracts(&self) -> &'static [ContractId] {
@@ -125,17 +152,18 @@ impl Obj for ProcRootNode {
                     Some(Value::Buf(b)) => b.clone(),
                     _ => return Err(ObjError::Denied),
                 };
-                let task = spawn_child(&buf).map_err(|_| ObjError::OutOfMemory)?;
-                let h = CapHandle {
-                    id: CapId(0),
-                    node: Arc::new(TaskNode { task }),
-                    rights: CapRights::new(
-                        Rights::INVOKE.or(Rights::QUERY),
-                        ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-                    ),
-                    state: HandleState::Live,
-                };
-                Ok(Reply::Caps(vec![h]))
+                let (task, stdin, stdout, stderr) =
+                    spawn_child(&buf).map_err(|_| ObjError::OutOfMemory)?;
+                let rights = CapRights::new(
+                    Rights::INVOKE.or(Rights::QUERY),
+                    ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
+                );
+                Ok(Reply::Caps(vec![
+                    CapHandle { id: CapId(0), node: Arc::new(TaskNode { task }), rights, state: HandleState::Live },
+                    CapHandle { id: CapId(0), node: stdin, rights, state: HandleState::Live },
+                    CapHandle { id: CapId(0), node: stdout, rights, state: HandleState::Live },
+                    CapHandle { id: CapId(0), node: stderr, rights, state: HandleState::Live },
+                ]))
             }
             PROC_YIELD => crate::proc::yield_current(),
             PROC_KILL => {
@@ -178,16 +206,11 @@ impl Obj for TaskNode {
     }
 
     fn surface(&self) -> Option<&'static SurfaceDesc> {
-        Some(&TASK_NODE_SURFACE)
+        Some(&PROC_SURFACE)
     }
 
     fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {
-        match name {
-            "state" => Some(Value::U64(self.task.state() as u64)),
-            "id" => Some(Value::U64(self.task.id as u64)),
-            "domain_id" => Some(Value::U64(self.task.domain.id as u64)),
-            _ => None,
-        }
+        proc_surface_value(&self.task, name)
     }
 
     fn contracts(&self) -> &'static [ContractId] {
@@ -208,16 +231,6 @@ impl Obj for TaskNode {
         Err(ObjError::NotSupported)
     }
 }
-
-const TASK_NODE_SURFACE: SurfaceDesc = SurfaceDesc {
-    kind: "proc:task-node",
-    attrs: &[
-        SurfaceAttr { name: "state", ty: TypeTag::U64 },
-        SurfaceAttr { name: "id", ty: TypeTag::U64 },
-        SurfaceAttr { name: "domain_id", ty: TypeTag::U64 },
-    ],
-    events: &[],
-};
 
 /// The proc:task root node, for endowing a task (§7.8).
 pub fn proc_root_node() -> Arc<dyn Obj> {

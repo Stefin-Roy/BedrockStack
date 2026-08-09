@@ -159,6 +159,19 @@ impl MemRegionNode {
         self.kind
     }
 
+    /// The physical range this region authorizes, if it is a live physical
+    /// frame grant: `Some((base, size))` when `kind == Phys` and the identity
+    /// has not been released (a recycled or freed wrapper returns `None` and
+    /// grants nothing). Used by the addrspace `map` PA check to prove a
+    /// physical page is covered by a region the caller holds.
+    pub fn phys_range(&self) -> Option<(u64, u64)> {
+        let base = self.base.load(Ordering::Relaxed);
+        if base == 0 || self.kind != RegionKind::Phys {
+            return None;
+        }
+        Some((base, self.size.load(Ordering::Relaxed)))
+    }
+
     /// Return the backing to its allocator: physical frames via the bitmap's
     /// per-frame `free`, heap blocks via `dealloc` with the stored layout.
     /// Called exactly once by the `free` hook, before the fields are zeroed so
@@ -209,6 +222,10 @@ impl Obj for MemRegionNode {
 
     fn contracts(&self) -> &'static [ContractId] {
         MEM_REGION_CONTRACTS
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
     }
 
     fn surface_value<'a>(&self, name: &str) -> Option<Value<'a>> {

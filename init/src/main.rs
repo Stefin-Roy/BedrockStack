@@ -55,11 +55,13 @@ const CR_WRITE: u64 = 1 << 1;
 const CR_CALL: u64 = 1 << 2;
 
 /// Endowed capability ids (insertion order — process ABI, not resolved).
-const CAP_SERIAL: u64 = 0;
-const CAP_MOUNT: u64 = 1;
-const CAP_REGISTRY: u64 = 2;
-const CAP_PHYSMEM: u64 = 3;
-const CAP_PROC: u64 = 8;
+const CAP_STDIN: u64 = 0;
+const CAP_STDOUT: u64 = 1;
+const CAP_STDERR: u64 = 2;
+const CAP_MOUNT: u64 = 3;
+const CAP_REGISTRY: u64 = 4;
+const CAP_PHYSMEM: u64 = 5;
+const CAP_PROC: u64 = 10;
 
 /// FNV-1a constants, mirroring `kernel/src/obj/hook.rs`.
 const FNV_OFFSET: u64 = 0xcbf29ce484222325;
@@ -83,7 +85,7 @@ const fn hook_id(name: &'static str) -> u64 {
 pub extern "C" fn _start() -> ! {
     // Resolve the contracts we are about to invoke through. physmem is only
     // queried by cap id below, so its contract id is deliberately unbound.
-    let cid_serial = resolve(b"serial-console\0");
+    let cid_stream = resolve(b"io:stream\0");
     let cid_mount = resolve(b"fs:mount\0");
     let cid_dir = resolve(b"fs:dir\0");
     let _cid_physmem = resolve(b"physmem:allocation\0");
@@ -94,11 +96,11 @@ pub extern "C" fn _start() -> ! {
     // child); domain 100 falls through to the demo body below.
     let domain_id = get_domain_id();
     if domain_id != 100 {
-        worker(domain_id, cid_serial, cid_proc);
+        worker(domain_id, cid_stream, cid_proc);
     }
 
     // 1. Serial via cap (replaces ambient write).
-    puts_cap(CAP_SERIAL, cid_serial, b"Hello from ring 3 via serial cap!\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"Hello from ring 3 via serial cap!\n");
 
     // Yield through the proc:task node: parks this task; the scheduler runs
     // domain 101, then resumes us. The reply buffer is not written by a
@@ -108,9 +110,9 @@ pub extern "C" fn _start() -> ! {
     let _ = build_desc(&mut ydesc, CAP_PROC, cid_proc, hook_id("yield"), &[]);
     let yret = invoke(ydesc.as_ptr() as u64, yreply.as_ptr() as u64, 64);
     if yret == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] proc:task yield failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] proc:task yield failed\n");
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] yielded via proc:task, resumed\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] yielded via proc:task, resumed\n");
 
     let mut desc = [0u8; 512];
     let mut reply = [0u8; 4096];
@@ -123,135 +125,191 @@ pub extern "C" fn _start() -> ! {
         hook_id("mount"),
         &[DescArg::Str(b"tmpfs"), DescArg::U64(0)],
     );
-    let (_, ncaps, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_SERIAL, cid_serial);
+    let (_, ncaps, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
     if ncaps < 1 {
-        die(CAP_SERIAL, cid_serial, b"[init] mount: expected a cap\n");
+        die(CAP_STDOUT, cid_stream, b"[init] mount: expected a cap\n");
     }
     let dir_cap = read_u64(&reply, &mut cur);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] mounted A>\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] mounted A>\n");
 
     // 3. mkdir userland.
     let _ = build_desc(&mut desc, dir_cap, cid_dir, hook_id("mkdir"), &[DescArg::Str(b"userland")]);
-    let _ = invoke_reply(&mut desc, &mut reply, 4096, CAP_SERIAL, cid_serial);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] mkdir userland ok\n");
+    let _ = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] mkdir userland ok\n");
 
     // 4. label — the reply carries one Str value.
     let _ = build_desc(&mut desc, dir_cap, cid_dir, hook_id("label"), &[]);
-    let (nvalues, _, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_SERIAL, cid_serial);
+    let (nvalues, _, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
     if nvalues < 1 {
-        die(CAP_SERIAL, cid_serial, b"[init] label: expected a value\n");
+        die(CAP_STDOUT, cid_stream, b"[init] label: expected a value\n");
     }
     let tag = read_u64(&reply, &mut cur);
     if tag != TAG_STR && tag != TAG_BUF {
-        die(CAP_SERIAL, cid_serial, b"[init] label: expected a Str or Buf value\n");
+        die(CAP_STDOUT, cid_stream, b"[init] label: expected a Str or Buf value\n");
     }
     let slen = read_u64(&reply, &mut cur) as usize;
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] label: ");
-    print_str(CAP_SERIAL, cid_serial, &reply[cur..cur + slen]);
-    puts_cap(CAP_SERIAL, cid_serial, b"\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] label: ");
+    print_str(CAP_STDOUT, cid_stream, &reply[cur..cur + slen]);
+    puts_cap(CAP_STDOUT, cid_stream, b"\n");
 
     // 5. traverse into userland.
     let _ = build_desc(&mut desc, dir_cap, cid_dir, hook_id("traverse"), &[DescArg::Str(b"userland")]);
-    let (_, ncaps, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_SERIAL, cid_serial);
+    let (_, ncaps, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
     if ncaps < 1 {
-        die(CAP_SERIAL, cid_serial, b"[init] traverse: expected a cap\n");
+        die(CAP_STDOUT, cid_stream, b"[init] traverse: expected a cap\n");
     }
     let child_cap = read_u64(&reply, &mut cur);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] traversed to userland (cap ");
-    print_u64(CAP_SERIAL, cid_serial, child_cap);
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] traversed to userland (cap ");
+    print_u64(CAP_STDOUT, cid_stream, child_cap);
 
     // 6. Query the physmem surface.
     let query = b"total_frames\0";
     let frames = cap_query(CAP_PHYSMEM, query.as_ptr() as u64);
     if frames == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_query(total_frames) failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_query(total_frames) failed\n");
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] physmem total_frames: ");
-    print_u64(CAP_SERIAL, cid_serial, frames);
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] physmem total_frames: ");
+    print_u64(CAP_STDOUT, cid_stream, frames);
 
     // 7. Dup the serial cap and use it.
-    let dup_serial = cap_dup(CAP_SERIAL);
+    let dup_serial = cap_dup(CAP_STDOUT);
     if dup_serial == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_dup failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_dup failed\n");
     }
-    puts_cap(dup_serial, cid_serial, b"[init] via dup'd cap\n");
+    puts_cap(dup_serial, cid_stream, b"[init] via dup'd cap\n");
 
     // 8. Registry discovery — the reply carries two Str values (name, doc).
     let _ = build_desc(&mut desc, CAP_REGISTRY, cid_registry, hook_id("lookup"), &[DescArg::U64(cid_mount)]);
-    let (nvalues, _, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_SERIAL, cid_serial);
+    let (nvalues, _, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
     let mut i = 0;
     while i < nvalues {
         let tag = read_u64(&reply, &mut cur);
         if tag != TAG_STR {
-            die(CAP_SERIAL, cid_serial, b"[init] lookup: expected a Str value\n");
+            die(CAP_STDOUT, cid_stream, b"[init] lookup: expected a Str value\n");
         }
         let slen = read_u64(&reply, &mut cur) as usize;
-        puts_cap(CAP_SERIAL, cid_serial, &reply[cur..cur + slen]);
-        puts_cap(CAP_SERIAL, cid_serial, b"\n");
+        puts_cap(CAP_STDOUT, cid_stream, &reply[cur..cur + slen]);
+        puts_cap(CAP_STDOUT, cid_stream, b"\n");
         cur += slen;
         i += 1;
     }
 
     // 9. v2 user-boundary syscalls: domain id, clock, sleep.
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] domain id: ");
-    print_u64(CAP_SERIAL, cid_serial, get_domain_id());
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] wallclock secs: ");
-    print_u64(CAP_SERIAL, cid_serial, clock(0));
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] monotonic ns: ");
-    print_u64(CAP_SERIAL, cid_serial, clock(1));
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] sleeping 50ms...\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] domain id: ");
+    print_u64(CAP_STDOUT, cid_stream, get_domain_id());
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] wallclock secs: ");
+    print_u64(CAP_STDOUT, cid_stream, clock(0));
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] monotonic ns: ");
+    print_u64(CAP_STDOUT, cid_stream, clock(1));
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] sleeping 50ms...\n");
     sleep(50);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] woke up\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] woke up\n");
 
     // 10. cap_dup_limited: a full-mask copy writes; a READ-only copy is
-    // denied on a CALL hook (puts).
-    let full_dup = cap_dup_limited(CAP_SERIAL, RIGHT_INVOKE, CR_READ | CR_WRITE | CR_CALL);
+    // denied on a CALL hook (write).
+    let full_dup = cap_dup_limited(CAP_STDOUT, RIGHT_INVOKE, CR_READ | CR_WRITE | CR_CALL);
     if full_dup == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_dup_limited(full) failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_dup_limited(full) failed\n");
     }
-    puts_cap(full_dup, cid_serial, b"[init] via full-mask dup_limited cap\n");
+    puts_cap(full_dup, cid_stream, b"[init] via full-mask dup_limited cap\n");
 
-    let ro_dup = cap_dup_limited(CAP_SERIAL, RIGHT_INVOKE, CR_READ);
+    let ro_dup = cap_dup_limited(CAP_STDOUT, RIGHT_INVOKE, CR_READ);
     if ro_dup == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_dup_limited(ro) failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_dup_limited(ro) failed\n");
     }
     let mut d2 = [0u8; 512];
     let r2 = [0u8; 64];
-    let _ = build_desc(&mut d2, ro_dup, cid_serial, hook_id("puts"), &[DescArg::Buf(b"x\n")]);
+    let _ = build_desc(&mut d2, ro_dup, cid_stream, hook_id("write"), &[DescArg::Buf(b"x\n")]);
     let ret = invoke(d2.as_ptr() as u64, r2.as_ptr() as u64, 64);
     if ret == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] READ-only invoke: bad ptr\n");
+        die(CAP_STDOUT, cid_stream, b"[init] READ-only invoke: bad ptr\n");
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] READ-only puts status: ");
-    print_u64(CAP_SERIAL, cid_serial, read_u64(&r2, &mut 0));
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] (expect 2 = Denied)\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] READ-only write status: ");
+    print_u64(CAP_STDOUT, cid_stream, read_u64(&r2, &mut 0));
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] (expect 2 = Denied)\n");
 
     // 11. cap_revoke: a revoked dup answers -1 on query.
     let pm_dup = cap_dup(CAP_PHYSMEM);
     if pm_dup == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_dup(physmem) failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_dup(physmem) failed\n");
     }
     if cap_revoke(pm_dup) == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_revoke failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_revoke failed\n");
     }
     let q = cap_query(pm_dup, query.as_ptr() as u64);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] query on revoked cap: ");
-    print_u64(CAP_SERIAL, cid_serial, q);
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] (expect 18446744073709551615)\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] query on revoked cap: ");
+    print_u64(CAP_STDOUT, cid_stream, q);
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] (expect 18446744073709551615)\n");
 
     // 12. cap_read: full tagged read of total_frames.
     let rbuf = [0u8; 64];
     if cap_read(CAP_PHYSMEM, query.as_ptr() as u64, rbuf.as_ptr() as u64) == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_read failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_read failed\n");
     }
     if read_u64(&rbuf, &mut 0) != TAG_U64 {
-        die(CAP_SERIAL, cid_serial, b"[init] cap_read: expected U64\n");
+        die(CAP_STDOUT, cid_stream, b"[init] cap_read: expected U64\n");
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] cap_read(total_frames): ");
-    print_u64(CAP_SERIAL, cid_serial, read_u64(&rbuf, &mut 8));
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] cap_read(total_frames): ");
+    print_u64(CAP_STDOUT, cid_stream, read_u64(&rbuf, &mut 8));
 
-    // 13. Exit back into the kernel idle loop.
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] domain 100 done, exiting\n");
+    // 13. Stream I/O: write into own stdin, read the proc surface, consume it.
+    let _ = build_desc(
+        &mut desc,
+        CAP_STDIN,
+        cid_stream,
+        hook_id("write"),
+        &[DescArg::Buf(b"hello stdin")],
+    );
+    let _ = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
+
+    // cap_read(CAP_PROC, "stdin") shows the full input history.
+    let mut sbuf = [0u8; 256];
+    if cap_read(CAP_PROC, b"stdin\0".as_ptr() as u64, sbuf.as_ptr() as u64) == u64::MAX {
+        die(CAP_STDOUT, cid_stream, b"[init] cap_read(stdin) failed\n");
+    }
+    if read_u64(&sbuf, &mut 0) != TAG_BUF {
+        die(CAP_STDOUT, cid_stream, b"[init] cap_read(stdin): expected Buf\n");
+    }
+    let slen = read_u64(&sbuf, &mut 8) as usize;
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] proc stdin surface: ");
+    print_str(CAP_STDOUT, cid_stream, &sbuf[16..16 + slen]);
+    puts_cap(CAP_STDOUT, cid_stream, b"\n");
+
+    // Consume the history via the stdin stream's read hook.
+    let _ = build_desc(
+        &mut desc,
+        CAP_STDIN,
+        cid_stream,
+        hook_id("read"),
+        &[DescArg::U64(64)],
+    );
+    let (nvalues, _, mut cur) = invoke_reply(&mut desc, &mut reply, 4096, CAP_STDOUT, cid_stream);
+    if nvalues < 1 {
+        die(CAP_STDOUT, cid_stream, b"[init] stdin read: expected a value\n");
+    }
+    if read_u64(&reply, &mut cur) != TAG_BUF {
+        die(CAP_STDOUT, cid_stream, b"[init] stdin read: expected Buf\n");
+    }
+    let rlen = read_u64(&reply, &mut cur) as usize;
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] stdin read back: ");
+    print_str(CAP_STDOUT, cid_stream, &reply[cur..cur + rlen]);
+    puts_cap(CAP_STDOUT, cid_stream, b"\n");
+
+    // cap_read(CAP_PROC, "stdout") shows the full accumulated output.
+    let mut obuf = [0u8; 4096];
+    if cap_read(CAP_PROC, b"stdout\0".as_ptr() as u64, obuf.as_ptr() as u64) == u64::MAX {
+        die(CAP_STDOUT, cid_stream, b"[init] cap_read(stdout) failed\n");
+    }
+    if read_u64(&obuf, &mut 0) == TAG_BUF {
+        puts_cap(CAP_STDOUT, cid_stream, b"[init] proc stdout bytes: ");
+        print_u64(CAP_STDOUT, cid_stream, read_u64(&obuf, &mut 8));
+        puts_cap(CAP_STDOUT, cid_stream, b"\n");
+    } else {
+        puts_cap(CAP_STDOUT, cid_stream, b"[init] proc stdout: (overflow marker)\n");
+    }
+
+    // 14. Exit back into the kernel idle loop.
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] domain 100 done, exiting\n");
     unsafe {
         syscall(SYS_EXIT, 0, 0, 0);
     }
@@ -406,35 +464,35 @@ fn invoke_reply(
     desc: &mut [u8],
     reply: &mut [u8],
     reply_cap: u64,
-    serial_cap: u64,
-    cid_serial: u64,
+    out_cap: u64,
+    cid_stream: u64,
 ) -> (u64, u64, usize) {
     let ret = invoke(desc.as_ptr() as u64, reply.as_ptr() as u64, reply_cap);
     if ret == u64::MAX {
-        die(serial_cap, cid_serial, b"[init] invoke: bad descriptor/reply ptr\n");
+        die(out_cap, cid_stream, b"[init] invoke: bad descriptor/reply ptr\n");
     }
     let mut cur = 0;
     let status = read_u64(reply, &mut cur);
     if status != REPLY_OK {
-        puts_cap(serial_cap, cid_serial, b"[init] invoke status: ");
-        print_u64(serial_cap, cid_serial, status);
-        die(serial_cap, cid_serial, b"[init] invoke failed\n");
+        puts_cap(out_cap, cid_stream, b"[init] invoke status: ");
+        print_u64(out_cap, cid_stream, status);
+        die(out_cap, cid_stream, b"[init] invoke failed\n");
     }
     let nvalues = read_u64(reply, &mut cur);
     let ncaps = read_u64(reply, &mut cur);
     (nvalues, ncaps, cur)
 }
 
-/// Build and run a serial puts over a capability; ignores the reply.
-fn puts_cap(serial_cap: u64, cid_serial: u64, s: &[u8]) {
+/// Build and run a stream write over a capability; ignores the reply.
+fn puts_cap(cap: u64, cid_stream: u64, s: &[u8]) {
     let mut desc = [0u8; 512];
     let reply = [0u8; 64];
-    let _ = build_desc(&mut desc, serial_cap, cid_serial, hook_id("puts"), &[DescArg::Buf(s)]);
+    let _ = build_desc(&mut desc, cap, cid_stream, hook_id("write"), &[DescArg::Buf(s)]);
     let _ = invoke(desc.as_ptr() as u64, reply.as_ptr() as u64, 64);
 }
 
-/// Print a decimal u64 over a serial cap, followed by a newline.
-fn print_u64(cap: u64, cid: u64, mut v: u64) {
+/// Print a decimal u64 over an out cap, followed by a newline.
+fn print_u64(cap: u64, cid_stream: u64, mut v: u64) {
     let mut buf = [0u8; 20];
     let mut len = 0;
     if v == 0 {
@@ -453,18 +511,18 @@ fn print_u64(cap: u64, cid: u64, mut v: u64) {
         buf[len - 1 - i] = t;
         i += 1;
     }
-    puts_cap(cap, cid, &buf[..len]);
-    puts_cap(cap, cid, b"\n");
+    puts_cap(cap, cid_stream, &buf[..len]);
+    puts_cap(cap, cid_stream, b"\n");
 }
 
-/// Print raw bytes over a serial cap.
-fn print_str(cap: u64, cid: u64, s: &[u8]) {
-    puts_cap(cap, cid, s);
+/// Print raw bytes over an out cap.
+fn print_str(cap: u64, cid_stream: u64, s: &[u8]) {
+    puts_cap(cap, cid_stream, s);
 }
 
 /// Print a failure message and exit with status 1.
-fn die(serial_cap: u64, cid_serial: u64, msg: &[u8]) -> ! {
-    puts_cap(serial_cap, cid_serial, msg);
+fn die(out_cap: u64, cid_stream: u64, msg: &[u8]) -> ! {
+    puts_cap(out_cap, cid_stream, msg);
     unsafe {
         syscall(SYS_EXIT, 1, 0, 0);
     }
@@ -475,27 +533,27 @@ fn die(serial_cap: u64, cid_serial: u64, msg: &[u8]) -> ! {
 /// cooperative yield via the proc:task node at startup (safe: the main task is
 /// alive and queued), then a bounded sleep loop. Sleeps are always safe even if
 /// this is the last live task (the timer re-queues us).
-fn worker(domain_id: u64, cid_serial: u64, cid_proc: u64) -> ! {
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker task, domain id: ");
-    print_u64(CAP_SERIAL, cid_serial, domain_id);
+fn worker(domain_id: u64, cid_stream: u64, cid_proc: u64) -> ! {
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] worker task, domain id: ");
+    print_u64(CAP_STDOUT, cid_stream, domain_id);
 
     let mut wdesc = [0u8; 512];
     let wreply = [0u8; 64];
     let _ = build_desc(&mut wdesc, CAP_PROC, cid_proc, hook_id("yield"), &[]);
     let wret = invoke(wdesc.as_ptr() as u64, wreply.as_ptr() as u64, 64);
     if wret == u64::MAX {
-        die(CAP_SERIAL, cid_serial, b"[init] worker: yield failed\n");
+        die(CAP_STDOUT, cid_stream, b"[init] worker: yield failed\n");
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker: yielded, resumed\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] worker: yielded, resumed\n");
 
     let mut ticks: u64 = 0;
     while ticks < 30 {
-        puts_cap(CAP_SERIAL, cid_serial, b"[init] worker tick: ");
-        print_u64(CAP_SERIAL, cid_serial, ticks);
+        puts_cap(CAP_STDOUT, cid_stream, b"[init] worker tick: ");
+        print_u64(CAP_STDOUT, cid_stream, ticks);
         sleep(20);
         ticks += 1;
     }
-    puts_cap(CAP_SERIAL, cid_serial, b"[init] worker done, exiting\n");
+    puts_cap(CAP_STDOUT, cid_stream, b"[init] worker done, exiting\n");
     unsafe {
         syscall(SYS_EXIT, 0, 0, 0);
     }
