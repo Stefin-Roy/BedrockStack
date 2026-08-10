@@ -25,6 +25,8 @@ pub mod x86_64;
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
 
+use spin::Once;
+
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 
@@ -38,6 +40,23 @@ use msi::MsiAllocator;
 use dma::DmaAllocator;
 use pci_device::PciDeviceManager;
 use acpi::AcpiProvider;
+
+// ── Global KernelServices singleton ──────────────────────────────────
+//
+// Set once during `Kernel::init()` via `set_kernel_services`, then
+// retrievable from anywhere via `kernel_services_static()` (mirrors the
+// `dma_allocator_static()` pattern).  `spin::Once` guarantees
+// single-assignment; the `expect` only fires if a consumer races before
+// init, which is a kernel-internal init-order bug, not device data.
+static SERVICES: Once<&'static KernelServices> = Once::new();
+
+pub fn set_kernel_services(svc: &'static KernelServices) {
+    let _ = SERVICES.call_once(|| svc);
+}
+
+pub fn kernel_services_static() -> &'static KernelServices {
+    SERVICES.get().expect("KernelServices not set")
+}
 
 /// Container for all arch-independent kernel capability providers.
 ///

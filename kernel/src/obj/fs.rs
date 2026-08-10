@@ -479,7 +479,7 @@ impl Obj for MountNode {
             };
             // Handle tmpfs without a block device cap (CapabilityVfs step 3, §7.11)
             if fstype == "tmpfs" && id == 0 {
-                let mount = mount_into('A', || crate::filesystems::vfs::mount("tmpfs", None, 'A'))?;
+                let mount = mount_into('A', || crate::filesystems::vfs::mount("tmpfs", None, "A"))?;
                 let node: Arc<dyn Obj> = Arc::new(DirNode::new(mount.root.clone()));
                 object_store().register_with_id(node.obj_id(), node.kind(), None);
                 let child_rights = rights
@@ -502,7 +502,7 @@ impl Obj for MountNode {
                 .ok_or(ObjError::Denied)?;
             let device = block.device();
             let mount = mount_into('B', || {
-                crate::filesystems::partition::mount_first_partition(device, fstype, 'B')
+                crate::filesystems::partition::mount_first_partition(device, fstype, "B")
             })?;
             let node = Arc::new(DirNode::new(mount.root.clone()));
             object_store().register_with_id(node.obj_id(), node.kind(), None);
@@ -601,6 +601,7 @@ impl DirNode {
                 object_store().register_with_id(node.obj_id(), node.kind(), None);
                 Ok(CapHandle { id: CapId(0), node, rights: child_rights, state: HandleState::Live })
             }
+            _ => Err(ObjError::NotSupported),
         }
     }
 }
@@ -850,14 +851,14 @@ impl Obj for FileNode {
             let offset = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let data = arg_buf(args, 1).ok_or(ObjError::Denied)?;
             let mut buf = data.clone();
-            let bytes = self.inode.ops.read_at(offset, &mut buf).map_err(|_| ObjError::Denied)?;
+            let bytes = self.inode.ops.read(offset, &mut buf).map_err(|_| ObjError::Denied)?;
             return Ok(Reply::Data(vec![Value::U64(bytes as u64), Value::Buf(buf)]));
         }
         if hook == FILE_WRITE_AT {
             let offset = arg_u64(args, 0).ok_or(ObjError::Denied)?;
             let data = arg_buf(args, 1).ok_or(ObjError::Denied)?;
             let data_clone = data.clone();
-            let bytes = self.inode.ops.write_at(offset, &data_clone).map_err(|_| ObjError::Denied)?;
+            let bytes = self.inode.ops.write(offset, &data_clone).map_err(|_| ObjError::Denied)?;
             if offset + bytes as u64 > self.inode.size.load(Ordering::Relaxed) {
                 self.inode.size.store(offset + bytes as u64, Ordering::Relaxed);
             }
@@ -871,6 +872,7 @@ impl Obj for FileNode {
             let ft = match self.inode.file_type {
                 FileType::Directory => 1u64,
                 FileType::Regular => 0u64,
+                _ => 2u64,
             };
             let sz = self.inode.size.load(Ordering::Relaxed);
             return Ok(Reply::Data(vec![

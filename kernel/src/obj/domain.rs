@@ -1,41 +1,52 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
 use spin::Once;
 
 use super::table::CapabilityTable;
 use crate::mm::vmm::Vmm;
+use crate::ns::namespace::Namespace;
 
 /// An independent principal-in-the-small: an execution context holding its own
-/// capability table (§6).
+/// namespace (path→`FileOps` bindings) and, for non-kernel domains, its own
+/// address space (§6).
 ///
 /// Paged isolation (§8.14): a non-kernel domain also owns its own address
 /// space — a page-table root cloned from the kernel's higher half, empty in the
 /// low half — so two domains cannot reach each other's memory by position. The
 /// kernel (boot) domain is `addrspace = None` + `is_kernel = true`; it *is* the
 /// kernel's root and never switches CR3 away from it.
+///
+/// The capability table survives as a transitional field (kerneldump and the
+/// phase-6 deletions still read it) but is no longer endowed per task; the
+/// namespace is the operative endowment.
 pub struct Domain {
     pub table: CapabilityTable,
     pub id: u32,
     pub addrspace: Option<Vmm>,
     pub is_kernel: bool,
+    pub ns: Arc<Namespace>,
 }
 
 impl Domain {
-    pub const fn new(id: u32) -> Self {
+    pub fn new(id: u32) -> Self {
         Domain {
             table: CapabilityTable::new(),
             id,
             addrspace: None,
             is_kernel: false,
+            ns: Arc::new(Namespace::new()),
         }
     }
 
     /// Build a non-kernel domain with its own address space: a fresh root that
     /// inherits the kernel's higher-half mappings from `parent_root` (the
-    /// active kernel root) and starts with an empty low half (§8.14).
+    /// active kernel root) and starts with an empty low half (§8.14). `ns` is
+    /// the task's namespace (a `Namespace::child_of` snapshot of the kernel
+    /// root plus any per-task overlays).
     ///
     /// The clone deliberately SHARES the kernel root's PML4/PDPT subtrees (see
     /// `mm::vmm::clone_high_half`) rather than re-mapping the device windows
@@ -45,7 +56,7 @@ impl Domain {
     ///
     /// # Panics
     /// - On fatal memory shortage while cloning the page tables.
-    pub fn with_addrspace(id: u32, parent_root: u64) -> &'static Domain {
+    pub fn with_addrspace(id: u32, parent_root: u64, ns: Arc<Namespace>) -> &'static Domain {
         let alloc = crate::mm::heap::get_phys_allocator_mut();
         let root = crate::mm::vmm::clone_high_half(alloc, parent_root);
         let d: &'static Domain = Box::leak(Box::new(Domain {
@@ -53,6 +64,7 @@ impl Domain {
             id,
             addrspace: Some(Vmm::from_root(root)),
             is_kernel: false,
+            ns,
         }));
         d
     }

@@ -1,5 +1,5 @@
 use core::sync::atomic::{fence, Ordering};
-use crate::obj::clients::DmaClient;
+use crate::services::dma::DmaAllocator;
 
 pub const TRB_TYPE_NORMAL: u8 = 1;
 pub const TRB_TYPE_SETUP_STAGE: u8 = 2;
@@ -106,7 +106,7 @@ pub struct TrbRing {
 }
 
 impl TrbRing {
-    pub fn new(dma: DmaClient, size: usize) -> Result<Self, &'static str> {
+    pub fn new(dma: &'static dyn DmaAllocator, size: usize) -> Result<Self, &'static str> {
         let page_count = (size + 4095) / 4096;
         let buf = dma.alloc_contiguous(page_count).ok_or("OOM for TRB ring")?;
         let trb_count = (buf.size / 16) as u16;

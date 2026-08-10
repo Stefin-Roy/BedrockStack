@@ -9,7 +9,8 @@ pub mod context;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::filesystems::blockdriver::traits::BlockDevice;
-use crate::obj::clients::DmaClient;
+use crate::services::dma::{DmaAllocator, dma_allocator_static};
+use crate::services::msi::MsiAllocator;
 use crate::pci::PciDevice;
 use crate::services::dma::DmaBuffer;
 use crate::usb::class::driver::BoundUsbDevice;
@@ -44,7 +45,7 @@ struct XhciControllerState {
     slots: spin::Mutex<device::DeviceSlotManager>,
     cmd_ring: spin::Mutex<memory::TrbRing>,
     doorbell_va: u64,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     protocol_caps: Vec<ProtocolCap>,
 }
 
@@ -54,7 +55,7 @@ pub fn init_all(
     pci_devices: &[PciDevice],
 ) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
-    let dma = DmaClient::driver_dma();
+    let dma = dma_allocator_static();
     let mut usb_block_devices = Vec::new();
     for dev in pci_devices {
         if dev.class == 0x0C && dev.subclass == 0x03 && dev.prog_if == 0x30 {
@@ -82,7 +83,7 @@ pub fn init_all(
     usb_block_devices
 }
 
-fn init_controller(dev: &PciDevice, dma: DmaClient) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
     crate::pci::enable_device(dev);
@@ -293,7 +294,7 @@ fn bind_slot(
     slot: &mut device::DeviceSlot,
     cmd_ring: &mut memory::TrbRing,
     doorbell_va: u64,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
 ) -> Result<Vec<BoundUsbDevice>, &'static str> {
     use crate::drivers::serial::SerialPort;
     use crate::usb::class::driver::{EndpointResource, InterfaceResources, UsbClassDriver};
@@ -666,7 +667,7 @@ fn controller_reset(regs: &registers::XhciRegisters) {
     }
 }
 
-fn alloc_dcbaa(dma: DmaClient, max_slots: u8) -> Result<DmaBuffer, &'static str> {
+fn alloc_dcbaa(dma: &'static dyn DmaAllocator, max_slots: u8) -> Result<DmaBuffer, &'static str> {
     let bytes = (max_slots as usize + 1) * 8;
     let pages = (bytes + 4095) / 4096;
     let buf = dma.alloc_contiguous(pages).ok_or("OOM for DCBAA")?;
@@ -675,7 +676,7 @@ fn alloc_dcbaa(dma: DmaClient, max_slots: u8) -> Result<DmaBuffer, &'static str>
 }
 
 fn alloc_scratchpad_array(
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     spbuf_cnt: u16,
     ac64: bool,
 ) -> Result<DmaBuffer, &'static str> {
@@ -700,7 +701,7 @@ fn setup_interrupts(
     dev: &PciDevice,
     rt_va: u64,
     mmio_va: u64,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     _ac64: bool,
 ) -> Option<MsixFallback> {
     use crate::pci::caps;
@@ -718,7 +719,7 @@ fn setup_interrupts(
     // Try MSI-X first (more capable: per-vector masking, more entries).
     // Falls back to MSI if MSI-X fails.
     if let Some(cap) = msix_cap {
-        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
+        if let Some(vector) = crate::services::x86_64::x86_msi::msi_static().allocate_device_vector(event::xhci_irq_handler) {
             let info = crate::pci::msix::table_info(dev, cap);
             SerialPort::puts("[xhci] MSI-X BIR=");
             SerialPort::put_u64(info.bir as u64);
@@ -768,7 +769,7 @@ fn setup_interrupts(
 
     // Fallback: MSI
     if let Some(ref cap) = msi_cap {
-        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
+        if let Some(vector) = crate::services::x86_64::x86_msi::msi_static().allocate_device_vector(event::xhci_irq_handler) {
             crate::pci::msi::enable(dev, cap, vector, bsp_apic_id);
             crate::drivers::serial::SerialPort::puts("[xhci] MSI enabled\n");
             return None;
@@ -783,7 +784,7 @@ fn setup_interrupts(
     SerialPort::puts("\n");
 
     if dev.interrupt_line != 0 {
-        if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, event::xhci_irq_handler) {
+        if let Some(vector) = crate::services::x86_64::x86_msi::msi_static().allocate_device_vector(event::xhci_irq_handler) {
             if crate::platform::x86_64_pc::ioapic::enable_irq(
                 dev.interrupt_line as u32,
                 crate::acpi::Polarity::ActiveLow,
@@ -794,7 +795,7 @@ fn setup_interrupts(
                 }
                 crate::drivers::serial::SerialPort::puts("[xhci] INTX enabled\n");
             } else {
-                let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
+                crate::services::x86_64::x86_msi::msi_static().release_device_vector(vector);
             }
         }
     }
@@ -804,7 +805,7 @@ fn setup_interrupts(
 fn enumerate_initial_ports(
     usb_ports: &mut ports::UsbPorts,
     cmd_ring: &mut memory::TrbRing,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     doorbell_va: u64,
     ctx_size: u8,
     max_slots: u8,

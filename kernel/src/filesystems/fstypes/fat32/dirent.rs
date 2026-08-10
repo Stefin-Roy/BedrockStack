@@ -106,6 +106,10 @@ pub fn make_sfn_bytes(stem: &str, ext: &str) -> [u8; MAX_SFN_LEN] {
 
 pub fn sfn_from_name(name: &str, existing_sfns: &HashSet<[u8; MAX_SFN_LEN]>) -> Option<[u8; MAX_SFN_LEN]> {
     if name.is_empty() { return None; }
+    // `:` is the namespace path-component separator; it is invalid in FAT32
+    // filenames (and forbidden by the VFAT spec).  Reject it here so no
+    // create/mkdir/rename can smuggle a separator into an on-disk entry.
+    if name.bytes().any(|b| b == b':') { return None; }
     let (stem, ext) = if let Some(dot) = name.rfind('.') {
         if dot == 0 { ("", &name[1..]) } else { (&name[..dot], &name[dot + 1..]) }
     } else {

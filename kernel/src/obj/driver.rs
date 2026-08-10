@@ -55,7 +55,11 @@ const DRIVER_CONTRACT: ContractRights = ContractRights::READ.or(ContractRights::
 /// in the low half — so its memory is structurally unreachable from the boot
 /// domain's page tables and vice versa.
 pub fn create(parent_root: u64) {
-    let driver: &'static Domain = Domain::with_addrspace(1, parent_root);
+    let driver: &'static Domain = Domain::with_addrspace(
+        1,
+        parent_root,
+        alloc::sync::Arc::new(crate::ns::namespace::Namespace::new()),
+    );
 
     // Endow the driver domain by constructing its CapHandles directly from the
     // same provider nodes the boot domain was endowed with (§5.4); only the

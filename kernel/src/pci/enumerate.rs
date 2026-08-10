@@ -4,9 +4,10 @@ use alloc::vec::Vec;
 use spin::Once;
 
 use crate::pci::PciDevice;
+use crate::services::pci_config::PciConfigSpace;
 
-fn cfg() -> crate::obj::clients::PciCfgClient {
-    crate::obj::clients::PciCfgClient::driver_pci()
+fn cfg() -> &'static dyn PciConfigSpace {
+    crate::services::ecam_pci_config::ecam_static()
 }
 
 /// The discovered PCI device census — the interior of [`crate::pci::devices`]

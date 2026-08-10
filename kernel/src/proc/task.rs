@@ -22,6 +22,18 @@ pub const TASK_ZOMBIE: u8 = 2;
 /// the syscall's RAX value.
 pub type Continuation = fn(&mut UserFrame) -> u64;
 
+/// A physical range mapped into a task's own page tables via `/res/:map`
+/// (map-on-open). The frames are BORROWED from their donor — the task never
+/// owns them — so teardown must unmap the VAs (PTE clear only, no
+/// `alloc.free` on the frames) *before* `teardown_low_half` frees the
+/// genuinely-owned low-half (ELF + stack) frames. Detaching first means
+/// teardown_low_half never sees the borrowed PTEs and cannot double-free a
+/// donor frame.
+pub struct BorrowedRange {
+    pub va: u64,
+    pub size: u64,
+}
+
 /// A schedulable user task.
 ///
 /// The scheduler runs tasks cooperatively on the BSP: a task is either parked
@@ -85,6 +97,12 @@ pub struct Task {
     /// syscall path, consumed by the same path on re-entry, and flipped to
     /// `Done` by the device ISR completion callback (`wake_io_complete`).
     pub io_state: IrqLock<super::IoState>,
+    /// Borrowed physical ranges mapped into this task's tables via
+    /// `/res/:map` (map-on-open). The frames belong to their donors, not the
+    /// task; teardown unmaps these VAs (PTE clear only) before freeing the
+    /// genuinely-owned low-half frames. Ordering-exempt (order 0): touched
+    /// only from the syscall path.
+    pub borrowed: IrqLock<alloc::vec::Vec<BorrowedRange>>,
 }
 
 /// A task's parked registers and user RSP, stashed at every syscall entry.
@@ -134,6 +152,7 @@ impl Task {
                     rdi: 0,
                     rsi: 0,
                     rdx: 0,
+                    r8: 0,
                     r10: 1,
                 },
                 user_rsp,
@@ -146,6 +165,7 @@ impl Task {
             sleep_timer: IrqLock::new(None),
             joiners: IrqLock::with_order(alloc::vec::Vec::new(), lockorder::JOINERS),
             io_state: IrqLock::new(super::IoState::Idle),
+            borrowed: IrqLock::new(alloc::vec::Vec::new()),
         }
     }
 

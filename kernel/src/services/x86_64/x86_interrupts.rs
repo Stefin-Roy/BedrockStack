@@ -34,3 +34,8 @@ static X86_INTERRUPTS: X86Interrupts = X86Interrupts;
 pub fn init() -> &'static dyn InterruptManager {
     &X86_INTERRUPTS as &'static dyn InterruptManager
 }
+
+/// C5: return the concrete interrupt manager for direct (post-Phase-1) access.
+pub fn interrupts_static() -> &'static X86Interrupts {
+    &X86_INTERRUPTS
+}

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 use spin::Mutex;
 
 use super::traits::BlockDevice;
-use crate::obj::clients::DmaClient;
+use crate::services::dma::{DmaAllocator, dma_allocator_static};
 use crate::pci::PciDevice;
 
 pub trait StorageDriver: Send + Sync {
@@ -13,17 +13,15 @@ pub trait StorageDriver: Send + Sync {
     fn init_controller(
         &self,
         dev: &PciDevice,
-        dma: DmaClient,
+        dma: &'static dyn DmaAllocator,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str>;
 }
 
 static REGISTRY: Mutex<Vec<&'static dyn StorageDriver>> = Mutex::new(Vec::new());
 
-/// The block-device registry — INTERIOR of the `block:family` family root
-/// (`BlockFamilyNode`, obj/fs.rs §7.11.4). Reachable only by that node's
-/// `first`/`register` materialize hooks and the kernel bring-up registration
-/// path; consumers must go through the block-family capability, never this
-/// ambient list.
+/// The block-device registry — the ambient list consulted by
+/// `first_block_device()`, the VFS mount path, and the synthetic `/dev`
+/// tree.  Populated by `init_all` (bring-up) and `register_block_device`.
 pub(crate) static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
 
 pub fn register(driver: &'static dyn StorageDriver) {
@@ -42,7 +40,7 @@ pub fn init_all(
 
     register_all();
 
-    let dma = DmaClient::driver_dma();
+    let dma = dma_allocator_static();
 
     #[cfg(target_arch = "x86_64")]
     let results: Arc<spin::Mutex<Vec<Arc<dyn BlockDevice>>>> =

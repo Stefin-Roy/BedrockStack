@@ -1,41 +1,21 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use alloc::sync::Arc;
-use alloc::vec::Vec;
 use spin::Mutex;
 
-use super::error::VfsError;
 use super::irq::IrqMutex;
-use super::types::{DirEntry, FileType, Stat};
+use super::types::{FileType, Stat};
 
-pub trait InodeOps: Send + Sync {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError>;
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError>;
-    fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError>;
-    fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError>;
-    fn unlink(&self, name: &str) -> Result<(), VfsError>;
-    fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError>;
-    fn rmdir(&self, name: &str) -> Result<(), VfsError>;
-    fn readdir(&self) -> Result<Vec<DirEntry>, VfsError>;
-    fn getattr(&self) -> Result<Stat, VfsError>;
-    fn rename(&self, old_name: &str, new_name: &str) -> Result<(), VfsError>;
-    fn truncate(&self, len: u64) -> Result<(), VfsError>;
-    fn file_type(&self) -> FileType;
-    fn ino(&self) -> u64;
-    fn size(&self) -> u64;
-
-    /// Called by VFS before the inode is removed from the namespace (unlink,
-    /// rmdir).  The filesystem can mark the inode for deferred cleanup — the
-    /// inode won't be dropped until the last open handle is closed.
-    fn on_unlink(&self) {}
-}
+// Re-export the unified trait from file_ops.rs. `FileOps` is the canonical
+// name; `Inode` wraps an `Arc<dyn FileOps>`.
+pub use super::file_ops::{FileOps, OpDesc};
 
 pub struct InodeMeta {
     pub mtime: u64,
 }
 
 pub struct Inode {
-    pub ops: Arc<dyn InodeOps>,
+    pub ops: Arc<dyn FileOps>,
     pub ino: u64,
     pub file_type: FileType,
     pub size: AtomicU64,
@@ -44,14 +24,14 @@ pub struct Inode {
 }
 
 impl Inode {
-    pub fn new(ops: Arc<dyn InodeOps>) -> Self {
+    pub fn new(ops: Arc<dyn FileOps>) -> Self {
         let ino = ops.ino();
-        let file_type = ops.file_type();
+        let file_kind = ops.file_kind();
         let size = ops.size();
         Inode {
             ops,
             ino,
-            file_type,
+            file_type: file_kind,
             size: AtomicU64::new(size),
             meta: IrqMutex::new(InodeMeta { mtime: 0 }),
             append_lock: Mutex::new(()),

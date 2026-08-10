@@ -11,7 +11,6 @@ pub mod adapters;
 pub mod bootstrap;
 pub mod devices;
 pub mod cap_handle;
-pub mod clients;
 pub mod contract;
 pub mod domain;
 pub mod driver;

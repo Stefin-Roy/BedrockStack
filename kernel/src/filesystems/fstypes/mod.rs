@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::InodeOps;
+use crate::filesystems::vfs::file_ops::FileOps;
 use crate::filesystems::vfs::superblock::SuperBlock;
 
 pub mod tmpfs;
@@ -13,7 +13,7 @@ pub mod fat32;
 pub trait FileSystem: Send + Sync {
     fn name(&self) -> &str;
     fn mount(&self, device: Option<Arc<dyn BlockDevice>>)
-        -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>;
+        -> Result<(Arc<SuperBlock>, Arc<dyn FileOps>), VfsError>;
 }
 
 static REGISTRY: Mutex<Vec<&'static dyn FileSystem>> = Mutex::new(Vec::new());

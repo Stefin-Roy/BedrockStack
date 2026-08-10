@@ -129,7 +129,7 @@ pub fn probe(device: Arc<dyn BlockDevice>) -> Result<PartitionTable, &'static st
 pub fn mount_first_partition(
     device: Arc<dyn BlockDevice>,
     fstype: &str,
-    drive: char,
+    name: &str,
 ) -> Result<Arc<DriveMount>, VfsError> {
     let table = probe(device.clone()).map_err(|_| VfsError::InvalidDevice)?;
     let info = table
@@ -138,7 +138,7 @@ pub fn mount_first_partition(
         .find(|p| !p.is_extended)
         .ok_or(VfsError::NotFound)?;
     let part_dev = PartitionDevice::new(device, info);
-    vfs::mount(fstype, Some(Arc::new(part_dev)), drive)
+    vfs::mount(fstype, Some(Arc::new(part_dev)), name)
 }
 
 fn read_sector(device: &dyn BlockDevice, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {

@@ -4,9 +4,10 @@ use super::bar::Bar;
 use super::caps::{self, PciCapability};
 use super::PciDevice;
 use crate::drivers::serial::SerialPort;
+use crate::services::pci_config::PciConfigSpace;
 
-fn cfg() -> crate::obj::clients::PciCfgClient {
-    crate::obj::clients::PciCfgClient::driver_pci()
+fn cfg() -> &'static dyn PciConfigSpace {
+    crate::services::ecam_pci_config::ecam_static()
 }
 
 /// MSI-X Message Control register bits (capability offset +2).

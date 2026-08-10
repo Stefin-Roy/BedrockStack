@@ -52,9 +52,7 @@ use crate::mm::elf::{self, ElfError};
 use crate::mm::heap;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
-use crate::obj::cap_handle::{CapHandle, CapId, HandleState};
 use crate::obj::domain::{self, Domain};
-use crate::obj::rights::{CapRights, ContractRights, Rights};
 use crate::services::irqsafe::IrqLock;
 use crate::services::lockorder;
 use crate::services::universal_timer::{
@@ -103,50 +101,6 @@ static NEXT_TASK_ID: AtomicU32 = AtomicU32::new(TASK_WORKER_ID + 1);
 
 fn next_task_id() -> u32 {
     NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed)
-}
-
-/// The capability endowment handed to a task at creation.
-///
-/// The process ABI is positional: the first eleven slots of the task domain's
-/// table are these capabilities, in insertion order (0=stdin, 1=stdout,
-/// 2=stderr, 3=mount, 4=registry, 5=physmem, 6=heap, 7=addrspace, 8=block,
-/// 9=table, 10=proc).
-///
-/// Slots 0/1/2 are fresh per-task `io:stream` nodes: stdin is an `Input`-kind
-/// stream, stdout/stderr are `Serial`-kind streams that echo writes to the
-/// console. The fd 0/1/2 write path in `sys_write` routes through them.
-///
-/// Slot 9 is a `TableNode` over the process's OWN table, endowed with
-/// INVOKE|QUERY only (no REVOKE), so `delegate` moves the process's own caps
-/// and family cascade-revocation is unreachable from ring 3. Slot 10 is the
-/// `proc:task` root node (spawn/yield/kill/join), the Phase A multitask seam.
-///
-/// The 5/7 pair is hardened: slot 5 (physmem) is attuned to READ|CALL only
-/// (no provider `free`/`reserve`), and slot 7 (addrspace) is NOT a copy of the
-/// boot domain's kernel-root cap — it is a per-task `AddressSpaceNode` over
-/// the task's own cloned root, confined to the low half and to physical frames
-/// the task holds `mem:region` caps for. A ring-3 process can never map into,
-/// protect, or unmap the kernel's page tables.
-#[derive(Clone, Copy)]
-pub struct ProcessEndowment {
-    pub stdin: CapId,
-    pub stdout: CapId,
-    pub stderr: CapId,
-    pub mount: CapId,
-    pub registry: CapId,
-    pub physmem: CapId,
-    pub heap: CapId,
-    pub addrspace: CapId,
-    pub block: CapId,
-    pub table: CapId,
-    pub proc: CapId,
-}
-
-static PROCESS_ENDOWMENT: Once<ProcessEndowment> = Once::new();
-
-/// The init (task 100) process's capability endowment, once booted.
-pub fn process_endowment() -> &'static ProcessEndowment {
-    PROCESS_ENDOWMENT.get().expect("process endowment not set")
 }
 
 // ── Scheduler state ────────────────────────────────────────────────────
@@ -346,138 +300,29 @@ pub fn ap_main(cpu: u32) -> ! {
     schedule_cpu(cpu)
 }
 
-/// Endow a fresh task domain with the eleven positional process capabilities.
-fn endow_task(
-    domain: &'static Domain,
-) -> Result<(ProcessEndowment, Arc<StreamNode>, Arc<StreamNode>, Arc<StreamNode>), ()> {
-    let boot = crate::obj::bootstrap::boot_domain();
-    let boot_end = crate::obj::bootstrap::boot_endowment();
-
-    // Stream slots 0/1/2: fresh per-task io:stream nodes. stdin is an
-    // Input-kind stream; stdout/stderr are Serial-kind streams that echo
-    // writes to the console.
-    let stdin = StreamNode::new(StreamRole::Stdin, StreamKind::Input);
-    let stdout = StreamNode::new(StreamRole::Stdout, StreamKind::Serial);
-    let stderr = StreamNode::new(StreamRole::Stderr, StreamKind::Serial);
-    let stream_rights = CapRights::new(
-        Rights::INVOKE.or(Rights::QUERY),
-        ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-    );
-    let stdin_cap = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stdin) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-    let stdout_cap = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stdout) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-    let stderr_cap = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stderr) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-
-    let mount = boot.table.delegate(&domain.table, boot_end.mount).map_err(|_| ())?;
-    let registry = boot.table.delegate(&domain.table, boot_end.registry).map_err(|_| ())?;
-    // physmem: attuned to READ|CALL only — no WRITE, so a ring-3 process can
-    // never reach the provider-level `free`/`reserve` hooks (both WRITE-gated);
-    // it keeps alloc_frames/alloc_contiguous (CALL) and stats (READ). The
-    // frames it allocates come back as mem:region caps (READ|WRITE) that it
-    // can still free through the region's own `free` hook.
-    let physmem = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: crate::obj::nodes::phys_mem_node(),
-        rights: CapRights::new(
-            Rights::INVOKE.or(Rights::QUERY),
-            ContractRights::READ.or(ContractRights::CALL),
-        ),
-        state: HandleState::Live,
-    });
-    let heap_cap = boot.table.delegate(&domain.table, boot_end.heap).map_err(|_| ())?;
-    // addrspace: NOT a delegation of the boot domain's cap (which wraps the
-    // SHARED KERNEL root). Each task gets an AddressSpaceNode over its OWN
-    // cloned root, confined to the low half and to frames it holds mem:region
-    // caps for — a ring-3 process can never map into the kernel's page tables.
-    let addrspace = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::new(crate::obj::nodes::AddressSpaceNode::task(
-            domain.page_root().ok_or(())?,
-        )),
-        rights: CapRights::new(
-            Rights::INVOKE.or(Rights::QUERY),
-            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-        ),
-        state: HandleState::Live,
-    });
-    let block = boot.table.delegate(&domain.table, boot_end.block).map_err(|_| ())?;
-    // The process's own table node (not boot's): `delegate` operates on the
-    // process's own caps, and no REVOKE is granted, so a ring-3 process can
-    // never cascade-sever a family or re-delegate boot's capabilities.
-    let table = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: crate::obj::table::table_node(&domain.table),
-        rights: CapRights::new(
-            Rights::INVOKE.or(Rights::QUERY),
-            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-        ),
-        state: HandleState::Live,
-    });
-    // The proc:task root node: spawn/yield/kill/join on the caller task.
-    let proc = domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: contracts::proc_root_node(),
-        rights: CapRights::new(
-            Rights::INVOKE.or(Rights::QUERY),
-            ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-        ),
-        state: HandleState::Live,
-    });
-    Ok((
-        ProcessEndowment {
-            stdin: stdin_cap,
-            stdout: stdout_cap,
-            stderr: stderr_cap,
-            mount,
-            registry,
-            physmem,
-            heap: heap_cap,
-            addrspace,
-            block,
-            table,
-            proc,
-        },
-        stdin,
-        stdout,
-        stderr,
-    ))
-}
-
 /// Spawn a boot task (init or worker) from the same init binary.
+///
+/// The task's namespace is a `child_of` snapshot of the kernel-root namespace
+/// (dev/mem/irq/mnt/pci/tasks/proc/console/res + A/esp mounts). Streams are
+/// fresh per task and addressed via the per-caller `:N` self-root.
 fn spawn_task(
     id: u32,
     data: &[u8],
     alloc: &mut BitmapAllocator,
     kernel_root: u64,
 ) -> Result<Arc<Task>, &'static str> {
-    let domain = Domain::with_addrspace(id, kernel_root);
+    let ns = crate::ns::namespace::Namespace::child_of(&crate::ns::kernel_root_namespace());
+    let domain = Domain::with_addrspace(id, kernel_root, ns);
     domain::register_domain(domain);
 
-    let (endowment, stdin, stdout, stderr) = endow_task(domain).map_err(|_| "endowment failed")?;
+    let stdin = StreamNode::new(StreamRole::Stdin, StreamKind::Input);
+    let stdout = StreamNode::new(StreamRole::Stdout, StreamKind::Serial);
+    let stderr = StreamNode::new(StreamRole::Stderr, StreamKind::Serial);
 
     // Boot priorities differ so the level-2 and level-1 paths are both
     // exercised: init (the demo) runs at 2, the worker at 1.
     let priority = if id == TASK_INIT_ID { 2 } else { 1 };
-    let task = build_task(id, priority, domain, data, alloc, stdin, stdout, stderr)?;
-
-    if id == TASK_INIT_ID {
-        PROCESS_ENDOWMENT.call_once(|| endowment);
-    }
-    Ok(task)
+    build_task(id, priority, domain, data, alloc, stdin, stdout, stderr)
 }
 
 /// Load a task's ELF + user stack into `domain` and enqueue it.
@@ -568,6 +413,17 @@ pub(crate) fn current_task() -> Option<Arc<Task>> {
         return None;
     }
     current_task_option()
+}
+
+/// Snapshot of every task ever spawned (append-only registry).  Used by the
+/// synthetic `/tasks` tree; each returned `Arc` keeps the TCB alive.
+pub(crate) fn task_snapshot() -> alloc::vec::Vec<Arc<Task>> {
+    scheduler().all_tasks.lock().clone()
+}
+
+/// Find a task by id in the append-only registry.
+pub(crate) fn task_by_id(id: u32) -> Option<Arc<Task>> {
+    scheduler().all_tasks.lock().iter().find(|t| t.id == id).cloned()
 }
 
 /// The currently executing task (kernel-bug panic if none).
@@ -879,6 +735,7 @@ unsafe extern "C" fn resume_user(_frame: *const UserFrame) -> ! {
         "mov rax, [rdi + {rax_off}]",
         "mov rdx, [rdi + {rdx_off}]",
         "mov rsi, [rdi + {rsi_off}]",
+        "mov r8,  [rdi + {r8_off}]",
         "mov r10, [rdi + {r10_off}]",
         "mov rbx, [rdi + {rbx_off}]",
         "mov rbp, [rdi + {rbp_off}]",
@@ -895,6 +752,7 @@ unsafe extern "C" fn resume_user(_frame: *const UserFrame) -> ! {
         rax_off = const offset_of!(UserFrame, rax),
         rdx_off = const offset_of!(UserFrame, rdx),
         rsi_off = const offset_of!(UserFrame, rsi),
+        r8_off = const offset_of!(UserFrame, r8),
         r10_off = const offset_of!(UserFrame, r10),
         rbx_off = const offset_of!(UserFrame, rbx),
         rbp_off = const offset_of!(UserFrame, rbp),
@@ -941,11 +799,11 @@ pub fn wake_io_complete(task: &Arc<Task>, outcome: IoOutcome) {
 
 // ── Ring-3 spawn (proc:task `spawn` hook) ──────────────────────────────
 
-/// Spawn a child task from an ELF image. The child inherits what the parent
-/// held: every live cap handle except the parent's own standard streams is
-/// delegated into the child's table, and the child gets its own address space
-/// (fresh higher-half clone), stack, and three fresh `io:stream` nodes at
-/// slots 0/1/2.
+/// Spawn a child task from an ELF image. The child gets its own address space
+/// (fresh higher-half clone), stack, and three fresh `io:stream` nodes (bound
+/// on as the task's self:0/1/2 streams by `build_task`). Inheritance is now
+/// namespace-based: the child takes a `Namespace::child_of` snapshot of the
+/// kernel-root namespace rather than a positional cap-table delegation.
 pub(crate) fn spawn_child(
     elf_data: &[u8],
 ) -> Result<(Arc<Task>, Arc<StreamNode>, Arc<StreamNode>, Arc<StreamNode>), crate::obj::ObjError> {
@@ -953,52 +811,13 @@ pub(crate) fn spawn_child(
     let id = next_task_id();
     let parent = current_task_arc("spawn");
 
-    let domain = Domain::with_addrspace(id, kernel_root);
+    let ns = crate::ns::namespace::Namespace::child_of(&crate::ns::kernel_root_namespace());
+    let domain = Domain::with_addrspace(id, kernel_root, ns);
     domain::register_domain(domain);
 
-    // The child's fresh standard streams land at slots 0/1/2 before the
-    // parent-cap delegation below fills slots 3..N (same positional ABI as a
-    // boot task).
     let stdin = StreamNode::new(StreamRole::Stdin, StreamKind::Input);
     let stdout = StreamNode::new(StreamRole::Stdout, StreamKind::Serial);
     let stderr = StreamNode::new(StreamRole::Stderr, StreamKind::Serial);
-    let stream_rights = CapRights::new(
-        Rights::INVOKE.or(Rights::QUERY),
-        ContractRights::READ.or(ContractRights::WRITE).or(ContractRights::CALL),
-    );
-    domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stdin) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-    domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stdout) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-    domain.table.insert(CapHandle {
-        id: CapId(0),
-        node: Arc::clone(&stderr) as Arc<dyn crate::obj::Obj>,
-        rights: stream_rights,
-        state: HandleState::Live,
-    });
-
-    // Inherit the parent's capability table: clone every live handle, in slot
-    // order (the child's slots 3..N mirror the parent's slots 3..N). No
-    // amplification — delegation copies the held rights and state. The
-    // parent's own stream slots (0/1/2) are skipped: the child's are fresh.
-    for (cap_id, _, _, _) in parent.domain.table.snapshot() {
-        if cap_id.0 <= 2 {
-            continue;
-        }
-        parent
-            .domain
-            .table
-            .delegate(&domain.table, cap_id)
-            .map_err(|_| crate::obj::ObjError::OutOfMemory)?;
-    }
 
     let task = build_task(
         id,
@@ -1015,19 +834,19 @@ pub(crate) fn spawn_child(
     Ok((task, stdin, stdout, stderr))
 }
 
-/// Read the init binary from the mounted ESP (B:\EFI\BEDROCK\INIT).
+/// Read the init binary from the mounted ESP (/mnt/esp/EFI/BEDROCK/INIT).
 fn read_init_from_esp() -> Result<Vec<u8>, &'static str> {
-    use crate::filesystems::vfs::inode::InodeOps;
+    use crate::filesystems::vfs::inode::FileOps;
 
-    // Get the mounted B: drive (ESP).
-    let mount = crate::filesystems::vfs::get_mount('B').ok_or("B: not mounted")?;
+    // Get the mounted ESP.
+    let mount = crate::filesystems::vfs::get_mount("esp").ok_or("esp not mounted")?;
 
     // Get root inode ops from the mount's root dentry.
     let root_inode = mount.root.inode.lock();
     let root_inode_arc = root_inode.as_ref().ok_or("no root inode")?;
-    let root_ops: &dyn InodeOps = &*root_inode_arc.ops;
+    let root_ops: &dyn FileOps = &*root_inode_arc.ops;
 
-    // Walk B:\EFI\BEDROCK\INIT.
+    // Walk /mnt/esp/EFI/BEDROCK/INIT.
     let efi = root_ops.lookup("EFI").map_err(|_| "EFI not found")?;
     let bedrock = efi.lookup("BEDROCK").map_err(|_| "BEDROCK not found")?;
     let init = bedrock.lookup("INIT").map_err(|_| "INIT not found")?;
@@ -1038,7 +857,7 @@ fn read_init_from_esp() -> Result<Vec<u8>, &'static str> {
     }
 
     let mut data = alloc::vec![0u8; size];
-    init.read_at(0, &mut data).map_err(|_| "read failed")?;
+    init.read(0, &mut data).map_err(|_| "read failed")?;
 
     Ok(data)
 }

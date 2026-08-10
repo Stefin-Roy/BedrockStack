@@ -7,7 +7,7 @@
 //! job is ever stranded when the scheduler takes over.
 //!
 //! Jobs are plain `FnOnce` closures.  Every piece of shared state they touch
-//! (DmaClient, ioapic, obj tables, serial, the DMA VA cursor) is already
+//! (the DMA allocator, ioapic, obj tables, serial, the DMA VA cursor) is already
 //! lock-guarded, and the MMIO/DMA mappings they create land in the shared
 //! kernel-root page tables every CPU runs under — page-table mutation there is
 //! serialized by the VMM-wide `PAGE_TABLE` lock, so concurrent jobs cannot race

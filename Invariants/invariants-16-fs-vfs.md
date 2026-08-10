@@ -188,3 +188,6 @@ superblock's `shutdown()` before dropping the drive.
   (`CrossDeviceLink` error).
 - The `.` and `..` entries in `readdir()` are synthesized, not stored
   in the filesystem.
+
+
+Critical FAT32 fact: FAT32 inode read/write are fully synchronous (fat32/io.rs read_sectors/write_sectors call device.submit). No async read path in FAT32/tmpfs inodes. Park-on-read (IoState/park_async_retry) applies to stdin/join/irq/block-op files; FAT32 sys_read stays synchronous (same as boot's read_init_from_esp).

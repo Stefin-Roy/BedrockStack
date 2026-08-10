@@ -1,4 +1,5 @@
 use super::PciDevice;
+use crate::services::pci_config::PciConfigSpace;
 
 pub const CAP_MSI: u8 = 0x05;
 pub const CAP_MSIX: u8 = 0x11;
@@ -15,8 +16,8 @@ pub struct PciCapability {
 
 /// Walk the capabilities list for a given device.
 /// Returns all capabilities found, in list order.
-fn cfg() -> crate::obj::clients::PciCfgClient {
-    crate::obj::clients::PciCfgClient::driver_pci()
+fn cfg() -> &'static dyn PciConfigSpace {
+    crate::services::ecam_pci_config::ecam_static()
 }
 
 pub fn all(dev: &PciDevice) -> alloc::vec::Vec<PciCapability> {

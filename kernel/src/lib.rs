@@ -16,6 +16,7 @@ pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
 pub mod mm;
+pub mod ns;
 pub mod obj;
 pub mod pci;
 pub mod platform;
@@ -251,6 +252,7 @@ impl Kernel {
         ));
         let svc_static: &'static crate::services::KernelServices = alloc::boxed::Box::leak(svc);
         self.services = Some(svc_static);
+        crate::services::set_kernel_services(svc_static);
 
         // C5 — RootGraph bootstrap: create the Boot domain, mint the primitive
         // family roots, and endow the real service providers as capabilities
@@ -260,11 +262,15 @@ impl Kernel {
         crate::obj::domain::register_domain(crate::obj::bootstrap::boot_domain());
         crate::obj::domain::register_domain(crate::obj::driver::driver_domain());
 
+        // Bind the kernel-root namespace: the static synthetic trees (dev,
+        // mem, irq, mnt, pci, tasks, proc, console, res). Every task inherits
+        // a snapshot of this at spawn; the concrete mount roots (A, esp) are
+        // added later in `run()` once the boot mounts exist.
+        crate::ns::init_kernel_root();
+
         // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
-        // NX) VM-backed allocation. Runs AFTER bootstrap so the allocation is
-        // routed through the Boot domain's Heap family-root capability (§7.10.2)
-        // instead of a raw kernel-heap call. Nothing dereferences the display
-        // until `run()`.
+        // NX) VM-backed allocation via direct kernel-heap alloc. Nothing
+        // dereferences the display until `run()`.
         self.init_framebuffer_shadow();
 
         // Initialise SMP — discover and start Application Processors.
@@ -283,60 +289,26 @@ impl Kernel {
         crate::drivers::serial::SerialPort::puts("[obj] bootstrap self-revoke: mint authority returned to Principal\n");
     }
 
-    /// Phase D: allocate the framebuffer shadow buffer on the heap and bind it.
+    /// Phase D: allocate the framebuffer shadow buffer on the kernel heap and bind it.
     ///
     /// The shadow lives in the guard-mapped, NX heap arena rather than as raw
     /// contiguous physical frames, so the display path never dereferences a
     /// physical address. The allocation is deliberately leaked: it is needed
     /// for the lifetime of the kernel and `Framebuffer` keeps no ownership.
     ///
-    /// The allocation is routed through the Boot domain's Heap family root
-    /// (§7.10.2): invoke `heap:alloc`, recover the `mem:region` capability it
-    /// replies, and read its base. The block is a kernel-heap `MemRegion`, so
-    /// its base is already the virtual address of the guard-mapped arena —
-    /// exactly what `Framebuffer::set_shadow_va` expects. If the cap-mediated
-    /// path ever fails (e.g. pool exhaustion), we fall back to a plain kernel
-    /// allocation so display stays available; both leaks are deliberate.
+    /// The allocation goes directly through the kernel's global heap allocator
+    /// (`mm::heap::HeapAllocator`, the `#[global_allocator]`), which routes
+    /// growth through the VMM-backed arena set up in `init()`. The shadow
+    /// starts zeroed so the first un-drawn frame is black, not stale heap.
     fn init_framebuffer_shadow(&mut self) {
-        use crate::obj::bootstrap::{boot_domain, boot_endowment};
-        use crate::obj::memregion::{MEM_REGION_BASE, MEM_REGION_CONTRACT};
-        use crate::obj::nodes::{HEAP_ALLOC, HEAP_CONTRACT};
-        use crate::obj::{Args, Reply, Value, invoke};
-
         let size = self.framebuffer.lock().total_bytes();
-        let align = 8u64;
-        let args = Args { vals: alloc::vec![Value::U64(size as u64), Value::U64(align)] };
-        let table = &boot_domain().table;
-        let va = match invoke(table, boot_endowment().heap, HEAP_CONTRACT, HEAP_ALLOC, &args) {
-            Ok(Reply::Caps(caps)) if caps.len() == 1 => {
-                let region_id = caps[0].id;
-                match invoke(table, region_id, MEM_REGION_CONTRACT, MEM_REGION_BASE, &Args::none()) {
-                    Ok(Reply::Data(vals)) if vals.len() == 1 => match &vals[0] {
-                        Value::U64(base) => {
-                            // Preserve the old behaviour: the shadow starts
-                            // zeroed so the first un-drawn frame is black, not
-                            // stale heap.
-                            unsafe { core::ptr::write_bytes(*base as *mut u8, 0, size) };
-                            log::info!("framebuffer shadow: {size} B via heap cap @ {base:#x}");
-                            Some(*base)
-                        }
-                        _ => None,
-                    },
-                    _ => None,
-                }
-            }
-            _ => None,
-        };
-        let va = match va {
-            Some(va) => va,
-            None => {
-                log::warn!("framebuffer shadow: heap-cap path failed; falling back");
-                let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
-                let va = shadow.as_mut_ptr() as u64;
-                core::mem::forget(shadow);
-                va
-            }
-        };
+        log::info!("framebuffer shadow: {size} B via direct heap alloc");
+        // Direct kernel-heap allocation: the global allocator (set up in
+        // `heap::init` during `init()`) serves this from the guard-mapped,
+        // NX heap arena — exactly what `Framebuffer::set_shadow_va` expects.
+        let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
+        let va = shadow.as_mut_ptr() as u64;
+        core::mem::forget(shadow);
         self.framebuffer.lock().set_shadow_va(va);
     }
 
@@ -473,16 +445,14 @@ impl Kernel {
             block_devices.extend(usb_block_devices);
         }
 
-        // A: tmpfs mount via mount cap (CapabilityVfs step 5, §7.11 — no ambient VFS remaining)
+        // A: tmpfs mount via direct VFS API (Phase 2: no capability endowment)
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         {
             crate::filesystems::fstypes::register_all();
 
             // Bring-up registration: push every discovered block device
-            // (AHCI + the xHCI-attached ones merged above) into the
-            // block-family interior through the `register` hook — the
-            // family node materializes later from its own interior, never an
-            // ambient list (§7.11.4).
+            // (AHCI + the xHCI-attached ones merged above) directly into
+            // BLOCK_DEVICES for direct access by first_block_device().
             #[cfg(target_arch = "x86_64")]
             {
                 for dev in block_devices.iter() {
@@ -490,79 +460,46 @@ impl Kernel {
                 }
             }
 
-            let table = &crate::obj::bootstrap::boot_domain().table;
-            let boot_end = crate::obj::bootstrap::boot_endowment();
-            let args = crate::obj::Args {
-                vals: alloc::vec![crate::obj::Value::Str("tmpfs"), crate::obj::Value::U64(0)],
-            };
-            match crate::obj::invoke(
-                table,
-                boot_end.mount,
-                crate::obj::fs::MOUNT_CONTRACT,
-                crate::obj::fs::MOUNT_HOOK,
-                &args,
-            ) {
-                Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => {
-                    log::info!("Mounted A> (tmpfs, via mount cap)");
+            match crate::filesystems::vfs::mount("tmpfs", None, "A") {
+                Ok(_mount) => {
+                    log::info!("Mounted A> (tmpfs)");
                     #[cfg(feature = "selftest")]
                     {
-                        // Create a test directory via the DirNode cap so fs-walk
-                        // has something to exercise (CapabilityVfs step 3, §7.12.3).
-                        let dir_cap = caps[0].id;
-                        let mkdir_args = crate::obj::Args {
-                            vals: alloc::vec![crate::obj::Value::Str("tmp")],
-                        };
-                        match crate::obj::invoke(
-                            table,
-                            dir_cap,
-                            crate::obj::fs::DIR_CONTRACT,
-                            crate::obj::fs::DIR_MKDIR,
-                            &mkdir_args,
-                        ) {
-                            Ok(crate::obj::Reply::Caps(_)) => log::info!("Created A>tmp via DirNode mkdir cap"),
-                            Ok(_) => log::warn!("mkdir A>tmp via cap: unexpected reply"),
-                            Err(e) => log::warn!("mkdir A>tmp via cap failed: {:?}", e),
+                        // Create a test directory via the VFS inode ops so
+                        // fs-walk has something to exercise.  The VFS exposes
+                        // `FileOps::mkdir` reachable through the mount's root
+                        // dentry, so there is no need to go through a cap here.
+                        let inode_guard = _mount.root.inode.lock();
+                        match inode_guard.as_ref() {
+                            Some(inode) => match inode.ops.mkdir("tmp") {
+                                Ok(_) => log::info!("Created A>tmp via VFS mkdir"),
+                                Err(e) => log::warn!("mkdir A>tmp via VFS failed: {:?}", e),
+                            },
+                            None => log::warn!("mkdir A>tmp: root inode missing"),
                         }
                     }
                 }
-                _ => log::warn!("A> tmpfs mount via cap failed"),
+                Err(e) => log::warn!("A> tmpfs mount via VFS failed: {:?}", e),
             }
         }
 
-        // Mount the ESP via block-family + fs:mount caps (CapabilityVfs step 2, §7.11)
+        // Mount the ESP via direct VFS API (Phase 2: no capability endowment)
         #[cfg(target_arch = "x86_64")]
         {
-            let table = &crate::obj::bootstrap::boot_domain().table;
-            let boot_end = crate::obj::bootstrap::boot_endowment();
-            let mounted = (|| {
-                let first = match crate::obj::invoke(
-                    table, boot_end.block,
-                    crate::obj::fs::BLOCK_FAMILY_CONTRACT,
-                    crate::obj::fs::BLOCK_FAMILY_FIRST,
-                    &crate::obj::Args::none(),
-                ) {
-                    Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty() => caps[0].id,
-                    _ => return false,
-                };
-                let args = crate::obj::Args {
-                    vals: alloc::vec![crate::obj::Value::Str("fat32"), crate::obj::Value::U64(first.0)],
-                };
-                matches!(
-                    crate::obj::invoke(
-                        table, boot_end.mount,
-                        crate::obj::fs::MOUNT_CONTRACT,
-                        crate::obj::fs::MOUNT_HOOK,
-                        &args,
-                    ),
-                    Ok(crate::obj::Reply::Caps(caps)) if !caps.is_empty()
-                )
-            })();
-            if mounted {
-                log::info!("Mounted ESP as B> (fat32, via mount cap)");
-            } else {
-                log::warn!("Could not mount ESP on B> via mount cap");
+            let first = crate::filesystems::blockdriver::driver::first_block_device();
+            match first {
+                Some(dev) => match crate::filesystems::vfs::mount("fat32", Some(dev), "esp") {
+                    Ok(_) => log::info!("Mounted ESP as B> (fat32)"),
+                    Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
+                },
+                None => log::warn!("Could not mount ESP on B>: no block device"),
             }
         }
+
+        // Bind the concrete boot mounts (A, esp) into the kernel-root
+        // namespace so every task inherits them at spawn (the scheduler runs
+        // below, after this).
+        crate::ns::bind_mount_roots();
 
         // C8 — the device sweep is done; return to the boot domain before the
         // idle loop, which runs platform halt and xHCI hot-plug poll as the
@@ -617,39 +554,15 @@ impl Kernel {
     }
 }
 
-/// Register a block device into the `block:family` interior via the
-/// `register` hook (§7.11.4): wrap the device in a `BlockNode` cap inserted
-/// into the boot table, then invoke the hook with that cap's id. The family
-/// node resolves the cap, downcasts to `BlockNode`, and pushes the device
-/// into its interior — the kernel's own bring-up path, no ambient list.
+/// Register a block device by pushing it directly into the
+/// `BLOCK_DEVICES` registry (Phase 2: no capability endowment). The
+/// registry is the single interior list consulted by
+/// `first_block_device()` and the VFS mount path.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn register_block_device(
     device: alloc::sync::Arc<dyn crate::filesystems::blockdriver::traits::BlockDevice>,
 ) {
-    use crate::obj::bootstrap::{boot_domain, boot_endowment};
-    use crate::obj::fs::{BLOCK_FAMILY_CONTRACT, BLOCK_FAMILY_REGISTER, BlockNode};
-    use crate::obj::{
-        invoke, Args, CapHandle, CapId, CapRights, ContractRights, HandleState, Rights, Value,
-    };
-
-    let table = &boot_domain().table;
-    let cap = table.insert(CapHandle {
-        id: CapId(0),
-        node: alloc::sync::Arc::new(BlockNode::new(device)),
-        rights: CapRights::new(Rights::INVOKE, ContractRights::empty()),
-        state: HandleState::Live,
-    });
-    let args = Args { vals: alloc::vec![Value::U64(cap.0)] };
-    match invoke(
-        table,
-        boot_endowment().block,
-        BLOCK_FAMILY_CONTRACT,
-        BLOCK_FAMILY_REGISTER,
-        &args,
-    ) {
-        Ok(_) => {}
-        Err(e) => log::warn!("block:family register failed: {:?}", e),
-    }
+    crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock().push(device);
 }
 
 fn find_bitmap_region(memory_map: &[MemoryRegion]) -> (u64, u64) {

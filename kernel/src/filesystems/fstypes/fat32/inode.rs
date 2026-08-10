@@ -7,8 +7,8 @@ use hashbrown::HashSet;
 use spin::Mutex;
 
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::InodeOps;
-use crate::filesystems::vfs::types::{DirEntry, FileType, Stat};
+use crate::filesystems::vfs::file_ops::FileOps;
+use crate::filesystems::vfs::types::{DirEntry, FileKind, RightsMask, Stat};
 
 use super::bpb::DIR_ENTRY_SIZE;
 use super::bpb::MAX_SFN_LEN;
@@ -39,7 +39,7 @@ pub struct Fat32Inode {
     pub(crate) sb: Arc<Fat32SuperBlock>,
     pub(crate) first_clus: AtomicU32,
     pub(crate) size: AtomicU32,
-    pub(crate) file_type: FileType,
+    pub(crate) file_kind: FileKind,
     pub(crate) ino: u64,
     /// Epoch-seconds modification time, mirrored from the directory entry's
     /// DOS write date/time (0 for the root, or before any timestamp is known).
@@ -167,11 +167,11 @@ impl Fat32Inode {
     }
 }
 
-impl InodeOps for Fat32Inode {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+impl FileOps for Fat32Inode {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         let _write_lock = self.write_lock.lock();
         self.check_not_degraded()?;
-        if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
+        if self.file_kind != FileKind::Regular { return Err(VfsError::IsADirectory); }
         let file_size = self.size.load(Ordering::Relaxed) as u64;
         let first = self.first_clus.load(Ordering::Relaxed);
         if offset >= file_size || buf.is_empty() || first == 0 { return Ok(0); }
@@ -231,9 +231,9 @@ impl InodeOps for Fat32Inode {
         Ok(done)
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         self.check_not_degraded()?;
-        if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
+        if self.file_kind != FileKind::Regular { return Err(VfsError::IsADirectory); }
         if buf.is_empty() { return Ok(0); }
         if offset.saturating_add(buf.len() as u64) > u32::MAX as u64 {
             return Err(VfsError::FileTooLarge);
@@ -325,9 +325,9 @@ impl InodeOps for Fat32Inode {
         Ok(buf.len())
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+    fn lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
         self.check_not_degraded()?;
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         let slots: Arc<Vec<DirEntrySlot>> = if name == ".." {
             Arc::new(read_dir_slots(&self.sb, self.first_clus.load(Ordering::Relaxed))?)
         } else {
@@ -339,12 +339,12 @@ impl InodeOps for Fat32Inode {
                 let actual_clus = if name == ".." && fc == 0 { self.sb.bpb.root_clus } else { fc };
                 let sz = file_size_from_entry(&slot.sfn_entry);
                 let attr = slot.sfn_entry[0x0B];
-                let ft = if attr & ATTR_DIRECTORY != 0 { FileType::Directory } else { FileType::Regular };
+                let ft = if attr & ATTR_DIRECTORY != 0 { FileKind::Directory } else { FileKind::Regular };
                 return Ok(Arc::new(Fat32Inode {
                     sb: self.sb.clone(),
                     first_clus: AtomicU32::new(actual_clus),
                     size: AtomicU32::new(sz),
-                    file_type: ft,
+                    file_kind: ft,
                     ino: self.sb.ino_for(self.first_clus.load(Ordering::Relaxed), name),
                     mtime: AtomicU64::new(mtime_from_entry(&slot.sfn_entry)),
                     parent_clus: self.first_clus.load(Ordering::Relaxed),
@@ -356,15 +356,15 @@ impl InodeOps for Fat32Inode {
                     write_lock: Mutex::new(()),
                     chain_cache: Mutex::new(None),
                     chain_cache_dirty: AtomicBool::new(false),
-                }) as Arc<dyn InodeOps>);
+                }) as Arc<dyn FileOps>);
             }
         }
         Err(VfsError::NotFound)
     }
 
-    fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+    fn create(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create enter\n"));
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] create get_dir_slots\n"));
         let slots = self.get_dir_slots()?;
@@ -405,7 +405,7 @@ impl InodeOps for Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(0),
             size: AtomicU32::new(0),
-            file_type: FileType::Regular,
+            file_kind: FileKind::Regular,
             ino,
             mtime: AtomicU64::new(mtime),
             parent_clus: self.first_clus.load(Ordering::Relaxed),
@@ -417,12 +417,12 @@ impl InodeOps for Fat32Inode {
             write_lock: Mutex::new(()),
             chain_cache: Mutex::new(None),
             chain_cache_dirty: AtomicBool::new(false),
-        }) as Arc<dyn InodeOps>)
+        }) as Arc<dyn FileOps>)
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] unlink enter\n"));
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
         let _lock = self.dir_lock.lock();
 
@@ -454,8 +454,8 @@ impl InodeOps for Fat32Inode {
         Ok(())
     }
 
-    fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] mkdir enter\n"));
         let slots = self.get_dir_slots()?;
@@ -525,7 +525,7 @@ impl InodeOps for Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(new_clus),
             size: AtomicU32::new(0),
-            file_type: FileType::Directory,
+            file_kind: FileKind::Directory,
             ino,
             mtime: AtomicU64::new(mtime),
             parent_clus: self.first_clus.load(Ordering::Relaxed),
@@ -537,11 +537,11 @@ impl InodeOps for Fat32Inode {
             write_lock: Mutex::new(()),
             chain_cache: Mutex::new(None),
             chain_cache_dirty: AtomicBool::new(false),
-        }) as Arc<dyn InodeOps>)
+        }) as Arc<dyn FileOps>)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
         let _lock = self.dir_lock.lock();
 
@@ -571,7 +571,7 @@ impl InodeOps for Fat32Inode {
 
     fn readdir(&self) -> Result<Vec<DirEntry>, VfsError> {
         self.check_not_degraded()?;
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] readdir enter\n"));
         let slots = self.get_dir_slots()?;
         fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] readdir got slots\n"));
@@ -581,8 +581,8 @@ impl InodeOps for Fat32Inode {
             let name = decode_entry_name(slot);
             if name.is_empty() || name == "." || name == ".." { continue; }
             let attr = slot.sfn_entry[0x0B];
-            let ft = if attr & ATTR_DIRECTORY != 0 { FileType::Directory } else { FileType::Regular };
-            entries.push(DirEntry { ino: self.sb.ino_for(dir_clus, &name), name, file_type: ft });
+            let ft = if attr & ATTR_DIRECTORY != 0 { FileKind::Directory } else { FileKind::Regular };
+            entries.push(DirEntry { ino: self.sb.ino_for(dir_clus, &name), name, file_kind: ft, rights: RightsMask::R });
         }
         Ok(entries)
     }
@@ -590,14 +590,14 @@ impl InodeOps for Fat32Inode {
     fn getattr(&self) -> Result<Stat, VfsError> {
         Ok(Stat {
             ino: self.ino,
-            size: if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 },
-            file_type: self.file_type,
+            size: if self.file_kind == FileKind::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 },
+            file_kind: self.file_kind,
             mtime: self.mtime.load(Ordering::Relaxed),
         })
     }
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), VfsError> {
-        if self.file_type != FileType::Directory { return Err(VfsError::NotADirectory); }
+        if self.file_kind != FileKind::Directory { return Err(VfsError::NotADirectory); }
         let _lock = self.dir_lock.lock();
 
         let slots = self.get_dir_slots()?;
@@ -668,7 +668,7 @@ impl InodeOps for Fat32Inode {
     }
 
     fn truncate(&self, len: u64) -> Result<(), VfsError> {
-        if self.file_type != FileType::Regular { return Err(VfsError::IsADirectory); }
+        if self.file_kind != FileKind::Regular { return Err(VfsError::IsADirectory); }
         if len > u32::MAX as u64 { return Err(VfsError::FileTooLarge); }
         let _write_lock = self.write_lock.lock();
 
@@ -730,10 +730,10 @@ impl InodeOps for Fat32Inode {
         Ok(())
     }
 
-    fn file_type(&self) -> FileType { self.file_type }
+    fn file_kind(&self) -> FileKind { self.file_kind }
     fn ino(&self) -> u64 { self.ino }
     fn size(&self) -> u64 {
-        if self.file_type == FileType::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 }
+        if self.file_kind == FileKind::Directory { 0 } else { self.size.load(Ordering::Relaxed) as u64 }
     }
 
     fn on_unlink(&self) {

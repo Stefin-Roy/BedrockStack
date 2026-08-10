@@ -28,7 +28,8 @@ use spin::Mutex;
 
 use super::driver::StorageDriver;
 use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
-use crate::obj::clients::DmaClient;
+use crate::services::dma::DmaAllocator;
+use crate::services::msi::MsiAllocator;
 
 const AHCI_MAX_SLOTS: usize = 32;
 const MAX_PRDT: usize = 64;
@@ -179,7 +180,7 @@ struct AhciPort {
     _rfis_vaddr: u64,
     scratch_paddr: u64,
     scratch_vaddr: u64,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     max_prdt: usize,
     n_slots: u8,
     sector_count: u64,
@@ -882,7 +883,7 @@ impl BlockDevice for AhciPort {
 
 // ── Initialisation ──────────────────────────────────────────────
 
-fn init_controller(dev: &crate::pci::PciDevice, dma: DmaClient) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(dev: &crate::pci::PciDevice, dma: &'static dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
     crate::pci::enable_device(dev);
     let base = match crate::pci::bar::bar(dev, 5) {
@@ -971,7 +972,7 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: DmaClient) -> Result<Vec<Ar
 
     // Register IRQ once per controller (all ports share the same INTX# line).
     if !port_numbers.is_empty() && dev.interrupt_line != 0 {
-    if let Ok(vector) = crate::obj::clients::IrqClient::driver_irq().register(None, handle_ahci_irq) {
+    if let Some(vector) = crate::services::x86_64::x86_msi::msi_static().allocate_device_vector(handle_ahci_irq) {
         if crate::platform::x86_64_pc::ioapic::enable_irq(
             dev.interrupt_line as u32,
             crate::acpi::Polarity::ActiveLow,
@@ -981,14 +982,14 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: DmaClient) -> Result<Vec<Ar
                 mmio.pw32(p, port_off::IE, 0x0000_0089);
             }
         } else {
-            let _ = crate::obj::clients::IrqClient::driver_irq().unregister(vector);
+            crate::services::x86_64::x86_msi::msi_static().release_device_vector(vector);
         }
     }
     }
 
     Ok(ports)
 }
-fn init_one(p: u8, hba: &Hba, dma: DmaClient, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
+fn init_one(p: u8, hba: &Hba, dma: &'static dyn DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
@@ -1087,7 +1088,7 @@ impl StorageDriver for AhciDriver {
     fn init_controller(
         &self,
         dev: &crate::pci::PciDevice,
-        dma: DmaClient,
+        dma: &'static dyn DmaAllocator,
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
         init_controller(dev, dma)
     }

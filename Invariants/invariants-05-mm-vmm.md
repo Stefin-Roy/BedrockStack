@@ -162,3 +162,7 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 - The `VirtualMemoryManager` capability trait (`services/virt_mem.rs`) is
   intentionally **unimplemented** — `Vmm` is used directly at init. See
   `invariants-23-services.md` (SVC-D001, orphaned/dead trait).
+
+
+
+Critical VMM fact: Vmm::map_*/unmap are inherent methods taking &mut BitmapAllocator; map_* assert! on double-map (panic=abort) → must pre-check with translate() before map-on-open.

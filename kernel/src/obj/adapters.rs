@@ -429,7 +429,8 @@ fn dma_alloc(
         SerialPort::puts("\n");
     });
 
-    // Same reply shape as before, so `DmaClient::decode_buffer` is unchanged.
+    // Same reply shape as the historical DMA cap; consumers decode the
+    // (base, va, size) triple unchanged.
     Ok(Reply::Data(vec![
         Value::U64(base),
         Value::U64(va),

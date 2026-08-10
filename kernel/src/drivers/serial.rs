@@ -18,37 +18,6 @@ type Inner = common::serial::riscv64::SerialPort;
 
 static GLOBAL_LOCK: AtomicBool = AtomicBool::new(false);
 
-// ── Capability-edge routing ───────────────────────────────────────────
-// Once the capability graph exists, console output crosses the serial cap
-// (SERIAL_PUTS / SERIAL_PUTC) instead of touching the port ambiently.  The
-// port itself is written only by the raw primitives below — the serial
-// node's implementation (services/serial.rs) and the pre-boot seed path.
-//
-// `SINK_ARMED` flips once `obj::bootstrap::bootstrapped()` becomes true;
-// `IN_CAP` is the re-entrancy guard (nested logging inside a cap dispatch
-// falls back to the raw path); `SINK` caches the boot-domain `SerialClient`
-// so the capability table is resolved once, not per line.
-static SINK_ARMED: AtomicBool = AtomicBool::new(false);
-static IN_CAP: AtomicBool = AtomicBool::new(false);
-static SINK: spin::Once<crate::obj::clients::SerialClient> = spin::Once::new();
-
-/// Arm the capability sink once bootstrap has completed.  Safe to call
-/// repeatedly; no-ops until `obj::bootstrap::bootstrapped()` is true.
-pub fn arm_cap_sink() {
-    if crate::obj::bootstrap::bootstrapped() {
-        SINK_ARMED.store(true, Ordering::Relaxed);
-    }
-}
-
-/// True once the capability sink may be used.  Arms lazily on the first
-/// post-bootstrap write, so no explicit handshake is required.
-fn cap_sink_ready() -> bool {
-    if !SINK_ARMED.load(Ordering::Relaxed) {
-        arm_cap_sink();
-    }
-    SINK_ARMED.load(Ordering::Relaxed)
-}
-
 /// Serial port with per-CPU line buffering and `[CPU(N)]` prefix.
 ///
 /// Only complete lines reach the port.  `putc`, `put_u64` and `put_hex` are
@@ -66,18 +35,8 @@ impl SerialPort {
     }
 
     /// Write one raw byte without prefix.
-    ///
-    /// Post-bootstrap the byte crosses the serial capability; before that
-    /// (boot seed / re-entrancy) it goes straight to the port.
     pub fn putc(c: u8) {
-        if !cap_sink_ready() || IN_CAP.load(Ordering::Relaxed) {
-            raw_putc(c);
-            return;
-        }
-        IN_CAP.store(true, Ordering::Relaxed);
-        let client = SINK.call_once(crate::obj::clients::SerialClient::boot_serial);
-        client.putc(c);
-        IN_CAP.store(false, Ordering::Relaxed);
+        raw_putc(c);
     }
 
     /// Write a string, prefixing each complete line with `[CPU(N)] `.
@@ -86,38 +45,17 @@ impl SerialPort {
     /// current CPU's line and applies the prefix/flush.  Nothing here touches
     /// the port directly.
     pub fn puts(s: &str) {
-        if !cap_sink_ready() || IN_CAP.load(Ordering::Relaxed) {
-            raw_puts(s);
-            return;
-        }
-        IN_CAP.store(true, Ordering::Relaxed);
-        let client = SINK.call_once(crate::obj::clients::SerialClient::boot_serial);
-        client.puts(s);
-        IN_CAP.store(false, Ordering::Relaxed);
+        raw_puts(s);
     }
 
     /// Write a 64-bit value as hex without prefix.
     pub fn put_hex(val: u64) {
-        if !cap_sink_ready() || IN_CAP.load(Ordering::Relaxed) {
-            raw_put_hex(val);
-            return;
-        }
-        IN_CAP.store(true, Ordering::Relaxed);
-        let client = SINK.call_once(crate::obj::clients::SerialClient::boot_serial);
-        client.put_hex(val);
-        IN_CAP.store(false, Ordering::Relaxed);
+        raw_put_hex(val);
     }
 
     /// Write a 64-bit value in decimal without prefix.
     pub fn put_u64(val: u64) {
-        if !cap_sink_ready() || IN_CAP.load(Ordering::Relaxed) {
-            raw_put_u64(val);
-            return;
-        }
-        IN_CAP.store(true, Ordering::Relaxed);
-        let client = SINK.call_once(crate::obj::clients::SerialClient::boot_serial);
-        client.put_u64(val);
-        IN_CAP.store(false, Ordering::Relaxed);
+        raw_put_u64(val);
     }
 }
 
@@ -170,10 +108,11 @@ static LINE_BUFS: SharedLineBufs = SharedLineBufs(core::cell::UnsafeCell::new([
 ]));
 
 // ── Lock-guarded raw primitives ─────────────────────────────────────
-// These are the serial node's implementation (services/serial.rs dispatches
-// into them through the serial capability) and the pre-boot seed path.  They
-// are the only place raw port I/O happens post-bootstrap.  They never route
-// back through the cap, so calling them from inside cap dispatch is safe.
+// These are the serial node's implementation (services/serial.rs's
+// `KernelSerial` delegates straight into them) and the pre-boot seed path.
+// `SerialPort`'s public wrappers route directly here (the capability
+// indirection was removed), so the whole driver collapses to raw port I/O
+// under the serial locks.  They never route back through any cap.
 //
 // Every primitive appends to the current CPU's line buffer and flushes whole
 // lines (on `\n` or buffer-full) under the serial locks, so a multi-fragment

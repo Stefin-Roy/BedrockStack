@@ -16,6 +16,7 @@ pub enum VfsError {
     MountBusy,
     InvalidDevice,
     FileTooLarge,
+    NotSupported,
 }
 
 impl fmt::Display for VfsError {
@@ -35,6 +36,7 @@ impl fmt::Display for VfsError {
             VfsError::MountBusy => write!(f, "mount busy"),
             VfsError::InvalidDevice => write!(f, "invalid device"),
             VfsError::FileTooLarge => write!(f, "file too large"),
+            VfsError::NotSupported => write!(f, "not supported"),
         }
     }
 }

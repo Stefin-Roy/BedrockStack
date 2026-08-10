@@ -8,9 +8,9 @@ use spin::Mutex;
 use crate::filesystems::blockdriver::block_cache::CachedDevice;
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::InodeOps;
+use crate::filesystems::vfs::file_ops::FileOps;
 use crate::filesystems::vfs::superblock::{SuperBlock, SuperOps, StatFs};
-use crate::filesystems::vfs::types::FileType;
+use crate::filesystems::vfs::types::FileKind;
 use crate::filesystems::fstypes::FileSystem;
 
 use super::bpb::{Bpb, parse_bpb, SECTOR_SIZE};
@@ -30,7 +30,7 @@ pub struct Fat32SuperBlock {
     pub(crate) volume_dirty: AtomicBool,
     /// Set when the root directory could not be read at mount (corrupt root
     /// cluster chain with a valid BPB).  The volume stays mounted but every
-    /// InodeOps path short-circuits to `IOError` instead of walking garbage.
+    /// FileOps path short-circuits to `IOError` instead of walking garbage.
     pub(crate) degraded: AtomicBool,
 }
 
@@ -105,7 +105,7 @@ impl FileSystem for Fat32FileSystem {
     fn name(&self) -> &str { "fat32" }
 
     fn mount(&self, device: Option<Arc<dyn BlockDevice>>)
-             -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>
+             -> Result<(Arc<SuperBlock>, Arc<dyn FileOps>), VfsError>
     {
         use crate::filesystems::vfs::inode::Inode;
         use super::inode::Fat32Inode;
@@ -175,7 +175,7 @@ impl FileSystem for Fat32FileSystem {
             sb: sb.clone(),
             first_clus: AtomicU32::new(root_clus),
             size: AtomicU32::new(0),
-            file_type: FileType::Directory,
+            file_kind: FileKind::Directory,
             ino: 1,
             mtime: AtomicU64::new(0),
             parent_clus: root_clus,
@@ -187,7 +187,7 @@ impl FileSystem for Fat32FileSystem {
             write_lock: Mutex::new(()),
             chain_cache: Mutex::new(None),
             chain_cache_dirty: AtomicBool::new(false),
-        }) as Arc<dyn InodeOps>;
+         }) as Arc<dyn FileOps>;
 
         let root_inode = Arc::new(Inode::new(root_ops.clone()));
         let super_ops = sb.clone() as Arc<dyn SuperOps>;
@@ -195,7 +195,7 @@ impl FileSystem for Fat32FileSystem {
 
         // A corrupt root directory (valid BPB, garbage root cluster chain)
         // must not fail the mount — but later lookups would walk garbage.
-        // Mark the volume degraded; every InodeOps path on it short-circuits
+        // Mark the volume degraded; every FileOps path on it short-circuits
         // to IOError instead.
         if super::dir::read_dir_slots(&sb, root_clus).is_err() {
             sb.degraded.store(true, Ordering::Relaxed);

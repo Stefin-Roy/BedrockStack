@@ -1,6 +1,6 @@
 use alloc::vec::Vec;
 use crate::drivers::serial::SerialPort;
-use crate::obj::clients::DmaClient;
+use crate::services::dma::DmaAllocator;
 use crate::usb::usb;
 use crate::usb::usb::SetupPacket;
 use crate::usb::usb::descriptors::{ConfigDescriptor, InterfaceDescriptor, EndpointDescriptor};
@@ -380,7 +380,7 @@ pub fn configure_device(
     slot: &mut DeviceSlot,
     cmd_ring: &mut TrbRing,
     doorbell_va: u64,
-    dma: DmaClient,
+    dma: &'static dyn DmaAllocator,
     iface_indices: &[usize],
 ) -> Result<(), &'static str> {
     if slot.config_value != 0 {
@@ -518,7 +518,7 @@ impl DeviceSlotManager {
         &mut self,
         cmd_ring: &mut TrbRing,
         doorbell_va: u64,
-        dma: DmaClient,
+        dma: &'static dyn DmaAllocator,
         port_num: u8,
         speed: u8,
     ) -> Result<(), &'static str> {

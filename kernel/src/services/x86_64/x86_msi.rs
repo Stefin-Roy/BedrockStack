@@ -27,3 +27,8 @@ static X86_MSI: X86Msi = X86Msi;
 pub fn init() -> &'static dyn MsiAllocator {
     &X86_MSI as &'static dyn MsiAllocator
 }
+
+/// C5: return the concrete MSI allocator for direct (post-Phase-1) access.
+pub fn msi_static() -> &'static X86Msi {
+    &X86_MSI
+}

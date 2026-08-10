@@ -7,11 +7,18 @@ use hashbrown::HashMap;
 use spin::Mutex;
 
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::InodeOps;
-use crate::filesystems::vfs::types::{DirEntry, FileType, Stat};
+use crate::filesystems::vfs::file_ops::FileOps;
+use crate::filesystems::vfs::types::{DirEntry, FileKind, RightsMask, Stat};
 
 static NEXT_INO: AtomicU64 = AtomicU64::new(2);
 const ROOT_INO: u64 = 1;
+
+/// Reject names containing `:` — the colon is reserved by the kernel to flag
+/// synthetic/synthetic-mapped files.  A real filesystem under tmpfs may never
+/// create such an entry.
+fn contains_colon(name: &str) -> bool {
+    name.as_bytes().contains(&b':')
+}
 
 pub(super) enum TmpfsEntry {
     File { data: Mutex<Vec<u8>> },
@@ -20,7 +27,7 @@ pub(super) enum TmpfsEntry {
 
 pub(super) struct TmpfsInode {
     pub ino: u64,
-    pub file_type: FileType,
+    pub file_kind: FileKind,
     pub entry: TmpfsEntry,
     pub mtime: Mutex<u64>,
     pub size: AtomicU64,
@@ -32,7 +39,7 @@ impl TmpfsInode {
     pub fn new_root(used: Arc<AtomicU64>) -> Self {
         TmpfsInode {
             ino: ROOT_INO,
-            file_type: FileType::Directory,
+            file_kind: FileKind::Directory,
             entry: TmpfsEntry::Dir {
                 children: Mutex::new(HashMap::new()),
             },
@@ -43,8 +50,8 @@ impl TmpfsInode {
     }
 }
 
-impl InodeOps for TmpfsInode {
-    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
+impl FileOps for TmpfsInode {
+    fn read(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         match &self.entry {
             TmpfsEntry::File { data } => {
                 let data = data.lock();
@@ -60,7 +67,7 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
+    fn write(&self, offset: u64, buf: &[u8]) -> Result<usize, VfsError> {
         match &self.entry {
             TmpfsEntry::File { data } => {
                 let mut data = data.lock();
@@ -82,20 +89,23 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn lookup(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+    fn lookup(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let children = children.lock();
                 children
                     .get(name)
-                    .map(|c| c.clone() as Arc<dyn InodeOps>)
+                    .map(|c| c.clone() as Arc<dyn FileOps>)
                     .ok_or(VfsError::NotFound)
             }
             _ => Err(VfsError::NotADirectory),
         }
     }
 
-    fn create(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+    fn create(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
+        if contains_colon(name) {
+            return Err(VfsError::InvalidInput);
+        }
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
@@ -105,7 +115,7 @@ impl InodeOps for TmpfsInode {
                 let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);
                 let child = Arc::new(TmpfsInode {
                     ino,
-                    file_type: FileType::Regular,
+                    file_kind: FileKind::Regular,
                     entry: TmpfsEntry::File {
                         data: Mutex::new(Vec::new()),
                     },
@@ -114,7 +124,7 @@ impl InodeOps for TmpfsInode {
                     used: self.used.clone(),
                 });
                 children.insert(String::from(name), child.clone());
-                Ok(child as Arc<dyn InodeOps>)
+                Ok(child as Arc<dyn FileOps>)
             }
             _ => Err(VfsError::NotADirectory),
         }
@@ -134,7 +144,10 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn mkdir(&self, name: &str) -> Result<Arc<dyn InodeOps>, VfsError> {
+    fn mkdir(&self, name: &str) -> Result<Arc<dyn FileOps>, VfsError> {
+        if contains_colon(name) {
+            return Err(VfsError::InvalidInput);
+        }
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
@@ -144,7 +157,7 @@ impl InodeOps for TmpfsInode {
                 let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);
                 let child = Arc::new(TmpfsInode {
                     ino,
-                    file_type: FileType::Directory,
+                    file_kind: FileKind::Directory,
                     entry: TmpfsEntry::Dir {
                         children: Mutex::new(HashMap::new()),
                     },
@@ -153,7 +166,7 @@ impl InodeOps for TmpfsInode {
                     used: self.used.clone(),
                 });
                 children.insert(String::from(name), child.clone());
-                Ok(child as Arc<dyn InodeOps>)
+                Ok(child as Arc<dyn FileOps>)
             }
             _ => Err(VfsError::NotADirectory),
         }
@@ -188,7 +201,8 @@ impl InodeOps for TmpfsInode {
                     entries.push(DirEntry {
                         ino: inode.ino,
                         name: name.clone(),
-                        file_type: inode.file_type,
+                        file_kind: inode.file_kind,
+                        rights: RightsMask::R,
                     });
                 }
                 Ok(entries)
@@ -201,7 +215,7 @@ impl InodeOps for TmpfsInode {
         Ok(Stat {
             ino: self.ino,
             size: self.size.load(Ordering::Relaxed),
-            file_type: self.file_type,
+            file_kind: self.file_kind,
             mtime: *self.mtime.lock(),
         })
     }
@@ -227,6 +241,12 @@ impl InodeOps for TmpfsInode {
     }
 
     fn rename(&self, old_name: &str, new_name: &str) -> Result<(), VfsError> {
+        if contains_colon(new_name) {
+            return Err(VfsError::InvalidInput);
+        }
+        if contains_colon(old_name) {
+            return Err(VfsError::InvalidInput);
+        }
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
@@ -242,7 +262,7 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn file_type(&self) -> FileType { self.file_type }
+    fn file_kind(&self) -> FileKind { self.file_kind }
     fn ino(&self) -> u64 { self.ino }
     fn size(&self) -> u64 { self.size.load(Ordering::Relaxed) }
 }

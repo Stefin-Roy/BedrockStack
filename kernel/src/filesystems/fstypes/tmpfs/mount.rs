@@ -2,7 +2,8 @@ use alloc::sync::Arc;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::inode::{Inode, InodeOps};
+use crate::filesystems::vfs::file_ops::FileOps;
+use crate::filesystems::vfs::inode::Inode;
 use crate::filesystems::vfs::superblock::{SuperBlock, SuperOps, StatFs};
 
 use crate::filesystems::fstypes::FileSystem;
@@ -19,11 +20,11 @@ impl FileSystem for Tmpfs {
     fn name(&self) -> &str { "tmpfs" }
 
     fn mount(&self, _device: Option<Arc<dyn BlockDevice>>)
-             -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>
+             -> Result<(Arc<SuperBlock>, Arc<dyn FileOps>), VfsError>
     {
         let used = Arc::new(core::sync::atomic::AtomicU64::new(0));
         let super_ops = Arc::new(TmpfsSuperOps { used: used.clone() });
-        let root_ops = Arc::new(TmpfsInode::new_root(used)) as Arc<dyn InodeOps>;
+        let root_ops = Arc::new(TmpfsInode::new_root(used)) as Arc<dyn FileOps>;
         let root_inode = Arc::new(Inode::new(root_ops.clone()));
         let sb = Arc::new(SuperBlock::new(super_ops.clone(), root_inode));
         Ok((sb, root_ops))

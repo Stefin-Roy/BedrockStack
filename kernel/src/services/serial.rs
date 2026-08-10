@@ -12,10 +12,9 @@ pub trait SerialConsole: Send + Sync {
 pub struct KernelSerial;
 
 impl SerialConsole for KernelSerial {
-    // This is the serial node's implementation — the ONE place raw port I/O
-    // happens, reached only via the serial capability.  It must call the raw
-    // primitives, never the public cap-routing `SerialPort` wrappers, or the
-    // cap dispatch would recurse on itself.
+    // The serial console service delegates straight to the driver's raw
+    // primitives; the capability indirection was removed in the de-cap, so
+    // `SerialPort`'s public wrappers and this impl share the same raw path.
     fn putc(&self, c: u8) {
         crate::drivers::serial::raw_putc(c);
     }

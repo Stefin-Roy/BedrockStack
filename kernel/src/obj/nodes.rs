@@ -1269,7 +1269,11 @@ pub fn selftest_addrspace_authority() -> Result<(), &'static str> {
 
     // A fresh task domain with its own cloned root, exactly as `endow_task`
     // builds for a ring-3 process.
-    let domain: &'static Domain = Domain::with_addrspace(0xBEEF, kernel_root);
+    let domain: &'static Domain = Domain::with_addrspace(
+        0xBEEF,
+        kernel_root,
+        alloc::sync::Arc::new(crate::ns::namespace::Namespace::new()),
+    );
     let task_root = domain.page_root().ok_or("selftest: no task root")?;
 
     // 1. The per-task node carries task authority: own root, low-half bound,

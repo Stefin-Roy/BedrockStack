@@ -8,6 +8,7 @@ pub mod msix;
 use alloc::vec::Vec;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::acpi::PciConfigRegions;
+use crate::services::pci_config::PciConfigSpace;
 
 /// A discovered PCI(e) device / function.
 #[derive(Debug, Clone, Copy)]
@@ -81,7 +82,7 @@ pub fn devices() -> &'static [PciDevice] {
 /// is set.  QEMU hides the problem because OVMF enables every device during
 /// POST.  Mirrors Linux `pci_enable_device()`.
 pub fn enable_device(dev: &PciDevice) {
-    let pci_cfg = crate::obj::clients::PciCfgClient::driver_pci();
+    let pci_cfg = crate::services::ecam_pci_config::ecam_static();
     let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
     pci_cfg.write16(
         dev.segment, dev.bus, dev.device, dev.function, 0x04,

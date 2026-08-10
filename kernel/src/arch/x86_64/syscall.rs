@@ -46,6 +46,7 @@ pub struct UserFrame {
     pub rdi: u64,       // arg 0
     pub rsi: u64,       // arg 1
     pub rdx: u64,       // arg 2
+    pub r8: u64,        // arg 3
     pub r10: u64,       // table version
 }
 
@@ -115,13 +116,13 @@ unsafe fn write_syscall_msrs() {
 }
 
 /// Point the current CPU's per-CPU syscall stack at the top of its dedicated
-/// slot, rounded down to 16 bytes then back 8, so the pre-call RSP (after the
-/// 13 pushes in `syscall_entry` = 104 bytes ≡ 8 mod 16) lands 16-aligned.
+/// slot, rounded down to 16 bytes, so the pre-call RSP (after the 14 pushes in
+/// `syscall_entry` = 112 bytes ≡ 0 mod 16) lands 16-aligned.
 fn set_syscall_stack_for_current_cpu() {
     let pc = current_per_cpu();
     let slot = pc.cpu_id as usize;
     let base = &syscall_stacks()[slot] as *const u8 as u64;
-    pc.syscall_stack = ((base + SYSCALL_STACK_SIZE as u64) & !0xF) - 8;
+    pc.syscall_stack = (base + SYSCALL_STACK_SIZE as u64) & !0xF;
     pc.syscall_user_rsp = 0;
 }
 
@@ -132,6 +133,7 @@ fn set_syscall_stack_for_current_cpu() {
 ///   RDI = arg 0
 ///   RSI = arg 1
 ///   RDX = arg 2
+///   R8  = arg 3
 ///   R10 = syscall table version
 ///   RCX = clobbered (saved RIP by `syscall`)
 ///   R11 = clobbered (saved RFLAGS by `syscall`)
@@ -149,6 +151,7 @@ pub unsafe extern "C" fn syscall_entry() {
         // Push order matches the struct layout: r10 first, r15 last (lowest
         // address, i.e. what `mov rdi, rsp` hands the handler).
         "push r10",                  // table version
+        "push r8",                   // arg 3
         "push rdx",                  // arg 2
         "push rsi",                  // arg 1
         "push rdi",                  // arg 0
@@ -188,6 +191,7 @@ pub unsafe extern "C" fn syscall_entry() {
         "pop rdi",
         "pop rsi",
         "pop rdx",
+        "pop r8",
         "pop r10",
 
         "mov rsp, gs:[{usr}]",       // restore user RSP
@@ -214,9 +218,10 @@ pub extern "C" fn syscall_handler(frame: *const UserFrame) -> u64 {
     let arg0 = frame.rdi;
     let arg1 = frame.rsi;
     let arg2 = frame.rdx;
+    let arg3 = frame.r8;
     let table_ver = frame.r10;
 
     // Route by the table version the caller passed in R10; dispatch selects
     // the right table and rejects unknown versions.
-    crate::syscall::dispatch(table_ver, num, arg0, arg1, arg2)
+    crate::syscall::dispatch(table_ver, num, arg0, arg1, arg2, arg3)
 }
