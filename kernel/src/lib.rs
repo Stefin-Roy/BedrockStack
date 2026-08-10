@@ -43,7 +43,9 @@ unsafe extern "C" {
     static __rodata_end: u8;
     pub static __stack_start: u8;
     pub static __stack_end: u8;
+    #[cfg(target_arch = "x86_64")]
     pub static __idt_start: u8;
+    #[cfg(target_arch = "x86_64")]
     pub static __idt_end: u8;
     // Absolute linker symbols holding the kernel image's PHYSICAL (LMA)
     // bounds, defined in linker.ld for x86_64 (`__kernel_start_phys =
@@ -72,7 +74,9 @@ pub struct KernelLayout {
     pub rela_dyn_end: u64,
     pub rodata_start: u64,
     pub rodata_end: u64,
+    #[cfg(target_arch = "x86_64")]
     pub idt_start: u64,
+    #[cfg(target_arch = "x86_64")]
     pub idt_end: u64,
 }
 
@@ -133,7 +137,9 @@ impl Kernel {
                 rela_dyn_end: &__rela_dyn_end as *const u8 as u64,
                 rodata_start: &__rodata_start as *const u8 as u64,
                 rodata_end: &__rodata_end as *const u8 as u64,
+                #[cfg(target_arch = "x86_64")]
                 idt_start: &__idt_start as *const u8 as u64,
+                #[cfg(target_arch = "x86_64")]
                 idt_end: &__idt_end as *const u8 as u64,
             }
         };
