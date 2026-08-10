@@ -91,15 +91,26 @@ pub fn unregister_device_handler(vector: u8) {
     DEVICE_HANDLERS[idx].store(core::ptr::null_mut(), Ordering::Release);
 }
 
-/// Callback invoked by the BSP's APIC timer ISR before EOI.
+/// Callback invoked by every CPU's APIC timer ISR before EOI.
 static TIMER_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Set the function called on each APIC timer interrupt.
 ///
 /// Used by `UniversalTimer` to wire up queue processing and clockevent
-/// reprogramming.
+/// reprogramming for the current CPU's base.
 pub fn set_timer_callback(cb: fn()) {
     TIMER_CALLBACK.store(cb as *mut fn(), Ordering::Release);
+}
+
+/// Callback invoked by the reschedule IPI ISR (vector 52) before EOI.
+static TIMER_IPI_CALLBACK: AtomicPtr<fn()> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Set the function called on each timer-reschedule IPI.
+///
+/// Used by `UniversalTimer` to ask a remote CPU to re-run `tick()` on its
+/// own base after a cross-CPU earliest-deadline change.
+pub fn set_timer_ipi_callback(cb: fn()) {
+    TIMER_IPI_CALLBACK.store(cb as *mut fn(), Ordering::Release);
 }
 
 fn device_irq_handler(vector: u8) {
@@ -167,6 +178,9 @@ pub fn init() {
         // Register APIC timer interrupt at vector 32 (interrupt gate, clears IF).
         idt[32].set_handler_fn(timer_handler).disable_interrupts(true);
 
+        // Register the timer-reschedule IPI at vector 52 (interrupt gate).
+        idt[52].set_handler_fn(ipi_timer_handler).disable_interrupts(true);
+
         // Register device interrupt vectors 33-48 (interrupt gates, clears IF).
         idt[33].set_handler_fn(irq_33).disable_interrupts(true);
         idt[34].set_handler_fn(irq_34).disable_interrupts(true);
@@ -196,18 +210,26 @@ pub fn init() {
 
 /// Timer interrupt handler (vector 32).
 ///
-/// On the BSP: calls the registered universal timer tick (processes
-/// expired timers and reprograms the APIC one-shot), then signals EOI.
-/// On APs: just acknowledges and returns — APs never arm their LAPIC
-/// timer.
+/// Runs on whichever CPU's LAPIC fired.  Each CPU processes its own
+/// universal-timer base (drains expired timers, reprograms the LAPIC
+/// one-shot), then signals EOI.
 extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
-    // APs should not receive timer interrupts, but if one slips through
-    // (e.g. a broadcast), just EOI and return.
-    if crate::smp::current_cpu_id() != 0 {
-        apic::apic_eoi();
-        return;
-    }
     let ptr = TIMER_CALLBACK.load(Ordering::Acquire);
+    if !ptr.is_null() {
+        let handler: fn() = unsafe { core::mem::transmute(ptr) };
+        handler();
+    }
+    apic::apic_eoi();
+}
+
+/// Timer-reschedule IPI handler (vector 52).
+///
+/// Sent by a remote CPU when this CPU's base got an earlier earliest
+/// deadline.  Runs the same tick routine so the local base re-arms, then
+/// signals EOI.  A missed IPI is non-fatal — the LAPIC is still armed for
+/// the previous earliest and `tick()` re-arms after it fires.
+extern "x86-interrupt" fn ipi_timer_handler(_stack_frame: InterruptStackFrame) {
+    let ptr = TIMER_IPI_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
         handler();

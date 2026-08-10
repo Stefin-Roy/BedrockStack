@@ -8,7 +8,8 @@ use super::universal_timer::{TimerCallback, TimerId};
 /// `TimerEntry` is `Send + Sync` because:
 /// - `callback` is a function pointer (already `Sync`)
 /// - `context` is an opaque pointer only dereferenced inside the
-///   callback, which always runs on the BSP with the lock held
+///   callback, which runs on the CPU whose base fired, with that base's
+///   queue lock held
 pub struct TimerEntry {
     pub id: TimerId,
     pub deadline: u64,
@@ -85,6 +86,25 @@ impl TimerQueue {
         let len = self.heap.len();
         self.heap.retain(|e| e.id != id);
         self.heap.len() != len
+    }
+
+    /// Remove and return the entry with the given `id`, or `None` if it
+    /// already fired, was migrated, or never existed.
+    ///
+    /// `BinaryHeap` has no index-based removal, so the heap is drained and
+    /// rebuilt — O(n log n), acceptable while the timer count stays modest.
+    pub fn remove(&mut self, id: TimerId) -> Option<TimerEntry> {
+        let mut found = None;
+        let mut rest = alloc::vec::Vec::new();
+        for entry in self.heap.drain() {
+            if entry.id == id && found.is_none() {
+                found = Some(entry);
+            } else {
+                rest.push(entry);
+            }
+        }
+        self.heap.extend(rest);
+        found
     }
 
     /// Peek at the earliest deadline without removing it.

@@ -123,7 +123,16 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
                     plic::complete(irq);
                 }
             }
-            SUPV_SOFTWARE => {}
+            SUPV_SOFTWARE => {
+                // SBI software IPI — a reschedule hint from a remote hart.
+                // SBI clears SSIP before returning to S-mode; we just re-run
+                // tick() so this hart's base reprograms its own timer.  A
+                // missed IPI is non-fatal (the timer re-arms on its next
+                // fire), so the universal timer must be ready before use.
+                if crate::services::universal_timer::is_ready() {
+                    crate::services::universal_timer::universal_timer_impl().tick();
+                }
+            }
             _ => {
                 panic!("unhandled interrupt: scause={:#x}, sepc={:#x}", scause, frame.sepc);
             }
