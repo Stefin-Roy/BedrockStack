@@ -39,6 +39,9 @@ core::arch::global_asm!(
     "out  0x92, al",
 
     ".byte 0x0f, 0x01, 0x16",
+    // 16-bit displacement to the GDTR block, relative to the COPY at 0x8000
+    // (`_trampoline_gdt_ptr - _trampoline_start` is a section-local offset,
+    // identical in high or low — only the + 0x8000 makes it a low address).
     ".word _trampoline_gdt_ptr - _trampoline_start + 0x8000",
 
     "mov  eax, cr0",
@@ -142,6 +145,9 @@ core::arch::global_asm!(
     ".balign 4",
     "_trampoline_gdt_ptr:",
     ".word _trampoline_gdt_end - _trampoline_gdt - 1",
+    // Difference-based: `_trampoline_gdt - _trampoline_start` is a size/offset
+    // (both symbols live in the high `.text.trampoline` section), so + 0x8000
+    // is the correct LOW linear address of the copied GDT in real mode.
     ".long _trampoline_gdt - _trampoline_start + 0x8000",
 
     ".globl _trampoline_end",
@@ -161,6 +167,12 @@ pub unsafe fn start_aps(
         static _trampoline_lm: u8;
         static _trampoline_end: u8;
     }
+    // Phase 5+ (higher-half): `.text.trampoline` is an input section swept into
+    // `.text.*`, so `_trampoline_start/_trampoline_lm/_trampoline_end` are HIGH
+    // VMAs now.  Only their *differences* are used below (a size/offset, which
+    // is the same in low or high), so `lm_phys = 0x8000 + offset` is still the
+    // correct LOW physical address of `_trampoline_lm` in the copied block.
+    // No absolute low-VMA assumption is made about any symbol's value.
     let src = unsafe { &_trampoline_start as *const u8 as u64 };
     let lm_phys = unsafe { TRAMPOLINE_ADDR + (&_trampoline_lm as *const u8 as u64 - src) };
     let end = unsafe { &_trampoline_end as *const u8 as u64 };
@@ -170,9 +182,17 @@ pub unsafe fn start_aps(
 
     allocator.reserve_region(TRAMPOLINE_ADDR, TRAMPOLINE_ADDR + 0x1000);
     unsafe {
+        // Source is the high VMA of the kernel image (mapped readable by the
+        // kernel root); destination 0x8000 is the identity RWX trampoline
+        // window, which the root also maps.  The copied bytes are the
+        // pre-relocated low block (all internal references were assembled as
+        // `sym - _trampoline_start + 0x8000`, i.e. already 0x8000-based).
         core::ptr::copy_nonoverlapping(src as *const u8, TRAMPOLINE_ADDR as *mut u8, size);
     }
 
+    // `ap_entry64` is a HIGH VMA (kernel text).  The AP fetches it from the
+    // data block at 0x8710 only *after* loading the kernel root into CR3, so
+    // the high value is valid at jump time.
     let entry = ap_entry64 as *const () as usize as u64;
     let data = (TRAMPOLINE_ADDR + DATA_OFFSET) as *mut TrampolineData;
 
@@ -182,8 +202,16 @@ pub unsafe fn start_aps(
         let pc = crate::smp::per_cpu_by_id(ap.cpu_id);
         let record_addr = (0x8D00 + (i as u64) * 32) as *mut u64;
         unsafe {
+            // PER_CPU_SLOTS lives in .data (now HIGH) — the full high VA is
+            // written here; the AP's WRMSR path loads all 64 bits, no masking.
             *record_addr = pc as *const crate::smp::PerCpu as u64;
-            *record_addr.add(1) = ap.stack_top;
+            // `ap.stack_top` is a *physical* frame (from alloc_contiguous).  In
+            // the higher-half root RAM lives only at PHYS_MAP_BASE (DIRECT_MAP),
+            // so the AP's RSP must be that physmap VA — a raw physical stack
+            // pointer would page-fault on the first push (no IDT yet → #DF →
+            // triple fault → machine reset).  riscv64 is unaffected: its paging
+            // identity-maps RAM and it reads PerCpu.stack_top directly.
+            *record_addr.add(1) = crate::mm::layout::to_physmap(ap.stack_top);
         }
     }
     // Reset atomic boot counter at 0x8CF8 (before the record area).

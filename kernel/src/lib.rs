@@ -45,10 +45,23 @@ unsafe extern "C" {
     pub static __stack_end: u8;
     pub static __idt_start: u8;
     pub static __idt_end: u8;
+    // Absolute linker symbols holding the kernel image's PHYSICAL (LMA)
+    // bounds, defined in linker.ld for x86_64 (`__kernel_start_phys =
+    // __low_end`, `__kernel_end_phys = __kernel_end + __phys_delta`, and
+    // `__stack_start_phys = LOADADDR(.stack)`).  The RISC-V script does not
+    // define these (that kernel is not yet higher-half), so they are gated.
+    #[cfg(target_arch = "x86_64")]
+    static __kernel_start_phys: u8;
+    #[cfg(target_arch = "x86_64")]
+    static __kernel_end_phys: u8;
+    #[cfg(target_arch = "x86_64")]
+    pub static __stack_start_phys: u8;
 }
 
-/// Physical-address boundaries of the kernel image sections, used to apply
-/// W^X permissions when building the page tables.
+/// Higher-half VIRTUAL-address boundaries of the kernel image sections, used
+/// to apply W^X permissions when building the page tables (the kernel links
+/// at `KERNEL_VMA_BASE`).  Physical (LMA) bounds live in the `__*_phys`
+/// linker symbols, which the physical allocator uses instead.
 #[derive(Clone, Copy)]
 pub struct KernelLayout {
     pub kernel_start: u64,
@@ -65,6 +78,10 @@ pub struct KernelLayout {
 
 pub struct Kernel {
     framebuffer: Framebuffer,
+    /// Physical address of the boot framebuffer, kept here for paging setup
+    /// (which maps it identity).  Drivers access the framebuffer through the
+    /// `Framebuffer` VA, never through this raw address.
+    fb_phys: u64,
     allocator: BitmapAllocator,
     layout: KernelLayout,
     stack_guard: u64,
@@ -80,6 +97,17 @@ impl Kernel {
     /// memory_map must be a valid slice of MemoryRegion.
     /// framebuffer must be a valid reference to data collected before exit_boot_services.
     /// stack_guard is the physical address of the stack guard page to leave unmapped.
+    ///
+    /// # Handoff-pointer lifetime (Phase 5)
+    /// `memory_map` and `framebuffer` point into low PHYSICAL memory handed
+    /// over by the bootloader.  `Kernel::new` runs BEFORE `switch_to_higher_half`,
+    /// while the static `.boottables` identity map is still live, so the raw
+    /// derefs below (bitmap sizing, `Framebuffer::new`) are safe.  Nothing
+    /// after the switch may deref these raw pointers: the only values retained
+    /// are `fb_phys` (covered by the identity framebuffer window that
+    /// `paging::setup` maps) and `rsdp_addr` (deref'd through the VMM), and
+    /// `rsdp_data` is either absent (UEFI path) or a `'static` copy that was
+    /// moved into kernel memory before the switch (MB2 path).
     pub unsafe fn new(
         memory_map: &'static [MemoryRegion],
         framebuffer: &FramebufferInfo,
@@ -111,17 +139,31 @@ impl Kernel {
         };
 
         SerialPort::puts("[kernel] Kernel::new: BitmapAllocator::new\n");
+        // The allocator consumes PHYSICAL kernel bounds (bitmap placement,
+        // frame reservation).  `layout.*` holds higher-half VMAs for paging
+        // (Phase 4), so the physical extent comes from the `__*_phys` linker
+        // symbols.  RISC-V still links low (VMA == physical), so its VMA
+        // bounds ARE the physical bounds.
+        #[cfg(target_arch = "x86_64")]
+        let (kernel_start_phys, kernel_end_phys) = unsafe {
+            (
+                &__kernel_start_phys as *const u8 as u64,
+                &__kernel_end_phys as *const u8 as u64,
+            )
+        };
+        #[cfg(target_arch = "riscv64")]
+        let (kernel_start_phys, kernel_end_phys) = (layout.kernel_start, layout.kernel_end);
         let mut allocator = unsafe {
             BitmapAllocator::new(
                 bitmap_region,
                 memory_map,
-                layout.kernel_start,
-                layout.kernel_end,
+                kernel_start_phys,
+                kernel_end_phys,
             )
         };
 
         SerialPort::puts("[kernel] Kernel::new: reserve_region\n");
-        allocator.reserve_region(layout.kernel_start, layout.kernel_end);
+        allocator.reserve_region(kernel_start_phys, kernel_end_phys);
 
         SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
         let fb_size = (framebuffer.stride as u64)
@@ -131,11 +173,11 @@ impl Kernel {
         // Belt-and-suspenders: reserve the framebuffer's physical range in the
         // allocator so we never hand out the GPU's own memory as system RAM.
         allocator.reserve_range(framebuffer.address, fb_size as u64);
-        let fb_pages = (fb_size + 4095) / 4096;
-        let shadow_phys = allocator
-            .alloc_contiguous(fb_pages)
-            .expect("OOM for framebuffer shadow buffer");
-        unsafe { core::ptr::write_bytes(shadow_phys as *mut u8, 0, fb_size) };
+        // Phase D: no physical shadow buffer here.  The shadow is a heap/
+        // guard-mapped VM-backed allocation that is created in `init()` once
+        // the heap is live, and bound via `set_shadow_va()`.  Until then the
+        // framebuffer's shadow pointer is null (every accessor already treats a
+        // null shadow as inert).
         let display = unsafe {
             Framebuffer::new(
                 framebuffer.address,
@@ -144,17 +186,15 @@ impl Kernel {
                 framebuffer.stride,
                 framebuffer.pixel_format,
                 framebuffer.bpp,
-                shadow_phys,
+                0,
             )
         };
-
-        SerialPort::puts("[kernel] Kernel::new: heap::init\n");
-        unsafe { heap::init(&mut allocator) };
 
         SerialPort::puts("[kernel] Kernel::new: done\n");
 
         Kernel {
             framebuffer: display,
+            fb_phys: framebuffer.address,
             allocator,
             layout,
             stack_guard,
@@ -177,6 +217,16 @@ impl Kernel {
         heap::set_phys_allocator(&mut self.allocator);
         unsafe { crate::smp::early_init_bsp(); }
         self.switch_to_higher_half();
+        crate::mm::layout::verify_layout();
+
+        // The heap lives in a mapped arena above KERNEL_VMA_BASE, so it can be
+        // initialised only once the kernel page tables are live. Nothing
+        // between `new()` and here allocates from the heap, so moving it after
+        // `switch_to_higher_half` is safe.
+        unsafe {
+            heap::init(self.page_table_root, &mut self.allocator);
+        }
+
         CurrentArch::init();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
@@ -195,7 +245,7 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();
 
-        // Build the service container for capability-based dispatch.
+        // Build the service container for driver dispatch.
         let acpi_static = self.acpi.as_ref().map(|a| unsafe { &*(a as *const crate::acpi::AcpiSubsystem) });
         let svc = alloc::boxed::Box::new(crate::services::init_services(
             self.page_table_root,
@@ -206,6 +256,11 @@ impl Kernel {
         crate::services::set_global(svc_static);
         self.services = Some(svc_static);
 
+        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
+        // NX) VM-backed allocation via direct kernel-heap alloc. Nothing
+        // dereferences the display until `run()`.
+        self.init_framebuffer_shadow();
+
         // Initialise SMP — discover and start Application Processors.
         let ncpus = unsafe {
             crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc())
@@ -215,6 +270,24 @@ impl Kernel {
 
         // Enable interrupts after arch init, page tables, and SMP are live.
         self.svc().platform.enable_interrupts();
+    }
+
+    /// Phase D: allocate the framebuffer shadow buffer on the kernel heap and bind it.
+    ///
+    /// The shadow lives in the guard-mapped, NX heap arena rather than as raw
+    /// contiguous physical frames, so the display path never dereferences a
+    /// physical address. The allocation is deliberately leaked: it is needed
+    /// for the lifetime of the kernel and `Framebuffer` keeps no ownership.
+    fn init_framebuffer_shadow(&mut self) {
+        let size = self.framebuffer.total_bytes();
+        log::info!("framebuffer shadow: {size} B via direct heap alloc");
+        // Direct kernel-heap allocation: the global allocator (set up in
+        // `heap::init` during `init()`) serves this from the guard-mapped,
+        // NX heap arena — exactly what `Framebuffer::set_shadow_va` expects.
+        let mut shadow: alloc::vec::Vec<u8> = alloc::vec![0u8; size];
+        let va = shadow.as_mut_ptr() as u64;
+        core::mem::forget(shadow);
+        self.framebuffer.set_shadow_va(va);
     }
 
     /// Parse the ACPI interrupt model and initialise I/O APIC(s).
@@ -241,7 +314,7 @@ impl Kernel {
             &mut self.allocator,
             &self.layout,
             self.stack_guard,
-            self.framebuffer.phys_addr(),
+            self.fb_phys,
             self.framebuffer.height(),
             self.framebuffer.stride(),
             self.framebuffer.bpp(),
@@ -249,6 +322,10 @@ impl Kernel {
         let root = vmm.root();
         unsafe {
             vmm::activate(root);
+            // DIRECT_MAP was built into these tables by paging::setup; from
+            // here on the VMM walkers deref page-table frames through the
+            // kernel-internal physmap instead of the identity map.
+            crate::mm::init_physmap(self.allocator.alloc_end());
             crate::acpi::init_vmm(root, &mut self.allocator as *mut _);
         }
         self.page_table_root = root;

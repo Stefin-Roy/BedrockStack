@@ -1,10 +1,8 @@
 use crate::mm::vmm::PageFlags;
 
-use super::capability::Capability;
-
 pub use crate::acpi::{InterruptModel, IoApic, PciConfigRegions, PlatformInfo};
 
-pub trait AcpiProvider: Capability {
+pub trait AcpiProvider: Send + Sync {
     fn interrupt_model(&self) -> &InterruptModel;
     fn pci_config_regions(&self) -> &PciConfigRegions;
     fn platform_info(&self) -> Option<&PlatformInfo>;

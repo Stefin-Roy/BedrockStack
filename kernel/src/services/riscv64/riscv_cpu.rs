@@ -3,17 +3,11 @@ use alloc::vec::Vec;
 use crate::acpi::AcpiSubsystem;
 use crate::arch::riscv64::sbi;
 use crate::smp::ApContext;
-
-use super::super::capability::Capability;
 use super::super::cpu::CpuManager;
 
 pub struct RiscvCpu;
 
-impl Capability for RiscvCpu {
-    fn name(&self) -> &str {
-        "riscv-cpu"
-    }
-}
+
 
 impl CpuManager for RiscvCpu {
     fn current_cpu_id(&self) -> u32 {

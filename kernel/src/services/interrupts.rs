@@ -1,6 +1,5 @@
-use super::capability::Capability;
 
-pub trait InterruptManager: Capability {
+pub trait InterruptManager: Send + Sync {
     fn register_handler(&self, vector: u8, handler: fn());
     fn unregister_handler(&self, vector: u8);
     fn enable(&self, vector: u8);

@@ -1,4 +1,3 @@
-pub mod capability;
 pub mod clocksource;
 pub mod clockevent;
 pub mod timer_queue;
@@ -38,7 +37,7 @@ use dma::DmaAllocator;
 use pci_device::PciDeviceManager;
 use acpi::AcpiProvider;
 
-/// Container for all arch-independent kernel capability providers.
+/// Container for all arch-independent kernel service providers.
 ///
 /// Built once during `Kernel::init()` after arch init completes.
 /// Accessed via `Kernel::svc()` throughout the rest of the boot sequence.

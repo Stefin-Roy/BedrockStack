@@ -1,15 +1,9 @@
 use crate::arch::x86_64::idt;
-
-use super::super::capability::Capability;
 use super::super::msi::MsiAllocator;
 
 pub struct X86Msi;
 
-impl Capability for X86Msi {
-    fn name(&self) -> &str {
-        "x86-msi"
-    }
-}
+
 
 impl MsiAllocator for X86Msi {
     fn allocate_device_vector(&self, handler: fn()) -> Option<u8> {

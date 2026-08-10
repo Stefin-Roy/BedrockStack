@@ -24,6 +24,19 @@ unsafe impl Send for BitmapAllocator {}
 unsafe impl Sync for BitmapAllocator {}
 
 impl BitmapAllocator {
+    /// Translate the stored (physical) bitmap base through the current physmap
+    /// offset, mirroring the VMM walkers.
+    ///
+    /// Before `init_physmap` the offset is 0 (identity); once the DIRECT_MAP at
+    /// `PHYS_MAP_BASE` is live, low physical pages are only reachable through
+    /// the physmap, so the bitmap must be deref'd at `to_physmap(base)`.  The
+    /// bitmap lives in a usable region below 4 GiB, which Phase 4's tables map
+    /// only at `PHYS_MAP_BASE + phys` — the old identity-window access would
+    /// page-fault on the first post-switch allocation.
+    fn bitmap_ptr(&self) -> *mut u8 {
+        crate::mm::layout::to_physmap(self.bitmap as u64) as *mut u8
+    }
+
     /// Create a new allocator.
     ///
     /// The bitmap is placed at the start of `bitmap_region`, unless that would
@@ -147,6 +160,13 @@ impl BitmapAllocator {
         self.total_frames
     }
 
+    /// The allocator's forward-scan cursor (next frame index `alloc()` /
+    /// `alloc_contiguous()` will start probing). Read-only; `dma_trace` uses it
+    /// to report allocator state on a frame-alloc failure.
+    pub fn next_free(&self) -> usize {
+        self.next_free
+    }
+
     /// Allocate a physical frame.
     ///
     /// Returns physical address of allocated frame, or None if no frames available.
@@ -154,7 +174,7 @@ impl BitmapAllocator {
         // INV-PA-02: linear scan, find first free frame
         // Scan 64 bits (one u64 word) at a time for ~64× throughput.
         let total_words = (self.total_frames + 63) / 64;
-        let bitmap_u64 = self.bitmap as *const u64;
+        let bitmap_u64 = self.bitmap_ptr() as *const u64;
 
         let start_word = self.next_free / 64;
         let start_bit = self.next_free % 64;
@@ -299,15 +319,15 @@ impl BitmapAllocator {
     }
 
     fn is_free(&self, idx: usize) -> bool {
-        unsafe { *self.bitmap.add(idx / 8) & (1 << (idx % 8)) == 0 }
+        unsafe { *self.bitmap_ptr().add(idx / 8) & (1 << (idx % 8)) == 0 }
     }
 
     fn set_used(&mut self, idx: usize) {
-        unsafe { *self.bitmap.add(idx / 8) |= 1 << (idx % 8); }
+        unsafe { *self.bitmap_ptr().add(idx / 8) |= 1 << (idx % 8); }
     }
 
     fn set_free(&mut self, idx: usize) {
-        unsafe { *self.bitmap.add(idx / 8) &= !(1 << (idx % 8)); }
+        unsafe { *self.bitmap_ptr().add(idx / 8) &= !(1 << (idx % 8)); }
     }
 }
 
@@ -331,16 +351,10 @@ fn clear_region(bitmap: *mut u8, region: &MemoryRegion, total_frames: usize) {
     }
 }
 
-// ── Service capability traits ─────────────────────────────────────────
-
-use crate::services::capability::Capability;
+// ── Service provider traits ───────────────────────────────────────────
 use crate::services::phys_mem::PhysicalMemoryAllocator;
 
-impl Capability for BitmapAllocator {
-    fn name(&self) -> &str {
-        "bitmap-allocator"
-    }
-}
+
 
 impl PhysicalMemoryAllocator for BitmapAllocator {
     fn alloc_frames(&mut self, count: usize) -> Result<u64, ()> {

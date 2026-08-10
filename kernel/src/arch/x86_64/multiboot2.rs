@@ -9,6 +9,37 @@ core::arch::global_asm!(include_str!("multiboot2_header.s"));
 const MB2_MAGIC: u32 = 0x36d76289;
 const MAX_REGIONS: usize = 64;
 
+// ── RSDP stash (Phase 5) ──────────────────────────────────────────────
+// Tags 14/15 embed the RSDP bytes in the LOW multiboot2 info buffer, which
+// is identity-mapped before `switch_to_higher_half` but stripped from the
+// page tables afterwards.  ACPI parses `rsdp_data` only after the switch, so
+// the bytes must be copied into a kernel-resident ('static) buffer here.
+const RSDP_BUF_SIZE: usize = 512; // RSDP v2 is ~44 bytes; 512 is ample.
+static mut RSDP_BUF: [u8; RSDP_BUF_SIZE] = [0u8; RSDP_BUF_SIZE];
+static mut RSDP_LEN: usize = 0;
+
+/// Copy `data` into the static RSDP stash and return it as `'static`.
+///
+/// # Safety
+/// Single-threaded (BSP, pre-SMP).  The stash is written once and read-only
+/// afterwards.
+unsafe fn stash_rsdp(data: &[u8]) -> &'static [u8] {
+    assert!(
+        data.len() <= RSDP_BUF_SIZE,
+        "RSDP too large for stash ({})",
+        data.len()
+    );
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            core::ptr::addr_of_mut!(RSDP_BUF) as *mut u8,
+            data.len(),
+        );
+        RSDP_LEN = data.len();
+        core::slice::from_raw_parts(core::ptr::addr_of!(RSDP_BUF) as *const u8, RSDP_LEN)
+    }
+}
+
 unsafe fn r32(p: *const u8, off: usize) -> u32 {
     unsafe { read_unaligned(p.add(off) as *const u32) }
 }
@@ -27,6 +58,13 @@ fn tag_next(tag: *const u8) -> *const u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
+    // NOTE (Phase 3): this entry runs BEFORE `switch_to_higher_half`, while
+    // the static `.boottables` (CR3 = `__boot_pml4`) identity map is still
+    // live.  `info` is the low physical pointer GRUB passed us — its value
+    // is < 1 GiB, so direct dereference below works via the identity map.
+    // `to_physmap()` also returns identity while PHYS_MAP_ON is false, so the
+    // handoff pointers are never double-translated.  Do NOT move the tag
+    // parsing after the higher-half switch without adding phys→virt fixes.
     // Initialise COM1 serial as early as possible so diagnostics are
     // available even if a tag parse or allocation panics later.
     SerialPort::init();
@@ -119,14 +157,17 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
             // embed the *entire* RSDP table data at `tag + 8`, NOT a
             // pointer to it.  Extract the embedded bytes and pass them
             // as a data slice so `parse_tables_from_data` can parse them
-            // without needing to map from a physical address.
+            // without needing to map from a physical address.  The bytes
+            // are copied into the kernel-resident stash because the low
+            // multiboot2 info buffer is unmapped after the higher-half
+            // switch, and ACPI parses this data only afterwards.
             14 if size >= 28 => {
                 let data = unsafe { core::slice::from_raw_parts(tag.add(8), (size - 8) as usize) };
-                rsdp_data = Some(data);
+                rsdp_data = Some(unsafe { stash_rsdp(data) });
             }
             15 if size >= 44 => {
                 let data = unsafe { core::slice::from_raw_parts(tag.add(8), (size - 8) as usize) };
-                rsdp_data = Some(data);
+                rsdp_data = Some(unsafe { stash_rsdp(data) });
             }
             _ => {}
         }
@@ -138,7 +179,10 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
         core::slice::from_raw_parts(&region_buf as *const MemoryRegion, region_count)
     };
 
-    let stack_guard = unsafe { &crate::__stack_start as *const u8 as u64 - 4096 };
+    // The guard page is the physical frame just below the kernel's `.stack`
+    // section.  `__stack_start` is a higher-half VMA; `__stack_start_phys`
+    // is the LMA (physical) value the allocator and pager compare against.
+    let stack_guard = unsafe { &crate::__stack_start_phys as *const u8 as u64 - 4096 };
 
     let mut kernel = unsafe {
         Kernel::new(memory_map, &fb_info, stack_guard, 0, rsdp_data)

@@ -1,6 +1,5 @@
-use super::capability::Capability;
 
-pub trait SerialConsole: Capability {
+pub trait SerialConsole: Send + Sync {
     fn putc(&self, c: u8);
     fn puts(&self, s: &str);
     fn put_hex(&self, val: u64);
@@ -13,11 +12,7 @@ pub trait SerialConsole: Capability {
 /// `drivers::serial` via the `Inner` type alias.
 pub struct KernelSerial;
 
-impl Capability for KernelSerial {
-    fn name(&self) -> &str {
-        "kernel-serial"
-    }
-}
+
 
 impl SerialConsole for KernelSerial {
     fn putc(&self, c: u8) {

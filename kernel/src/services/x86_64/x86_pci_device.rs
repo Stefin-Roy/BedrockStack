@@ -1,14 +1,9 @@
-use super::super::capability::Capability;
 use super::super::pci_config::PciConfigSpace;
 use super::super::pci_device::{Bar, PciCapability, PciDevice, PciDeviceManager};
 
 pub struct X86PciDevice;
 
-impl Capability for X86PciDevice {
-    fn name(&self) -> &str {
-        "x86-pci-device"
-    }
-}
+
 
 impl PciDeviceManager for X86PciDevice {
     fn devices(&self) -> &[PciDevice] {

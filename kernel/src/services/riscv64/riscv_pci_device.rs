@@ -1,14 +1,9 @@
-use super::super::capability::Capability;
 use super::super::pci_config::PciConfigSpace;
 use super::super::pci_device::{Bar, PciCapability, PciDevice, PciDeviceManager};
 
 pub struct RiscvPciDevice;
 
-impl Capability for RiscvPciDevice {
-    fn name(&self) -> &str {
-        "riscv-pci-device"
-    }
-}
+
 
 impl PciDeviceManager for RiscvPciDevice {
     fn devices(&self) -> &[PciDevice] {

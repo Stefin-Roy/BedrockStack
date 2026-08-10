@@ -1,8 +1,6 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use crate::arch::riscv64::time;
-
-use super::super::capability::Capability;
 use super::super::timer::TimerProvider;
 
 const TIMEBASE_HZ: u64 = 10_000_000;
@@ -24,11 +22,7 @@ pub fn tick() {
 
 pub struct SbiTimer;
 
-impl Capability for SbiTimer {
-    fn name(&self) -> &str {
-        "sbi-timer"
-    }
-}
+
 
 impl TimerProvider for SbiTimer {
     fn now_ns(&self) -> u64 {

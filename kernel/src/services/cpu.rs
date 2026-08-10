@@ -3,9 +3,7 @@ use alloc::vec::Vec;
 use crate::acpi::AcpiSubsystem;
 use crate::smp::ApContext;
 
-use super::capability::Capability;
-
-pub trait CpuManager: Capability {
+pub trait CpuManager: Send + Sync {
     fn current_cpu_id(&self) -> u32;
     fn cpu_count(&self) -> u32;
     fn send_ipi(&self, cpu_id: u32, vector: u8);

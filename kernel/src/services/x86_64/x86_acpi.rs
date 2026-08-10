@@ -2,7 +2,6 @@ use crate::acpi::{AcpiSubsystem, InterruptModel, PciConfigRegions, PlatformInfo}
 use crate::mm::vmm::PageFlags;
 
 use super::super::acpi::AcpiProvider;
-use super::super::capability::Capability;
 
 pub struct X86Acpi {
     acpi: &'static AcpiSubsystem,
@@ -14,11 +13,7 @@ impl X86Acpi {
     }
 }
 
-impl Capability for X86Acpi {
-    fn name(&self) -> &str {
-        "x86-acpi"
-    }
-}
+
 
 impl AcpiProvider for X86Acpi {
     fn interrupt_model(&self) -> &InterruptModel {

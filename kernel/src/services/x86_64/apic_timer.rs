@@ -1,7 +1,5 @@
 use core::mem;
 use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
-
-use super::super::capability::Capability;
 use super::super::timer::TimerProvider;
 
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -19,11 +17,7 @@ pub fn tick() {
 
 pub struct ApicTimer;
 
-impl Capability for ApicTimer {
-    fn name(&self) -> &str {
-        "apic-timer"
-    }
-}
+
 
 impl TimerProvider for ApicTimer {
     fn now_ns(&self) -> u64 {

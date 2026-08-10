@@ -11,11 +11,19 @@ use crate::mm::phys_alloc::BitmapAllocator;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::activate;
 #[cfg(target_arch = "x86_64")]
+pub use self::x86_64::clone_high_half;
+#[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "x86_64")]
-pub use self::x86_64::make_read_only_both;
+pub use self::x86_64::make_read_only;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::clone_high_half;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::prepopulate_window;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -72,33 +80,52 @@ impl core::ops::BitAndAssign for PageFlags {
 /// Base address for the higher-half kernel alias mapping.
 ///
 /// The kernel image is linked at its physical address (e.g. `0x400000` on
-/// x86_64).  Phase 2 of the VMM adds an *alias* mapping so that every kernel
+/// x86_64).  Phase 2 of the VMM adds an *alias* mapping so that every kernel
 /// page is also reachable at `KERNEL_VMA_BASE + phys_addr`.  This gives us a
 /// higher-half view without changing the linker script or the code's
 /// compiled addresses.
-pub const KERNEL_VMA_BASE: u64 = 0xFFFFFF8000000000;
+pub const KERNEL_VMA_BASE: u64 = crate::mm::layout::KERNEL_VMA_BASE;
 
 // ── Vmm ─────────────────────────────────────────────────────────────
 
 /// A page table root object that can be queried and modified at run time.
 pub struct Vmm {
     root: u64, // physical address of the root table (PML4 / L2)
+    alloc: *mut BitmapAllocator,
 }
+
+unsafe impl Send for Vmm {}
+unsafe impl Sync for Vmm {}
 
 impl Vmm {
     /// Allocate a fresh, empty page table (one zeroed root frame).
     pub fn new(alloc: &mut BitmapAllocator) -> Self {
         let root = alloc.alloc().expect("VMM: OOM for root page table");
-        // Zero the frame.
+        // Zero the frame (through the physmap — the identity window no longer
+        // covers all of RAM, so a raw physical write would fault).
         unsafe {
-            core::ptr::write_bytes(root as *mut u8, 0, 4096);
+            core::ptr::write_bytes(crate::mm::layout::to_physmap(root) as *mut u8, 0, 4096);
         }
-        Vmm { root }
+        Vmm { root, alloc: alloc as *mut BitmapAllocator }
     }
 
-    /// Wrap an existing root frame — no allocation.
+    /// Wrap an existing root frame — no allocation.  The internal allocator
+    /// pointer is taken from the global physical allocator if it is already
+    /// registered, otherwise `null` (callers that map must pass an allocator
+    /// to the inherent methods, or call `set_alloc` first).
     pub fn from_root(root: u64) -> Self {
-        Vmm { root }
+        Vmm { root, alloc: crate::mm::heap::phys_allocator_raw() }
+    }
+
+    /// Bind an allocator to this VMM so the allocator-independent trait
+    /// methods (`VirtualMemoryManager::map`) can allocate intermediate tables.
+    pub fn set_alloc(&mut self, alloc: *mut BitmapAllocator) {
+        self.alloc = alloc;
+    }
+
+    /// The allocator bound to this VMM (may be null until `set_alloc`).
+    pub fn allocator(&self) -> *mut BitmapAllocator {
+        self.alloc
     }
 
     pub fn root(&self) -> u64 { self.root }
@@ -224,20 +251,60 @@ impl Vmm {
         return riscv64::translate(self.root, vaddr);
     }
 
-    /// Flush the TLB (entirety).
+    /// Flush the TLB (entirety).  Delegates to the arch-agnostic free fn.
     pub fn flush_tlb(&self) {
-        #[cfg(target_arch = "x86_64")]
-        unsafe {
-            core::arch::asm!("mov rax, cr3; mov cr3, rax", options(nostack, preserves_flags));
-        }
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("sfence.vma", options(nostack));
-        }
+        flush_tlb()
     }
 }
 
-// Service capability traits for Vmm are not yet implemented because
-// the inherent `map`/`unmap` methods require a `&mut BitmapAllocator`
-// parameter.  The `VirtualMemoryManager` trait will be implemented once
-// that dependency is resolved (e.g. by storing the allocator inside Vmm).
+/// Flush the TLB for the whole address space.
+///
+/// The `Vmm` bound is not required by the operation itself, so this is exposed
+/// as a free function for code (e.g. `unmap_4k`) that reclaims page-table
+/// frames and needs a full flush without holding a `Vmm`.
+pub fn flush_tlb() {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("mov rax, cr3; mov cr3, rax", options(nostack, preserves_flags));
+    }
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("sfence.vma", options(nostack));
+    }
+}
+
+// ── VirtualMemoryManager provider ─────────────────────────────────────
+//
+// Implemented now that `Vmm` stores its own allocator pointer. The inherent
+// `map`/`unmap` methods (which take an explicit `&mut BitmapAllocator`) are
+// kept for early-boot/explicit callers; the provider methods reuse the
+// stored allocator.
+use crate::services::virt_mem::VirtualMemoryManager;
+
+
+
+impl VirtualMemoryManager for Vmm {
+    fn map(&mut self, vaddr: u64, paddr: u64, size: u64, flags: PageFlags) {
+        let alloc = self.alloc;
+        assert!(!alloc.is_null(), "VMM::map: no allocator bound to Vmm");
+        self.map(unsafe { &mut *alloc }, vaddr, paddr, size, flags);
+    }
+
+    fn unmap(&mut self, vaddr: u64, size: u64) {
+        let alloc = self.alloc;
+        assert!(!alloc.is_null(), "VMM::unmap: no allocator bound to Vmm");
+        self.unmap(unsafe { &mut *alloc }, vaddr, size);
+    }
+
+    fn translate(&self, vaddr: u64) -> Option<u64> {
+        self.translate(vaddr)
+    }
+
+    fn root(&self) -> u64 {
+        self.root
+    }
+
+    fn flush_tlb(&self) {
+        self.flush_tlb()
+    }
+}

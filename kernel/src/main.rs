@@ -13,16 +13,19 @@ use kernel::drivers::serial::SerialPort;
 
 /// Kernel entry point (custom bootloader path).
 ///
+/// Runs at KERNEL_VMA (higher half): the low assembly `_start` stub in
+/// `.text.boot64` installs CR3 = `__boot_pml4` and long-jumps here.
+///
 /// # Safety
 /// Called from boot after exit_boot_services.
 #[unsafe(no_mangle)]
 #[cfg(not(feature = "kernelmb2"))]
 #[cfg(target_arch = "x86_64")]
-pub extern "sysv64" fn _start(
+pub extern "sysv64" fn kernel_main(
     memory_map_ptr: *const MemoryRegion,
     memory_map_len: usize,
     framebuffer_ptr: *const FramebufferInfo,
-    stack_guard: u64,
+    _stack_guard: u64,
     rsdp_addr: u64,
 ) -> ! {
     // ── Kernel arrived ──
@@ -30,6 +33,11 @@ pub extern "sysv64" fn _start(
     // Reinit COM1 — boot already did this, but be safe
     SerialPort::init();
     SerialPort::puts("[kernel] _start entered\n");
+
+    // The low stub switched RSP to the kernel's high `.stack` after loading
+    // CR3, so the guard page is the frame below it — NOT the bootloader's
+    // stack guard (that stack is never used; the stub overrides RSP).
+    let stack_guard = unsafe { &kernel::__stack_start_phys as *const u8 as u64 - 4096 };
 
     #[cfg(feature = "cpu_slow")]
     {
@@ -53,6 +61,48 @@ pub extern "sysv64" fn _start(
     kernel.init();
     kernel.run();
 }
+
+/// Low 64-bit `_start` stub for the UEFI bootloader path (non-`kernelmb2`).
+///
+/// The kernel is linked higher-half, so `e_entry` must be a LOW stub that
+/// installs the static `.boottables` (CR3 = `__boot_pml4`) and long-jumps
+/// into the high `kernel_main`.  The UEFI-provided sysv64 args
+/// (rdi/rsi/rdx/rcx/r8 = memory_map_ptr/len/framebuffer/stack_guard/rsdp)
+/// are already in exactly the registers `kernel_main` expects, and none of
+/// the setup instructions below clobber them, so they pass straight through.
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelmb2")))]
+core::arch::global_asm!(
+    r#"
+    .section .text.boot64, "ax"
+    .code64
+.globl _start
+_start:
+    // Low `.bootstack` — the kernel `.stack` is higher-half and unmapped
+    // before the CR3 switch, so the stub stacks onto the low boot stack.
+    lea rsp, [rip + __boot_stack_end]
+    xor rbp, rbp
+
+    // Install the static higher-half page tables.  `__boot_pml4` is a low
+    // region symbol whose value == its physical address (identity mapped),
+    // and this stub is still running low, so the switch is safe.
+    movabs rax, offset __boot_pml4
+    mov cr3, rax
+
+    // Switch to the kernel's high `.stack` — `.boottables` maps the whole
+    // [KERNEL_VMA, +256 MiB) window RW, and `.stack` (ending at `__kernel_end`)
+    // lies inside it, so it is reachable the moment CR3 is loaded.  The low
+    // `.bootstack` is dead from here on; the kernel runs its entire life on
+    // this high stack, which every domain's cloned high half maps.
+    movabs rax, offset __stack_end
+    mov rsp, rax
+
+    // Far-into-high jump: `kernel_main` is a kernel-region symbol (high VMA)
+    // that `.boottables` maps at [KERNEL_VMA, +256 MiB).  The 5 sysv64 args
+    // in rdi/rsi/rdx/rcx/r8 are untouched and match kernel_main's signature.
+    movabs rax, offset kernel_main
+    jmp rax
+"#,
+);
 
 #[cfg(target_arch = "riscv64")]
 global_asm!(

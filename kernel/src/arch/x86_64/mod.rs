@@ -9,7 +9,6 @@ pub mod trampoline;
 mod multiboot2;
 
 use crate::platform::x86_64_pc::apic;
-use crate::services::capability::Capability;
 use crate::services::clockevent::Clockevent;
 use crate::services::clocksource::Clocksource;
 use crate::services::universal_timer;
@@ -79,11 +78,7 @@ impl X86_64 {
 
 pub struct X86TscClocksource;
 
-impl Capability for X86TscClocksource {
-    fn name(&self) -> &str {
-        "x86-tsc"
-    }
-}
+
 
 impl Clocksource for X86TscClocksource {
     fn now_ns(&self) -> u64 {
@@ -98,11 +93,7 @@ impl Clocksource for X86TscClocksource {
 
 pub struct ApicOneShotClockevent;
 
-impl Capability for ApicOneShotClockevent {
-    fn name(&self) -> &str {
-        "apic-oneshot"
-    }
-}
+
 
 impl Clockevent for ApicOneShotClockevent {
     /// Program the APIC timer to fire at (or slightly after) `deadline_ns`.

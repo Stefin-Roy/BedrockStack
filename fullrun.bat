@@ -367,11 +367,11 @@ echo [3/3] Creating disk image...
 echo --- image creation --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 
-REM Place GRUB EFI where create_image.py expects boot.efi
-if not exist "%TARGET_DIR%\x86_64-unknown-uefi\debug" mkdir "%TARGET_DIR%\x86_64-unknown-uefi\debug"
-copy /Y "%GRUB_EFI%" "%TARGET_DIR%\x86_64-unknown-uefi\debug\boot.efi" >nul
-
-python "%SCRIPT_DIR%create_image.py" 2>&1
+REM Pass the GRUB standalone image directly to the image builder.  Do NOT
+REM copy it over the real UEFI loader (boot.efi): cargo considers boot.efi
+REM fresh and won't rebuild it, so a later UEFI-mode run would silently boot
+REM GRUB instead of the Bedrock loader.
+python "%SCRIPT_DIR%create_image.py" --boot "%GRUB_EFI%" 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: image creation failed with exit code %errorlevel%
     echo image creation FAILED: exit %errorlevel% >> "%LOG_FILE%"

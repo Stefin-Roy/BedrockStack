@@ -3,17 +3,11 @@ use alloc::vec::Vec;
 use crate::acpi::AcpiSubsystem;
 use crate::platform::x86_64_pc::apic;
 use crate::smp::ApContext;
-
-use super::super::capability::Capability;
 use super::super::cpu::CpuManager;
 
 pub struct X86Cpu;
 
-impl Capability for X86Cpu {
-    fn name(&self) -> &str {
-        "x86-cpu"
-    }
-}
+
 
 impl CpuManager for X86Cpu {
     fn current_cpu_id(&self) -> u32 {

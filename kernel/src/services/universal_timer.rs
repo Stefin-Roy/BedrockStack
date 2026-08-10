@@ -2,8 +2,6 @@ use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use spin::Once;
-
-use super::capability::Capability;
 use super::clockevent::Clockevent;
 use super::clocksource::Clocksource;
 use super::timer_queue::{TimerEntry, TimerQueue};
@@ -73,7 +71,7 @@ pub struct TimerId(u64);
 
 // ── UniversalTimer trait ──────────────────────────────────────────
 
-pub trait UniversalTimer: Capability {
+pub trait UniversalTimer: Send + Sync {
     /// Fire `callback(context)` at or after `deadline_ns` (absolute).
     fn set(&self, deadline_ns: u64, callback: TimerCallback, context: *mut u8) -> TimerId;
 
@@ -144,11 +142,7 @@ impl UniversalTimerImpl {
     }
 }
 
-impl Capability for UniversalTimerImpl {
-    fn name(&self) -> &str {
-        "universal-timer"
-    }
-}
+
 
 impl UniversalTimer for UniversalTimerImpl {
     fn set(&self, deadline_ns: u64, callback: TimerCallback, context: *mut u8) -> TimerId {
