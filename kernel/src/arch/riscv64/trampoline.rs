@@ -85,7 +85,8 @@ pub unsafe fn start_aps(
         }
     }
 
-    // Phase 2: Parallel poll
+    // Phase 2: Parallel poll (30 ms timeout)
+    let deadline = crate::services::universal_timer::now_ns() + 30_000_000;
     let mut started_ok = 0usize;
     while started_ok < aps.len() {
         started_ok = 0;
@@ -95,6 +96,9 @@ pub unsafe fn start_aps(
             {
                 started_ok += 1;
             }
+        }
+        if started_ok < aps.len() && crate::services::universal_timer::now_ns() > deadline {
+            break;
         }
         core::hint::spin_loop();
     }
@@ -139,6 +143,7 @@ pub extern "C" fn ap_entry_riscv() -> ! {
 
     // Mark started — own cache line, no lock.
     crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
+    crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
 
     // Per-CPU arch init (trap vectors, PLIC, SIE).
     crate::arch::CurrentArch::init_ap(cpu_id);

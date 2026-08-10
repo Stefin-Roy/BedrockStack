@@ -166,6 +166,7 @@ struct AhciPort {
     slots: [Slot; AHCI_MAX_SLOTS],
     slot_alloc: core::sync::atomic::AtomicU32,
     irq_completed: AtomicU32,
+    submit_lock: spin::Mutex<()>,
 }
 
 unsafe impl Sync for AhciPort {}
@@ -579,6 +580,7 @@ impl AhciPort {
 
 impl BlockDevice for AhciPort {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
+        let _guard = self.submit_lock.lock();
         let n = reqs.len().min(if self.ncq { self.n_slots as usize } else { 1 });
         if n == 0 {
             return Ok(IoCompletions { completed: 0, errors: 0 });
@@ -899,6 +901,7 @@ fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_r
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),
+        submit_lock: spin::Mutex::new(()),
     };
 
     port.identify()?;

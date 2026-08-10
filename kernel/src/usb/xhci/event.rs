@@ -1,4 +1,5 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
 
@@ -227,7 +228,10 @@ fn route_to_interrupt_target(slot_id: u8, ep_id: u8, cc: u8, remaining: u32) -> 
     false
 }
 
+static EVENT_RING_LOCK: Mutex<()> = Mutex::new(());
+
 pub fn consume_pending_events() {
+    let _guard = EVENT_RING_LOCK.lock();
     let er_vaddr = XHCI_ER_VADDR.load(Ordering::Relaxed);
     if er_vaddr == 0 {
         return;
