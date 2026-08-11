@@ -110,6 +110,9 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
 
     let total_data_sectors = total_sectors - first_data_sec;
     let total_clus = (total_data_sectors / sec_per_clus as u64) as u32;
+    if root_clus as u64 >= 2u64 + total_clus as u64 {
+        return Err(VfsError::InvalidInput);
+    }
     let byts_per_clus = (bytes_per_sec as u32) * (sec_per_clus as u32);
 
     // BPB_ExtFlags (offset 0x28): bits 0-3 = active FAT (only meaningful when
@@ -141,11 +144,14 @@ impl Bpb {
             + sector_idx as u64
     }
 
-    pub fn fat_entry_position(&self, cluster: u32) -> (u32, u32) {
-        let byte_off = cluster as u32 * 4;
-        let sector_idx = byte_off / self.bytes_per_sec as u32;
-        let offset = byte_off % self.bytes_per_sec as u32;
-        (sector_idx, offset)
+    pub fn fat_entry_position(&self, cluster: u32) -> Result<(u32, u32), VfsError> {
+        if cluster < 2 || cluster as u64 >= 2u64 + self.total_clus as u64 {
+            return Err(VfsError::InvalidInput);
+        }
+        let byte_off = cluster as u64 * 4;
+        let sector_idx = byte_off / self.bytes_per_sec as u64;
+        let offset = byte_off % self.bytes_per_sec as u64;
+        Ok((sector_idx as u32, offset as u32))
     }
 
     pub fn fsinfo_is_valid(&self) -> bool {

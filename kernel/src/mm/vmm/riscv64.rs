@@ -107,6 +107,7 @@ pub fn map_4k(
     paddr: u64,
     flags: PageFlags,
 ) {
+    let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let rf = page_flags_to_riscv(flags);
 
@@ -145,6 +146,7 @@ pub fn map_2m(
     paddr: u64,
     flags: PageFlags,
 ) {
+    let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let rf = page_flags_to_riscv(flags);
 
@@ -163,7 +165,8 @@ pub fn map_2m(
     }
 }
 
-pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
+pub fn unmap_4k(root: u64, vaddr: u64, _pending: &mut super::PendingFrames) -> bool {
+    let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let idx2 = vpn_index(vaddr, 2);
     let idx1 = vpn_index(vaddr, 1);
@@ -181,8 +184,10 @@ pub fn unmap_4k(root: u64, _alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
         return false;
     }
 
+    // The leaf is cleared here; the local `sfence.vma` plus the cross-hart
+    // TLB shootdown are hoisted to the range-level caller (`Vmm::unmap` /
+    // `Vmm::unmap_4k`), which runs them before any frame is freed.
     l1.entries[idx0].clear();
-    unsafe { asm!("sfence.vma"); }
     true
 }
 

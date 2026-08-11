@@ -90,6 +90,7 @@ pub fn map_4k(
     paddr: u64,
     flags: PageFlags,
 ) {
+    let _guard = super::lock();
     let mut mapper = mapper_at(root);
     let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
@@ -112,6 +113,7 @@ pub fn map_2m(
     paddr: u64,
     flags: PageFlags,
 ) {
+    let _guard = super::lock();
     let mut mapper = mapper_at(root);
     let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
@@ -127,12 +129,16 @@ pub fn map_2m(
     }
 }
 
-pub fn unmap_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
+pub fn unmap_4k(root: u64, vaddr: u64, pending: &mut super::PendingFrames) -> bool {
+    let _guard = super::lock();
     let mut mapper = mapper_at(root);
 
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     let removed = match mapper.unmap(page) {
         Ok((_mapped_frame, flush)) => {
+            // Local per-page invalidation only.  The range-level path performs
+            // the full local flush plus a cross-CPU TLB shootdown before any
+            // frame (leaf or intermediate table) is released to the allocator.
             flush.flush();
             // NB: `_mapped_frame` is the frame that was mapped at this VA and
             // is owned by the *caller* — freeing it here would release memory
@@ -145,10 +151,7 @@ pub fn unmap_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
     if !removed {
         return false;
     }
-    reclaim_empty_tables(root, alloc, vaddr);
-    // Freeing intermediate tables drops valid working-set entries for the
-    // whole address space, not just the single unmapped page.  Full flush.
-    crate::mm::vmm::flush_tlb();
+    reclaim_empty_tables(root, pending, vaddr);
     true
 }
 
@@ -188,13 +191,25 @@ unsafe fn table_is_empty(frame: u64) -> bool {
 }
 
 /// Free 4-level intermediate page tables that became empty after the leaf at
-/// `vaddr` was unmapped, returning their frames to `alloc`.
+/// `vaddr` was unmapped, returning their frames to the allocator.
 ///
 /// Walks from the PML4 down to the deepest (Level-1) table holding the leaf.
 /// After the leaf is cleared (already done by the caller), each table is freed
 /// and its parent entry cleared only when it has no remaining present entries.
 /// The root (PML4) itself is never freed — it is owned by the kernel.
-fn reclaim_empty_tables(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) {
+///
+/// Orphaned frames are pushed into `pending` rather than freed directly: the
+/// caller completes a cross-CPU TLB shootdown before `pending.flush()` returns
+/// them to the allocator, so no CPU re-walks a frame that is being released.
+///
+/// # Clone subtrees
+/// `clone_high_half` shares the parent's higher-half PDPT/PD/PT subtrees into
+/// every cloned root.  Those tables are still walked by the clone even after
+/// this root drops them, so when any clone exists the empty tables are left
+/// allocated (their parent entries are still cleared, releasing the VA space)
+/// rather than freed — freeing a shared table would let the clone's next walk
+/// dereference a reallocated frame.
+fn reclaim_empty_tables(root: u64, pending: &mut super::PendingFrames, vaddr: u64) {
     // Level-0 (leaf) table index, Level-1 (PD), Level-2 (PDPT), Level-3 (PML4).
     #[rustfmt::skip]
     let (i_pt, i_pd, i_pdpt, i_pml4) = (
@@ -203,6 +218,8 @@ fn reclaim_empty_tables(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) {
         ((vaddr >> 30) & 0x1FF) as usize,
         ((vaddr >> 39) & 0x1FF) as usize,
     );
+
+    let keep_frames = super::has_clone_roots();
 
     unsafe {
         let pml4 = pte_deref(root);
@@ -230,16 +247,22 @@ fn reclaim_empty_tables(root: u64, alloc: &mut BitmapAllocator, vaddr: u64) {
         }
 
         if table_is_empty(pt_frame) {
-            alloc.free(pt_frame);
+            if !keep_frames {
+                pending.push(pt_frame);
+            }
             write_pte(pd, i_pd, 0);
             // PD may now be empty → free it and clear PDPT entry.
             let pd_frame = pte_frame(pdpte);
             if table_is_empty(pd_frame) {
-                alloc.free(pd_frame);
+                if !keep_frames {
+                    pending.push(pd_frame);
+                }
                 write_pte(pdpt, i_pdpt, 0);
                 let pdpt_frame = pte_frame(pml4e);
                 if table_is_empty(pdpt_frame) {
-                    alloc.free(pdpt_frame);
+                    if !keep_frames {
+                        pending.push(pdpt_frame);
+                    }
                     write_pte(pml4, i_pml4, 0);
                 }
             }
@@ -304,6 +327,9 @@ pub fn make_read_only(root: u64, vaddr: u64) {
 /// # Panics
 /// - If the allocator cannot supply a root frame (OOM).
 pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
+    // Register the clone so `reclaim_empty_tables` stops freeing intermediate
+    // tables: the clone shares the parent's higher-half PDPT/PD/PT subtrees.
+    super::register_clone_root();
     let new_root = alloc.alloc().expect("x86_64 VMM: OOM for cloned root");
     let new_pml4 = pte_deref(new_root);
     let parent_pml4 = pte_deref(parent_root);

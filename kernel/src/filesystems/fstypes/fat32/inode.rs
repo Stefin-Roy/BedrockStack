@@ -122,11 +122,16 @@ impl Fat32Inode {
         let mut v = Vec::new();
         if first >= 2 && first < super::fat::EOC_MARKER {
             let mut c = first;
+            let mut count: u32 = 0;
             loop {
                 v.push(c);
                 let next = self.sb.read_fat_entry(c)?;
                 if next >= super::fat::EOC_MARKER { break; }
                 c = next;
+                count += 1;
+                if count > self.sb.bpb.total_clus + 2 {
+                    return Err(VfsError::IOError);
+                }
             }
         }
         let arc = Arc::new(v);

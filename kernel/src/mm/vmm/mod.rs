@@ -5,6 +5,10 @@
 //! live.  Arch-specific page-table walks live in the sibling modules
 //! `x86_64` and `riscv64`.
 
+use core::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::AtomicUsize;
+
 use crate::mm::phys_alloc::BitmapAllocator;
 
 // Re-export arch-specific activation helpers so callers can switch tables.
@@ -214,25 +218,71 @@ impl Vmm {
 
     // ── Unmapping ───────────────────────────────────────────────────
 
+    /// Clear the leaf PTE at `vaddr` and collect any orphaned intermediate
+    /// page-table frames into `pending` (no TLB flush, no frame freeing).
+    ///
+    /// Shared by the single-page and range unmap paths so the cross-CPU TLB
+    /// shootdown runs exactly once per range.
+    fn unmap_page_collect(&mut self, pending: &mut PendingFrames, vaddr: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return x86_64::unmap_4k(self.root, vaddr, pending);
+        #[cfg(target_arch = "riscv64")]
+        return riscv64::unmap_4k(self.root, vaddr, pending);
+    }
+
     /// Unmap the 4 KiB page at `vaddr`.
     ///
     /// Returns `false` if the page was not mapped.
+    ///
+    /// After clearing the PTE this flushes the local TLB, broadcasts a full
+    /// TLB shootdown to every online CPU, and only then returns any orphaned
+    /// page-table frames to `alloc` — so no CPU can hold a stale mapping to a
+    /// frame that is being released.
     pub fn unmap_4k(&mut self, alloc: &mut BitmapAllocator, vaddr: u64) -> bool {
         assert_eq!(vaddr & 0xFFF, 0, "VMM: vaddr not 4K aligned");
-        #[cfg(target_arch = "x86_64")]
-        return x86_64::unmap_4k(self.root, alloc, vaddr);
-        #[cfg(target_arch = "riscv64")]
-        return riscv64::unmap_4k(self.root, alloc, vaddr);
+        let mut pending = PendingFrames::new();
+        let removed = self.unmap_page_collect(&mut pending, vaddr);
+        if removed {
+            flush_tlb();
+            shootdown_tlb();
+            pending.flush(alloc);
+        }
+        removed
     }
 
     /// Unmap a range of pages (4 KiB granularity).
+    ///
+    /// All leaf PTEs are cleared first, then a single full TLB shootdown is
+    /// broadcast before any freed frame (intermediate tables or, by the
+    /// caller, the leaves) is released to the allocator.
     pub fn unmap(&mut self, alloc: &mut BitmapAllocator, vaddr: u64, size: u64) {
         assert_eq!(vaddr & 0xFFF, 0);
+        let mut pending = PendingFrames::new();
         let mut v = vaddr;
         let end = vaddr + size;
+        let mut removed_any = false;
         while v < end {
-            self.unmap_4k(alloc, v);
+            if self.unmap_page_collect(&mut pending, v) {
+                removed_any = true;
+            }
             v += 4096;
+            if pending.is_full() {
+                // Drain the collector to keep the buffer bounded.  Draining
+                // mid-range is still correct: every PTE cleared so far is
+                // flushed before its orphaned frames are freed; the remaining
+                // pages get their own shootdown when the loop finishes.
+                if removed_any {
+                    flush_tlb();
+                    shootdown_tlb();
+                }
+                pending.flush(alloc);
+                removed_any = false;
+            }
+        }
+        if removed_any {
+            flush_tlb();
+            shootdown_tlb();
+            pending.flush(alloc);
         }
     }
 
@@ -253,11 +303,16 @@ impl Vmm {
     }
 }
 
-/// Flush the TLB for the whole address space.
+/// Flush the TLB for the whole address space, local to the calling CPU only.
 ///
 /// The `Vmm` bound is not required by the operation itself, so this is exposed
 /// as a free function for code (e.g. `unmap_4k`) that reclaims page-table
 /// frames and needs a full flush without holding a `Vmm`.
+///
+/// This only invalidates the *local* CPU's TLB.  When frames are about to be
+/// returned to the physical allocator, callers must also run
+/// [`shootdown_tlb`] so every online CPU invalidates before the frames can be
+/// reallocated.
 pub fn flush_tlb() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
@@ -267,6 +322,170 @@ pub fn flush_tlb() {
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack));
     }
+}
+
+// ── Cross-CPU TLB shootdown ───────────────────────────────────────────
+//
+// Every CPU in the system shares the active higher-half page tables (the boot
+// root, and any roots produced by `clone_high_half`).  Unmapping a page and
+// freeing its frames on one CPU is unsafe while another CPU may hold a stale
+// TLB entry for that VA — the freed frame can be reallocated immediately and
+// the stale entry would read/write the new owner's memory.
+//
+// The x86_64 mappings never set the `GLOBAL` (PGE) flag, so a full CR3 reload
+// (`flush_tlb`) invalidates the entire TLB on the executing CPU; the same
+// `sfence.vma` is used on riscv64.  A shootdown therefore only needs every
+// CPU to run that flush before any freed frame is released to the allocator.
+
+/// Serialize all page-table mutations (map / unmap / table reclamation).
+///
+/// A plain spin lock (interrupts stay enabled while spinning) so a CPU blocked
+/// here can still take an IPI and acknowledge a TLB shootdown — holding this
+/// lock across the shootdown *wait* is never done (see [`shootdown_tlb`]).
+pub(crate) fn lock() -> spin::MutexGuard<'static, ()> {
+    static VMM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+    VMM_LOCK.lock()
+}
+
+/// Monotonic shootdown generation.  A target CPU acknowledges the latest
+/// generation it has flushed, so overlapping shootdowns cannot be confused.
+static TLB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Per-CPU acknowledgement: the highest shootdown generation each CPU has
+/// flushed and acknowledged.
+static TLB_ACK: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Number of live cloned roots (from `clone_high_half`).  Clones share the
+/// parent's higher-half PDPT/PD/PT subtrees, so intermediate table frames can
+/// never be freed while a clone exists.  x86_64-only: riscv64 shares a single
+/// root and never reclaims intermediate tables.
+#[cfg(target_arch = "x86_64")]
+static CLONE_ROOTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Record a cloned root so table-frame reclamation is disabled for the parent.
+///
+/// Called by `clone_high_half`.  There is no clone teardown in the current
+/// design (the boot domain outlives every clone), so the count only grows.
+#[cfg(target_arch = "x86_64")]
+pub fn register_clone_root() {
+    CLONE_ROOTS.fetch_add(1, Ordering::SeqCst);
+}
+
+/// True when any cloned root shares the parent's higher-half subtrees.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn has_clone_roots() -> bool {
+    CLONE_ROOTS.load(Ordering::SeqCst) != 0
+}
+
+/// Deferred page-table frames collected during an unmap and freed only after
+/// the cross-CPU TLB shootdown has completed.
+///
+/// Reclamation of a single 4 KiB page can orphan at most three frames (the
+/// PT, its parent PD, and the PDPT).  The buffer is sized for a full heap
+/// chunk; `Vmm::unmap` drains it whenever it fills.
+pub struct PendingFrames {
+    frames: [u64; PENDING_CAPACITY],
+    len: usize,
+}
+
+const PENDING_CAPACITY: usize = 256;
+
+impl PendingFrames {
+    pub fn new() -> Self {
+        PendingFrames { frames: [0; PENDING_CAPACITY], len: 0 }
+    }
+
+    /// Record a frame to be freed once the shootdown completes.
+    pub fn push(&mut self, frame: u64) {
+        assert!(
+            self.len < PENDING_CAPACITY,
+            "VMM: pending table-frame collector overflow"
+        );
+        self.frames[self.len] = frame;
+        self.len += 1;
+    }
+
+    pub fn is_full(&self) -> bool {
+        self.len >= PENDING_CAPACITY
+    }
+
+    /// Return the deferred frames to the physical allocator.
+    ///
+    /// # Safety
+    /// Must only be called after every CPU's TLB has been flushed of mappings
+    /// referencing these frames (i.e. after `shootdown_tlb`).
+    pub fn flush(&mut self, alloc: &mut BitmapAllocator) {
+        for i in 0..self.len {
+            unsafe { alloc.free(self.frames[i]); }
+        }
+        self.len = 0;
+    }
+}
+
+/// Broadcast a full TLB flush to every online CPU and wait for them all to
+/// complete it.
+///
+/// The calling CPU must already have flushed its own TLB (`flush_tlb`).
+/// Holds no lock while waiting, so a remote CPU that is blocked on the VMM
+/// operation lock (spinning with interrupts enabled) can still take the IPI
+/// and acknowledge — no deadlock.
+///
+/// # Ordering
+/// Any page-table clears performed *before* this call happen-before the
+/// flush on every remote CPU (seq release / handler acquire), and every ack
+/// happens-before the caller proceeds to free the affected frames.  Frames
+/// touched by those clears must therefore only be released to the allocator
+/// after this function returns.
+pub fn shootdown_tlb() {
+    let my = crate::smp::current_cpu_id() as usize;
+    let seq = TLB_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+    // The local CPU was flushed by the caller before the seq bump.
+    TLB_ACK[my].store(seq, Ordering::Release);
+
+    let count = crate::smp::cpu_count() as usize;
+
+    // Send to online CPUs only — a starting AP has no IDT to handle this IPI,
+    // and reclaim cannot run before all APs are online anyway.
+    for cpu in 0..count {
+        if cpu == my {
+            continue;
+        }
+        if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
+            continue;
+        }
+        #[cfg(target_arch = "x86_64")]
+        crate::platform::x86_64_pc::apic::send_ipi(
+            crate::smp::per_cpu_by_id(cpu as u32).apic_id,
+            crate::platform::x86_64_pc::apic::IPI_TLB_SHOOTDOWN,
+        );
+        #[cfg(target_arch = "riscv64")]
+        crate::arch::riscv64::sbi::send_ipi(1u64 << cpu);
+    }
+
+    // Wait for every targeted CPU to flush and acknowledge.
+    for cpu in 0..count {
+        if cpu == my {
+            continue;
+        }
+        if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
+            continue;
+        }
+        while TLB_ACK[cpu].load(Ordering::Acquire) < seq {
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Flush this CPU's TLB and acknowledge the latest shootdown generation.
+///
+/// Called from the TLB-shootdown IPI handler (vector 50 on x86_64, the SBI
+/// software-IPI branch on riscv64) on every online CPU.
+pub fn tlb_shootdown_on_this_cpu() {
+    flush_tlb();
+    let my = crate::smp::current_cpu_id() as usize;
+    let seq = TLB_SEQ.load(Ordering::Acquire);
+    TLB_ACK[my].store(seq, Ordering::Release);
 }
 
 // ── VirtualMemoryManager provider ─────────────────────────────────────

@@ -181,6 +181,11 @@ pub fn init() {
         // Register the timer-reschedule IPI at vector 52 (interrupt gate).
         idt[52].set_handler_fn(ipi_timer_handler).disable_interrupts(true);
 
+        // Register the cross-CPU TLB-shootdown IPI at vector 50 (interrupt
+        // gate).  Every online CPU flushes its TLB and acknowledges here, so
+        // the initiator can safely release unmapped frames to the allocator.
+        idt[50].set_handler_fn(ipi_tlb_shootdown_handler).disable_interrupts(true);
+
         // Register device interrupt vectors 33-48 (interrupt gates, clears IF).
         idt[33].set_handler_fn(irq_33).disable_interrupts(true);
         idt[34].set_handler_fn(irq_34).disable_interrupts(true);
@@ -234,6 +239,17 @@ extern "x86-interrupt" fn ipi_timer_handler(_stack_frame: InterruptStackFrame) {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
         handler();
     }
+    apic::apic_eoi();
+}
+
+/// Cross-CPU TLB-shootdown IPI handler (vector 50).
+///
+/// Flushes this CPU's entire TLB and acknowledges the shootdown generation, so
+/// the initiating CPU may then release the just-unmapped frames to the
+/// allocator.  Runs with interrupts disabled (interrupt gate); does not touch
+/// any VMM lock, so it can never deadlock against an in-progress shootdown.
+extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStackFrame) {
+    crate::mm::vmm::tlb_shootdown_on_this_cpu();
     apic::apic_eoi();
 }
 

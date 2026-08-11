@@ -11,7 +11,7 @@ use super::mount::Fat32SuperBlock;
 
 impl Fat32SuperBlock {
     pub fn read_fat_entry(&self, cluster: u32) -> Result<u32, VfsError> {
-        let (sector_idx, offset) = self.bpb.fat_entry_position(cluster);
+        let (sector_idx, offset) = self.bpb.fat_entry_position(cluster)?;
         let fat_idx = self.bpb.active_fat_idx();
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();
@@ -24,7 +24,7 @@ impl Fat32SuperBlock {
     }
 
     pub fn write_fat_entry(&self, cluster: u32, value: u32) -> Result<(), VfsError> {
-        let (sector_idx, offset) = self.bpb.fat_entry_position(cluster);
+        let (sector_idx, offset) = self.bpb.fat_entry_position(cluster)?;
         let fat_idx = self.bpb.active_fat_idx();
         let lba = self.bpb.fat_sector_lba(fat_idx, sector_idx);
         let mut cache = self.fat_cache.lock();

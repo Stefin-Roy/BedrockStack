@@ -60,12 +60,20 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
     let entry_lba = u64::from_le(hdr.partition_entry_lba);
     let num_entries = u32::from_le(hdr.num_partition_entries);
     let entry_size = u32::from_le(hdr.partition_entry_size) as usize;
-    if entry_size < 128 {
-        return Err("GPT entry size too small");
+    if entry_size < 128 || entry_size > 4096 {
+        return Err("GPT entry size out of range");
+    }
+    if num_entries == 0 || num_entries > 4096 {
+        return Err("GPT too many partition entries");
     }
 
-    let total_bytes = num_entries as usize * entry_size;
+    let total_bytes = (num_entries as usize)
+        .checked_mul(entry_size)
+        .ok_or("GPT entry table too large")?;
     let sector_count = (total_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE;
+    if entry_lba.checked_add(sector_count as u64).is_none_or(|end| end > device.sector_count()) {
+        return Err("GPT entry table out of device range");
+    }
     let mut entries_buf = alloc::vec![0u8; sector_count * SECTOR_SIZE];
     read_sectors(&*device, entry_lba, sector_count as u32, &mut entries_buf)?;
 
