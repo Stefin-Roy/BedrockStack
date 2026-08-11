@@ -22,6 +22,7 @@ pub mod platform;
 pub mod usb;
 pub mod smp;
 pub mod services;
+pub mod unispace;
 
 use acpi::AcpiSubsystem;
 use arch::CurrentArch;
@@ -447,6 +448,15 @@ impl Kernel {
                 Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
             }
         }
+
+        // Unispace: build the / registry, attach the providers (VFS mounts,
+        // /sys), then run the boot self-test.
+        crate::unispace::init();
+        match crate::unispace::provider::register_all() {
+            Ok(()) => log::info!("unispace: providers registered"),
+            Err(e) => log::warn!("unispace: provider registration failed: {:?}", e),
+        }
+        crate::unispace::self_test();
 
         loop {
             #[cfg(target_arch = "x86_64")]
