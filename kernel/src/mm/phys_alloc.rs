@@ -173,6 +173,28 @@ impl BitmapAllocator {
         self.inner.lock().next_free
     }
 
+    /// Count of currently-free 4 KiB frames (bitmap scan; O(n), for `/sys`).
+    pub fn free_frames(&self) -> usize {
+        let total_words = (self.total_frames + 63) / 64;
+        let bitmap_u64 = self.bitmap_ptr() as *const u64;
+        let mut free = 0usize;
+        for wi in 0..total_words {
+            let mask = if wi == total_words - 1 {
+                let rem = self.total_frames % 64;
+                if rem == 0 {
+                    u64::MAX
+                } else {
+                    (1u64 << rem) - 1
+                }
+            } else {
+                u64::MAX
+            };
+            let w = unsafe { *bitmap_u64.add(wi) } & mask;
+            free += mask.count_ones() as usize - w.count_ones() as usize;
+        }
+        free
+    }
+
     /// Allocate a physical frame.
     ///
     /// Returns physical address of allocated frame, or None if no frames available.
