@@ -2,7 +2,7 @@
 
 **Version:** 0.4.0
 **Date:** 2026-07-31
-**Source:** `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,interrupt}.rs`
+**Source:** `kernel/src/acpi/{mod,tables,madt,mcfg,fadt,gas,platform,aml_ctx,handler}.rs`
 **Status:** Stable
 
 ---
@@ -74,7 +74,36 @@ The `AcpiProvider: Capability` trait (`services/acpi.rs`) exposes
 `map_device_mmio()`. On x86_64, `X86Acpi` wraps a `Box::leak`ed
 `&'static AcpiSubsystem`; on RISC-V, `RiscvAcpi` is a unit struct returning
 empty `cpus()`, `InterruptModel::Unknown`, and a no-op `map_device_mmio`.
-- Location: `kernel/src/services/acpi.rs:7-15`, `kernel/src/services/x86_64/x86_acpi.rs:7-43`, `kernel/src/services/x86_64/mod.rs:19-24`, `kernel/src/services/riscv64/riscv_acpi.rs:8-43`
+- Location: `kernel/src/services/acpi.rs:7-21`, `kernel/src/services/x86_64/x86_acpi.rs:7-47`, `kernel/src/services/x86_64/mod.rs:19-24`, `kernel/src/services/riscv64/riscv_acpi.rs:8-43`
+
+**ACPI-012 — AML interpreter persists over DSDT + all SSDTs (x86_64 only):**
+`AcpiSubsystem.aml: Option<Mutex<aml::AmlContext>>` is built during
+`AcpiSubsystem::new()` via `aml_boot()`. The DSDT comes from the RSDT/XSDT
+walk or the FADT `dsdt_addr` pointer; a broken SSDT is logged and skipped;
+a DSDT parse failure drops the interpreter and disables the PM1 `\_S5`
+path loudly (no guessed SLP_TYP). `initialize_objects()` runs the `_INI`
+sweep. The `aml` crate is the unmodified mainline `0.16.4` from crates.io;
+no loop-hardening patches are carried, so a pathological table fails boot
+rather than being worked around. `AcpiProvider::aml_invoke` is a
+cfg-gated trait item, implemented only by `X86Acpi`.
+- Location: `kernel/src/acpi/mod.rs:43-44,74-80,146-203`, `kernel/src/acpi/aml_ctx.rs`, `kernel/Cargo.toml`
+- Config: `aml = "0.16.4"` under `[target.'cfg(target_arch = "x86_64")'.dependencies]`
+  (RISC-V never builds the crate or the interpreter).
+
+**ACPI-013 — `\_S5` SLP_TYP is decoded by invoking the method:**
+The PkgOp byte-walk (`s5.rs`) is deleted; SLP_TYPa is the first element of
+the `\_S5` package returned by `ctx.invoke_method("\\_S5")`, masked to the
+3-bit field. `shutdown()` additionally invokes `\_PTS(5)` before
+programming the PM1 registers; a `\_PTS` failure is logged and ignored.
+- Location: `kernel/src/acpi/aml_ctx.rs:39-63`, `kernel/src/acpi/mod.rs:253-266`
+
+**ACPI-014 — AML op-regions map through the ACPI VMM with a page cache:**
+`AmlHandler` (x86_64) maps SystemMemory op-region pages on demand via
+`map_device_mmio()` behind an 8-slot cache (the VMM is a bump allocator, so
+repeated accesses must not re-map). SystemIO routes through
+`gas::port_in`/`gas::port_out`; PCI config accesses through `pci::ecam`.
+`DefFatal` is logged, never panicked.
+- Location: `kernel/src/acpi/handler.rs`
 
 ---
 
@@ -117,19 +146,25 @@ Attempts reset via:
 
 **ACPI-API-003 — `AcpiSubsystem::shutdown()`:**
 Attempts S5 sleep via:
-1. PM1 control registers (SLP_TYP + SLP_EN)
-2. QEMU PM I/O port (x86_64 only)
-3. SBI system_reset (RISC-V only)
-4. Infinite halt (ultimate fallback)
-- Location: `kernel/src/acpi/mod.rs:201`
+1. `\_PTS(5)` on the AML interpreter (x86_64; failure is logged, not fatal)
+2. PM1 control registers (SLP_TYP + SLP_EN)
+3. QEMU PM I/O port (x86_64 only)
+4. SBI system_reset (RISC-V only)
+5. Infinite halt (ultimate fallback)
+- Location: `kernel/src/acpi/mod.rs:257`
 
 ---
 
 ## Design Notes
 
-- AML interpreter (`init_aml()`) is defined but currently **disabled**
-  because it hangs on QEMU. SLP_TYP for S5 defaults to `0x00` which
-  works on virtual hardware.
+- The AML interpreter is the unmodified mainline `aml` crate (0.16.4 from
+  crates.io, x86_64 only). It parses the DSDT + SSDTs into a persistent
+  `AmlContext`, runs the `_INI` sweep at boot, decodes `\_S5`, and stays
+  resident for `aml_invoke`. A DSDT that the mainline parser cannot handle
+  disables the interpreter — SLP_TYP is never guessed.
+- The kernel `.stack` is 256 KiB (0x40000) because AML parsing is recursive:
+  an 8 KiB stack overflowed around `.bss` (allocator state) and surfaced as
+  an allocator-corruption GPF. The oversize stack keeps parser frames clear.
 - The ACPI table walker maps each table header (8 bytes) first to check
   `length`, then re-maps the full `length` bytes — two mapping operations
   per table.

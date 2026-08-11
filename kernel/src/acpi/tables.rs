@@ -233,7 +233,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
     let sig_bytes: [u8; 4] = [raw[0], raw[1], raw[2], raw[3]];
     // Only care about tables we actually parse
     let sig_u32 = u32::from_le_bytes(sig_bytes);
-    let keep_sigs = [sig(b"FACP"), sig(b"APIC"), sig(b"MCFG")];
+    let keep_sigs = [sig(b"FACP"), sig(b"APIC"), sig(b"MCFG"), sig(b"DSDT"), sig(b"SSDT")];
     if !keep_sigs.contains(&sig_u32) {
         return Ok(None);
     }
@@ -247,4 +247,27 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
         phys_addr,
         length: hdr_len,
     }))
+}
+
+/// Map an SDT by physical address, validate its signature, length, and
+/// checksum, and return its full raw bytes. Used for tables referenced by
+/// other tables rather than walked from the RSDT/XSDT (e.g. the DSDT pointer
+/// in the FADT). Returns `None` when the table is missing or malformed.
+pub fn map_sdt_bytes(phys_addr: u64, expected_sig: &[u8; 4]) -> Option<&'static [u8]> {
+    let vaddr = map_region(phys_addr, 8);
+    let hdr_len = unsafe {
+        let p = vaddr as *const u8;
+        u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
+    };
+    if hdr_len < 36 || hdr_len > 0x0100_0000 {
+        log::warn!("ACPI table at 0x{:x}: invalid header length {}", phys_addr, hdr_len);
+        return None;
+    }
+    let vaddr = map_region(phys_addr, hdr_len as u64);
+    let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
+    if !checksum(raw) || &raw[0..4] != expected_sig {
+        log::warn!("ACPI table at 0x{:x}: bad signature/checksum", phys_addr);
+        return None;
+    }
+    Some(raw)
 }

@@ -35,4 +35,12 @@ impl AcpiProvider for X86Acpi {
     fn map_device_mmio(&self, paddr: u64, size: u64, flags: PageFlags) -> u64 {
         crate::acpi::map_device_mmio(paddr, size, flags)
     }
+
+    fn aml_invoke(
+        &self,
+        path: &str,
+        args: ::aml::value::Args,
+    ) -> Result<::aml::AmlValue, ::aml::AmlError> {
+        self.acpi.aml_invoke(path, args)
+    }
 }
