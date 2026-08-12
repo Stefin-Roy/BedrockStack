@@ -453,19 +453,20 @@ impl Kernel {
         }
 
         // Unispace: build the / registry, attach the providers (VFS mounts,
-        // /sys), then run the boot self-test.
+        // /sys), then run the boot self-test (gated behind `selftest`).
         crate::unispace::init();
         match crate::unispace::provider::register_all() {
             Ok(()) => log::info!("unispace: providers registered"),
             Err(e) => log::warn!("unispace: provider registration failed: {:?}", e),
         }
+        #[cfg(feature = "selftest")]
         crate::unispace::self_test();
 
-        // Cooperative scheduler + kernel-only context-switch smoke test.
-        // The two smoke tasks alternate on serial and then exit into idle.
+        // Cooperative scheduler init (needed for the INIT launch below).
         #[cfg(target_arch = "x86_64")]
         {
             crate::task::init(self.page_table_root);
+            #[cfg(feature = "selftest")]
             crate::task::smoke_test(&mut self.allocator);
         }
 
@@ -492,6 +493,22 @@ impl Kernel {
                     crate::filesystems::blockdriver::driver::BLOCK_DEVICES
                         .lock()
                         .extend(new_devices);
+                }
+
+                // Run any ready task, including sleepers whose deadline has
+                // passed (wake_sleepers moves them back to Ready first).
+                // Returns to idle once every task is running, sleeping, or
+                // dead — the timer ISR never touches the scheduler, so all
+                // sleep bookkeeping happens here in idle context.
+                crate::task::wake_sleepers();
+                crate::task::schedule();
+
+                // Nothing ready: park until the earliest sleeping deadline so
+                // a sleeper wakes on time, else fall through to the plain
+                // device-IRQ halt below.
+                if let Some(d) = crate::task::earliest_sleep_deadline() {
+                    crate::services::universal_timer::wait_until(d.saturating_add(1));
+                    continue;
                 }
             }
             self.svc().platform.halt();
