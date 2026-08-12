@@ -208,22 +208,28 @@ syscall_entry:
 ///
 ///   0  read(path, buf, buf_len)
 ///   1  write(path, buf, buf_len)
-///   2  brk(new_break)
-///   3  mmap(addr, len, prot)
-///   4  munmap(addr, len)
+///
+/// Only two raw syscalls exist. Every other operation — memory management,
+/// process control, sleeping — is a unispace object method (e.g.
+/// `/proc/self:brk`, `/proc/self:mmap`, `/proc/self:munmap`,
+/// `/proc/self:exit`).
 ///
 /// - `path` (rdi) is a NUL-terminated C string (bounded scan; no separate
 ///   length).
 /// - `buf` (rsi) is arbitrary bytes and may contain embedded NUL — its length
 ///   (`buf_len`, rdx) is required, since memory has no size metadata.
+/// - `arg4` (r10) is an optional provider-defined flags word for `read`/
+///   `write` — the register is unused by the two syscalls beyond that. `0` is
+///   a plain value read/write; a nonzero value has semantics chosen by the
+///   target object (the VFS file object uses it for read-at / append /
+///   write-at, see `unispace/provider/vfs.rs`). An object without flag
+///   semantics rejects a nonzero `arg4` with `-ENOSYS` rather than silently
+///   ignoring it.
 /// - `write`'s buffer is in-place request/response: the input is decoded first,
 ///   then the provider's return bytes (method output or error detail) are
 ///   rewritten into the same `buf` starting at byte 0, zero-filled past them.
 ///   A caller that still needs its input must keep its own copy.
-/// - `brk` / `mmap` / `munmap` commit their backing frames **eagerly and
-///   atomically** at syscall time (see `mm::usermem`) — no demand paging, no
-///   #PF-based allocation.
-/// - Return (`rax`): `>= 0` = result (bytes written, new break, mapping base;
+/// - Return (`rax`): `>= 0` = result (bytes read, output bytes written;
 ///   0 is valid); `< 0` = errno. On error, error-detail bytes may still be in
 ///   `buf`.
 ///
@@ -234,9 +240,6 @@ pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
     match frame.rax {
         0 => sys_read(frame),
         1 => sys_write(frame),
-        2 => sys_brk(frame),
-        3 => sys_mmap(frame),
-        4 => sys_munmap(frame),
         _ => frame.rax = (-1i64) as u64,
     }
 }
@@ -257,7 +260,12 @@ fn sys_read(frame: &mut SyscallFrame) {
         }
     };
     let mut data = Vec::new();
-    match unispace::read(&path, &mut data, core::cmp::min(frame.rdx, MAX_COPY) as usize) {
+    match unispace::read_flags(
+        &path,
+        &mut data,
+        core::cmp::min(frame.rdx, MAX_COPY) as usize,
+        frame.r10,
+    ) {
         Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &data) {
             Ok(n) => frame.rax = n as u64,
             Err(e) => frame.rax = e as u64,
@@ -285,7 +293,7 @@ fn sys_write(frame: &mut SyscallFrame) {
         }
     };
     let mut resp = Vec::new();
-    match unispace::write(&path, &data, &mut resp) {
+    match unispace::write_flags(&path, &data, &mut resp, frame.r10) {
         Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &resp) {
             Ok(_) => frame.rax = resp.len() as u64,
             Err(e) => frame.rax = e as u64,
@@ -296,61 +304,6 @@ fn sys_write(frame: &mut SyscallFrame) {
             frame.rax = errno(e) as u64;
         }
     }
-}
-
-// ── User-memory syscalls ────────────────────────────────────────────
-
-/// The eager user-memory table index of the current task, if it has one.
-fn current_vm_index() -> Result<usize, i64> {
-    crate::task::current_vm().ok_or(-1)
-}
-
-/// 2 brk(new_break): grow or shrink the caller's committed program break.
-fn sys_brk(frame: &mut SyscallFrame) {
-    let vm = match current_vm_index() {
-        Ok(v) => v,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
-    };
-    let alloc = crate::mm::heap::get_phys_allocator_mut();
-    frame.rax = match crate::mm::usermem::brk(vm, frame.rdi, alloc) {
-        Ok(b) => b,
-        Err(e) => e as u64,
-    };
-}
-
-/// 3 mmap(addr, len, prot): eagerly commit `len` zeroed anonymous pages.
-fn sys_mmap(frame: &mut SyscallFrame) {
-    let vm = match current_vm_index() {
-        Ok(v) => v,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
-    };
-    let alloc = crate::mm::heap::get_phys_allocator_mut();
-    frame.rax = match crate::mm::usermem::mmap(vm, frame.rdi, frame.rsi, frame.rdx, alloc) {
-        Ok(base) => base,
-        Err(e) => e as u64,
-    };
-}
-
-/// 4 munmap(addr, len): release whole anonymous regions.
-fn sys_munmap(frame: &mut SyscallFrame) {
-    let vm = match current_vm_index() {
-        Ok(v) => v,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
-    };
-    let alloc = crate::mm::heap::get_phys_allocator_mut();
-    frame.rax = match crate::mm::usermem::munmap(vm, frame.rdi, frame.rsi, alloc) {
-        Ok(()) => 0,
-        Err(e) => e as u64,
-    };
 }
 
 // ── User-pointer helpers ─────────────────────────────────────────────
@@ -505,6 +458,9 @@ fn errno(e: UnispaceError) -> i64 {
         NotADirectory => -20,  // ENOTDIR
         Unsupported => -38,      // ENOSYS
         InvalidPath | DecodeError | SchemaMismatch => -22, // EINVAL
+        OutOfMemory => -12,    // ENOMEM
+        BadAddress => -14,     // EFAULT
+        InvalidArgument => -22, // EINVAL
         MethodNotFound => -38, // ENOSYS
         Vfs(_) => -5,          // EIO
     }

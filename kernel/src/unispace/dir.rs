@@ -72,4 +72,13 @@ impl Object for SimpleDir {
     fn invoke(&self, _method: usize, _v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         Err(UnispaceError::MethodNotFound)
     }
+
+    fn insert_child(&self, name: &str, obj: Arc<dyn Object>) -> Result<(), UnispaceError> {
+        self.insert(name, obj);
+        Ok(())
+    }
+
+    fn remove_child(&self, name: &str) -> Result<bool, UnispaceError> {
+        Ok(self.remove(name))
+    }
 }
