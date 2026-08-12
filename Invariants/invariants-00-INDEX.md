@@ -3,7 +3,7 @@
 **Version:** 0.7.0
 **Date:** 2026-08-03
 **Status:** All subsystems documented — MM, Arch (x86_64, RISC-V), ACPI, Display, PCI, Platform,
-Drivers (Serial, PS/2), Input (UInputL), Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI
+Drivers (Serial, PS/2), Input (UInputL), Services, VFS, Tmpfs, AHCI, SMP, Kerneldump, Boot, Common, Partition, USB/xHCI, User memory (eager)
 
 ---
 
@@ -48,6 +48,7 @@ Rust module hierarchy under `kernel/src/`.
 | 22 | `invariants-22-derived.md` | Derived properties | All |
 | 23 | `invariants-23-services.md` | Services capability layer | `kernel/src/services/{mod,capability,acpi,cpu,dma,ecam_pci_config,interrupts,pci_config,pci_device,platform,serial,timer,timer_queue,universal_timer,virt_mem,phys_mem,clockevent,clocksource,msi,null_msi,block_device}.rs`, `kernel/src/services/{x86_64,riscv64}/` |
 | 24 | `invariants-24-usb.md` | USB/xHCI host controller driver | `kernel/src/usb/{mod,xhci/{mod,registers,memory,event,command,device,ports,context},class/mass_storage,usb/{mod,descriptors}}.rs` |
+| 26 | `invariants-26-user-mem.md` | Eager user memory | `kernel/src/mm/usermem.rs`, `kernel/src/task/load.rs`, `kernel/src/task/mod.rs`, `kernel/src/arch/x86_64/syscall.rs`, `kernel/src/unispace/provider/proc.rs` |
 
 ---
 
@@ -58,7 +59,7 @@ Invariant IDs follow the pattern `AREA-NNN` where:
 - `AREA` is a short subsystem code: `ALLOC`, `HEAP`, `VMM`, `PAGING`, `BOOT`,
   `ACPI`, `DISP`, `PCI`, `APIC`, `IOAPIC`, `PIT`, `SMP`, `VFS`, `TMPFS`,
   `AHCI`, `SERIAL`, `PLAT`, `ARCH`, `DUMP`, `INIT`, `COMMON`, `PART`, `WC`,
-  `SVC`, `USB`, `XHCI`, `PS2`, `INPUT`
+  `SVC`, `USB`, `XHCI`, `PS2`, `INPUT`, `UM`
 - `NNN` is a three-digit number
 
 Example: `ALLOC-001`, `PAGING-003`, `ACPI-007`.
@@ -103,6 +104,7 @@ When modifying code, verify that relevant invariants still hold:
 - [ ] **TMPFS**: atomic counter, per-inode locking, no deadlock
 - [ ] **AHCI**: DMA safety, MMIO ordering, PRDT bounds, timeout handling, NCQ vs non-NCQ FIS selection
 - [ ] **USB/xHCI**: MMIO mapping, event ring/TRB management, IRQ handling, device enumeration
+- [ ] **UM**: eager commit at creation, atomic rollback, guard pages, budget accounting, destroy/unregister ordering, no #PF allocation, W^X, no panics on user input
 - [ ] **FAT**: BPB discriminant validation (RootEntCnt, FATSz16, FATSz32), per-field bounds checks
 - [ ] **PCI**: ECAM VMM, read/write alignment, device enumeration
 - [ ] **SVC**: service matrix wiring order, Box::leak lifetime, orphaned/dead traits
