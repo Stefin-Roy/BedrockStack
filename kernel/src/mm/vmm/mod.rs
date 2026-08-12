@@ -5,9 +5,13 @@
 //! live.  Arch-specific page-table walks live in the sibling modules
 //! `x86_64` and `riscv64`.
 
+#[cfg(target_arch = "x86_64")]
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::AtomicUsize;
+#[cfg(target_arch = "x86_64")]
+use spin::Mutex;
 
 use crate::mm::phys_alloc::BitmapAllocator;
 
@@ -17,13 +21,19 @@ pub use self::x86_64::activate;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::clone_high_half;
 #[cfg(target_arch = "x86_64")]
+pub use self::x86_64::destroy_root;
+#[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::make_read_only;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::prepopulate_window;
+#[cfg(target_arch = "x86_64")]
+pub use self::x86_64::translate_user;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::activate;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::translate_user;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -363,13 +373,49 @@ static TLB_ACK: [AtomicU64; crate::smp::MAX_CPUS] =
 #[cfg(target_arch = "x86_64")]
 static CLONE_ROOTS: AtomicUsize = AtomicUsize::new(0);
 
-/// Record a cloned root so table-frame reclamation is disabled for the parent.
-///
-/// Called by `clone_high_half`.  There is no clone teardown in the current
-/// design (the boot domain outlives every clone), so the count only grows.
+/// Live cloned roots, kept in step with `CLONE_ROOTS`: pushes on
+/// `register_clone_root`, removal on `unregister_clone_root`.  Iterated by
+/// `sync_clone_half` so a higher-half PML4 slot populated after a clone was
+/// born is copied into that clone too (sharing, not snapshotting, is the
+/// invariant — but a slot that was *absent* at clone time has nothing to share
+/// until it is synced).
 #[cfg(target_arch = "x86_64")]
-pub fn register_clone_root() {
+static CLONES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+
+/// Record a cloned root so table-frame reclamation is disabled for the parent
+/// and so `sync_clone_half` can keep it sharing the higher half.
+///
+/// Called by `clone_high_half` once the new root exists.  Clones are torn down
+/// via `destroy_root`, which calls `unregister_clone_root` once its frames are
+/// released, so the count/registry reflect the *live* clones.
+#[cfg(target_arch = "x86_64")]
+pub fn register_clone_root(root: u64) {
     CLONE_ROOTS.fetch_add(1, Ordering::SeqCst);
+    CLONES.lock().push(root);
+}
+
+/// Release a cloned root that has been destroyed, re-arming empty-table
+/// reclamation on the parent once no clone remains.
+///
+/// Called by `destroy_root` after the clone's low-half frames are freed and a
+/// TLB shootdown has completed.  The dead clone's higher-half subtrees are
+/// never freed by `destroy_root` (they stay referenced by the parent), so this
+/// decrement exactly restores `reclaim_empty_tables` to its eager behavior
+/// when the last clone disappears.  Must be balanced against every
+/// `register_clone_root`.
+#[cfg(target_arch = "x86_64")]
+pub fn unregister_clone_root(root: u64) {
+    let mut clones = CLONES.lock();
+    if let Some(i) = clones.iter().position(|&r| r == root) {
+        clones.swap_remove(i);
+        CLONE_ROOTS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Snapshot of the live cloned roots, for the clone re-sync walk.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn clone_roots() -> Vec<u64> {
+    CLONES.lock().clone()
 }
 
 /// True when any cloned root shares the parent's higher-half subtrees.

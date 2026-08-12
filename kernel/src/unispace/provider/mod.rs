@@ -1,3 +1,4 @@
+pub mod driver;
 pub mod sys;
 pub mod vfs;
 
@@ -7,5 +8,6 @@ use super::UnispaceError;
 pub fn register_all() -> Result<(), UnispaceError> {
     vfs::register()?;
     sys::register()?;
+    driver::register()?;
     Ok(())
 }

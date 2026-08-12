@@ -59,7 +59,7 @@ impl Object for SimpleDir {
         Ok(())
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let mut entries = Vec::new();
         self.list(&mut entries)?;
         super::encode_listing(entries, out)

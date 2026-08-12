@@ -7,6 +7,7 @@
 use core::mem::MaybeUninit;
 use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
 use x86_64::instructions::tables::load_tss;
+use x86_64::registers::segmentation::SegmentSelector;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
 use x86_64::VirtAddr;
@@ -33,6 +34,32 @@ static mut CPU_TSS: [MaybeUninit<TaskStateSegment>; MAX_CPUS] = [MaybeUninit::un
 ///
 /// The GDT heap-buffer stays alive because the struct is stored here.
 static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] = [const { MaybeUninit::uninit() }; MAX_CPUS];
+
+/// Selector for the user code segment (0x28, DPL3). Written once by the first
+/// CPU through `init()` — always the BSP, since it runs before any AP is woken.
+/// The GDT layout is identical on every CPU, so one value suffices.
+static mut USER_CODE_SEL: SegmentSelector = SegmentSelector::NULL;
+
+/// Selector for the user data segment (0x20, DPL3).
+static mut USER_DATA_SEL: SegmentSelector = SegmentSelector::NULL;
+
+/// Selector for the kernel code segment that SYSCALL lands in (0x18, DPL0).
+static mut SYSCALL_KERNEL_CS: SegmentSelector = SegmentSelector::NULL;
+
+/// User code selector (0x28). Valid after BSP `init()`.
+pub fn user_code_sel() -> SegmentSelector {
+    unsafe { USER_CODE_SEL }
+}
+
+/// User data selector (0x20). Valid after BSP `init()`.
+pub fn user_data_sel() -> SegmentSelector {
+    unsafe { USER_DATA_SEL }
+}
+
+/// Kernel CS that SYSCALL lands in (0x18). Valid after BSP `init()`.
+pub fn syscall_kernel_cs() -> SegmentSelector {
+    unsafe { SYSCALL_KERNEL_CS }
+}
 
 /// Return the kernel GDT pointer (base + limit) for AP trampoline use.
 ///
@@ -66,12 +93,22 @@ pub fn init() {
 
     // ── build per-CPU GDT ───────────────────────────────────────────
     let mut gdt = GlobalDescriptorTable::new();
-    let code_sel = gdt.append(Descriptor::kernel_code_segment());
-    let data_sel = gdt.append(Descriptor::kernel_data_segment());
-    let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));
+    let code_sel = gdt.append(Descriptor::kernel_code_segment());      // 0x08
+    let data_sel = gdt.append(Descriptor::kernel_data_segment());      // 0x10
+    let syscall_kernel_cs = gdt.append(Descriptor::kernel_code_segment()); // 0x18 (SYSCALL landing CS)
+    let user_data_sel = gdt.append(Descriptor::user_data_segment());   // 0x20
+    let user_code_sel = gdt.append(Descriptor::user_code_segment());   // 0x28
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));        // 0x30
 
     unsafe {
         CPU_GDT[cpu_id].write(gdt);
+
+        // The GDT layout is identical on every CPU, so these selectors are the
+        // same everywhere. The BSP writes them first (no AP is woken yet);
+        // later AP writes are idempotent.
+        SYSCALL_KERNEL_CS = syscall_kernel_cs;
+        USER_DATA_SEL = user_data_sel;
+        USER_CODE_SEL = user_code_sel;
 
         // Load the GDT, segments, and task register for this CPU.
         let gdt_ref = &*CPU_GDT[cpu_id].as_ptr();
@@ -82,4 +119,14 @@ pub fn init() {
         SS::set_reg(data_sel);
         load_tss(tss_sel);
     }
+}
+
+/// Update the current CPU's TSS.rsp0 (kernel stack top used on interrupt/
+/// syscall entry). Must be called after `init()` on that CPU. No TR reload is
+/// needed — the TSS descriptor base is unchanged, only the struct field moves.
+/// IST0 (double-fault stack) is left untouched.
+pub fn set_kernel_stack(top: u64) {
+    let cpu = current_cpu_id() as usize;
+    let tss = unsafe { &mut *CPU_TSS[cpu].as_mut_ptr() };
+    tss.privilege_stack_table[0] = VirtAddr::new(top);
 }

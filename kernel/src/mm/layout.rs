@@ -32,6 +32,24 @@ pub const HEAP_FLOOR: u64 = KERNEL_VMA_BASE + 0x1000_0000; //      (+256 MiB)
 pub const HEAP_GUARD_PAGES: u64 = 1;
 pub const HEAP_GUARD_BYTES: u64 = HEAP_GUARD_PAGES * 4096;
 
+/// Per-task kernel stack size (16 KiB) and the fixed window holding one stack
+/// per concurrent kernel task.
+pub const KSTACK_SIZE: u64 = 16 * 1024;
+pub const MAX_KSTACKS: usize = 256;
+pub const KSTACK_WINDOW_SIZE: u64 = (MAX_KSTACKS as u64) * KSTACK_SIZE;
+
+/// Task-stack window: a fixed range above the heap, inside PML4 slot 511.
+///
+/// Kernel stacks are mapped here (frame-based, not heap-based) at
+/// `KSTACK_VADDR_BASE - slot * KSTACK_SIZE`.  Slot 511's subtree is
+/// established before the first `clone_high_half` (the heap maps the same
+/// slot during `init`), so every clone shares the window by construction —
+/// a stack mapped into the kernel root is visible under any task root, and
+/// post-clone mapping is irrelevant because sharing, not snapshotting, is the
+/// mechanism (see `clone_high_half`).
+pub const KSTACK_VADDR_BASE: u64  = KERNEL_VMA_BASE + 0x4000_0000; // (+1 GiB)
+pub const KSTACK_VADDR_FLOOR: u64 = KSTACK_VADDR_BASE - KSTACK_WINDOW_SIZE;
+
 /// Private physmap: DIRECT_MAP maps physical `[0, alloc_end)` here.  Grows
 /// upward from this base to cover all of usable RAM; bounded above by the DMA
 /// device-window floor (see `DMA_VADDR_FLOOR`), which leaves ~252 GiB of room.
@@ -166,12 +184,13 @@ pub fn to_physmap(phys: u64) -> u64 {
 
 /// Assert the static regions do not overlap. Called once early in `init`.
 pub fn verify_layout() {
-    let regions: [(&str, Range<u64>); 5] = [
-        ("heap",   HEAP_FLOOR..HEAP_TOP),
+    let regions: [(&str, Range<u64>); 6] = [
+        ("heap",    HEAP_FLOOR..HEAP_TOP),
+        ("kstack",  KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE),
         ("physmap", PHYS_MAP_BASE..PHYS_MAP_BASE + physmap_end()),
-        ("acpi",   ACPI_VADDR_FLOOR..ACPI_VADDR_BASE),
-        ("ecam",   ECAM_VADDR_FLOOR..ECAM_VADDR_BASE),
-        ("dma",    DMA_VADDR_FLOOR..DMA_VADDR_BASE),
+        ("acpi",    ACPI_VADDR_FLOOR..ACPI_VADDR_BASE),
+        ("ecam",    ECAM_VADDR_FLOOR..ECAM_VADDR_BASE),
+        ("dma",     DMA_VADDR_FLOOR..DMA_VADDR_BASE),
     ];
     for (i, (an, ar)) in regions.iter().enumerate() {
         for (bn, br) in &regions[i + 1..] {

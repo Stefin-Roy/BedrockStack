@@ -22,6 +22,8 @@ pub mod platform;
 pub mod usb;
 pub mod smp;
 pub mod services;
+#[cfg(target_arch = "x86_64")]
+pub mod task;
 pub mod unispace;
 
 use acpi::AcpiSubsystem;
@@ -233,6 +235,7 @@ impl Kernel {
         unsafe {
             heap::init(self.page_table_root, &mut self.allocator);
         }
+        crate::drivers::serial::switch_to_growable();
 
         CurrentArch::init();
 
@@ -458,9 +461,30 @@ impl Kernel {
         }
         crate::unispace::self_test();
 
+        // Cooperative scheduler + kernel-only context-switch smoke test.
+        // The two smoke tasks alternate on serial and then exit into idle.
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::task::init(self.page_table_root);
+            crate::task::smoke_test(&mut self.allocator);
+        }
+
+        // Phase 6: load \EFI\BEDROCK\INIT from the ESP (via the unispace /B
+        // mount) into its own address space and drop to ring 3. No-ops with a
+        // serial notice when INIT is absent. Control returns only after INIT
+        // has exited and parked into idle; the poll/halt loop below is the
+        // long-lived idle from then on.
+        #[cfg(target_arch = "x86_64")]
+        crate::task::load::load_init_from_esp(&mut self.allocator);
+
         loop {
             #[cfg(target_arch = "x86_64")]
             {
+                // Reap parked dead tasks: free their user page tables, kernel
+                // stacks, and task boxes.  Runs here (idle stack, kernel CR3)
+                // so no task is ever torn down while parked on its own stack.
+                crate::task::reap_dead(&mut self.allocator);
+
                 // Hot-plug: poll the retained xHCI controller for port
                 // changes and register any newly attached block devices.
                 let new_devices = crate::usb::xhci::poll();

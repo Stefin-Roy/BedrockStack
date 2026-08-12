@@ -144,7 +144,7 @@ impl Object for VfsDir {
         Ok(())
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let mut entries = Vec::new();
         self.list(&mut entries)?;
         super::super::encode_listing(entries, out)
@@ -208,11 +208,14 @@ impl Object for VfsFile {
         &FILE_METHODS
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError> {
         let size = self.ops.size();
         let mut pos = 0u64;
-        while pos < size {
-            let want = ((size - pos) as usize).min(READ_CHUNK);
+        while pos < size && out.len() < max {
+            let want = ((size - pos) as usize).min(READ_CHUNK).min(max - out.len());
+            if want == 0 {
+                break;
+            }
             let mut chunk = vec![0u8; want];
             let n = self.ops.read_at(pos, &mut chunk)?;
             if n == 0 {

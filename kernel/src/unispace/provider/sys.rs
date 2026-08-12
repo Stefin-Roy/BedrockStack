@@ -51,7 +51,7 @@ impl Object for VersionObject {
         &[]
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let v = Value::Str(String::from(VERSION));
         schema::encode_value(&v, &schema::SCHEMA_STR, out)
     }
@@ -72,7 +72,7 @@ impl Object for PhysMemObject {
         &[]
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let alloc = crate::mm::heap::get_phys_allocator_mut();
         let v = Value::Struct(vec![
             Value::U64(alloc.total_frames() as u64),
@@ -98,7 +98,7 @@ impl Object for CpusObject {
         &[]
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let v = Value::U64(crate::smp::cpu_count() as u64);
         schema::encode_value(&v, &schema::SCHEMA_U32, out)
     }
@@ -119,7 +119,7 @@ impl Object for FeaturesObject {
         &[]
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let mut list = Vec::new();
         if cfg!(feature = "cpu_slow") {
             list.push(Value::Str(String::from("cpu_slow")));

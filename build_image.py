@@ -37,6 +37,24 @@ def find_kernel(profile):
     return None
 
 
+def find_user(profile):
+    """Locate the built user INIT binary for the given profile."""
+    candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", profile_dir(profile), "user")
+    if os.path.exists(candidate):
+        return candidate
+    # Fall back to the other common profile directory.
+    for alt in ("debug", "release"):
+        candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", alt, "user")
+        if os.path.exists(candidate):
+            return candidate
+    # Fall back to the legacy shared x86_64-unknown-none location.
+    for alt in (profile_dir(profile), "debug", "release"):
+        candidate = os.path.join(TARGET_DIR, "x86_64-unknown-none", alt, "user")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def run(cmd, **kwargs):
     print(f"  {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=WORKSPACE, **kwargs)
@@ -103,6 +121,12 @@ def create_fat32_with_mtools(efi_binary_path, profile):
         print(f"  Kernel copied: {kernel_path}")
     else:
         print("  WARNING: Kernel binary not found")
+    user_path = find_user(profile)
+    if user_path:
+        run(["mcopy", "-i", OUTPUT_IMG, user_path, "::/EFI/BEDROCK/INIT"])
+        print(f"  INIT (user) copied: {user_path}")
+    else:
+        print("  WARNING: user INIT binary not found")
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
         run(["mcopy", "-i", OUTPUT_IMG, wav_path, "::/EFI/BEDROCK/STARTUP.WAV"])
@@ -130,6 +154,13 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
     if kernel_path:
         shutil.copy2(kernel_path, os.path.join(efi_bedrock_dir, "KERNEL"))
         print(f"  Kernel copied: {kernel_path}")
+
+    user_path = find_user(profile)
+    if user_path:
+        shutil.copy2(user_path, os.path.join(efi_bedrock_dir, "INIT"))
+        print(f"  INIT (user) copied: {user_path}")
+    else:
+        print("  WARNING: user INIT binary not found")
 
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
@@ -264,7 +295,14 @@ def create_gpt_image(boot_path, kernel_path):
     print("  Formatting ESP with mkfs.fat via WSL...")
     boot_wsl = to_wsl(boot_path)
     kernel_wsl = to_wsl(kernel_path)
+    user_path = find_user("dev")
     esp_img_wsl = to_wsl(os.path.join(TARGET_DIR, "esp_part.img"))
+
+    if user_path:
+        user_init_copy = f"mcopy -i '{esp_img_wsl}' '{to_wsl(user_path)}' ::/EFI/BEDROCK/INIT; "
+    else:
+        print("  WARNING: user INIT binary not found - skipping /EFI/BEDROCK/INIT")
+        user_init_copy = ""
 
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
@@ -283,6 +321,7 @@ def create_gpt_image(boot_path, kernel_path):
         f"mmd -i '{esp_img_wsl}' ::/EFI/BEDROCK; "
         f"mcopy -i '{esp_img_wsl}' '{boot_wsl}' ::/EFI/BOOT/BOOTX64.EFI; "
         f"mcopy -i '{esp_img_wsl}' '{kernel_wsl}' ::/EFI/BEDROCK/KERNEL; "
+        + user_init_copy
         + wav_copy
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BEDROCK"
