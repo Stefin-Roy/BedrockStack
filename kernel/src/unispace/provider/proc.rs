@@ -7,6 +7,8 @@
 //!
 //! Each `<pid>` dir exposes:
 //!   - `status` — `read` yields `{pid, state}` from the scheduler snapshot;
+//!   - `mem`    — `read` yields the eager user-memory accounting
+//!     `{root, brk, stack_top, committed_pages, budget_pages}` from `mm::usermem`;
 //!   - `:exit`  — write `{code}` to terminate the current task (diverges);
 //!   - `:yield` — write `()` to cooperatively reschedule;
 //!   - `:kill`  — write `{pid}` to park another task for reaping;
@@ -41,6 +43,15 @@ static PROC_STATE_VARIANTS: [EnumVariant; 4] = [
 static STATUS: Schema = Schema::Struct(&[
     schema::Field { name: "pid", ty: &schema::SCHEMA_U64 },
     schema::Field { name: "state", ty: &Schema::Enum(&PROC_STATE_VARIANTS) },
+]);
+
+/// `read(/proc/<pid>/mem)`: eager user-memory snapshot from `mm::usermem`.
+static MEM: Schema = Schema::Struct(&[
+    schema::Field { name: "root", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "brk", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "stack_top", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "committed_pages", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "budget_pages", ty: &schema::SCHEMA_U64 },
 ]);
 
 /// `write(/proc/<pid>:exit, { code })`.
@@ -194,12 +205,19 @@ impl Object for ProcDir {
         if name == "status" {
             return Some(Arc::new(StatusObject { pid: self.pid }) as Arc<dyn Object>);
         }
+        if name == "mem" {
+            return Some(Arc::new(MemObject { pid: self.pid }) as Arc<dyn Object>);
+        }
         None
     }
 
     fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
         out.push(ListingEntry {
             name: String::from("status"),
+            kind: ObjectKind::Service,
+        });
+        out.push(ListingEntry {
+            name: String::from("mem"),
             kind: ObjectKind::Service,
         });
         Ok(())
@@ -279,6 +297,45 @@ impl Object for StatusObject {
     }
 }
 
+// ── /proc/<pid>/mem ─────────────────────────────────────────────────
+
+/// Service leaf: `read` snapshots the eager user-memory accounting of
+/// `self.pid` from `mm::usermem` (through the scheduler's pid→vm lookup).
+struct MemObject {
+    pid: u64,
+}
+
+impl Object for MemObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Service
+    }
+
+    fn value_schema(&self) -> &'static Schema {
+        &MEM
+    }
+
+    fn methods(&self) -> &'static [MethodDesc] {
+        &[]
+    }
+
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
+        let vm = crate::task::task_vm(self.pid).ok_or(UnispaceError::NotFound)?;
+        let s = crate::mm::usermem::summarize(vm).ok_or(UnispaceError::NotFound)?;
+        let v = Value::Struct(vec![
+            Value::U64(s.root),
+            Value::U64(s.brk_cur),
+            Value::U64(s.stack_top),
+            Value::U64(s.committed_pages),
+            Value::U64(s.budget_pages),
+        ]);
+        schema::encode_value(&v, &MEM, out)
+    }
+
+    fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
+        Err(UnispaceError::Unsupported)
+    }
+}
+
 // ── :spawn implementation ────────────────────────────────────────────
 
 /// Load `path` as an ELF, build its address space, and spawn it as a task.
@@ -288,7 +345,7 @@ fn spawn_proc(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     super::super::read(path, &mut elf, usize::MAX)?;
 
     let alloc = crate::mm::heap::get_phys_allocator_mut();
-    let (root, entry, user_stack_top) = crate::task::load::create_process(&elf, alloc)
+    let (root, entry, user_stack_top, vm) = crate::task::load::create_process(&elf, alloc)
         .map_err(|_| UnispaceError::DecodeError)?;
 
     let (kernel_stack_top, slot) =
@@ -312,6 +369,7 @@ fn spawn_proc(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         crate::task::TaskContext::new(frame_base, crate::task::user_iret_addr()),
     );
     task.kstack_slot = slot;
+    task.vm = vm;
     let pid = crate::task::spawn(task);
     attach(pid);
     let v = Value::Struct(vec![Value::U64(pid)]);

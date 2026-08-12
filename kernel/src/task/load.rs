@@ -245,11 +245,11 @@ fn map_segment(
 /// segment at its `p_vaddr` with USER permissions, and places a 32 KiB user
 /// stack at the canonical user ceiling with an unmapped guard page below.
 ///
-/// Returns `(page_table_root, entry_point, user_stack_top)`.
+/// Returns `(page_table_root, entry_point, user_stack_top, vm_idx)`.
 pub fn create_process(
     elf: &[u8],
     alloc: &mut BitmapAllocator,
-) -> Result<(u64, u64, u64), &'static str> {
+) -> Result<(u64, u64, u64, usize), &'static str> {
     let e_entry = read_u64(elf, 24);
     let segs = parse_segments(elf)?;
 
@@ -273,7 +273,30 @@ pub fn create_process(
         va += 4096;
     }
 
-    Ok((root, e_entry, USER_STACK_TOP))
+    // Page-aligned extent of the ELF image — the floor the program break grows
+    // from. Registered with the eager user-memory table so brk/mmap/munmap and
+    // `/proc/<pid>/mem` share one view.
+    let mut image_floor = u64::MAX;
+    let mut image_top = 0u64;
+    for seg in &segs {
+        let s = seg.vaddr & !0xFFF;
+        let t = seg
+            .vaddr
+            .checked_add(seg.memsz)
+            .ok_or("segment vaddr overflow")?
+            .wrapping_add(0xFFF)
+            & !0xFFF;
+        if s < image_floor {
+            image_floor = s;
+        }
+        if t > image_top {
+            image_top = t;
+        }
+    }
+    let stack_flags = PageFlags::USER | PageFlags::READ | PageFlags::WRITE;
+    let vm = crate::mm::usermem::register(root, image_floor, image_top, USER_STACK_TOP, stack_flags);
+
+    Ok((root, e_entry, USER_STACK_TOP, vm))
 }
 
 /// Encode a `struct{name: str}` method payload and invoke it on `path`.
@@ -308,7 +331,7 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     precreate("/A:mkdir", "init", &mut payload, &mut out);
     precreate("/A/init:create", "test", &mut payload, &mut out);
 
-    let (root, entry, user_stack_top) = match create_process(&elf, alloc) {
+    let (root, entry, user_stack_top, vm) = match create_process(&elf, alloc) {
         Ok(x) => x,
         Err(e) => {
             log::warn!("[sched] failed to load INIT: {}", e);
@@ -348,7 +371,7 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     SerialPort::put_hex(0x001B_0018_0000_0000u64);
     SerialPort::puts(" SCE=1\n");
 
-    crate::task::enter_userspace(entry, user_stack_top, root, 0, alloc);
+    crate::task::enter_userspace(entry, user_stack_top, root, 0, vm, alloc);
 
     // The INIT task exited and parked into idle; we resumed here. Read back
     // what it wrote to prove the write→read→exit→resume cycle end-to-end.

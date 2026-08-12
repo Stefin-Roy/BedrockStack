@@ -46,6 +46,10 @@ pub struct Task {
     /// `usize::MAX` when the task has no kernel stack of its own (the idle
     /// anchor).  Freed by `reap_dead`.
     pub kstack_slot: usize,
+    /// Index into the eager user-memory table (`mm::usermem`), or `0` when the
+    /// task has no user address space.  Set by `enter_userspace`/`:spawn` and
+    /// released by `reap_dead`.
+    pub vm: usize,
     /// Page-table root (CR3) this task runs in.
     pub root: u64,
     pub user_gs: u64,
@@ -59,6 +63,7 @@ impl Task {
             state: TaskState::Ready,
             kernel_stack_top,
             kstack_slot: usize::MAX,
+            vm: 0,
             root,
             user_gs,
             ctx,
@@ -177,6 +182,22 @@ pub fn init(root: u64) {
 /// address spaces.
 pub fn kernel_root() -> u64 {
     KERNEL_ROOT.load(Ordering::Relaxed)
+}
+
+/// The eager user-memory table index of the task running on this CPU, or
+/// `None` when in kernel context (no current task, or a kernel-only task).
+pub fn current_vm() -> Option<usize> {
+    let pc = crate::smp::current_per_cpu();
+    if pc.current_task.is_null() {
+        return None;
+    }
+    let t = unsafe { &*(pc.current_task as *const Task) };
+    let vm = t.vm;
+    if vm == 0 {
+        None
+    } else {
+        Some(vm)
+    }
 }
 
 /// Enqueue a task for the scheduler. Returns its id.
@@ -322,6 +343,37 @@ pub fn process_state(pid: u64) -> Option<TaskState> {
     None
 }
 
+/// Look up the eager user-memory table index (`vm`) of `pid`, mirroring the
+/// `process_state` scan of the three scheduler lists. `None` for a reaped or
+/// unknown pid, or a kernel-only task (`vm == 0`).
+pub fn task_vm(pid: u64) -> Option<usize> {
+    {
+        let cur = CURRENT.lock();
+        if let Some(t) = cur.as_ref() {
+            if t.id == pid && t.vm != 0 {
+                return Some(t.vm);
+            }
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid && t.vm != 0 {
+                return Some(t.vm);
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid && t.vm != 0 {
+                return Some(t.vm);
+            }
+        }
+    }
+    None
+}
+
 /// Kill the task with id `pid`, handing it to the idle loop for reaping.
 ///
 /// - `pid == current task`: the caller marks itself `Dead` and parks (never
@@ -399,6 +451,11 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
         }
         if task.kstack_slot != usize::MAX {
             free_kernel_stack(task.kstack_slot, alloc);
+        }
+        if task.vm != 0 {
+            // The region table alone is dropped — `destroy_root` already walked
+            // the page tables and freed every user leaf frame.
+            crate::mm::usermem::unregister(task.vm);
         }
         let raw = &mut *task as *mut Task;
         crate::unispace::provider::proc::detach(task.id);
@@ -511,6 +568,7 @@ pub fn enter_userspace(
     user_stack_top: u64,
     root: u64,
     user_gs: u64,
+    vm: usize,
     alloc: &mut BitmapAllocator,
 ) {
     // This task gets its own slot in the fixed kernel-stack window; the iretq
@@ -539,6 +597,7 @@ pub fn enter_userspace(
         TaskContext::new(frame_base, user_iret_addr()),
     );
     task.kstack_slot = slot;
+    task.vm = vm;
     task.id = next_id();
     crate::unispace::provider::proc::attach(task.id);
     task.state = TaskState::Running;
