@@ -521,6 +521,87 @@ pub fn self_test() {
         Err(e) => log::warn!("unispace: read /kernel/timer:sleep failed: {:?}", e),
     }
 
+    // /input provider: the UInputL event surface.  Runs before the scheduler
+    // smoke test, so no task exists yet — the queue is drained empty and the
+    // blocking `kbd:get` method is only schema-probed (never invoked).
+    out.clear();
+    match read("/input", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_value(&out, &DIR_SCHEMA) {
+            Ok(v) => {
+                SerialPort::puts("read(/input) = ");
+                SerialPort::puts(&schema::value_text(&v, &DIR_SCHEMA));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: /input listing decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /input failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/input/devices", &mut out, usize::MAX) {
+        Ok(()) => {
+            let s = &provider::input::DEVICE_LIST;
+            match schema::decode_value(&out, s) {
+                Ok(v) => {
+                    SerialPort::puts("read(/input/devices) = ");
+                    SerialPort::puts(&schema::value_text(&v, s));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /input/devices decode failed: {:?}", e),
+            }
+        }
+        Err(e) => log::warn!("unispace: read /input/devices failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/input/events", &mut out, usize::MAX) {
+        Ok(()) => {
+            let s = &provider::input::EVENT_LIST;
+            match schema::decode_value(&out, s) {
+                Ok(v) => {
+                    SerialPort::puts("read(/input/events) = ");
+                    SerialPort::puts(&schema::value_text(&v, s));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /input/events decode failed: {:?}", e),
+            }
+        }
+        Err(e) => log::warn!("unispace: read /input/events failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/input/kbd", &mut out, usize::MAX) {
+        Ok(()) => {
+            let s = &provider::input::KBD_STATE;
+            match schema::decode_value(&out, s) {
+                Ok(v) => {
+                    SerialPort::puts("read(/input/kbd) = ");
+                    SerialPort::puts(&schema::value_text(&v, s));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /input/kbd decode failed: {:?}", e),
+            }
+        }
+        Err(e) => log::warn!("unispace: read /input/kbd failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/input/kbd:get", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_method_bytes(&out) {
+            Ok((name, input, output)) => {
+                SerialPort::puts("read(/input/kbd:get) = method ");
+                SerialPort::puts(&name);
+                SerialPort::puts(" in ");
+                SerialPort::puts(&schema::text_of_owned(&input));
+                SerialPort::puts(" out ");
+                SerialPort::puts(&schema::text_of_owned(&output));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: /input/kbd:get decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /input/kbd:get failed: {:?}", e),
+    }
+
     // Cleanup the exercise tree.
     let _ = write_method("/A/nos_test:unlink", &name_val("file"), s_create, &mut payload, &mut out);
     let _ = write_method("/A/nos_test:rmdir", &name_val("sub"), s_create, &mut payload, &mut out);
