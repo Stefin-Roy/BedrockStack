@@ -224,6 +224,58 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     Some(base | offset)
 }
 
+/// Manual Sv39 walk returning `(physical, is_user, is_writable)`.
+///
+/// Mirrors [`translate`] but also reports the U (user) bit on every level and
+/// the W (writable) bit on the leaf, so the syscall layer can reject non-user
+/// buffers before touching them.  Returns `None` when any level is invalid.
+pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
+    let root_pt = unsafe { &*(root as *const PageTable) };
+    let idx2 = vpn_index(vaddr, 2);
+    let idx1 = vpn_index(vaddr, 1);
+    let idx0 = vpn_index(vaddr, 0);
+
+    let e2 = root_pt.entries[idx2];
+    if !e2.is_valid() {
+        return None;
+    }
+    let mut user_ok = e2.0 & PTE_U != 0;
+    if e2.is_leaf() {
+        // 1 GiB gigapage at L2.
+        return Some((
+            ppn_to_paddr(e2.ppn()) | (vaddr & 0x3FFF_FFFF),
+            user_ok,
+            e2.0 & PTE_W != 0,
+        ));
+    }
+
+    let l2 = pt_at(e2.ppn());
+    let e1 = l2.entries[idx1];
+    if !e1.is_valid() {
+        return None;
+    }
+    user_ok &= e1.0 & PTE_U != 0;
+    if e1.is_leaf() {
+        // 2 MiB megapage at L1.
+        return Some((
+            ppn_to_paddr(e1.ppn()) | (vaddr & 0x1F_FFFF),
+            user_ok,
+            e1.0 & PTE_W != 0,
+        ));
+    }
+
+    let l1 = pt_at(e1.ppn());
+    let e0 = l1.entries[idx0];
+    if !e0.is_valid() {
+        return None;
+    }
+    Some((
+        ppn_to_paddr(e0.ppn()) | (vaddr & 0xFFF),
+        user_ok & (e0.0 & PTE_U != 0),
+        e0.0 & PTE_W != 0,
+    ))
+}
+
 /// Switch to the given root table (physical address of L2).
 ///
 /// # Safety

@@ -100,6 +100,8 @@ echo boot build OK >> "%LOG_FILE%"
 echo [fullrun] Boot built successfully.
 echo.
 
+call :build_user
+
 echo [3/4] Creating FAT32 disk image...
 echo --- image creation --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
@@ -363,6 +365,8 @@ if %GRUB_SKIP% equ 1 (
 echo [fullrun] GRUB standalone image ready.
 echo.
 
+call :build_user
+
 echo [3/3] Creating disk image...
 echo --- image creation --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
@@ -423,6 +427,22 @@ if not exist "%QEMU_PATH%" (
 echo QEMU exited with code %errorlevel% >> "%LOG_FILE%"
 echo [fullrun] QEMU exited with code %errorlevel%.
 goto :done
+
+:build_user
+echo [user] Building user init (x86_64-bedrock-user, debug)...
+echo --- user build --- >> "%LOG_FILE%"
+echo %date% %time% >> "%LOG_FILE%"
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user 2>&1
+set USERERR=%errorlevel%
+if %USERERR% neq 0 (
+    echo [fullrun] ERROR: user build failed with exit code %USERERR%
+    echo user build FAILED: exit %USERERR% >> "%LOG_FILE%"
+    exit /b 1
+)
+echo user build OK >> "%LOG_FILE%"
+echo [fullrun] User init built successfully.
+echo.
+exit /b 0
 
 :done
 echo [fullrun] Log saved to %LOG_FILE%

@@ -127,7 +127,7 @@ pub trait Object: Send + Sync {
         Ok(())
     }
 
-    fn read_value(&self, out: &mut Vec<u8>) -> Result<(), UnispaceError>;
+    fn read_value(&self, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError>;
 
     fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
         Err(UnispaceError::PermissionDenied)
@@ -237,14 +237,27 @@ fn find_method(obj: &dyn Object, name: &str) -> Option<usize> {
 }
 
 /// Read an object's value, or (with `:method`/`:desc`) a schema.
-pub fn read(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+///
+/// `max` bounds how many bytes the object may emit into `out`, so the kernel
+/// stops allocating once a caller's buffer is satisfied (a hostile `len` on
+/// `sys_read` cannot force a full-object heap allocation). Object value reads
+/// never exceed `max`; schema/desc reads are inherently small.
+pub fn read(path: &str, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError> {
     let (obj, method) = resolve(path)?;
     match method {
-        Some("desc") => encode_object_desc(&*obj, out),
+        Some("desc") => {
+            let mut v = Vec::new();
+            encode_object_desc(&*obj, &mut v)?;
+            out.extend_from_slice(&v[..core::cmp::min(max, v.len())]);
+            Ok(())
+        }
         Some(m) => {
             let idx = find_method(&*obj, m).ok_or(UnispaceError::MethodNotFound)?;
             let md = &obj.methods()[idx];
-            encode_method_desc(md, out)
+            let mut v = Vec::new();
+            encode_method_desc(md, &mut v)?;
+            out.extend_from_slice(&v[..core::cmp::min(max, v.len())]);
+            Ok(())
         }
         None => {
             if obj.kind() == ObjectKind::Dir {
@@ -252,7 +265,7 @@ pub fn read(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
                 obj.list(&mut entries)?;
                 encode_listing(entries, out)
             } else {
-                obj.read_value(out)
+                obj.read_value(out, max)
             }
         }
     }
@@ -308,7 +321,7 @@ pub fn self_test() {
     let mut out = Vec::new();
 
     // Listing of the root (the system registry).
-    match read("/", &mut out) {
+    match read("/", &mut out, usize::MAX) {
         Ok(()) => match schema::decode_value(&out, &DIR_SCHEMA) {
             Ok(v) => {
                 SerialPort::puts("read(/) = ");
@@ -322,7 +335,7 @@ pub fn self_test() {
 
     // Method input schema on a folder: read(/A:mkdir).
     out.clear();
-    match read("/A:mkdir", &mut out) {
+    match read("/A:mkdir", &mut out, usize::MAX) {
         Ok(()) => match schema::decode_method_bytes(&out) {
             Ok((name, input, output)) => {
                 SerialPort::puts("read(/A:mkdir) = method ");
@@ -340,7 +353,7 @@ pub fn self_test() {
 
     // Object schema on a system root: read(/sys:desc).
     out.clear();
-    match read("/sys:desc", &mut out) {
+    match read("/sys:desc", &mut out, usize::MAX) {
         Ok(()) => match schema::decode_object_bytes(&out) {
             Ok((kind, value, methods)) => {
                 SerialPort::puts("read(/sys:desc) = kind ");
@@ -383,7 +396,7 @@ pub fn self_test() {
         Err(e) => log::warn!("unispace: file write failed: {:?}", e),
     }
     out.clear();
-    match read("/A/nos_test/file", &mut out) {
+    match read("/A/nos_test/file", &mut out, usize::MAX) {
         Ok(()) => {
             SerialPort::puts("read(/A/nos_test/file) = ");
             SerialPort::puts(core::str::from_utf8(&out).unwrap_or("<non-utf8>"));
@@ -409,7 +422,7 @@ pub fn self_test() {
 
     // sys provider: non-filesystem objects.
     out.clear();
-    match read("/sys/version", &mut out) {
+    match read("/sys/version", &mut out, usize::MAX) {
         Ok(()) => match schema::decode_value(&out, &schema::SCHEMA_STR) {
             Ok(v) => {
                 SerialPort::puts("read(/sys/version) = ");
@@ -422,7 +435,7 @@ pub fn self_test() {
     }
 
     out.clear();
-    match read("/sys/phys_mem", &mut out) {
+    match read("/sys/phys_mem", &mut out, usize::MAX) {
         Ok(()) => {
             let s = &provider::sys::PHYS_MEM;
             match schema::decode_value(&out, s) {
@@ -438,7 +451,7 @@ pub fn self_test() {
     }
 
     out.clear();
-    match read("/sys/cpus", &mut out) {
+    match read("/sys/cpus", &mut out, usize::MAX) {
         Ok(()) => match schema::decode_value(&out, &schema::SCHEMA_U32) {
             Ok(v) => {
                 SerialPort::puts("read(/sys/cpus) = ");

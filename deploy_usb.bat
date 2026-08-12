@@ -12,33 +12,43 @@ goto :deploy_uefi
 
 :deploy_uefi
 REM Build kernel with cpu_slow (release)
-echo [1/3] Building kernel (release, features: cpu_slow)...
+echo [1/4] Building kernel (release, features: cpu_slow)...
 cargo build --target x86_64-unknown-none -p kernel --features cpu_slow --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Build bootloader with cpu_slow (release)
-echo [2/3] Building bootloader (release, features: cpu_slow)...
+echo [2/4] Building bootloader (release, features: cpu_slow)...
 cargo build --target x86_64-unknown-uefi -p boot --features cpu_slow --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
+REM Build user INIT (release)
+echo [3/4] Building user init (release)...
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+if %errorlevel% neq 0 exit /b %errorlevel%
+
 REM Copy to USB folder
-echo [3/3] Copying to USB folder...
+echo [4/4] Copying to USB folder...
 rmdir /S /Q "%USB_DIR%" 2>nul
 mkdir "%USB_DIR%\EFI\BOOT"
 mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%TARGET_DIR%\x86_64-unknown-uefi\release\boot.efi" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
+copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\user" "%USB_DIR%\EFI\BEDROCK\INIT"
 call :copy_chime
 echo Done. Copy contents of USB\ to your ESP.
 goto :done
 
 :deploy_grub
 echo === GRUB+Multiboot2 USB deployment ===
-echo [1/2] Building kernel (release, kernelmb2)...
+echo [1/3] Building kernel (release, kernelmb2)...
 cargo build --target x86_64-unknown-none -p kernel --features "kernelmb2 cpu_slow" --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
-echo [2/2] Creating GRUB standalone image and copying to USB folder...
+echo [2/3] Building user init (release)...
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+echo [3/3] Creating GRUB standalone image and copying to USB folder...
 set GRUB_CFG=%TARGET_DIR%\grub.cfg
 set GRUB_CFG_CACHED=%GRUB_CFG%.cached
 set GRUB_EFI=%TARGET_DIR%\grub_bootx64.efi
@@ -112,6 +122,7 @@ mkdir "%USB_DIR%\EFI\BOOT"
 mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%GRUB_EFI%" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
+copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\user" "%USB_DIR%\EFI\BEDROCK\INIT"
 call :copy_chime
 echo Done. Copy contents of USB\ to your ESP (boot via UEFI GRUB which loads kernel via multiboot2).
 goto :done

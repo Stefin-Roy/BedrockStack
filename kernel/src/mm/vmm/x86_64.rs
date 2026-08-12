@@ -5,6 +5,7 @@
 //! offset becomes `PHYS_MAP_BASE`, so page-table frames are dereferenced
 //! through the kernel-internal physmap rather than the identity map.
 
+use alloc::vec::Vec;
 use x86_64::registers::control::{Cr3, Cr3Flags};
 use x86_64::structures::paging::{
     FrameAllocator, Mapper, OffsetPageTable, Page, PageTable, PageTableFlags, PhysFrame, Size2MiB,
@@ -76,9 +77,21 @@ pub fn init_pat_wc() {
     unsafe { msr.write(new_val); }
 }
 
+/// Table flags for newly-allocated intermediate page-table entries.
+///
+/// Propagates the USER_ACCESSIBLE bit from the leaf being mapped so that user
+/// mappings stay reachable through every level.  Invariant: user mappings must
+/// live under freshly-created intermediate tables — they do, because the low
+/// half of a `clone_high_half` root starts empty and every table on the path is
+/// allocated by `map_to_with_table_flags`, which only applies these flags to
+/// new tables.  (Kernel leaves stay as before: no USER on their tables.)
 #[inline]
-fn table_flags() -> PageTableFlags {
-    PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED
+fn table_flags_for(leaf: PageTableFlags) -> PageTableFlags {
+    let mut f = PageTableFlags::PRESENT | PageTableFlags::WRITABLE | PageTableFlags::ACCESSED;
+    if leaf.contains(PageTableFlags::USER_ACCESSIBLE) {
+        f |= PageTableFlags::USER_ACCESSIBLE;
+    }
+    f
 }
 
 // ── Public API ──────────────────────────────────────────────────────
@@ -91,6 +104,8 @@ pub fn map_4k(
     flags: PageFlags,
 ) {
     let _guard = super::lock();
+    // A brand-new higher-half PML4 slot must be fanned out to every clone.
+    let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
     let mut mapper = mapper_at(root);
     let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
@@ -100,9 +115,14 @@ pub fn map_4k(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags(), &mut frame_alloc)
+            .map_to_with_table_flags(page, frame, x86_flags, table_flags_for(x86_flags), &mut frame_alloc)
             .expect("x86_64 4KiB map failed")
             .flush();
+    }
+    if new_slot {
+        sync_clone_half(root);
+        super::flush_tlb();
+        super::shootdown_tlb();
     }
 }
 
@@ -114,6 +134,7 @@ pub fn map_2m(
     flags: PageFlags,
 ) {
     let _guard = super::lock();
+    let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
     let mut mapper = mapper_at(root);
     let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
@@ -123,9 +144,14 @@ pub fn map_2m(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags(), &mut frame_alloc)
+            .map_to_with_table_flags(page, frame, x86_flags, table_flags_for(x86_flags), &mut frame_alloc)
             .expect("x86_64 2MiB map failed")
             .flush();
+    }
+    if new_slot {
+        sync_clone_half(root);
+        super::flush_tlb();
+        super::shootdown_tlb();
     }
 }
 
@@ -188,6 +214,50 @@ unsafe fn table_is_empty(frame: u64) -> bool {
         }
     }
     true
+}
+
+/// Copy the parent's higher-half PML4 entries (256..=511) into every live
+/// clone, so a higher-half PML4 slot that was *absent* when a clone was born —
+/// and is now populated on the parent — becomes visible to it.
+///
+/// Clones share the parent's subtrees for entries that were present at clone
+/// time; only entries that were empty then need syncing.  The parent is
+/// normally the kernel root, but `root` is taken as a parameter so any root's
+/// new higher-half slot can fan out.
+///
+/// # Safety/ordering
+/// Must be called with the VMM operation lock held (as from `map_4k` /
+/// `map_2m`), and the caller must follow up with a local `flush_tlb` plus a
+/// cross-CPU `shootdown_tlb` before any affected frames could be re-used.
+pub(crate) fn sync_clone_half(parent_root: u64) {
+    let clones = super::clone_roots();
+    if clones.is_empty() {
+        return;
+    }
+    unsafe {
+        let parent = pte_deref(parent_root);
+        for root in clones {
+            let pml4 = pte_deref(root);
+            for i in 256..=511usize {
+                let pe = read_pte(parent, i);
+                if read_pte(pml4, i) != pe {
+                    write_pte(pml4, i, pe);
+                }
+            }
+        }
+    }
+}
+
+/// True when `vaddr` is a higher-half address whose PML4 slot is *absent* in
+/// `root` right now — i.e. mapping it introduces a brand-new higher-half slot
+/// that every clone must be re-synced against.
+unsafe fn new_higher_half_slot(root: u64, vaddr: u64) -> bool {
+    let i = ((vaddr >> 39) & 0x1FF) as usize;
+    if i < 256 {
+        return false;
+    }
+    let pml4 = pte_deref(root);
+    unsafe { read_pte(pml4, i) & PTE_PRESENT == 0 }
 }
 
 /// Free 4-level intermediate page tables that became empty after the leaf at
@@ -275,6 +345,160 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())
 }
 
+/// Manual 4-level page-table walk returning `(physical, is_user, is_writable)`.
+///
+/// Unlike [`translate`], this reports permissions too, so the syscall layer can
+/// reject non-user pointers before dereferencing them (there is no #PF handler
+/// for a bogus user buffer — a raw copy would abort the kernel).
+///
+/// Every level must be PRESENT; U/S is checked on all four levels because
+/// `table_flags_for` propagates USER_ACCESSIBLE onto freshly allocated
+/// intermediate tables, and a mapping only reaches user mode if every level
+/// carries the bit.  W is read from the leaf.  Huge (PS) pages at levels 3 and
+/// 2 are handled.  Returns `None` when any level is not present.
+pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
+    const PRESENT: u64 = 1 << 0;
+    const WRITABLE: u64 = 1 << 1;
+    const USER: u64 = 1 << 2;
+    const PS: u64 = 1 << 7;
+
+    let i0 = ((vaddr >> 39) & 0x1FF) as usize;
+    let i1 = ((vaddr >> 30) & 0x1FF) as usize;
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let i3 = ((vaddr >> 12) & 0x1FF) as usize;
+
+    let pml4 = pte_deref(root);
+    let e0 = unsafe { read_pte(pml4, i0) };
+    if e0 & PRESENT == 0 {
+        return None;
+    }
+    let mut user_ok = e0 & USER != 0;
+
+    let pdpt = pte_deref(pte_frame(e0));
+    let e1 = unsafe { read_pte(pdpt, i1) };
+    if e1 & PRESENT == 0 {
+        return None;
+    }
+    user_ok &= e1 & USER != 0;
+    if e1 & PS != 0 {
+        return Some((
+            pte_frame(e1) | (vaddr & 0x3FFF_FFFF),
+            user_ok,
+            e1 & WRITABLE != 0,
+        ));
+    }
+
+    let pd = pte_deref(pte_frame(e1));
+    let e2 = unsafe { read_pte(pd, i2) };
+    if e2 & PRESENT == 0 {
+        return None;
+    }
+    user_ok &= e2 & USER != 0;
+    if e2 & PS != 0 {
+        return Some((pte_frame(e2) | (vaddr & 0x1F_FFFF), user_ok, e2 & WRITABLE != 0));
+    }
+
+    let pt = pte_deref(pte_frame(e2));
+    let e3 = unsafe { read_pte(pt, i3) };
+    if e3 & PRESENT == 0 {
+        return None;
+    }
+    Some((pte_frame(e3) | (vaddr & 0xFFF), user_ok & (e3 & USER != 0), e3 & WRITABLE != 0))
+}
+
+/// PS (huge-page) bit position in a level-2/3 entry.
+const PS: u64 = 1 << 7;
+
+/// Destroy a cloned root's user-space (low-half) mappings wholesale, freeing
+/// every leaf frame and empty intermediate table, then the root PML4 itself.
+/// The caller's count of live clones is decremented (`unregister_clone_root`).
+///
+/// # Safety
+/// Safe only for a root no CPU is running: the scheduler is BSP-only and a
+/// parked `Dead` task's root is idle, so no TLB anywhere can re-walk a frame
+/// we release — the flush (local + broadcast) that precedes the frees is
+/// strictly defensive.  The higher-half entries (PML4 indices 256..=511) are
+/// never dereferenced or freed: they alias the kernel root's shared subtrees,
+/// which are owned by the parent and outlive every clone.
+///
+/// Leaf freeing is valid here because a clone root's low half is entirely
+/// user-owned: `clone_high_half` copies only the higher half, and `create_process`
+/// allocates every low-half frame it maps, so nothing kernel-owned can be
+/// collateral.
+///
+/// Frames are collected into a heap `Vec` (unbounded — a whole process address
+/// space can exceed the fixed `PendingFrames` collector) and released only
+/// after a local `flush_tlb` plus a cross-CPU `shootdown_tlb`, so no CPU can
+/// dereference a released frame.  The VMM lock is held only for the table-walk
+/// mutation phase, never across the shootdown wait.
+pub fn destroy_root(root: u64, alloc: &mut BitmapAllocator) {
+    let mut frames: Vec<u64> = Vec::new();
+
+    {
+        let _guard = super::lock();
+        unsafe {
+            let pml4 = pte_deref(root);
+            for i0 in 0..256usize {
+                let e0 = read_pte(pml4, i0);
+                if e0 & PTE_PRESENT == 0 {
+                    continue;
+                }
+                let pdpt_base = pte_frame(e0);
+                let pdpt = pte_deref(pdpt_base);
+                for i1 in 0..512usize {
+                    let e1 = read_pte(pdpt, i1);
+                    if e1 & PTE_PRESENT == 0 {
+                        continue;
+                    }
+                    if e1 & PS != 0 {
+                        // 1 GiB huge leaf (defensive — user maps use 4 KiB).
+                        frames.push(pte_frame(e1));
+                        write_pte(pdpt, i1, 0);
+                        continue;
+                    }
+                    let pd_base = pte_frame(e1);
+                    let pd = pte_deref(pd_base);
+                    for i2 in 0..512usize {
+                        let e2 = read_pte(pd, i2);
+                        if e2 & PTE_PRESENT == 0 {
+                            continue;
+                        }
+                        if e2 & PS != 0 {
+                            // 2 MiB huge leaf (defensive).
+                            frames.push(pte_frame(e2));
+                            write_pte(pd, i2, 0);
+                            continue;
+                        }
+                        let pt_base = pte_frame(e2);
+                        let pt = pte_deref(pt_base);
+                        for i3 in 0..512usize {
+                            let e3 = read_pte(pt, i3);
+                            if e3 & PTE_PRESENT == 0 {
+                                continue;
+                            }
+                            frames.push(pte_frame(e3));
+                            write_pte(pt, i3, 0);
+                        }
+                        frames.push(pt_base);
+                        write_pte(pd, i2, 0);
+                    }
+                    frames.push(pd_base);
+                    write_pte(pdpt, i1, 0);
+                }
+                frames.push(pdpt_base);
+                write_pte(pml4, i0, 0);
+            }
+        }
+    }
+
+    super::flush_tlb();
+    super::shootdown_tlb();
+    for f in frames {
+        unsafe { alloc.free(f); }
+    }
+    super::unregister_clone_root(root);
+}
+
 /// Remove the WRITABLE flag from a single 4 KiB page, making it read-only.
 ///
 /// Phase 4: the kernel image is mapped exactly once, at `KERNEL_VMA` — there
@@ -327,9 +551,6 @@ pub fn make_read_only(root: u64, vaddr: u64) {
 /// # Panics
 /// - If the allocator cannot supply a root frame (OOM).
 pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
-    // Register the clone so `reclaim_empty_tables` stops freeing intermediate
-    // tables: the clone shares the parent's higher-half PDPT/PD/PT subtrees.
-    super::register_clone_root();
     let new_root = alloc.alloc().expect("x86_64 VMM: OOM for cloned root");
     let new_pml4 = pte_deref(new_root);
     let parent_pml4 = pte_deref(parent_root);
@@ -341,6 +562,11 @@ pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
             write_pte(new_pml4, i, read_pte(parent_pml4, i));
         }
     }
+    // Register the clone so `reclaim_empty_tables` stops freeing intermediate
+    // tables (the clone shares the parent's higher-half subtrees) and so
+    // `sync_clone_half` keeps it sharing any slot populated later.  Do this
+    // AFTER the copy so the registry never holds a half-built root.
+    super::register_clone_root(new_root);
     new_root
 }
 
@@ -362,6 +588,10 @@ pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
             let frame = alloc.alloc().expect("prepopulate_window: OOM for PDPT");
             core::ptr::write_bytes(pte_deref(frame) as *mut u8, 0, 4096);
             write_pte(pml4, i, frame | PTE_PRESENT | (1u64 << 1)); // PRESENT | WRITABLE
+            // A new higher-half slot: fan it out to live clones too.
+            sync_clone_half(root);
+            super::flush_tlb();
+            super::shootdown_tlb();
         }
     }
 }

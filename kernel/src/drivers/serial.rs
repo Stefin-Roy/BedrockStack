@@ -1,7 +1,14 @@
 //! Locked serial wrapper with per-CPU re-entrancy guard and `[CPU(N)]` prefix.
+//!
+//! Every byte emitted to COM1 through this wrapper is also appended to a
+//! capture log (see `switch_to_growable`/`capture_bytes`), so the history of
+//! all kernel serial output can be read back via `/driver/debugserial`.
 
-use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+use alloc::vec::Vec;
 use core::hint::spin_loop;
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
+
+use crate::filesystems::vfs::irq::IrqMutex;
 
 #[cfg(target_arch = "x86_64")]
 type Inner = common::serial::x86_64::SerialPort;
@@ -10,6 +17,98 @@ type Inner = common::serial::riscv64::SerialPort;
 
 static GLOBAL_LOCK: AtomicBool = AtomicBool::new(false);
 static LAST_WAS_NL: AtomicBool = AtomicBool::new(true);
+
+// ── Capture log ─────────────────────────────────────────────────────────
+// Serial output starts before the heap exists (kernel_main), so the first
+// `CAPTURE_RING_CAP` bytes land in a static ring.  Once the heap is live,
+// `switch_to_growable()` migrates the ring into a growable `Vec` and all
+// subsequent bytes append there — the readback is lossless.
+
+const CAPTURE_RING_CAP: usize = 8 * 1024;
+
+struct CaptureLog {
+    ring: [u8; CAPTURE_RING_CAP],
+    ring_len: usize,
+    ring_pos: usize,
+    vec: Vec<u8>,
+    growable: bool,
+}
+
+impl CaptureLog {
+    const fn new() -> Self {
+        CaptureLog {
+            ring: [0; CAPTURE_RING_CAP],
+            ring_len: 0,
+            ring_pos: 0,
+            vec: Vec::new(),
+            growable: false,
+        }
+    }
+
+    fn push(&mut self, c: u8) {
+        if self.growable {
+            self.vec.push(c);
+        } else if self.ring_len == CAPTURE_RING_CAP {
+            self.ring[self.ring_pos] = c;
+            self.ring_pos = (self.ring_pos + 1) % CAPTURE_RING_CAP;
+        } else {
+            self.ring[self.ring_len] = c;
+            self.ring_len += 1;
+        }
+    }
+
+    fn drain_ring(&mut self) {
+        if self.ring_len == 0 {
+            return;
+        }
+        self.vec.reserve(self.ring_len);
+        if self.ring_len == CAPTURE_RING_CAP && self.ring_pos > 0 {
+            self.vec.extend_from_slice(&self.ring[self.ring_pos..]);
+            self.vec.extend_from_slice(&self.ring[..self.ring_pos]);
+        } else {
+            self.vec.extend_from_slice(&self.ring[..self.ring_len]);
+        }
+        self.ring_len = 0;
+        self.ring_pos = 0;
+    }
+
+    fn write_to(&self, out: &mut Vec<u8>) {
+        if self.growable {
+            out.extend_from_slice(&self.vec);
+        } else if self.ring_len == CAPTURE_RING_CAP && self.ring_pos > 0 {
+            out.extend_from_slice(&self.ring[self.ring_pos..]);
+            out.extend_from_slice(&self.ring[..self.ring_pos]);
+        } else {
+            out.extend_from_slice(&self.ring[..self.ring_len]);
+        }
+    }
+}
+
+static CAPTURE: IrqMutex<CaptureLog> = IrqMutex::new(CaptureLog::new());
+
+/// Migrate the pre-heap ring into the growable log.  Call once, after the
+/// heap arena is live.  Idempotent.
+pub fn switch_to_growable() {
+    let mut log = CAPTURE.lock();
+    if !log.growable {
+        log.drain_ring();
+        log.growable = true;
+    }
+}
+
+/// Append the full captured COM1 history to `out`, oldest first.
+pub fn capture_bytes(out: &mut Vec<u8>) {
+    let log = CAPTURE.lock();
+    log.write_to(out);
+}
+
+/// Record `c` into the capture log, then write it to the hardware.  This is
+/// the single byte sink for all locked output paths.  The capture push never
+/// calls back into serial while holding `CAPTURE`, so there is no re-entrancy.
+fn emit(c: u8) {
+    CAPTURE.lock().push(c);
+    Inner::putc(c);
+}
 
 /// Serial port with per-CPU re-entrancy guard and `[CPU(N)]` prefix.
 ///
@@ -32,7 +131,7 @@ impl SerialPort {
         #[cfg(feature = "forceslowlogging")]
         slow_down();
         let cpu = acquire_locks();
-        Inner::putc(c);
+        emit(c);
         track_newline(c);
         release_locks(cpu);
     }
@@ -59,7 +158,7 @@ impl SerialPort {
                 write_prefix(cpu_id.unwrap());
                 need_prefix = false;
             }
-            Inner::putc(b);
+            emit(b);
             if b == b'\n' {
                 need_prefix = cpu_id.is_some();
             }
@@ -73,7 +172,7 @@ impl SerialPort {
         #[cfg(feature = "forceslowlogging")]
         slow_down();
         let cpu = acquire_locks();
-        Inner::put_hex(val);
+        write_hex(val);
         release_locks(cpu);
     }
 
@@ -82,8 +181,43 @@ impl SerialPort {
         #[cfg(feature = "forceslowlogging")]
         slow_down();
         let cpu = acquire_locks();
-        Inner::put_u64(val);
+        write_u64(val);
         release_locks(cpu);
+    }
+}
+
+fn write_hex(mut val: u64) {
+    if val == 0 {
+        emit(b'0');
+        return;
+    }
+    let mut buf = [0u8; 16];
+    let mut i = 16;
+    while val > 0 {
+        i -= 1;
+        let digit = (val & 0xF) as u8;
+        buf[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+        val >>= 4;
+    }
+    for &b in &buf[i..] {
+        emit(b);
+    }
+}
+
+fn write_u64(mut val: u64) {
+    if val == 0 {
+        emit(b'0');
+        return;
+    }
+    let mut buf = [0u8; 20];
+    let mut i = 20;
+    while val > 0 {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+    }
+    for &b in &buf[i..] {
+        emit(b);
     }
 }
 
@@ -121,13 +255,13 @@ pub fn dump_put_u64(val: u64) {
 }
 
 fn write_prefix(cpu_id: u32) {
-    Inner::putc(b'[');
-    Inner::putc(b'C');
-    Inner::putc(b'P');
-    Inner::putc(b'U');
-    Inner::put_u64(cpu_id as u64);
-    Inner::putc(b']');
-    Inner::putc(b' ');
+    emit(b'[');
+    emit(b'C');
+    emit(b'P');
+    emit(b'U');
+    write_u64(cpu_id as u64);
+    emit(b']');
+    emit(b' ');
     // These primitives don't affect LAST_WAS_NL — only the caller's content does.
 }
 

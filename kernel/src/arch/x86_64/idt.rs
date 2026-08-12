@@ -40,6 +40,24 @@ pub fn check_integrity() -> bool {
     g == IDT_GUARD_MAGIC
 }
 
+// ── User-mode GS guards ────────────────────────────────────────────
+//
+// Invariant: the kernel runs with GS.base = the current PerCpu and
+// IA32_KERNEL_GS_BASE holding the user GS.  An interrupt taken from user
+// mode therefore arrives with GS.base = user GS and must swapgs on entry
+// to reach PerCpu state, then swapgs again before returning.  All boot
+// frames are RPL0, so these guards no-op during boot.
+
+/// True when the interrupt frame was pushed from ring 3 (user mode).
+fn from_user(frame: &InterruptStackFrame) -> bool {
+    frame.code_segment.rpl() == x86_64::PrivilegeLevel::Ring3
+}
+
+/// Toggle GS.base / IA32_KERNEL_GS_BASE.
+fn swapgs() {
+    unsafe { core::arch::asm!("swapgs", options(nomem, nostack, preserves_flags)) }
+}
+
 // ── Device interrupt dispatch (vectors 33-48) ─────────────────────
 //
 // Drivers can register a handler for one of the 16 available device
@@ -125,28 +143,42 @@ fn device_irq_handler(vector: u8) {
     apic::apic_eoi();
 }
 
-extern "x86-interrupt" fn irq_33(_sf: InterruptStackFrame) { device_irq_handler(33); }
+macro_rules! device_irq_guard {
+    ($fnname:ident, $vec:expr) => {
+        extern "x86-interrupt" fn $fnname(frame: InterruptStackFrame) {
+            let u = from_user(&frame);
+            if u { swapgs(); }
+            device_irq_handler($vec);
+            if u { swapgs(); }
+        }
+    };
+}
+
+device_irq_guard!(irq_33, 33);
+device_irq_guard!(irq_35, 35);
+device_irq_guard!(irq_36, 36);
+device_irq_guard!(irq_37, 37);
+device_irq_guard!(irq_38, 38);
+device_irq_guard!(irq_39, 39);
+device_irq_guard!(irq_40, 40);
+device_irq_guard!(irq_41, 41);
+device_irq_guard!(irq_42, 42);
+device_irq_guard!(irq_43, 43);
+device_irq_guard!(irq_44, 44);
+device_irq_guard!(irq_45, 45);
+device_irq_guard!(irq_46, 46);
+device_irq_guard!(irq_47, 47);
+device_irq_guard!(irq_48, 48);
 static mut VEC34_COUNT: u64 = 0;
 pub fn vec34_count() -> u64 { unsafe { VEC34_COUNT } }
 
-extern "x86-interrupt" fn irq_34(_sf: InterruptStackFrame) {
+extern "x86-interrupt" fn irq_34(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
     unsafe { VEC34_COUNT += 1; }
     device_irq_handler(34);
+    if u { swapgs(); }
 }
-extern "x86-interrupt" fn irq_35(_sf: InterruptStackFrame) { device_irq_handler(35); }
-extern "x86-interrupt" fn irq_36(_sf: InterruptStackFrame) { device_irq_handler(36); }
-extern "x86-interrupt" fn irq_37(_sf: InterruptStackFrame) { device_irq_handler(37); }
-extern "x86-interrupt" fn irq_38(_sf: InterruptStackFrame) { device_irq_handler(38); }
-extern "x86-interrupt" fn irq_39(_sf: InterruptStackFrame) { device_irq_handler(39); }
-extern "x86-interrupt" fn irq_40(_sf: InterruptStackFrame) { device_irq_handler(40); }
-extern "x86-interrupt" fn irq_41(_sf: InterruptStackFrame) { device_irq_handler(41); }
-extern "x86-interrupt" fn irq_42(_sf: InterruptStackFrame) { device_irq_handler(42); }
-extern "x86-interrupt" fn irq_43(_sf: InterruptStackFrame) { device_irq_handler(43); }
-extern "x86-interrupt" fn irq_44(_sf: InterruptStackFrame) { device_irq_handler(44); }
-extern "x86-interrupt" fn irq_45(_sf: InterruptStackFrame) { device_irq_handler(45); }
-extern "x86-interrupt" fn irq_46(_sf: InterruptStackFrame) { device_irq_handler(46); }
-extern "x86-interrupt" fn irq_47(_sf: InterruptStackFrame) { device_irq_handler(47); }
-extern "x86-interrupt" fn irq_48(_sf: InterruptStackFrame) { device_irq_handler(48); }
 
 /// Initialize and load the IDT.
 ///
@@ -218,13 +250,16 @@ pub fn init() {
 /// Runs on whichever CPU's LAPIC fired.  Each CPU processes its own
 /// universal-timer base (drains expired timers, reprograms the LAPIC
 /// one-shot), then signals EOI.
-extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
     let ptr = TIMER_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
         handler();
     }
     apic::apic_eoi();
+    if u { swapgs(); }
 }
 
 /// Timer-reschedule IPI handler (vector 52).
@@ -233,13 +268,16 @@ extern "x86-interrupt" fn timer_handler(_stack_frame: InterruptStackFrame) {
 /// deadline.  Runs the same tick routine so the local base re-arms, then
 /// signals EOI.  A missed IPI is non-fatal — the LAPIC is still armed for
 /// the previous earliest and `tick()` re-arms after it fires.
-extern "x86-interrupt" fn ipi_timer_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ipi_timer_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
     let ptr = TIMER_IPI_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
         handler();
     }
     apic::apic_eoi();
+    if u { swapgs(); }
 }
 
 /// Cross-CPU TLB-shootdown IPI handler (vector 50).
@@ -248,12 +286,18 @@ extern "x86-interrupt" fn ipi_timer_handler(_stack_frame: InterruptStackFrame) {
 /// the initiating CPU may then release the just-unmapped frames to the
 /// allocator.  Runs with interrupts disabled (interrupt gate); does not touch
 /// any VMM lock, so it can never deadlock against an in-progress shootdown.
-extern "x86-interrupt" fn ipi_tlb_shootdown_handler(_stack_frame: InterruptStackFrame) {
+extern "x86-interrupt" fn ipi_tlb_shootdown_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
     crate::mm::vmm::tlb_shootdown_on_this_cpu();
     apic::apic_eoi();
+    if u { swapgs(); }
 }
 
 extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     let rsp: u64;
     unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack)); }
     crate::drivers::serial::dump_puts("[#DE] RSP = 0x");
@@ -266,14 +310,23 @@ extern "x86-interrupt" fn divide_error_handler(frame: InterruptStackFrame) {
 }
 
 extern "x86-interrupt" fn breakpoint_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     crate::kerneldump::dump_full_fault(&frame, 0, 3);
 }
 
 extern "x86-interrupt" fn invalid_opcode_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     crate::kerneldump::dump_full_fault(&frame, 0, 6);
 }
 
 extern "x86-interrupt" fn invalid_tss_handler(frame: InterruptStackFrame, error_code: u64) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     crate::kerneldump::dump_full_fault(&frame, error_code, 10);
 }
 
@@ -281,6 +334,9 @@ extern "x86-interrupt" fn segment_not_present_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     crate::kerneldump::dump_full_fault(&frame, error_code, 11);
 }
 
@@ -288,6 +344,9 @@ extern "x86-interrupt" fn stack_segment_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     crate::kerneldump::dump_full_fault(&frame, error_code, 12);
 }
 
@@ -295,6 +354,8 @@ extern "x86-interrupt" fn double_fault_handler(
     frame: InterruptStackFrame,
     error_code: u64,
 ) -> ! {
+    let u = from_user(&frame);
+    if u { swapgs(); }
     crate::kerneldump::dump_full_fault(&frame, error_code, 8);
 }
 
@@ -302,6 +363,13 @@ extern "x86-interrupt" fn page_fault_handler(
     mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u {
+        // Ring-3 page fault (guard-page overflow, bad user pointer that got
+        // past the syscall walk, etc.): kill the task, don't brick the kernel.
+        crate::task::kill_user_fault();
+    }
     // ── PF recovery during a kernel dump ───────────────────────────
     if dump::is_dump_in_progress() {
         let target = dump::PF_RECOVERY_RIP.load(Ordering::Relaxed);
@@ -315,6 +383,7 @@ extern "x86-interrupt" fn page_fault_handler(
                     .as_mut()
                     .update(|val| val.instruction_pointer = VirtAddr::new(target));
             }
+            if u { swapgs(); }
             return;
         }
         crate::drivers::serial::dump_puts(
@@ -327,6 +396,9 @@ extern "x86-interrupt" fn page_fault_handler(
 }
 
 extern "x86-interrupt" fn gpf_handler(frame: InterruptStackFrame, error_code: u64) {
+    let u = from_user(&frame);
+    if u { swapgs(); }
+    if u { crate::task::kill_user_fault(); }
     let ecx: u32;
     unsafe { core::arch::asm!("mov {0:e}, ecx", out(reg) ecx); }
     crate::drivers::serial::dump_puts("[GPF] ECX (MSR) = 0x");
