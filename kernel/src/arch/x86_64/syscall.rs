@@ -202,30 +202,47 @@ syscall_entry:
     u_rip = const USER_RIP_OFF,
 );
 
-/// Phase 7 syscall dispatcher — read/write/exit over the unispace namespace.
+/// Syscall dispatcher — read/write over the unispace namespace.
 ///
-/// Args arrive in rdi/rsi/rdx/r10 (see the entry asm): rax = number, rdi =
-/// arg0, rsi = arg1, rdx = arg2, r10 = arg3. The frame's `rax` slot carries
-/// the return value out.
+/// ## Final syscall contract (x86_64)
+///
+/// Only two syscalls exist.
+///
+///   0  read(path, buf, buf_len)
+///   1  write(path, buf, buf_len)
+///
+/// - `path` (rdi) is a NUL-terminated C string (bounded scan; no separate
+///   length).
+/// - `buf` (rsi) is arbitrary bytes and may contain embedded NUL — its length
+///   (`buf_len`, rdx) is required, since memory has no size metadata.
+/// - `write`'s buffer is in-place request/response: the input is decoded first,
+///   then the provider's return bytes (method output or error detail) are
+///   rewritten into the same `buf` starting at byte 0, zero-filled past them.
+///   A caller that still needs its input must keep its own copy.
+/// - Return (`rax`): `>= 0` = the number of output bytes returned (0 is a
+///   valid empty output); `< 0` = errno. On error, error-detail bytes may
+///   still be in `buf`.
+///
+/// The frame's `rax` slot carries the syscall number in and return value out.
+/// r10 (the old fourth argument) is now unused.
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
     match frame.rax {
         0 => sys_read(frame),
         1 => sys_write(frame),
-        2 => sys_exit(frame),
         _ => frame.rax = (-1i64) as u64,
     }
 }
 
 // ── Syscall implementations ──────────────────────────────────────────
 
-/// 0 read(path, path_len, buf, buf_len): read the object's value into `buf`.
+/// 0 read(path, buf, buf_len): read the object's value into `buf`.
 ///
 /// The kernel never buffers more than `buf_len` bytes of the object, so a
 /// hostile/reckless read cannot exhaust the heap regardless of how large the
 /// source object is; `copy_user_out` further validates the buffer pages.
 fn sys_read(frame: &mut SyscallFrame) {
-    let path = match copy_user_string(frame.rdi, frame.rsi) {
+    let path = match copy_user_cstring(frame.rdi) {
         Ok(p) => p,
         Err(e) => {
             frame.rax = e as u64;
@@ -233,8 +250,8 @@ fn sys_read(frame: &mut SyscallFrame) {
         }
     };
     let mut data = Vec::new();
-    match unispace::read(&path, &mut data, core::cmp::min(frame.r10, MAX_COPY) as usize) {
-        Ok(()) => match copy_user_out(frame.rdx, frame.r10, &data) {
+    match unispace::read(&path, &mut data, core::cmp::min(frame.rdx, MAX_COPY) as usize) {
+        Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &data) {
             Ok(n) => frame.rax = n as u64,
             Err(e) => frame.rax = e as u64,
         },
@@ -242,17 +259,18 @@ fn sys_read(frame: &mut SyscallFrame) {
     }
 }
 
-/// 1 write(path, path_len, buf, buf_len): decode+validate `buf` as the
-/// object's value schema and apply it.
+/// 1 write(path, buf, buf_len): decode+validate `buf` as the object's value
+/// schema, apply it, and rewrite the provider's output (or error detail) into
+/// `buf` in place. Returns the number of output bytes — not the input length.
 fn sys_write(frame: &mut SyscallFrame) {
-    let path = match copy_user_string(frame.rdi, frame.rsi) {
+    let path = match copy_user_cstring(frame.rdi) {
         Ok(p) => p,
         Err(e) => {
             frame.rax = e as u64;
             return;
         }
     };
-    let data = match copy_user_in(frame.rdx, frame.r10) {
+    let data = match copy_user_in(frame.rsi, frame.rdx) {
         Ok(d) => d,
         Err(e) => {
             frame.rax = e as u64;
@@ -261,16 +279,16 @@ fn sys_write(frame: &mut SyscallFrame) {
     };
     let mut resp = Vec::new();
     match unispace::write(&path, &data, &mut resp) {
-        Ok(()) => frame.rax = data.len() as u64,
-        Err(e) => frame.rax = errno(e) as u64,
+        Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &resp) {
+            Ok(_) => frame.rax = resp.len() as u64,
+            Err(e) => frame.rax = e as u64,
+        },
+        Err(e) => {
+            // Best-effort copy of any error-detail bytes; the errno wins.
+            let _ = copy_user_out(frame.rsi, frame.rdx, &resp);
+            frame.rax = errno(e) as u64;
+        }
     }
-}
-
-/// 2 exit(code): log and terminate the current task. Never returns.
-fn sys_exit(frame: &mut SyscallFrame) -> ! {
-    let code = frame.rdi;
-    log::info!("[sched] init exit({})", code);
-    crate::task::exit_current(code);
 }
 
 // ── User-pointer helpers ─────────────────────────────────────────────
@@ -332,10 +350,50 @@ fn validate_user_range(root: u64, ptr: u64, len: u64, writable: bool) -> Result<
     Ok(())
 }
 
-/// Copy a NUL-less byte string from user memory, validating UTF-8.
-pub fn copy_user_string(ptr: u64, len: u64) -> Result<String, i64> {
-    let bytes = copy_user_in(ptr, len)?;
-    String::from_utf8(bytes).map_err(|_| -22) // EINVAL
+/// Copy a NUL-terminated string from user memory.
+///
+/// Walks the string page by page, validating each page readable before the
+/// raw deref — there is no page-fault handler for user pointers, so a raw
+/// copy at a bogus address would double-fault. Only pages actually touched up
+/// to the first 0x00 are validated (never an up-front full `MAX_COPY` window:
+/// a user address space maps far less than that contiguously). Bounded by
+/// `MAX_COPY` bytes and the `USER_BOUNDARY`. Decodes UTF-8, returning
+/// `-EINVAL` on bad bytes. If no NUL is found within the cap, the collected
+/// bytes are returned as-is (still bounded).
+pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
+    if ptr >= USER_BOUNDARY {
+        return Err(-14); // EFAULT
+    }
+    let root = current_task_root()?;
+    let mut out: Vec<u8> = Vec::new();
+    let mut va = ptr;
+    while va < USER_BOUNDARY && va - ptr < MAX_COPY {
+        let page = va & !0xFFF;
+        // Validate this page is present and user-accessible before reading it.
+        match crate::mm::vmm::translate_user(root, page) {
+            Some((_, user, _)) if user => {}
+            _ => return Err(-14), // EFAULT
+        }
+        // Read up to the end of this page, capped by the user boundary and the
+        // MAX_COPY budget.
+        let page_end = page + 0x1000;
+        let cap = core::cmp::min(page_end, core::cmp::min(USER_BOUNDARY, ptr + MAX_COPY));
+        if cap <= va {
+            break;
+        }
+        let src = unsafe { core::slice::from_raw_parts(va as *const u8, (cap - va) as usize) };
+        match src.iter().position(|&b| b == 0) {
+            Some(i) => {
+                out.extend_from_slice(&src[..i]);
+                break;
+            }
+            None => {
+                out.extend_from_slice(src);
+                va = cap;
+            }
+        }
+    }
+    String::from_utf8(out).map_err(|_| -22) // EINVAL
 }
 
 /// Copy `len` raw bytes from user memory into a kernel buffer.
@@ -383,7 +441,7 @@ fn errno(e: UnispaceError) -> i64 {
         NotFound => -2,        // ENOENT
         IsADirectory => -21,   // EISDIR
         NotADirectory => -20,  // ENOTDIR
-        PermissionDenied => -13, // EACCES
+        Unsupported => -38,      // ENOSYS
         InvalidPath | DecodeError | SchemaMismatch => -22, // EINVAL
         MethodNotFound => -38, // ENOSYS
         Vfs(_) => -5,          // EIO

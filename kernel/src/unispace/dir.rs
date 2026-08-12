@@ -66,7 +66,7 @@ impl Object for SimpleDir {
     }
 
     fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
-        Err(UnispaceError::PermissionDenied)
+        Err(UnispaceError::Unsupported)
     }
 
     fn invoke(&self, _method: usize, _v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {

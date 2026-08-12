@@ -26,9 +26,8 @@ use crate::drivers::serial::SerialPort;
 use crate::mm::layout::{KSTACK_SIZE, KSTACK_VADDR_BASE, MAX_KSTACKS};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
-use switch::{switch_to, user_iret_addr};
-
-pub use switch::TaskContext;
+use switch::switch_to;
+pub use switch::{TaskContext, user_iret_addr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
@@ -140,6 +139,14 @@ static CURRENT: Mutex<Option<&'static mut Task>> = Mutex::new(None);
 /// so there is no lock ordering against `QUEUE`.
 static DEAD_TASKS: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
 
+/// Parked `ZzZ` tasks awaiting their wake deadline (absolute monotonic ns).
+///
+/// A sleeping task is removed from the run queue at park time and lives here
+/// until `wake_sleepers` (idle loop) moves it back to `QUEUE` as `Ready`.
+/// Never held together with `QUEUE`: `wake_sleepers` drops the sleep list
+/// before locking the queue, and `schedule`/`yield` never touch it.
+static SLEEPING: Mutex<Vec<(u64, &'static mut Task)>> = Mutex::new(Vec::new());
+
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
 /// first `switch_to` away from it; restored when no ready task remains.
 static mut IDLE: Task = Task::new(0, 0, 0, TaskContext::zeroed());
@@ -178,6 +185,7 @@ pub fn spawn(mut task: Task) -> u64 {
     task.state = TaskState::Ready;
     let leaked: &'static mut Task = Box::leak(Box::new(task));
     let id = leaked.id;
+    crate::unispace::provider::proc::attach(id);
     QUEUE.lock().push_back(leaked);
     id
 }
@@ -186,6 +194,67 @@ pub fn spawn(mut task: Task) -> u64 {
 /// run the next ready task, if any.
 pub fn yield_now() {
     schedule();
+}
+
+/// Park the current task until `deadline_ns` (absolute, monotonic).  The task
+/// is marked `ZzZ`, registered in the sleeping list, and switched away; the
+/// idle loop re-queues it as `Ready` once the deadline passes (see
+/// `wake_sleepers`).  Returns only when the task is later rescheduled.
+/// With no current task (kernel boot context) it returns immediately.
+pub fn sleep_until(deadline_ns: u64) {
+    let mut cur = CURRENT.lock();
+    match cur.as_mut() {
+        Some(t) => {
+            let raw = &mut **t as *mut Task;
+            t.state = TaskState::ZzZ;
+            drop(cur);
+            SLEEPING.lock().push((deadline_ns, unsafe { &mut *raw }));
+            schedule();
+        }
+        None => {
+            // No current task — nothing to park.
+        }
+    }
+}
+
+/// Park the current task for `ns` nanoseconds (relative to now).
+pub fn sleep_current(ns: u64) {
+    sleep_until(crate::services::universal_timer::now_ns().saturating_add(ns));
+}
+
+/// Earliest absolute deadline among sleeping tasks, if any.  Used by the idle
+/// loop to arm the timer so a sleeper wakes on time.
+pub fn earliest_sleep_deadline() -> Option<u64> {
+    let sleeping = SLEEPING.lock();
+    sleeping.iter().map(|(d, _)| *d).min()
+}
+
+/// Requeue every sleeping task whose deadline has passed.  Called from the
+/// idle loop only — it may lock `QUEUE`, which must never be held across a
+/// timer ISR (the ISR itself never touches scheduler locks).  `SLEEPING` is
+/// dropped before `QUEUE` is taken, so the two are never held together.
+pub fn wake_sleepers() {
+    let now = crate::services::universal_timer::now_ns();
+    let mut due = Vec::new();
+    {
+        let mut sleeping = SLEEPING.lock();
+        let mut i = 0;
+        while i < sleeping.len() {
+            if sleeping[i].0 <= now {
+                due.push(sleeping.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if due.is_empty() {
+        return;
+    }
+    let mut q = QUEUE.lock();
+    for t in due {
+        t.state = TaskState::Ready;
+        q.push_back(t);
+    }
 }
 
 /// Mark the current task Dead and switch to the next ready task. A Dead task
@@ -219,6 +288,89 @@ pub fn kill_user_fault() -> ! {
     kill_current()
 }
 
+/// Snapshot the state of `pid` (excluding reaped/dead-parked tasks).
+///
+/// The scheduler is cooperative and BSP-only, so every live task is exactly one
+/// of: the current task (`Running`, in `CURRENT`), a ready task in `QUEUE`, or
+/// a parked sleeper in `SLEEPING` (`ZzZ`). `DEAD_TASKS` zombies are excluded.
+/// The three locks are taken and read separately, never nested with each other.
+pub fn process_state(pid: u64) -> Option<TaskState> {
+    {
+        let cur = CURRENT.lock();
+        if let Some(t) = cur.as_ref() {
+            if t.id == pid {
+                return Some(t.state);
+            }
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid {
+                return Some(t.state);
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid {
+                return Some(t.state);
+            }
+        }
+    }
+    None
+}
+
+/// Kill the task with id `pid`, handing it to the idle loop for reaping.
+///
+/// - `pid == current task`: the caller marks itself `Dead` and parks (never
+///   returns), mirroring `kill_current`.
+/// - a task in `QUEUE` is removed (order preserved) and pushed to `DEAD_TASKS`;
+/// - a task in `SLEEPING` is removed and pushed to `DEAD_TASKS`;
+/// - anything else (already reaped, or an unknown id) yields `Err(())`.
+///
+/// Cooperative BSP-only: every live non-executing task is in `QUEUE` or
+/// `SLEEPING`, and the only `Running` task is the caller.
+pub fn kill(pid: u64) -> Result<(), ()> {
+    {
+        let cur = CURRENT.lock();
+        let is_self = cur.as_ref().map(|t| t.id == pid).unwrap_or(false);
+        drop(cur);
+        if is_self {
+            kill_current(); // diverges: marked Dead and parked, never returns
+        }
+    }
+    {
+        let mut q = QUEUE.lock();
+        let mut i = 0;
+        while i < q.len() {
+            if q[i].id == pid {
+                if let Some(t) = q.remove(i) {
+                    t.state = TaskState::Dead;
+                    drop(q); // DEAD_TASKS is never acquired while QUEUE is held
+                    DEAD_TASKS.lock().push(t);
+                    return Ok(());
+                }
+            }
+            i += 1;
+        }
+    }
+    {
+        let mut s = SLEEPING.lock();
+        for i in 0..s.len() {
+            if s[i].1.id == pid {
+                let t = s.remove(i).1;
+                t.state = TaskState::Dead;
+                drop(s);
+                DEAD_TASKS.lock().push(t);
+                return Ok(());
+            }
+        }
+    }
+    Err(())
+}
+
 /// Point the current CPU's TSS.rsp0 and PerCpu.syscall_rsp0 at `top`, so
 /// interrupts and syscalls land on the running task's kernel stack.
 pub fn set_kernel_stack_meta(top: u64) {
@@ -249,6 +401,7 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
             free_kernel_stack(task.kstack_slot, alloc);
         }
         let raw = &mut *task as *mut Task;
+        crate::unispace::provider::proc::detach(task.id);
         unsafe { drop(Box::from_raw(raw)); }
     }
 }
@@ -287,15 +440,19 @@ pub fn schedule() {
             crate::smp::current_per_cpu().current_task = core::ptr::null_mut();
             // No ready task.
             match prev {
-                Some(p) if p.state == TaskState::Dead => {
-                    // Park the exiting task and resume idle.  The task is
+                Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
+                    // Park the current task and resume idle.  A Dead task is
                     // pushed into DEAD_TASKS (after `drop(q)`, so DEAD_TASKS
                     // is never acquired while QUEUE is held) for a later idle
-                    // loop reap; `pctx` stays valid — the vec owns the task.
+                    // loop reap; a ZzZ task is already registered in the
+                    // sleeping list, so it is simply left out of the queue.
+                    // `pctx` stays valid either way.
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     drop(q);
-                    DEAD_TASKS.lock().push(p);
+                    if p.state == TaskState::Dead {
+                        DEAD_TASKS.lock().push(p);
+                    }
                     unsafe { switch_to(pctx, idle_ctx(), root); }
                     return;
                 }
@@ -316,12 +473,16 @@ pub fn schedule() {
     };
 
     match prev {
-        // A Dead task may also switch straight to the next ready task (queue
-        // non-empty) — same deferred-reap push applies, after `drop(q)`.
-        Some(p) if p.state == TaskState::Dead => {
+        // A Dead or ZzZ task may also switch straight to the next ready task
+        // (queue non-empty).  Only a Dead task is parked into DEAD_TASKS — a
+        // ZzZ task is already registered in the sleeping list — both dealt
+        // with after `drop(q)`.
+        Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             drop(q);
-            DEAD_TASKS.lock().push(p);
+            if p.state == TaskState::Dead {
+                DEAD_TASKS.lock().push(p);
+            }
             unsafe { switch_to(pctx, next_ptr, next_root); }
         }
         Some(p) => {
@@ -379,6 +540,7 @@ pub fn enter_userspace(
     );
     task.kstack_slot = slot;
     task.id = next_id();
+    crate::unispace::provider::proc::attach(task.id);
     task.state = TaskState::Running;
     let t: &'static mut Task = Box::leak(Box::new(task));
     let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
@@ -395,14 +557,16 @@ pub fn enter_userspace(
 //
 // Two kernel-only tasks alternate on serial, proving the context switch works
 // before any user mode exists. Runs once at boot and exits into idle (and
-// gets reaped from the idle loop).
+// gets reaped from the idle loop). Gated behind the `selftest` feature.
 
+#[cfg(feature = "selftest")]
 const SMOKE_ITERS: u32 = 5;
 
 /// Explicit ABI-stable entry point for the first smoke task.  These must not
 /// be local closures: a closure coerced to `fn()` enters through a compiler
 /// generated `FnOnce` shim, but `switch_to` starts execution from a fabricated
 /// context rather than from a normal call frame.
+#[cfg(feature = "selftest")]
 extern "C" fn smoke_task_a() -> ! {
     for _ in 0..SMOKE_ITERS {
         SerialPort::puts("[task] A\n");
@@ -412,6 +576,7 @@ extern "C" fn smoke_task_a() -> ! {
 }
 
 /// Explicit ABI-stable entry point for the second smoke task.
+#[cfg(feature = "selftest")]
 extern "C" fn smoke_task_b() -> ! {
     for _ in 0..SMOKE_ITERS {
         SerialPort::puts("[task] B\n");
@@ -422,6 +587,7 @@ extern "C" fn smoke_task_b() -> ! {
 
 /// Spawn two kernel-only tasks that alternate on serial, then run the
 /// scheduler. Returns to the caller (idle) once both tasks have exited.
+#[cfg(feature = "selftest")]
 pub fn smoke_test(alloc: &mut BitmapAllocator) {
     let root = KERNEL_ROOT.load(Ordering::Relaxed);
 

@@ -95,7 +95,10 @@ pub enum UnispaceError {
     MethodNotFound,
     DecodeError,
     SchemaMismatch,
-    PermissionDenied,
+    /// The requested operation does not exist for this object (a read-only
+    /// leaf written without a `:method`, or a schema descriptor written at
+    /// all).  Not an access-control result — permissions are not implemented.
+    Unsupported,
     Vfs(VfsError),
 }
 
@@ -130,7 +133,7 @@ pub trait Object: Send + Sync {
     fn read_value(&self, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError>;
 
     fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
-        Err(UnispaceError::PermissionDenied)
+        Err(UnispaceError::Unsupported)
     }
 
     fn invoke(&self, _method: usize, _v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
@@ -276,7 +279,7 @@ pub fn read(path: &str, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceErr
 pub fn write(path: &str, data: &[u8], out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     let (obj, method) = resolve(path)?;
     match method {
-        Some("desc") => Err(UnispaceError::PermissionDenied),
+        Some("desc") => Err(UnispaceError::Unsupported),
         Some(m) => {
             let idx = find_method(&*obj, m).ok_or(UnispaceError::MethodNotFound)?;
             let md = &obj.methods()[idx];
@@ -314,7 +317,9 @@ fn encode_method_desc(md: &MethodDesc, out: &mut Vec<u8>) -> Result<(), Unispace
 // ── Boot self-test ─────────────────────────────────────────────────────
 
 /// Exercise read/write/schema dispatch over the registered providers and print
-/// results to serial.  Non-fatal: every step logs its own outcome.
+/// results to serial.  Non-fatal: every step logs its own outcome. Gated
+/// behind the `selftest` feature.
+#[cfg(feature = "selftest")]
 pub fn self_test() {
     use crate::drivers::serial::SerialPort;
     SerialPort::puts("[unispace] self-test start\n");
@@ -331,6 +336,27 @@ pub fn self_test() {
             Err(e) => log::warn!("unispace: decode / failed: {:?}", e),
         },
         Err(e) => log::warn!("unispace: read / failed: {:?}", e),
+    }
+
+    // The /proc provider: process pseudo-FS. At self-test time no task exists
+    // yet (runs before the scheduler smoke test), so the listing is empty and
+    // /proc/self resolves to NotFound (no current task in kernel context).
+    out.clear();
+    match read("/proc", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_value(&out, &DIR_SCHEMA) {
+            Ok(v) => {
+                SerialPort::puts("read(/proc) = ");
+                SerialPort::puts(&schema::value_text(&v, &DIR_SCHEMA));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: decode /proc failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /proc failed: {:?}", e),
+    }
+    out.clear();
+    match read("/proc/self", &mut out, usize::MAX) {
+        Ok(()) => log::warn!("unispace: read /proc/self unexpectedly succeeded"),
+        Err(e) => log::info!("unispace: read /proc/self -> {:?} (expected, no task yet)", e),
     }
 
     // Method input schema on a folder: read(/A:mkdir).
@@ -463,6 +489,38 @@ pub fn self_test() {
         Err(e) => log::warn!("unispace: read /sys/cpus failed: {:?}", e),
     }
 
+    // /kernel provider: monotonic timer object (uptime) and its :sleep method
+    // input schema.  The blocking methods are not invoked from boot context.
+    out.clear();
+    match read("/kernel/timer", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_value(&out, &schema::SCHEMA_U64) {
+            Ok(v) => {
+                SerialPort::puts("read(/kernel/timer) = ");
+                SerialPort::puts(&schema::value_text(&v, &schema::SCHEMA_U64));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: timer decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /kernel/timer failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/kernel/timer:sleep", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_method_bytes(&out) {
+            Ok((name, input, output)) => {
+                SerialPort::puts("read(/kernel/timer:sleep) = method ");
+                SerialPort::puts(&name);
+                SerialPort::puts(" in ");
+                SerialPort::puts(&schema::text_of_owned(&input));
+                SerialPort::puts(" out ");
+                SerialPort::puts(&schema::text_of_owned(&output));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: timer:sleep decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /kernel/timer:sleep failed: {:?}", e),
+    }
+
     // Cleanup the exercise tree.
     let _ = write_method("/A/nos_test:unlink", &name_val("file"), s_create, &mut payload, &mut out);
     let _ = write_method("/A/nos_test:rmdir", &name_val("sub"), s_create, &mut payload, &mut out);
@@ -475,6 +533,7 @@ pub fn self_test() {
 }
 
 /// Encode a `struct{name: str}` payload and invoke it as a method write.
+#[cfg(feature = "selftest")]
 fn write_method(
     path: &str,
     v: &Value,
@@ -488,6 +547,7 @@ fn write_method(
     write(path, payload, out)
 }
 
+#[cfg(feature = "selftest")]
 fn u64_short(n: u64) -> String {
     let mut s = String::new();
     use alloc::string::ToString as _;
