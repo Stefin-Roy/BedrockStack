@@ -191,6 +191,48 @@ pub fn encode_schema(s: &Schema, out: &mut Vec<u8>) {
     }
 }
 
+/// Encode an owned schema to the wire form (used by `:desc` on dynamically
+/// declared objects, where a `&'static Schema` does not exist).
+pub fn encode_schema_owned(s: &OwnedSchema, out: &mut Vec<u8>) {
+    match s {
+        OwnedSchema::Unit => out.push(TAG_UNIT),
+        OwnedSchema::Bool => out.push(TAG_BOOL),
+        OwnedSchema::U8 => out.push(TAG_U8),
+        OwnedSchema::U16 => out.push(TAG_U16),
+        OwnedSchema::U32 => out.push(TAG_U32),
+        OwnedSchema::U64 => out.push(TAG_U64),
+        OwnedSchema::I8 => out.push(TAG_I8),
+        OwnedSchema::I16 => out.push(TAG_I16),
+        OwnedSchema::I32 => out.push(TAG_I32),
+        OwnedSchema::I64 => out.push(TAG_I64),
+        OwnedSchema::F32 => out.push(TAG_F32),
+        OwnedSchema::F64 => out.push(TAG_F64),
+        OwnedSchema::Str => out.push(TAG_STR),
+        OwnedSchema::Bytes => out.push(TAG_BYTES),
+        OwnedSchema::Blob => out.push(TAG_BLOB),
+        OwnedSchema::Struct(fields) => {
+            out.push(TAG_STRUCT);
+            out.extend_from_slice(&(fields.len() as u32).to_le_bytes());
+            for (name, ty) in fields {
+                write_len_string(out, name);
+                encode_schema_owned(ty, out);
+            }
+        }
+        OwnedSchema::List(elem) => {
+            out.push(TAG_LIST);
+            encode_schema_owned(elem, out);
+        }
+        OwnedSchema::Enum(vars) => {
+            out.push(TAG_ENUM);
+            out.extend_from_slice(&(vars.len() as u32).to_le_bytes());
+            for (name, val) in vars {
+                out.extend_from_slice(&val.to_le_bytes());
+                write_len_string(out, name);
+            }
+        }
+    }
+}
+
 // ── Schema decoding (owned form, for clients / self-test) ─────────────
 
 #[derive(Debug, Clone)]
@@ -361,6 +403,230 @@ fn decode_value_at(c: &mut Cursor, schema: &Schema) -> Result<Value, UnispaceErr
             Value::Enum(disc)
         }
     })
+}
+
+/// Decode a value against an **owned** schema (runtime-declared objects have no
+/// `&'static Schema`; this mirrors [`decode_value`] over the owned form).
+pub fn decode_value_owned(data: &[u8], schema: &OwnedSchema) -> Result<Value, UnispaceError> {
+    let mut c = Cursor { data, pos: 0 };
+    let v = decode_value_owned_at(&mut c, schema)?;
+    if c.pos != data.len() {
+        return Err(UnispaceError::DecodeError);
+    }
+    Ok(v)
+}
+
+fn decode_value_owned_at(c: &mut Cursor, schema: &OwnedSchema) -> Result<Value, UnispaceError> {
+    Ok(match schema {
+        OwnedSchema::Unit => Value::Unit,
+        OwnedSchema::Bool => Value::Bool(c.read_u8()? != 0),
+        OwnedSchema::U8 => Value::U64(c.read_u8()? as u64),
+        OwnedSchema::U16 => Value::U64(c.read_u32()? as u64 & 0xFFFF),
+        OwnedSchema::U32 => Value::U64(c.read_u32()? as u64),
+        OwnedSchema::U64 => Value::U64(c.read_u64()?),
+        OwnedSchema::I8 => Value::I64(c.read_u8()? as i8 as i64),
+        OwnedSchema::I16 => Value::I64(c.read_u32()? as i16 as i64),
+        OwnedSchema::I32 => Value::I64(c.read_u32()? as i32 as i64),
+        OwnedSchema::I64 => Value::I64(c.read_u64()? as i64),
+        OwnedSchema::F32 => Value::F64(f32::from_bits(c.read_u32()?) as f64),
+        OwnedSchema::F64 => Value::F64(f64::from_bits(c.read_u64()?)),
+        OwnedSchema::Str => Value::Str(c.read_string()?),
+        OwnedSchema::Bytes => {
+            let len = c.read_u32()? as usize;
+            let b = c.read(len)?;
+            Value::Bytes(b.to_vec())
+        }
+        OwnedSchema::Blob => {
+            let len = c.data.len() - c.pos;
+            let b = c.read(len)?;
+            Value::Bytes(b.to_vec())
+        }
+        OwnedSchema::Struct(fields) => {
+            let mut vals = Vec::new();
+            for (_, ty) in fields {
+                vals.push(decode_value_owned_at(c, ty)?);
+            }
+            Value::Struct(vals)
+        }
+        OwnedSchema::List(elem) => {
+            let n = c.read_u32()? as usize;
+            let mut items = Vec::new();
+            for _ in 0..n {
+                items.push(decode_value_owned_at(c, elem)?);
+            }
+            Value::List(items)
+        }
+        OwnedSchema::Enum(vars) => {
+            let disc = c.read_u32()?;
+            if !vars.iter().any(|(_, v)| *v == disc) {
+                return Err(UnispaceError::SchemaMismatch);
+            }
+            Value::Enum(disc)
+        }
+    })
+}
+
+/// Encode a value against an **owned** schema (mirrors [`encode_value`]).
+pub fn encode_value_owned(
+    v: &Value,
+    schema: &OwnedSchema,
+    out: &mut Vec<u8>,
+) -> Result<(), UnispaceError> {
+    match schema {
+        OwnedSchema::Unit => match v {
+            Value::Unit => Ok(()),
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::Bool => match v {
+            Value::Bool(b) => {
+                out.push(*b as u8);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::U8 => match v {
+            Value::U64(n) if *n <= 0xFF => {
+                out.push(*n as u8);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::U16 => match v {
+            Value::U64(n) if *n <= 0xFFFF => {
+                out.extend_from_slice(&(*n as u16).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::U32 => match v {
+            Value::U64(n) if *n <= u32::MAX as u64 => {
+                out.extend_from_slice(&(*n as u32).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::U64 => match v {
+            Value::U64(n) => {
+                out.extend_from_slice(&n.to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::I8 => match v {
+            Value::I64(n) if *n >= i8::MIN as i64 && *n <= i8::MAX as i64 => {
+                out.push(*n as u8);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::I16 => match v {
+            Value::I64(n) if *n >= i16::MIN as i64 && *n <= i16::MAX as i64 => {
+                out.extend_from_slice(&(*n as i16).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::I32 => match v {
+            Value::I64(n) if *n >= i32::MIN as i64 && *n <= i32::MAX as i64 => {
+                out.extend_from_slice(&(*n as i32).to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::I64 => match v {
+            Value::I64(n) => {
+                out.extend_from_slice(&n.to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::F32 => match v {
+            Value::F64(f) => {
+                out.extend_from_slice(&(*f as f32).to_bits().to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::F64 => match v {
+            Value::F64(f) => {
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::Str => match v {
+            Value::Str(s) => {
+                write_len_string(out, s);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::Bytes => match v {
+            Value::Bytes(b) => {
+                out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                out.extend_from_slice(b);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::Blob => match v {
+            Value::Bytes(b) => {
+                out.extend_from_slice(b);
+                Ok(())
+            }
+            _ => Err(UnispaceError::SchemaMismatch),
+        },
+        OwnedSchema::Struct(fields) => {
+            let vals = match v {
+                Value::Struct(vals) => vals,
+                _ => return Err(UnispaceError::SchemaMismatch),
+            };
+            if vals.len() != fields.len() {
+                return Err(UnispaceError::SchemaMismatch);
+            }
+            for ((_, ty), val) in fields.iter().zip(vals) {
+                encode_value_owned(val, ty, out)?;
+            }
+            Ok(())
+        }
+        OwnedSchema::List(elem) => {
+            let items = match v {
+                Value::List(items) => items,
+                _ => return Err(UnispaceError::SchemaMismatch),
+            };
+            out.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for it in items {
+                encode_value_owned(it, elem, out)?;
+            }
+            Ok(())
+        }
+        OwnedSchema::Enum(vars) => {
+            let disc = match v {
+                Value::Enum(d) => *d,
+                _ => return Err(UnispaceError::SchemaMismatch),
+            };
+            if !vars.iter().any(|(_, val)| *val == disc) {
+                return Err(UnispaceError::SchemaMismatch);
+            }
+            out.extend_from_slice(&disc.to_le_bytes());
+            Ok(())
+        }
+    }
+}
+
+/// Convenience builder for an owned struct schema from pairs.
+pub fn owned_struct(fields: Vec<(String, OwnedSchema)>) -> OwnedSchema {
+    OwnedSchema::Struct(fields)
+}
+
+/// Convenience builder for an owned list schema.
+pub fn owned_list(elem: OwnedSchema) -> OwnedSchema {
+    OwnedSchema::List(Box::new(elem))
+}
+
+/// Convenience builder for an owned enum schema from `(name, value)` pairs.
+pub fn owned_enum(vars: Vec<(String, u32)>) -> OwnedSchema {
+    OwnedSchema::Enum(vars)
 }
 
 pub fn encode_value(v: &Value, schema: &Schema, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
@@ -616,6 +882,53 @@ pub fn value_text(v: &Value, schema: &Schema) -> String {
             for v in *vars {
                 if v.value == *d {
                     return String::from(v.name);
+                }
+            }
+            alloc::format!("enum#{}", d)
+        }
+        (Value::Unit, _) => String::from("()"),
+        (Value::Bool(b), _) => String::from(if *b { "true" } else { "false" }),
+        (Value::U64(n), _) => u64_str(*n),
+        (Value::I64(n), _) => i64_str(*n),
+        (Value::F64(f), _) => alloc::format!("{}", f),
+        (Value::Str(s), _) => alloc::format!("\"{}\"", s),
+        (Value::Bytes(b), _) => alloc::format!("<{} bytes>", b.len()),
+        _ => String::from("<?>"),
+    }
+}
+
+/// Textual rendering of a value against an **owned** schema (runtime-declared
+/// objects).  Mirrors [`value_text`] over `OwnedSchema`.
+pub fn value_text_owned(v: &Value, schema: &OwnedSchema) -> String {
+    match (v, schema) {
+        (Value::Struct(vals), OwnedSchema::Struct(fields)) => {
+            let mut t = String::from("{");
+            for (i, (val, (name, ty))) in vals.iter().zip(fields).enumerate() {
+                if i > 0 {
+                    t.push_str(", ");
+                }
+                t.push_str(name);
+                t.push_str(": ");
+                t.push_str(&value_text_owned(val, ty));
+            }
+            t.push('}');
+            t
+        }
+        (Value::List(items), OwnedSchema::List(elem)) => {
+            let mut t = String::from("[");
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    t.push_str(", ");
+                }
+                t.push_str(&value_text_owned(it, elem));
+            }
+            t.push(']');
+            t
+        }
+        (Value::Enum(d), OwnedSchema::Enum(vars)) => {
+            for (_, val) in vars {
+                if *val == *d {
+                    return alloc::format!("enum#{}", d);
                 }
             }
             alloc::format!("enum#{}", d)

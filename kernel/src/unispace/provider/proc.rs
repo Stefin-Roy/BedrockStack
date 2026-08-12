@@ -13,7 +13,14 @@
 //!   - `:yield` — write `()` to cooperatively reschedule;
 //!   - `:kill`  — write `{pid}` to park another task for reaping;
 //!   - `:spawn` — write `{path}` to fork a new process from an ELF on a
-//!     mounted filesystem.
+//!     mounted filesystem;
+//!   - `:brk`   — write `{new_break}` to grow/shrink/query the caller's break;
+//!   - `:mmap`  — write `{addr, len, prot}` to eagerly commit anonymous pages;
+//!   - `:munmap`— write `{addr, len}` to release whole anonymous regions.
+//!
+//! `:brk`/`:mmap`/`:munmap` target the address space of the *running* task
+//! (they mutate the caller's CR3), so they are meaningful only on `/proc/self`
+//! regardless of which pid the path names.
 //!
 //! `ProcDir` stores only its `pid` — never a `&'static mut Task`. Dead tasks
 //! are reaped with their boxes, and `detach` runs there, so a stale entry can
@@ -78,11 +85,48 @@ static SPAWN_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-static PROC_METHODS: [MethodDesc; 4] = [
+/// `write(/proc/self:brk, { new_break })` — grow/shrink/query the caller's
+/// committed program break. `{new_break: 0}` (or below the floor) is a query
+/// returning the current break.
+static BRK_INPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "new_break",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+/// `brk` output: the resulting break.
+static BRK_OUTPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "brk",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+/// `write(/proc/self:mmap, { addr, len, prot })` — eagerly commit `len` zeroed
+/// anonymous pages. `{addr: 0}` picks the first free gap above the break.
+static MMAP_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "addr", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "len", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "prot", ty: &schema::SCHEMA_U64 },
+]);
+
+/// `mmap` output: the mapping base.
+static MMAP_OUTPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "base",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+/// `write(/proc/self:munmap, { addr, len })` — release whole anonymous regions.
+static MUNMAP_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "addr", ty: &schema::SCHEMA_U64 },
+    schema::Field { name: "len", ty: &schema::SCHEMA_U64 },
+]);
+
+static PROC_METHODS: [MethodDesc; 7] = [
     MethodDesc { name: "exit", input: &EXIT_INPUT, output: &schema::SCHEMA_UNIT },
     MethodDesc { name: "yield", input: &schema::SCHEMA_UNIT, output: &schema::SCHEMA_UNIT },
     MethodDesc { name: "kill", input: &KILL_INPUT, output: &schema::SCHEMA_UNIT },
     MethodDesc { name: "spawn", input: &SPAWN_INPUT, output: &SPAWN_OUTPUT },
+    MethodDesc { name: "brk", input: &BRK_INPUT, output: &BRK_OUTPUT },
+    MethodDesc { name: "mmap", input: &MMAP_INPUT, output: &MMAP_OUTPUT },
+    MethodDesc { name: "munmap", input: &MUNMAP_INPUT, output: &schema::SCHEMA_UNIT },
 ];
 
 // ── Registry ─────────────────────────────────────────────────────────
@@ -252,6 +296,29 @@ impl Object for ProcDir {
                 let path = arg_str(&v, 0)?;
                 spawn_proc(path, out)
             }
+            4 => {
+                // brk: grow/shrink/query the *current* task's break. Must run
+                // on the caller's CR3 — never self.pid's address space.
+                let new_break = arg_u64(&v, 0)?;
+                let b = mem_method(|vm, alloc| crate::mm::usermem::brk(vm, new_break, alloc))?;
+                let v = Value::Struct(vec![Value::U64(b)]);
+                schema::encode_value(&v, &BRK_OUTPUT, out)
+            }
+            5 => {
+                let addr = arg_u64(&v, 0)?;
+                let len = arg_u64(&v, 1)?;
+                let prot = arg_u64(&v, 2)?;
+                let base =
+                    mem_method(|vm, alloc| crate::mm::usermem::mmap(vm, addr, len, prot, alloc))?;
+                let v = Value::Struct(vec![Value::U64(base)]);
+                schema::encode_value(&v, &MMAP_OUTPUT, out)
+            }
+            6 => {
+                let addr = arg_u64(&v, 0)?;
+                let len = arg_u64(&v, 1)?;
+                mem_method(|vm, alloc| crate::mm::usermem::munmap(vm, addr, len, alloc))?;
+                Ok(())
+            }
             _ => Err(UnispaceError::MethodNotFound),
         }
     }
@@ -377,6 +444,22 @@ fn spawn_proc(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
 }
 
 // ── Method input helpers (bounded; never panic on request data) ──────
+
+/// Run one of the `usermem` mutations against the *current* task's address
+/// space, translating the raw errno (`-EINVAL`/`-EFAULT`/`-ENOMEM`) into a
+/// `UnispaceError`. No current vm `→ NotFound`; a malformed request only ever
+/// produces `Err`, never a panic.
+fn mem_method<T>(
+    f: impl FnOnce(usize, &mut crate::mm::phys_alloc::BitmapAllocator) -> Result<T, i64>,
+) -> Result<T, UnispaceError> {
+    let vm = crate::task::current_vm().ok_or(UnispaceError::NotFound)?;
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    f(vm, alloc).map_err(|e| match e {
+        -12 => UnispaceError::OutOfMemory,
+        -14 => UnispaceError::BadAddress,
+        _ => UnispaceError::InvalidArgument,
+    })
+}
 
 /// Extract a `u64` field from a struct-typed method input.
 fn arg_u64(v: &Value, idx: usize) -> Result<u64, UnispaceError> {

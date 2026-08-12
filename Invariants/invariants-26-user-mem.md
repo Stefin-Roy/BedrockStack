@@ -2,7 +2,7 @@
 
 **Version:** 0.1.0
 **Date:** 2026-08-12
-**Source:** `kernel/src/mm/usermem.rs`, `kernel/src/task/load.rs`, `kernel/src/task/mod.rs`, `kernel/src/arch/x86_64/syscall.rs`
+**Source:** `kernel/src/mm/usermem.rs`, `kernel/src/task/load.rs`, `kernel/src/task/mod.rs`, `kernel/src/unispace/provider/proc.rs`, `kernel/src/arch/x86_64/syscall.rs`
 **Status:** Stable
 
 ---
@@ -88,7 +88,7 @@ addresses, non-page-aligned length, protected-region collisions, partial
 `munmap`, RWX `prot`. Address arithmetic is `checked`. With `panic = "abort"`
 a panic is fatal, so user-supplied values must only ever produce `Err`, never
 a panic.
-- Location: `kernel/src/mm/usermem.rs`, `kernel/src/arch/x86_64/syscall.rs`
+- Location: `kernel/src/mm/usermem.rs`, `kernel/src/unispace/provider/proc.rs` (`mem_method`)
 
 **UM-009 — `munmap` unmaps whole anonymous regions only:**
 `[addr, addr+len)` must tile exactly one or more contiguous `Anon` regions;
@@ -102,7 +102,12 @@ region, returns `-EINVAL`. The heap shrinks exclusively through `brk`.
 
 - `create_process` returns `(root, entry, user_stack_top, vm_idx)`; the
   `vm_idx` is stored on `Task.vm` by `enter_userspace` and `:spawn` and read
-  back by the syscalls through `task::current_vm`.
-- Syscall numbers: `2 = brk(new_break)`, `3 = mmap(addr, len, prot)`,
-  `4 = munmap(addr, len)` in `arch/x86_64/syscall.rs`. `brk(0)` is a query
-  returning the current break.
+  back by the memory methods through `task::current_vm`.
+- Memory operations are unispace methods on `/proc/self`, not syscalls:
+  `write(/proc/self:brk, {new_break})` (in `{new_break: u64}`, out `{brk: u64}`;
+  `{new_break: 0}` is a query returning the current break),
+  `write(/proc/self:mmap, {addr, len, prot})` (out `{base: u64}`), and
+  `write(/proc/self:munmap, {addr, len})` (out unit). They target the *running*
+  task's address space (they mutate the caller's CR3) and map their errnos
+  through `UnispaceError::{OutOfMemory, BadAddress, InvalidArgument}` to
+  `-ENOMEM`/`-EFAULT`/`-EINVAL` in `arch/x86_64/syscall.rs::errno`.

@@ -1,8 +1,8 @@
 //! Eager user-process memory management.
 //!
 //! Owns the per-process address-space bookkeeping (region table) and the
-//! commit/release primitives used by the loader and the ring-3 `brk`/`mmap`/
-//! `munmap` syscalls.
+//! commit/release primitives used by the loader and the ring-3
+//! `/proc/self:brk|mmap|munmap` unispace methods.
 //!
 //! # Contract (INV-UM-01..06, see `Invariants/invariants-26-user-mem.md`)
 //! - The backing frame(s) for every user mapping are allocated, zeroed and
