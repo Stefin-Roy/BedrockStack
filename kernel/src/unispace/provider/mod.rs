@@ -1,4 +1,5 @@
 pub mod driver;
+pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kernel;
 #[cfg(target_arch = "x86_64")]
@@ -13,6 +14,7 @@ pub fn register_all() -> Result<(), UnispaceError> {
     vfs::register()?;
     sys::register()?;
     driver::register()?;
+    input::register()?;
     #[cfg(target_arch = "x86_64")]
     kernel::register()?;
     #[cfg(target_arch = "x86_64")]

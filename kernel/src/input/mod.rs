@@ -144,6 +144,12 @@ pub fn device_names() -> Vec<&'static str> {
     DEVICES.lock().iter().map(|d| d.name).collect()
 }
 
+/// Snapshot of every registered device (`id`, `name`, `capabilities`).  The
+/// unispace `/input` provider reads this to describe devices to ring 3.
+pub fn device_snapshot() -> Vec<(u32, &'static str, u32)> {
+    DEVICES.lock().iter().map(|d| (d.id, d.name, d.capabilities)).collect()
+}
+
 /// Submit an event from a driver.  The core stamps the timestamp (the driver
 /// never needs a clock) and enqueues the event.  Returns `false` if the queue
 /// was full (the event is dropped and the overflow counter bumped).  Safe to
