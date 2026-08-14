@@ -175,6 +175,13 @@ impl EndpointDescriptor {
     pub fn interval(&self) -> u8 {
         unsafe { core::ptr::addr_of!(self.b_interval).read_unaligned() }
     }
+
+    /// High-speed isochronous/interrupt burst count (USB 2.0 §9.6.6):
+    /// `wMaxPacketSize` bits 12:11, "additional transactions per microframe",
+    /// values 0-3.  Zero for full/low-speed devices.
+    pub fn hs_burst(&self) -> u8 {
+        ((u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() }) >> 11) & 0x3) as u8
+    }
 }
 
 #[repr(C, packed)]
@@ -206,5 +213,36 @@ impl SsEndpointCompanionDescriptor {
 
     pub fn bytes_per_interval(&self) -> u16 {
         u16::from_le(unsafe { core::ptr::addr_of!(self.w_bytes_per_interval).read_unaligned() })
+    }
+}
+
+/// SuperSpeed Plus Isochronous Endpoint Companion descriptor (type 49,
+/// USB 3.2 §9.6.7).  `dwBytesPerInterval` bounds the per-ESIT payload for
+/// SSP isochronous endpoints; the type-48 companion carries the values used
+/// for plain SuperSpeed.  Only parsed here — SSP scheduling is out of scope.
+#[repr(C, packed)]
+pub struct SsIsochEpCompanionDescriptor {
+    pub b_length: u8,
+    pub b_descriptor_type: u8,
+    pub w_reserved: u16,
+    pub dw_bytes_per_interval: u32,
+}
+
+impl SsIsochEpCompanionDescriptor {
+    pub fn parse(data: &[u8]) -> Option<&SsIsochEpCompanionDescriptor> {
+        if data.len() < size_of::<SsIsochEpCompanionDescriptor>() {
+            return None;
+        }
+        if data[0] < size_of::<SsIsochEpCompanionDescriptor>() as u8 {
+            return None;
+        }
+        if data[1] != super::DESC_SS_ISOCH_EP_COMPANION {
+            return None;
+        }
+        Some(unsafe { &*(data.as_ptr() as *const SsIsochEpCompanionDescriptor) })
+    }
+
+    pub fn bytes_per_interval(&self) -> u32 {
+        u32::from_le(unsafe { core::ptr::addr_of!(self.dw_bytes_per_interval).read_unaligned() })
     }
 }

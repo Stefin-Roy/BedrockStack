@@ -423,6 +423,57 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         crate::audio::init();
 
+        // Capture self-test: with a duplex codec, record ~250 ms over the
+        // streaming ring path and report what came back.  All-zero audio (no
+        // host mic configured for the QEMU backend) still proves the input
+        // DMA moved — BCIS fired and the ring advanced.  Gated behind
+        // `selftest` so routine boots are untouched.
+        #[cfg(target_arch = "x86_64")]
+        #[cfg(feature = "selftest")]
+        {
+            use crate::drivers::serial::SerialPort as SP;
+            if crate::audio::can_record() {
+                let total_bytes = 48_000u32; // 250 ms of stereo 16-bit @ 48 kHz
+                let mut total: u64 = 0;
+                let mut peak: u32 = 0;
+                let mut rms_acc: u64 = 0;
+                let mut n_sum: u64 = 0;
+                let r = crate::audio::record_pcm_stream(
+                    total_bytes,
+                    8192,
+                    &mut |chunk: alloc::vec::Vec<i16>| {
+                        total += (chunk.len() * 2) as u64;
+                        for s in chunk {
+                            let a = s.unsigned_abs() as u64;
+                            rms_acc += (a * a) >> 8;
+                            n_sum += 1;
+                            peak = peak.max(a as u32);
+                        }
+                    },
+                );
+                SP::puts("[audio] selftest capture: ");
+                match r {
+                    Ok(b) => {
+                        SP::puts("ok bytes=");
+                        SP::put_u64(b);
+                    }
+                    Err(e) => {
+                        SP::puts("err ");
+                        SP::puts(e);
+                    }
+                }
+                SP::puts(" total=");
+                SP::put_u64(total);
+                SP::puts(" peak=");
+                SP::put_hex(peak as u64);
+                if n_sum > 0 {
+                    SP::puts(" rms8=");
+                    SP::put_hex(rms_acc / n_sum);
+                }
+                SP::puts("\n");
+            }
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             crate::drivers::serial::SerialPort::puts("\n=== vec34=");

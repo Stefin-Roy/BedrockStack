@@ -2,22 +2,28 @@
 //! fallback for generic-protocol (non-boot) devices.
 //!
 //! Binds the interrupt-IN endpoint of a HID interface, registering it as an
-//! xHCI interrupt-IN completion target at bind time and arming one read.  The
+//! xHCI transfer completion target at bind time and arming one read.  The
 //! UInputL `poll` hook then *consumes* completed reports: when the target's
 //! ready flag is armed it diffs the report against the previous state to emit
 //! normalized `InputEvent`s and re-arms the next read.  Exactly one TRB is
 //! ever in flight; an idle device simply NAKs and leaves the TRB pending, so
 //! the poll hook stays non-blocking.
 //!
+//! A keyboard with an interrupt-OUT endpoint also drives its Num/Caps/Scroll
+//! LEDs: the lock-key presses toggle a local LED bitmap which is written to a
+//! DMA page and flushed through the OUT endpoint using the same "exactly one
+//! TRB in flight" pattern, so the poll hook never blocks.
+//!
 //! Two paths select the report format:
 //! - **Boot protocol** (subclass 1, protocol 1 = keyboard / 2 = mouse): the
 //!   driver issues the class `SET_PROTOCOL` request on EP0, then decodes the
 //!   fixed boot report (8-byte keyboard, 4-byte mouse) with no report
-//!   descriptor.
+//!   descriptor.  The boot keyboard output report is the single LED byte.
 //! - **Generic protocol** (subclass 0, or boot subclass with protocol 0): the
 //!   driver fetches the HID descriptor (0x21) and report descriptor (0x22)
 //!   over EP0, parses them (see [`crate::usb::class::hid_report`]) for the
-//!   device kind and report length, and decodes the report boot-style.
+//!   device kind, report length, and output-report length, and decodes the
+//!   report boot-style.
 //!
 //! One keyboard and one mouse are supported in this phase; a second device of
 //! the same kind is rejected by `init_interface`.
@@ -42,6 +48,8 @@ use crate::usb::usb::{CLASS_HID, DESC_HID, DESC_REPORT, HID_PROTOCOL_MOUSE, HID_
 const HID_BOOT_KBD_REPORT_LEN: u32 = 8;
 /// Boot mouse report: buttons, X delta, Y delta, wheel delta.
 const HID_BOOT_MOUSE_REPORT_LEN: u32 = 4;
+/// Boot keyboard output report: the single LED byte (HID usage page 0x08).
+const HID_BOOT_KBD_OUTPUT_LEN: u32 = 1;
 const HID_MAX_KEYS: usize = 6;
 
 /// The device kind of a bound HID interface.
@@ -60,6 +68,20 @@ struct HidDeviceInner {
     report_va: u64,
     device_id: u32,
     report_len: u32,
+    /// LED output-endpoint state.  `out_dci == 0` means the device has no
+    /// usable interrupt-OUT endpoint (mouse/tablet) and LEDs are skipped.
+    out_dci: u8,
+    out_ring: Option<TrbRing>,
+    led_phys: u64,
+    led_va: u64,
+    led_len: u32,
+    /// Current NumLock/CapsLock/ScrollLock bitmap (HID usage page 0x08).
+    led_state: u8,
+    /// A lock-key press changed `led_state` and it has not been flushed yet.
+    led_dirty: bool,
+    /// True while one LED OUT TRB is pending; rewritten only after its
+    /// completion is consumed (exactly one TRB in flight, like the IN side).
+    out_inflight: bool,
     /// Generic-protocol pointer (QEMU `usb-tablet`) reports absolute X/Y and
     /// a button byte; boot-protocol mice report buttons first.  Drives the
     /// mouse decode below.
@@ -95,14 +117,18 @@ impl UsbClassDriver for HidDriver {
 
         // Decide the report format before moving `res.interrupt_in` (the
         // generic path borrows `res` for the EP0 descriptor fetches).
-        let (kind, report_len, absolute_pointer) = if res.iface_subclass == HID_SUBCLASS_BOOT
+        let (kind, report_len, output_len, absolute_pointer) = if res.iface_subclass == HID_SUBCLASS_BOOT
             && res.iface_protocol != crate::usb::usb::HID_PROTOCOL_NONE
         {
             // Boot path: select the protocol on EP0, then decode the fixed
             // boot report.  `SET_PROTOCOL` is a no-data control transfer.
-            let (kind, len) = match res.iface_protocol {
-                crate::usb::usb::HID_PROTOCOL_KEYBOARD => (HidKind::Keyboard, HID_BOOT_KBD_REPORT_LEN),
-                HID_PROTOCOL_MOUSE => (HidKind::Mouse, HID_BOOT_MOUSE_REPORT_LEN),
+            // The boot keyboard output report is the single LED byte; boot
+            // mice have no output report.
+            let (kind, len, out_len) = match res.iface_protocol {
+                crate::usb::usb::HID_PROTOCOL_KEYBOARD => {
+                    (HidKind::Keyboard, HID_BOOT_KBD_REPORT_LEN, HID_BOOT_KBD_OUTPUT_LEN)
+                }
+                HID_PROTOCOL_MOUSE => (HidKind::Mouse, HID_BOOT_MOUSE_REPORT_LEN, 0),
                 _ => return Err("unsupported HID boot protocol"),
             };
             let setup = SetupPacket::set_protocol(crate::usb::usb::HID_PROTOCOL_NONE as u16, res.iface_num as u16);
@@ -115,14 +141,14 @@ impl UsbClassDriver for HidDriver {
                 0,
                 false,
             )?;
-            (kind, len, false)
+            (kind, len, out_len, false)
         } else {
             // Generic path: fetch and parse the report descriptor to learn
-            // the kind and report length; the report is interpreted
+            // the kind and report lengths; the report is interpreted
             // boot-style, so a pointer decodes absolute coordinates.
             let scratch = dma.alloc_page().ok_or("OOM for HID descriptor page")?;
-            let (kind, len) = fetch_report_info(ep0_ring, &res, scratch.phys, scratch.virt)?;
-            (kind, len, kind == HidKind::Mouse)
+            let (kind, len, out_len) = fetch_report_info(ep0_ring, &res, scratch.phys, scratch.virt)?;
+            (kind, len, out_len, kind == HidKind::Mouse)
         };
 
         let ep = res.interrupt_in.ok_or("HID needs interrupt IN endpoint")?;
@@ -134,8 +160,26 @@ impl UsbClassDriver for HidDriver {
             return Err("one USB HID mouse already bound");
         }
 
-        if !event::register_interrupt_target(res.slot_id, ep.dci, report_page.virt, report_len) {
-            return Err("interrupt-IN target table full");
+        if !event::register_transfer_target(res.slot_id, ep.dci, report_page.virt, report_len, (1 << 1) | (1 << 13)) {
+            return Err("transfer target table full");
+        }
+
+        // Bind the interrupt-OUT endpoint for keyboard LED output.  Devices
+        // without one (mouse/tablet) skip LEDs entirely.
+        let mut out_dci = 0u8;
+        let mut out_ring = None;
+        let mut led_phys = 0u64;
+        let mut led_va = 0u64;
+        if output_len > 0 {
+            if let Some(oep) = res.interrupt_out {
+                let page = dma.alloc_page().ok_or("OOM for HID LED page")?;
+                if event::register_transfer_target(res.slot_id, oep.dci, page.virt, output_len, (1 << 1) | (1 << 13)) {
+                    led_phys = page.phys;
+                    led_va = page.virt;
+                    out_dci = oep.dci;
+                    out_ring = Some(oep.ring);
+                }
+            }
         }
 
         let device_id = match kind {
@@ -156,6 +200,14 @@ impl UsbClassDriver for HidDriver {
             report_va: report_page.virt,
             device_id,
             report_len,
+            out_dci,
+            out_ring,
+            led_phys,
+            led_va,
+            led_len: output_len,
+            led_state: 0,
+            led_dirty: false,
+            out_inflight: false,
             absolute_pointer,
             prev_mods: 0,
             prev_keys: [0; HID_MAX_KEYS],
@@ -184,21 +236,27 @@ impl UsbClassDriver for HidDriver {
         SerialPort::put_u64(ep.dci as u64);
         SerialPort::puts(" report=");
         SerialPort::put_u64(report_len as u64);
-        SerialPort::puts(" bytes\n");
+        SerialPort::puts(" bytes");
+        if out_dci != 0 {
+            SerialPort::puts(" LED out_dci=");
+            SerialPort::put_u64(out_dci as u64);
+        }
+        SerialPort::puts("\n");
 
         Ok(BoundUsbDevice::Input(device_id))
     }
 }
 
 /// Fetch the HID descriptor (0x21) for the report-descriptor length, then the
-/// report descriptor (0x22), and parse both.  Returns the device kind and
-/// report byte length, or an error for unrecognized devices.
+/// report descriptor (0x22), and parse both.  Returns the device kind, input
+/// report byte length, and output report byte length (0 when the descriptor
+/// has no Output items), or an error for unrecognized devices.
 fn fetch_report_info(
     ep0_ring: &mut TrbRing,
     res: &InterfaceResources,
     buf_phys: u64,
     buf_va: u64,
-) -> Result<(HidKind, u32), &'static str> {
+) -> Result<(HidKind, u32, u32), &'static str> {
     let setup = SetupPacket::get_descriptor_interface(DESC_HID, 0, res.iface_num as u16, 9);
     device::submit_control_transfer(ep0_ring, res.doorbell_va, res.slot_id, &setup, buf_phys, 9, true)?;
     let hid = unsafe { core::slice::from_raw_parts(buf_va as *const u8, 9) };
@@ -222,7 +280,7 @@ fn fetch_report_info(
     )?;
     let rd = unsafe { core::slice::from_raw_parts(buf_va as *const u8, report_len as usize) };
     let info = hid_report::parse_report_descriptor(rd).ok_or("unrecognized HID report descriptor")?;
-    Ok((info.kind, info.report_len as u32))
+    Ok((info.kind, info.report_len as u32, info.output_len as u32))
 }
 
 fn arm_read(inner: &mut HidDeviceInner) {
@@ -232,15 +290,21 @@ fn arm_read(inner: &mut HidDeviceInner) {
 }
 
 /// UInputL poll hook: non-blockingly consume one completed interrupt-IN read
-/// on the keyboard and emit the diff against the previous report.  Returns
-/// immediately when no completion has armed the ready flag, and re-arms the
-/// next read only after a consumed report is fully processed.
+/// on the keyboard and emit the diff against the previous report.  Also
+/// drains/arms the LED OUT transfer.  Returns immediately when no completion
+/// has armed the ready flag, and re-arms the next read only after a consumed
+/// report is fully processed.
 fn hid_keyboard_poll() {
     let mut kb = KEYBOARD.lock();
     let inner = match kb.as_mut() {
         Some(i) => i,
         None => return,
     };
+
+    // LED flush is independent of IN data, so drain/arm OUT first — a pending
+    // completion from the previous LED report must be consumed before the
+    // buffer can be rewritten.
+    flush_leds(inner);
 
     if event::take_interrupt_completion(inner.slot_id, inner.dci).is_none() {
         return;
@@ -275,6 +339,7 @@ fn hid_keyboard_poll() {
         if usage != 0 && !inner.prev_keys.contains(&usage) {
             if let Some(kc) = usage_to_keycode(usage) {
                 submit_key(inner.device_id, kc, 1);
+                track_lock_led(inner, kc, true);
             }
         }
     }
@@ -290,7 +355,63 @@ fn hid_keyboard_poll() {
     inner.prev_mods = mods;
     inner.prev_keys = keys;
 
+    // Reflect lock-key LED changes made above (may be deferred one poll if
+    // the previous OUT TRB is still in flight).
+    flush_leds(inner);
+
     arm_read(inner);
+}
+
+/// Toggle the HID LED bitmap (usage page 0x08) when a lock key is pressed.
+/// The OS keymap independently toggles the same locks from the identical
+/// event stream, so the two stay in sync as long as every press is delivered.
+fn track_lock_led(inner: &mut HidDeviceInner, kc: KeyCode, pressed: bool) {
+    if !pressed {
+        return;
+    }
+    let bit = match kc {
+        KeyCode::NumLock => 0x01,
+        KeyCode::CapsLock => 0x02,
+        KeyCode::ScrollLock => 0x04,
+        _ => return,
+    };
+    inner.led_state ^= bit;
+    inner.led_dirty = true;
+}
+
+/// Write the LED output report and flush it through the interrupt-OUT
+/// endpoint, non-blockingly.  Exactly one OUT TRB is in flight: the buffer is
+/// only rewritten after the previous transfer's completion is consumed.  A
+/// pending report that cannot be sent yet simply waits for the next poll.
+fn flush_leds(inner: &mut HidDeviceInner) {
+    if inner.out_dci == 0 {
+        return;
+    }
+    if inner.out_inflight {
+        if event::take_interrupt_completion(inner.slot_id, inner.out_dci).is_some() {
+            inner.out_inflight = false;
+        } else {
+            return;
+        }
+    }
+    if !inner.led_dirty {
+        return;
+    }
+    let out = match inner.out_ring.as_mut() {
+        Some(r) => r,
+        None => return,
+    };
+    unsafe { core::ptr::write_volatile(inner.led_va as *mut u8, inner.led_state) };
+    out.enqueue(&memory::make_normal_trb(inner.led_phys, inner.led_len));
+    out.flush();
+    command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.out_dci);
+    inner.out_inflight = true;
+    inner.led_dirty = false;
+    if cfg!(feature = "usb_trace") {
+        SerialPort::puts("[usb-hid] LED report 0x");
+        SerialPort::put_hex(inner.led_state as u64);
+        SerialPort::puts("\n");
+    }
 }
 
 /// UInputL poll hook for the mouse: button diffs plus signed axis deltas.

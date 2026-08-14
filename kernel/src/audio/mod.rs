@@ -5,9 +5,10 @@
 //! x86_64-only — the riscv64 `virt` machine has no PCI audio device, so the
 //! subsystem stays idle there (`init()` is a no-op).
 //!
-//! Playback is blocking and polled: `play_tone`/`play_pcm` synthesise (or
-//! copy) interleaved 16-bit signed stereo samples at 48 kHz into a DMA
-//! staging buffer, then drive the HDA output stream to completion.
+//! Playback and capture are blocking and polled: `play_tone`/`play_pcm`
+//! synthesise (or copy) interleaved 16-bit signed stereo samples at 48 kHz
+//! into a DMA staging buffer and drive the HDA output stream to completion;
+//! `record_pcm`/`record_pcm_stream` drive the input stream the other way.
 
 pub mod codec;
 pub mod hda;
@@ -36,10 +37,43 @@ pub trait AudioDevice: Send + Sync {
         entry_bytes: usize,
         next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
     ) -> Result<u64, &'static str>;
+
+    /// True once capture is wired end-to-end (the codec has an ADC and its
+    /// input path came up).  Playback-only devices return `false`.
+    fn can_record(&self) -> bool {
+        false
+    }
+
+    /// Record interleaved 16-bit signed stereo PCM at 48 kHz into `dest`.
+    /// Blocking; captures exactly `dest.len()` samples before returning.
+    fn record_pcm(&self, dest: &mut [i16]) -> Result<(), &'static str> {
+        let _ = dest;
+        Err("capture not supported")
+    }
+
+    /// Record PCM through a continuously-running DMA ring, so capture is
+    /// gapless and exactly real-time.  Blocking until the whole stream has
+    /// been captured.
+    ///
+    /// `total_bytes` is the exact payload size and `entry_bytes` the size of
+    /// every chunk except the last (which holds the remainder); `sink`
+    /// receives the captured chunks in order, as owned copies (the ring is
+    /// live DMA memory being overwritten by the controller).  Returns the
+    /// number of bytes recorded.
+    fn record_pcm_stream(
+        &self,
+        total_bytes: u32,
+        entry_bytes: usize,
+        sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
+    ) -> Result<u64, &'static str> {
+        let _ = (total_bytes, entry_bytes, sink);
+        Err("capture not supported")
+    }
 }
 
-const SAMPLE_RATE: u32 = 48_000;
-const CHANNELS: usize = 2;
+/// The fixed stream format the engine drives: 48 kHz, 16-bit signed, stereo.
+pub const SAMPLE_RATE: u32 = 48_000;
+pub const CHANNELS: usize = 2;
 
 static DEVICE: Once<&'static dyn AudioDevice> = Once::new();
 static READY: AtomicBool = AtomicBool::new(false);
@@ -107,6 +141,11 @@ pub fn is_ready() -> bool {
     READY.load(Ordering::Acquire)
 }
 
+/// The live device's name, when one is present (e.g. for introspection).
+pub fn device_name() -> Option<&'static str> {
+    DEVICE.get().map(|d| d.name())
+}
+
 /// Play interleaved 16-bit signed stereo PCM at 48 kHz.  Blocking.
 pub fn play_pcm(samples: &[i16]) -> Result<(), &'static str> {
     match DEVICE.get() {
@@ -124,6 +163,36 @@ pub fn play_pcm_stream(
 ) -> Result<u64, &'static str> {
     match DEVICE.get() {
         Some(d) => d.play_pcm_stream(total_bytes, entry_bytes, next),
+        None => Err("audio device not initialised"),
+    }
+}
+
+/// True once the live device can capture (an ADC path is wired).
+pub fn can_record() -> bool {
+    match DEVICE.get() {
+        Some(d) => d.can_record(),
+        None => false,
+    }
+}
+
+/// Record interleaved 16-bit signed stereo PCM at 48 kHz into `dest`.
+/// Blocking; mirrors `play_pcm`.
+pub fn record_pcm(dest: &mut [i16]) -> Result<(), &'static str> {
+    match DEVICE.get() {
+        Some(d) => d.record_pcm(dest),
+        None => Err("audio device not initialised"),
+    }
+}
+
+/// Record PCM through the device's DMA ring (gapless, real-time).  See
+/// [`AudioDevice::record_pcm_stream`].
+pub fn record_pcm_stream(
+    total_bytes: u32,
+    entry_bytes: usize,
+    sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
+) -> Result<u64, &'static str> {
+    match DEVICE.get() {
+        Some(d) => d.record_pcm_stream(total_bytes, entry_bytes, sink),
         None => Err("audio device not initialised"),
     }
 }

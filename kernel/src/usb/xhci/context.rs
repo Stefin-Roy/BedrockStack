@@ -15,14 +15,18 @@ const EP_CERR_SHIFT: u32 = 1;
 const EP_TYPE_SHIFT: u32 = 3;
 const EP_MAX_PACKET_SHIFT: u32 = 16;
 const EP_AVG_TRB_LENGTH_SHIFT: u32 = 0;
-const EP_MAX_BURST_SHIFT: u32 = 16;
+const EP_MAX_BURST_SHIFT: u32 = 8;
 const EP_INTERVAL_SHIFT: u32 = 16;
+const EP_MULT_SHIFT: u32 = 8;
+const EP_ESIT_LO_SHIFT: u32 = 16;
 const EP_DCS: u64 = 1;
 
-pub const EP_TYPE_CONTROL: u32 = 4;
+pub const EP_TYPE_ISOCH_OUT: u32 = 1;
 pub const EP_TYPE_BULK_OUT: u32 = 2;
-pub const EP_TYPE_BULK_IN: u32 = 6;
 pub const EP_TYPE_INTERRUPT_OUT: u32 = 3;
+pub const EP_TYPE_CONTROL: u32 = 4;
+pub const EP_TYPE_ISOCH_IN: u32 = 5;
+pub const EP_TYPE_BULK_IN: u32 = 6;
 pub const EP_TYPE_INTERRUPT_IN: u32 = 7;
 
 pub struct EndpointConfig {
@@ -34,6 +38,12 @@ pub struct EndpointConfig {
     pub avg_trb_len: u16,
     pub max_burst: u8,
     pub interval: u8,
+    /// Isochronous (SuperSpeed) endpoint context Mult field — the number of
+    /// packets per service interval (spec Table 6-8 dw0:8-9).  0 otherwise.
+    pub mult: u8,
+    /// Max ESIT Payload (dw4:16-31); non-zero for isochronous/interrupt
+    /// endpoints, 0 for bulk/control.
+    pub max_esit_payload: u16,
 }
 
 fn write32(va: u64, off: u64, val: u32) {
@@ -67,20 +77,31 @@ fn init_ep_context(
     avg_trb_len: u16,
     max_burst: u8,
     interval: u8,
+    mult: u8,
+    max_esit_payload: u16,
 ) {
     let base = icc_va + ep_ctx_off(ctx_size, context_index);
     // dw0 bits 23:16: Interval — the polling period as `125us * 2^Interval`
-    // (spec Table 6-8).  Zero for bulk/control (never NAK).
-    write32(base, 0x00, ((interval as u32) & 0xFF) << EP_INTERVAL_SHIFT);
-    // dw1: CErr | EP Type | Max Packet Size.
+    // (spec Table 6-8).  Zero for bulk/control (never NAK).  dw0 bits 9:8:
+    // Mult (SuperSpeed isochronous only; 0 below).
+    write32(
+        base,
+        0x00,
+        ((interval as u32) & 0xFF) << EP_INTERVAL_SHIFT
+            | ((mult as u32) & 0x3) << EP_MULT_SHIFT,
+    );
+    // dw1: CErr | EP Type | Max Burst Size (spec Table 6-8, dw1:8-15) |
+    // Max Packet Size.
     write32(
         base,
         0x04,
         ((cerr as u32) & 0x3) << EP_CERR_SHIFT
             | (ep_type & 0x7) << EP_TYPE_SHIFT
+            | ((max_burst as u32) & 0xFF) << EP_MAX_BURST_SHIFT
             | (mps as u32) << EP_MAX_PACKET_SHIFT,
     );
-    // dw2/dw3: Dequeue Pointer | DCS; dw4: Average TRB Length | Max Burst.
+    // dw2/dw3: Dequeue Pointer | DCS; dw4: Average TRB Length | Max ESIT
+    // Payload Lo (spec Table 6-8).
     let dequeue = dequeue_phys | EP_DCS;
     write32(base, 0x08, dequeue as u32);
     write32(base, 0x0C, (dequeue >> 32) as u32);
@@ -88,7 +109,7 @@ fn init_ep_context(
         base,
         0x10,
         (avg_trb_len as u32) << EP_AVG_TRB_LENGTH_SHIFT
-            | ((max_burst as u32) & 0xFF) << EP_MAX_BURST_SHIFT,
+            | ((max_esit_payload as u32) & 0xFFFF) << EP_ESIT_LO_SHIFT,
     );
 }
 
@@ -106,7 +127,7 @@ pub fn init_icc_for_address_device(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0, 0, 0);
 }
 
 /// Build an Input Control Context for an Evaluate Context command that
@@ -123,7 +144,7 @@ pub fn init_icc_for_evaluate_ep0(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0);
+    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0, 0, 0);
 }
 
 /// Build an Input Control Context for a Configure Endpoint command that
@@ -159,6 +180,8 @@ pub fn init_icc_for_configure_endpoint(
                 ep.avg_trb_len,
                 ep.max_burst,
                 ep.interval,
+                ep.mult,
+                ep.max_esit_payload,
             );
         }
     }
