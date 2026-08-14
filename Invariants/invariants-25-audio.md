@@ -1,12 +1,13 @@
 # BedrockOS Invariants — Audio Subsystem & Intel HD Audio Driver
 
-**Version:** 0.2.0
-**Date:** 2026-08-03
+**Version:** 0.4.0
+**Date:** 2026-08-13
 **Source paths:**
-- `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, sine synthesis
-- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream
+- `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, `record_pcm`/`record_pcm_stream`, sine synthesis, `device_name()`/`pub const SAMPLE_RATE, CHANNELS`
+- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream, input stream (capture)
 - `kernel/src/audio/codec.rs` — generic HDA codec driver: probe, widget graph, output/input path discovery, path bring-up
 - `kernel/src/lib.rs` — `pub mod audio`, `audio::init()` in `Kernel::run()`
+- `kernel/src/unispace/provider/driver.rs` — `/driver/audio` unispace device surface (AUD-026..028)
 - `run.bat`, `fullrun.bat` — `-audiodev dsound` + `ich9-intel-hda` + `hda-output` + `hda-duplex` QEMU wiring
 
 ---
@@ -23,8 +24,13 @@ compiles there, but `is_ready()` stays `false`.
 ## Subsystem Engine (`kernel/src/audio/mod.rs`)
 
 **AUD-001** `AudioDevice` is the playback capability: `name()` + blocking
-`play_pcm(&[i16])` for interleaved 16-bit signed stereo PCM at 48 kHz.
-- Location: `kernel/src/audio/mod.rs:20-27`
+`play_pcm(&[i16])` for interleaved 16-bit signed stereo PCM at 48 kHz.  It
+also carries the record surface: `can_record() -> bool` (default `false`),
+blocking `record_pcm(&mut [i16])` (default `Err("capture not supported")`),
+and streaming `record_pcm_stream(total_bytes, entry_bytes, sink)` (default
+`Err("capture not supported")`).  Defaults keep playback-only devices and the
+riscv64 no-op build compiling without overrides.
+- Location: `kernel/src/audio/mod.rs:19-86`
 
 **AUD-002** A single device is held in `Once<&'static dyn AudioDevice>`; the
 first controller that initialises successfully wins. `is_ready()` mirrors that
@@ -136,8 +142,9 @@ default-config device type is headphone-out, + EAPD if `PINCAP_EAPD`); then
 `SET_CONV` (stream tag 1, channel 0) and `SET_STREAM_FORMAT` (`0x11`).
 `codec::setup_input` mirrors this for the ADC (tag 2, `INPUT_TAG`): amps
 unmuted at the per-hop index, selectors routed, and the in-pin biased with the
-highest advertised VREF level. Capture is not exposed by the audio engine yet,
-so input bring-up is best-effort. Verbs are sent through the `VerbSender`
+highest advertised VREF level.  Input bring-up only runs when the selected
+codec exposes an ADC, and only a successful result arms capture.
+Verbs are sent through the `VerbSender`
 trait implemented by the controller, so the codec module stays
 controller-agnostic.
 - Location: `kernel/src/audio/codec.rs` `setup_output()`, `setup_input()`, `unmute_amp()`, `pick_vref()`, `set_power_d0()`; `kernel/src/audio/hda.rs` `impl VerbSender for Inner`
@@ -147,12 +154,21 @@ controller-agnostic.
 **AUD-018** `play_pcm` stages samples into the DMA buffer (rejected if larger
 than 256 KiB), builds a single-entry BDL `{ addr, 0, len, IOC }`, resets the
 stream (`SDnCTL.SRST` set then cleared), programs `BDPL/U`, `LVI=0`, `CBL=len`,
-`SDnFMT=0x0A11`, then starts DMA with `SDnCTL = tag(1)<<20 | RUN`. The stop
+`SDnFMT=0x0011`, then starts DMA with `SDnCTL = tag(1)<<20 | RUN`. The stop
 write clears RUN but **preserves the stream tag**: QEMU derives the stream
 number from `SDnCTL` on every RUN-bit flip, so clearing the tag would notify
 the codec with `stnr=0` and the converter (tag 1) would keep playing the
 wrapping BDL forever.
-- Location: `kernel/src/audio/hda.rs:248-299`
+
+`SDnFMT=0x0011` is the Table 53 stream-format structure for 48 kHz/16-bit/
+stereo (TYPE=0 · BASE=0 · MULT=000 · DIV=000 · BITS=001 · CHAN=0001), the
+encoding shared by the descriptor and the codec verb.  A previous `0x0A11`
+decoded to 32 kHz (MULT=001 · DIV=010) and silently disagreed with the codec's
+48 kHz `SET_STREAM_FORMAT`; both directions now use `0x0011`.
+`play_pcm`'s `LVI=0` single-entry list is a documented QEMU-tolerant deviation
+from the "LVI must be ≥ 1" requirement of 3.3.39; `record_pcm` uses two
+descriptors and is fully compliant.
+- Location: `kernel/src/audio/hda.rs` `play()`
 
 **AUD-019** Completion is polled: `sleep_ms(duration)`, then a BDL-wrap wait
 via `wait_until_cond` (500 ms cap), then a 50 ms drain pause, then `RUN=0`.
@@ -194,12 +210,102 @@ must match the codec's `SET_CONV` stream tag or the codec ignores the stream.
   connection-list formats, `GET_CONFIG_DEFAULT` indexing)
 
 ---
+ 
+### Capture (input stream)
+ 
+**AUD-022** Codec selection is two-way-aware.  The first probed analog-output
+codec is no longer blindly kept: among analog-out codecs, one that *also* has
+an ADC (`c.adc.is_some()`) is preferred over an analog-out-only one, so with
+both `hda-output` (cad 0, DAC-only) and `hda-duplex` (cad 1, DAC+ADC) attached
+the driver binds the duplex codec and gains both directions.  Selection order
+is: ALC256 (hardcoded path) → analog-out with ADC → analog-out → digital.
+Capture is armed only when `codec.adc` exists **and** `codec::setup_input`
+succeeds; `<audio cap_ready>` gates every record entry point.
+- Location: `kernel/src/audio/hda.rs` `init()` (`duplex` preference), `.cap_ready`
+ 
+**AUD-023** The input stream descriptor lives at `0x80` (register index 0 —
+QEMU decides stream direction by descriptor index, index ≥ 4 = output; input
+descriptors occupy 0..ISS-1 under the output block).  `Inner.in_base` holds
+it; `HDA_IN_BASE` (static, 0 = not armed) publishes it to the ISR.  The ISR
+clears **both** streams' `SD_STS.BCIS` (write-1-to-clear deasserts the shared
+INTx/MSI line) and counts each stream independently — `HDA_IRQ_COUNT` for
+output, `HDA_IN_IRQ_COUNT` for input — so a completion on one stream can never
+be counted as the other's.  `INTCTL` lights the input stream's completion bit
+alongside the output's only when capture is armed.
+- Location: `kernel/src/audio/hda.rs` `hda_irq_handler()`, `setup_stream_interrupt()`
+ 
+**AUD-024** `record_pcm(dest)` is the blocking whole-buffer mirror of `play`,
+brought into spec compliance: a **two-entry BDL** (both IOC, split at a
+128-byte boundary so both buffer starts honour the 3.6.3 alignment), with
+`LVI=1` (3.3.39 requires at least two valid descriptors), a word-aligned
+`dest` length, stream reset, `BDPL/U+CBL=len+SDnFMT 0x0011` programmed,
+started with `SD_CTL = (2 << 20) | RUN | IOCE` (tag 2 = the codec's input
+`SET_CONV`; `IOCE` per 3.3.35 so BCIS can raise real completion interrupts),
+allowed the full duration, then both entries' completions consumed (IRQ count
+delta or two BCIS poll-clears) before a 50 ms FIFO drain, copied into `dest`,
+then stopped **preserving the input tag** (QEMU derives the stream number from
+`SDnCTL` on every RUN flip, exactly as for output).  `record_pcm_stream`
+mirrors `play_stream`: a fixed-geometry BDL ring of `RING_ENTRIES` `eb`-sized
+entries (rejecting non-128-aligned `eb`), CBL = padded total,
+refilled/consumed entry-by-entry as input completions arrive; each completed
+slot is copied into an **owned** `Vec<i16>` (a ring slot is live DMA memory
+being overwritten by the controller) and the final chunk is trimmed to
+`total_bytes - (needed-1)*eb`.  The ring slot for completion `c` is `(c-1) mod n`,
+safe to read until the controller cycles `n` entries later.  QEMU delivers
+silence when no host audio source is configured, so the DMA still advances and
+the completion fires; a genuinely stalled input DMA times out with
+`"capture stalled"` rather than fabricating samples.
+- Location: `kernel/src/audio/hda.rs` `record()`, `record_stream()`
+ 
+**AUD-025** Capture is mutually exclusive with playback: both `play_*` and the
+`record_*` entry points hold the same `Inner` mutex for their whole duration,
+sharing the staging buffer, BDL page and stream-descriptor programming loops.
+Simultaneous full-duplex (record-while-play) requires splitting the mutex per
+direction and a second BDL/buffer allocation, and is a follow-up phase; the
+independent counters and per-stream BCIS handling make it a clean extension.
+ 
+---
 
+## Unispace Exposure (`/driver/audio`)
+
+**AUD-026** The audio engine is exposed through the `/driver` provider as a
+single device object (`kernel/src/unispace/provider/driver.rs`). Its value
+schema `AUDIO_STATE` is `struct{ present: bool, name: str, sample_rate: u32,
+channels: u32, can_record: bool }` — a live snapshot (`present` mirrors
+`audio::is_ready()`, `name` is `device_name()`/`""`, format comes from the
+exported `SAMPLE_RATE`/`CHANNELS` consts). Two methods wrap the blocking
+engine: `:play_tone{freq: u32, ms: u64}` and `:play_pcm{pcm: bytes}`, where
+`pcm` is raw little-endian interleaved 16-bit signed stereo (an odd length, an
+empty payload, or bytes over the 256 KiB staging limit is `InvalidArgument`;
+values are converted with `i16::from_le_bytes`).
+- Location: `kernel/src/unispace/provider/driver.rs` (`AudioObject`),
+  `kernel/src/audio/mod.rs` (`device_name()`, `pub const SAMPLE_RATE/CHANNELS`)
+
+**AUD-027** Without a live device (`!audio::is_ready()`) both playback methods
+return `Unsupported` immediately — never a spin, never a synthesised tone from
+an absent engine. Engine failures (`&'static str`) also surface as
+`Unsupported`; the wire has no errno vocabulary for them. The object is
+`ObjectKind::Device` like `/driver/debugserial`, and every read/method path is
+`Result`-only (no panics on device data).
+
+**AUD-028** Playback methods are strictly single-consumer: the engine's
+blocking waits HLT the calling CPU for the tone's whole duration
+(`universal_timer::sleep_ms`), so a ring-3 `:play_tone` parks its CPU rather
+than yielding. Safe for the single user INIT task; not for concurrent audio
+clients. The `selftest` suite probes both method schemas but never invokes
+them from boot context.
+ 
+---
+ 
 ## Boot Sequence
 
 **AUD-021** `audio::init()` runs in `Kernel::run()` immediately after the xHCI
 init block, before VFS init — it depends only on
 `pci::init()` (which precedes it) and on the services (DMA, timer).
+A `#[cfg(feature = "selftest")]` capture check right after `audio::init()`
+records ~250 ms through `record_pcm_stream` when `can_record()` and logs the
+byte count/peak/RMS — a serial proof that the input ring advanced even when
+the host audio backend feeds silence.
 - Location: `kernel/src/lib.rs` `run()`
 
 ---
@@ -209,7 +315,12 @@ init block, before VFS init — it depends only on
 - The driver is deliberately polled; HDA MSI (`pci::msi::enable` +
   `services.msi`) is a clean follow-up since the QEMU controller supports it.
 - The fixed 48 kHz / 16-bit / stereo stream format matches both the controller
-  `SDnFMT` encoding (`0x0A11`) and the codec format verb (`0x11`); a future
+  `SDnFMT` encoding and the codec format verb — both are the Table 53 stream
+  format structure, value `0x11`/`0x0011` (the old `0x0A11` descriptor value
+  was a 32 kHz encoding and is fixed); a future
   rate/channel change must keep the two in agreement.
-- Playback is blocking by design for now; a ring of buffers + interrupt-driven
-  completion (BDL `IOC`, `SDnSTS.BCIS`) is the path to non-blocking audio.
+- Playback and capture are blocking by design for now; a ring of buffers +
+  interrupt-driven completion (BDL `IOC`, `SDnSTS.BCIS`) is the path to
+  non-blocking both-way audio.  The streaming ring (`play_pcm_stream` /
+  `record_pcm_stream`) already uses IOC completions end-to-end; what remains
+  is decoupling the transfer from the calling thread.

@@ -3,18 +3,24 @@ use crate::drivers::serial::SerialPort;
 use crate::services::dma::DmaAllocator;
 use crate::usb::usb;
 use crate::usb::usb::SetupPacket;
-use crate::usb::usb::descriptors::{ConfigDescriptor, InterfaceDescriptor, EndpointDescriptor};
+use crate::usb::usb::descriptors::{
+    ConfigDescriptor, EndpointDescriptor, InterfaceDescriptor, SsEndpointCompanionDescriptor,
+    SsIsochEpCompanionDescriptor,
+};
 use crate::usb::xhci::command;
 use crate::usb::xhci::context::{self, EndpointConfig};
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing};
 
-/// A USB interface (alternate setting 0) parsed from the configuration
-/// descriptor.  Endpoints carry the xHCI endpoint-context fields so the
-/// Configure Endpoint command can be built directly from them.
+/// A USB interface parsed from the configuration descriptor.  Endpoints carry
+/// the xHCI endpoint-context fields so the Configure Endpoint command can be
+/// built directly from them.  Only records worth configuring are kept for
+/// each alternate setting; non-zero settings are retained so the isochronous
+/// transport path can select them via SET_INTERFACE.
 #[derive(Clone)]
 pub struct UsbInterface {
     pub iface_num: u8,
+    pub alt_setting: u8,
     pub class: u8,
     pub subclass: u8,
     pub protocol: u8,
@@ -22,15 +28,23 @@ pub struct UsbInterface {
 }
 
 /// One non-default endpoint of an interface.
-/// `ep_type` is the USB transfer type (`usb::EP_TYPE_BULK`/`EP_TYPE_INTERRUPT`);
-/// `interval` is the pre-converted xHCI endpoint-context Interval value
-/// (spec Table 6-12), 0 for bulk.
+/// `ep_type` is the USB transfer type (`usb::EP_TYPE_BULK`/`EP_TYPE_INTERRUPT`/
+/// `EP_TYPE_ISOCH`); `interval` is the pre-converted xHCI endpoint-context
+/// Interval value (spec Table 6-12), 0 for bulk.
 #[derive(Clone, Copy)]
 pub struct UsbEndpoint {
     pub dci: u8,
     pub ep_type: u8,
     pub mps: u16,
     pub interval: u8,
+    /// Max Burst Size — HS isoch/interrupt `wMaxPacketSize` bits 12:11, SS
+    /// `bMaxBurst` from the USB 3.0 EP Companion descriptor, 0 for FS/LS.
+    pub max_burst: u8,
+    /// Endpoint-context Mult (SuperSpeed isochronous only); 0 here.
+    pub mult: u8,
+    /// Max ESIT Payload (xHCI §4.14.2): FS = mps, HS = mps × (burst+1),
+    /// SS = companion wBytesPerInterval.  0 for bulk.
+    pub max_esit_payload: u16,
 }
 
 pub struct DeviceSlot {
@@ -83,16 +97,21 @@ impl DeviceSlot {
 
 /// Translate a USB `bInterval` into the xHCI endpoint-context Interval value
 /// (spec Table 6-12).  The context value is an exponent: service period is
-/// `125us * 2^n`.
-fn usb_interval_to_context(speed: u8, binterval: u8) -> u8 {
+/// `125us * 2^n`.  `ep_type` distinguishes interrupt (frame-based on FS/LS)
+/// from isochronous (exponent-based in 1 ms units on FS/LS) encoding.
+fn usb_interval_to_context(speed: u8, ep_type: u8, binterval: u8) -> u8 {
     if binterval == 0 {
         return 0;
     }
-    match speed {
+    match (speed, ep_type) {
+        // FS isoch bInterval is a base-2 exponent of 1 ms frames:
+        // `2^(bInterval-1) ms`.  Valid context range is 3-18.  HS/SS isoch
+        // uses the `2^(b-1) * 125us` formula (the `_` arm below).
+        (usb::SPEED_FS | usb::SPEED_LS, usb::EP_TYPE_ISOCH) => (binterval as u32 + 2).clamp(3, 18) as u8,
         // FS/LS interrupt bInterval is in 1 ms frames.  The service interval
         // (in 125us microframes) must be a power of two; round the frame
         // count up and take log2.  Valid context range is 3-10.
-        usb::SPEED_FS | usb::SPEED_LS => {
+        (usb::SPEED_FS | usb::SPEED_LS, _) => {
             let microframes = binterval as u32 * 8;
             let pow2 = microframes.next_power_of_two();
             (pow2.trailing_zeros() as u8).clamp(3, 10)
@@ -119,7 +138,11 @@ fn wait_for_transfer_timeout(slot_id: u8, ep_id: u8, timeout_ns: u64) -> Result<
         return Err("transfer timeout");
     }
     let (_sid, _eid, cc, _remaining) = event::last_transfer_completion().unwrap();
-    if cc == 1 || cc == 13 {
+    // Success (1), Short Packet (13), and the isochronous pair Isoch Buffer
+    // Overrun (10) / Underrun (11) all count as an executed transfer — the
+    // last two are the normal outcome when a device sends more/fewer bytes
+    // than the ESIT allowed.
+    if cc == 1 || cc == 13 || cc == 10 || cc == 11 {
         Ok(cc)
     } else {
         Err("transfer failed")
@@ -250,6 +273,11 @@ pub fn get_config_descriptor_full(
 
     let mut cur_iface_num: u8 = 0;
     let mut cur_alt_setting: u8 = 0;
+    // USB 3.x Endpoint Companion descriptors immediately follow the endpoint
+    // they describe; fold their bMaxBurst / wBytesPerInterval into the next
+    // recorded endpoint.
+    let mut pend_max_burst: u8 = 0;
+    let mut pend_esit: u16 = 0;
 
     let mut offset = 0usize;
     while offset < limit {
@@ -271,80 +299,123 @@ pub fn get_config_descriptor_full(
                 if let Some(iface) = InterfaceDescriptor::parse(&cfg_buf[offset..]) {
                     cur_iface_num = iface.interface_number();
                     cur_alt_setting = iface.alternate_setting();
-                    // Record only alternate setting 0; higher settings of the
-                    // same interface share the same class/subclass/protocol.
-                    if cur_alt_setting == 0 {
-                        slot.interfaces.push(UsbInterface {
-                            iface_num: cur_iface_num,
-                            class: iface.class(),
-                            subclass: iface.subclass(),
-                            protocol: iface.protocol(),
-                            endpoints: Vec::new(),
-                        });
-                        if cfg!(feature = "usb_trace") {
-                            SerialPort::puts("[xhci]    iface ");
-                            SerialPort::put_u64(iface.interface_number() as u64);
-                            SerialPort::puts(": class=0x");
-                            SerialPort::put_hex(iface.class() as u64);
-                            SerialPort::puts(" subclass=0x");
-                            SerialPort::put_hex(iface.subclass() as u64);
-                            SerialPort::puts(" protocol=0x");
-                            SerialPort::put_hex(iface.protocol() as u64);
-                            SerialPort::puts("\n");
-                        }
+                    // Record the interface at any alternate setting.  Alt 0 is
+                    // what class drivers bind; non-zero alts are kept so the
+                    // isochronous transport path can configure their endpoints
+                    // (UAC1 streaming exposes them only at alt >= 1).
+                    slot.interfaces.push(UsbInterface {
+                        iface_num: cur_iface_num,
+                        alt_setting: cur_alt_setting,
+                        class: iface.class(),
+                        subclass: iface.subclass(),
+                        protocol: iface.protocol(),
+                        endpoints: Vec::new(),
+                    });
+                    if cfg!(feature = "usb_trace") {
+                        SerialPort::puts("[xhci]    iface ");
+                        SerialPort::put_u64(iface.interface_number() as u64);
+                        SerialPort::puts(" alt=");
+                        SerialPort::put_u64(iface.alternate_setting() as u64);
+                        SerialPort::puts(" class=0x");
+                        SerialPort::put_hex(iface.class() as u64);
+                        SerialPort::puts(" subclass=0x");
+                        SerialPort::put_hex(iface.subclass() as u64);
+                        SerialPort::puts(" protocol=0x");
+                        SerialPort::put_hex(iface.protocol() as u64);
+                        SerialPort::puts("\n");
                     }
                 }
             }
             usb::DESC_ENDPOINT => {
-                if cur_alt_setting == 0 {
-                    if let Some(ep) = EndpointDescriptor::parse(&cfg_buf[offset..]) {
-                        let ep_num = ep.endpoint_number();
-                        let is_in = ep.is_in();
-                        let dci: u8 = (ep_num * 2) + if is_in { 1 } else { 0 };
-                        let ep_type = ep.transfer_type();
-                        // Record bulk endpoints (either direction) and
-                        // interrupt-IN endpoints.  Interrupt-OUT and isochronous
-                        // endpoints are not used by the current class drivers.
-                        let record = ep_type == usb::EP_TYPE_BULK
-                            || (ep_type == usb::EP_TYPE_INTERRUPT && is_in);
-                        if record {
-                            if let Some(iface) = slot
-                                .interfaces
-                                .iter_mut()
-                                .find(|i| i.iface_num == cur_iface_num)
-                            {
-                                iface.endpoints.push(UsbEndpoint {
-                                    dci,
-                                    ep_type,
-                                    mps: ep.max_packet_size(),
-                                    interval: if ep_type == usb::EP_TYPE_BULK {
-                                        0
-                                    } else {
-                                        usb_interval_to_context(slot.speed, ep.interval())
-                                    },
+                if let Some(ep) = EndpointDescriptor::parse(&cfg_buf[offset..]) {
+                    let ep_num = ep.endpoint_number();
+                    let is_in = ep.is_in();
+                    let dci: u8 = (ep_num * 2) + if is_in { 1 } else { 0 };
+                    let ep_type = ep.transfer_type();
+                    // Record every non-default transfer type.  Isochronous
+                    // endpoints are kept at any alternate setting; bulk and
+                    // interrupt only at alt 0 (the binding target).
+                    let record = match ep_type {
+                        usb::EP_TYPE_BULK | usb::EP_TYPE_INTERRUPT => cur_alt_setting == 0,
+                        usb::EP_TYPE_ISOCH => true,
+                        _ => false,
+                    };
+                    // Skip the default control pipe (EP0) and out-of-range DCIs.
+                    if record && ep_num != 0 && ep_num <= 15 {
+                        if let Some(iface) = slot
+                            .interfaces
+                            .iter_mut()
+                            .find(|i| i.iface_num == cur_iface_num && i.alt_setting == cur_alt_setting)
+                        {
+                            let usb_ep = UsbEndpoint {
+                                dci,
+                                ep_type,
+                                mps: ep.max_packet_size(),
+                                interval: if ep_type == usb::EP_TYPE_BULK {
+                                    0
+                                } else {
+                                    usb_interval_to_context(slot.speed, ep_type, ep.interval())
+                                },
+                                max_burst: if ep_type == usb::EP_TYPE_BULK {
+                                    0
+                                } else {
+                                    endpoint_max_burst(slot.speed, ep_type, ep, pend_max_burst)
+                                },
+                                mult: 0,
+                                max_esit_payload: if ep_type == usb::EP_TYPE_BULK {
+                                    0
+                                } else {
+                                    endpoint_max_esit(slot.speed, ep_type, ep, pend_esit)
+                                },
+                            };
+                            iface.endpoints.push(usb_ep);
+                            if cfg!(feature = "usb_trace") {
+                                SerialPort::puts("[xhci]      ");
+                                SerialPort::puts(match (ep_type, is_in) {
+                                    (usb::EP_TYPE_BULK, true) => "bulk IN ",
+                                    (usb::EP_TYPE_BULK, false) => "bulk OUT",
+                                    (usb::EP_TYPE_INTERRUPT, true) => "intr IN ",
+                                    (usb::EP_TYPE_INTERRUPT, false) => "intr OUT",
+                                    (usb::EP_TYPE_ISOCH, true) => "isoch IN ",
+                                    (usb::EP_TYPE_ISOCH, false) => "isoch OUT",
+                                    _ => "unknown ",
                                 });
-                                if cfg!(feature = "usb_trace") {
-                                    SerialPort::puts("[xhci]      ");
-                                    SerialPort::puts(match ep_type {
-                                        usb::EP_TYPE_BULK if is_in => "bulk IN ",
-                                        usb::EP_TYPE_BULK => "bulk OUT",
-                                        _ => "intr IN ",
-                                    });
-                                    SerialPort::puts(" dci=");
-                                    SerialPort::put_u64(dci as u64);
-                                    SerialPort::puts(" mps=");
-                                    SerialPort::put_u64(ep.max_packet_size() as u64);
-                                    SerialPort::puts("\n");
-                                }
+                                SerialPort::puts(" dci=");
+                                SerialPort::put_u64(dci as u64);
+                                SerialPort::puts(" mps=");
+                                SerialPort::put_u64(ep.max_packet_size() as u64);
+                                SerialPort::puts(" esit=");
+                                SerialPort::put_u64(usb_ep.max_esit_payload as u64);
+                                SerialPort::puts("\n");
                             }
                         }
                     }
+                    // The companion (if any) applied only to the endpoint it
+                    // followed; clear it regardless.
+                    pend_max_burst = 0;
+                    pend_esit = 0;
+                }
+            }
+            usb::DESC_SS_EP_COMPANION => {
+                if let Some(c) = SsEndpointCompanionDescriptor::parse(&cfg_buf[offset..]) {
+                    pend_max_burst = c.max_burst();
+                    pend_esit = c.bytes_per_interval();
+                }
+            }
+            usb::DESC_SS_ISOCH_EP_COMPANION => {
+                if let Some(c) = SsIsochEpCompanionDescriptor::parse(&cfg_buf[offset..]) {
+                    pend_esit = c.bytes_per_interval().min(0xFFFF) as u16;
                 }
             }
             _ => {}
         }
         offset += len;
     }
+
+    // Drop non-zero alternate settings that carried no recordable endpoints
+    // (a UAC streaming alt 1 with no isoch endpoints would otherwise pollute
+    // the list the drivers and Configure Endpoint scan).
+    slot.interfaces.retain(|i| i.alt_setting == 0 || !i.endpoints.is_empty());
 
     if cfg!(feature = "usb_trace") {
         SerialPort::puts("[xhci]  ");
@@ -355,11 +426,40 @@ pub fn get_config_descriptor_full(
     Ok(())
 }
 
+/// Max Burst Size for a recorded non-bulk endpoint (spec Table 6-8 dw1:8-15):
+/// HS isoch/interrupt = `wMaxPacketSize` bits 12:11, SS = companion
+/// `bMaxBurst`, FS/LS = 0.
+fn endpoint_max_burst(speed: u8, _ep_type: u8, ep: &EndpointDescriptor, ss_burst: u8) -> u8 {
+    match speed {
+        usb::SPEED_HS => ep.hs_burst(),
+        usb::SPEED_SS => ss_burst,
+        _ => 0,
+    }
+}
+
+/// Max ESIT Payload for a recorded non-bulk endpoint (xHCI §4.14.2): FS = mps,
+/// HS = mps × (burst + 1), SS = companion `wBytesPerInterval`.
+fn endpoint_max_esit(speed: u8, ep_type: u8, ep: &EndpointDescriptor, ss_esit: u16) -> u16 {
+    match (speed, ep_type) {
+        (usb::SPEED_FS, usb::EP_TYPE_ISOCH) => ep.max_packet_size(),
+        (usb::SPEED_HS, usb::EP_TYPE_ISOCH) => {
+            ep.max_packet_size().saturating_mul(ep.hs_burst() as u16 + 1)
+        }
+        (usb::SPEED_SS, usb::EP_TYPE_ISOCH) => if ss_esit != 0 { ss_esit } else { ep.max_packet_size() },
+        (usb::SPEED_FS | usb::SPEED_LS, usb::EP_TYPE_INTERRUPT) => ep.max_packet_size(),
+        (usb::SPEED_HS, usb::EP_TYPE_INTERRUPT) => ep.max_packet_size().saturating_mul(ep.hs_burst() as u16 + 1),
+        (usb::SPEED_SS, usb::EP_TYPE_INTERRUPT) => if ss_esit != 0 { ss_esit } else { ep.max_packet_size() },
+        _ => 0,
+    }
+}
+
 /// Map a USB transfer type + direction to the xHCI endpoint-context type
 /// (spec §6.2.3 Table 6-4: types are per-direction; DCI parity encodes it,
 /// even = OUT, odd = IN).
 fn context_ep_type(ep_type: u8, dci: u8) -> u32 {
     match (ep_type, dci & 1) {
+        (usb::EP_TYPE_ISOCH, 0) => context::EP_TYPE_ISOCH_OUT,
+        (usb::EP_TYPE_ISOCH, _) => context::EP_TYPE_ISOCH_IN,
         (usb::EP_TYPE_BULK, 0) => context::EP_TYPE_BULK_OUT,
         (usb::EP_TYPE_BULK, _) => context::EP_TYPE_BULK_IN,
         (usb::EP_TYPE_INTERRUPT, 0) => context::EP_TYPE_INTERRUPT_OUT,
@@ -409,14 +509,19 @@ pub fn configure_device(
                 ep_type: context_ep_type(ep.ep_type, ep.dci),
                 max_packet_size: ep.mps,
                 dequeue_phys: ring.phys,
-                cerr: 3,
+                // Isochronous endpoints report no transaction errors, so CErr
+                // must be 0 (xHCI §6.2.3.2); everything else uses the
+                // default 3 retries.
+                cerr: if ep.ep_type == usb::EP_TYPE_ISOCH { 0 } else { 3 },
                 avg_trb_len: if ep.ep_type == usb::EP_TYPE_BULK {
                     3072
                 } else {
                     ep.mps.max(8)
                 },
-                max_burst: 0,
+                max_burst: ep.max_burst,
                 interval: ep.interval,
+                mult: ep.mult,
+                max_esit_payload: ep.max_esit_payload,
             });
             ring_pairs.push((ep.dci, ring));
         }
@@ -480,6 +585,44 @@ pub fn submit_interrupt(
     command::ring_doorbell(doorbell_va, slot_id, dci);
     wait_for_transfer_timeout(slot_id, dci, timeout_ns)?;
     Ok(())
+}
+
+/// Submit a single isochronous transfer (one TRB covering one service
+/// interval) and wait for its completion.  `frame_id` and `sia` follow the
+/// isochronous TRB (Tables 6-32/33/34); the current callers use SIA=1 with
+/// `frame_id=0`, deferring MFINDEX-based frame scheduling (follow-up).
+pub fn submit_isoch(
+    ring: &mut TrbRing,
+    doorbell_va: u64,
+    slot_id: u8,
+    dci: u8,
+    data_phys: u64,
+    data_len: u32,
+    timeout_ns: u64,
+) -> Result<u8, &'static str> {
+    let trb = memory::make_isoch_trb(data_phys, data_len, 0, true, false, 0, true);
+    ring.enqueue(&trb);
+    ring.flush();
+    command::ring_doorbell(doorbell_va, slot_id, dci);
+    let cc = wait_for_transfer_timeout(slot_id, dci, timeout_ns)?;
+    Ok(cc)
+}
+
+/// Submit a single isochronous transfer without waiting.  Prefer this when
+/// completions are routed to a registered transfer target; otherwise the
+/// enqueued TRB's completion lands in the shared `LAST_TRANSFER_STATE` slot.
+pub fn enqueue_isoch(
+    ring: &mut TrbRing,
+    doorbell_va: u64,
+    slot_id: u8,
+    dci: u8,
+    data_phys: u64,
+    data_len: u32,
+) {
+    let trb = memory::make_isoch_trb(data_phys, data_len, 0, true, false, 0, true);
+    ring.enqueue(&trb);
+    ring.flush();
+    command::ring_doorbell(doorbell_va, slot_id, dci);
 }
 
 pub fn find_ep_ring(slot: &DeviceSlot, dci: u8) -> Option<&TrbRing> {

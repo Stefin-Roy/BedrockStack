@@ -3,10 +3,14 @@
 //! Polled driver for QEMU's `intel-hda` / `ich9-intel-hda` emulation.  The
 //! controller moves verbs to the codec over the CORB/RIRB rings and plays
 //! 16-bit signed stereo PCM at 48 kHz through the codec's output converter
-//! (discovered generically by `super::codec`).
+//! (discovered generically by `super::codec`).  When the chosen codec also
+//! exposes an input path (e.g. QEMU's `hda-duplex`), the same stream
+//! machinery drives the input converter the other way for capture, so the
+//! carriage rides in both directions.
 //!
 //! Playback runs as a single descriptor in a BDL (Buffer Descriptor List)
-//! that the controller DMA's into the codec.
+//! that the controller DMA's into the codec; capture is the mirror image —
+//! the controller DMA's codec samples out of a BDL into the staging buffer.
 //!
 //! QEMU-specific facts this driver relies on (see hw/audio/intel-hda.c,
 //! hw/audio/hda-codec.c):
@@ -118,10 +122,24 @@ const VERB_TIMEOUT_NS: u64 = 100_000_000;
 
 const SD_CTL_SRST: u32 = 1 << 0;
 const SD_CTL_RUN: u32 = 1 << 1;
+/// Interrupt On Completion Enable — spec 3.3.35 bit 2: BCIS raises a
+/// controller interrupt only while set (output's omission is a tolerated QEMU
+/// deviation; the poll fallback covers it).  Input sets it so real hardware
+/// gets completion interrupts too.
+const SD_CTL_IOCE: u32 = 1 << 2;
 const SD_CTL_STREAM_TAG: u32 = 1 << 20; // stream tag 1
+/// Input stream tag — matches the codec's ADC `SET_CONV` binding (tag 2).
+const SD_CTL_INPUT_STREAM_TAG: u32 = 2 << 20;
 
 /// Controller stream descriptor format: 16-bit stereo, 48 kHz base rate.
-const SD_FMT_48K_STEREO_16: u16 = 0x0A11;
+///
+/// Stream-format structure (spec 3.7.1, Table 53), shared by SDnFMT and the
+/// codec `SET_STREAM_FORMAT` verb: TYPE=0 (PCM) · BASE=0 (48 kHz) ·
+/// MULT=000 (÷1) · DIV=000 (÷1) · BITS=001 (16-bit) · CHAN=0001 (2 ch)
+/// ⇒ 0x0011.  This MUST agree with the codec-side verb (`codec::STREAM_FMT_48K_STEREO_16`
+/// is also 0x11); the previous 0x0A11 encoded 32 kHz (MULT=001, DIV=010) and
+/// silently disagreed with the 48 kHz verb.
+const SD_FMT_48K_STEREO_16: u16 = 0x0011;
 
 const BDL_IOC: u32 = 0x01; // interrupt-on-complete flag
 
@@ -137,16 +155,23 @@ const RING_ENTRIES: usize = 8;
 //
 // QEMU's intel-hda latches BCIS and raises the INTx/MSI line when an
 // IOC-flagged BDL entry completes.  The ISR clears BCIS to deassert the
-// line and counts the event; the playback loop waits on the counter and
-// refills the freed ring slot.  If the interrupt route is broken, the loop
-// falls back to polling BCIS (QEMU latches it regardless of enablement).
+// line and counts the event; the playback/capture loops wait on the counter
+// and refill the freed ring slot.  If the interrupt route is broken, the
+// loops fall back to polling BCIS (QEMU latches it regardless of enablement).
+// The output and input streams have separate descriptors and therefore
+// separate BCIS bits; each is counted independently so a completion on one
+// stream can never be mistaken for a completion on the other.
 
 static HDA_MMIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HDA_OUT_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+/// Input stream descriptor base.  0 = sentinel for "capture not armed" (the
+/// ISR must not touch a non-existent descriptor).
+static HDA_IN_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HDA_IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static HDA_IN_IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-/// Called from the device vector with interrupts disabled.  Acknowledges the
-/// completion interrupt and counts it; the playback loop drains the count.
+/// Called from the device vector with interrupts disabled.  Acknowledges
+/// every pending stream completion and counts each stream independently.
 fn hda_irq_handler() {
     use core::sync::atomic::Ordering;
     let mmio = HDA_MMIO.load(Ordering::Relaxed);
@@ -154,11 +179,16 @@ fn hda_irq_handler() {
         return;
     }
     let ob = HDA_OUT_BASE.load(Ordering::Relaxed) as u64;
+    let ib = HDA_IN_BASE.load(Ordering::Relaxed) as u64;
     unsafe {
-        // Write-1-to-clear BCIS: deasserts the INTx/MSI level.
+        // Write-1-to-clear each BCIS: deasserts the INTx/MSI level.
         core::ptr::write_volatile((mmio + ob + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+        let _ = HDA_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        if ib != 0 {
+            core::ptr::write_volatile((mmio + ib + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+            let _ = HDA_IN_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        }
     }
-    HDA_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 struct Inner {
@@ -173,6 +203,9 @@ struct Inner {
     buf_virt: u64,
     /// Register offset of the first output stream.
     out_base: u32,
+    /// Register offset of the first input stream (0x80; input descriptors
+    /// 0..BSS live under the output block).  0 when capture is not armed.
+    in_base: u32,
     /// RIRB write pointer seen so far (response ring consumption).
     last_wp: u16,
     /// BDL ring depth used by the streaming path.
@@ -358,6 +391,9 @@ impl VerbSender for Inner {
 
 pub struct HdaAudio {
     inner: Mutex<Inner>,
+    /// Whether the input path is wired end-to-end (codec has an ADC and its
+    /// input path came up).  Set once during init, read by `can_record`.
+    cap_ready: core::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for HdaAudio {}
@@ -379,6 +415,24 @@ impl AudioDevice for HdaAudio {
         next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
     ) -> Result<u64, &'static str> {
         self.play_stream(total_bytes, entry_bytes, next)
+    }
+
+    fn can_record(&self) -> bool {
+        use core::sync::atomic::Ordering;
+        self.cap_ready.load(Ordering::Acquire)
+    }
+
+    fn record_pcm(&self, dest: &mut [i16]) -> Result<(), &'static str> {
+        self.record(dest)
+    }
+
+    fn record_pcm_stream(
+        &self,
+        total_bytes: u32,
+        entry_bytes: usize,
+        sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
+    ) -> Result<u64, &'static str> {
+        self.record_stream(total_bytes, entry_bytes, sink)
     }
 }
 
@@ -578,6 +632,235 @@ impl HdaAudio {
         i.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
         Ok(total_bytes as u64)
     }
+
+    /// Record a whole buffer: `dest.len()` i16 samples of interleaved stereo
+    /// 48 kHz audio, captured through a two-entry BDL into the staging buffer
+    /// and copied out once the DMA has delivered the full length.  Blocking;
+    /// the mirror image of `play`.
+    fn record(&self, dest: &mut [i16]) -> Result<(), &'static str> {
+        use core::sync::atomic::Ordering;
+        if !self.cap_ready.load(Ordering::Acquire) {
+            return Err("capture not supported");
+        }
+        let i = self.inner.lock();
+        let nbytes = dest.len() * 2;
+        if nbytes == 0 {
+            return Err("empty PCM");
+        }
+        if nbytes > BUF_CAP {
+            return Err("PCM larger than DMA buffer");
+        }
+        // BDL lengths must be an integer number of 32-bit words (3.6.3).
+        if nbytes % 4 != 0 {
+            return Err("PCM length not word-aligned");
+        }
+        let ib = i.in_base;
+
+        // Two-entry BDL: the whole buffer split at a 128-byte boundary, both
+        // IOC.  The spec requires LVI >= 1 — at least two valid descriptors
+        // before DMA can begin (3.3.39) — and every buffer start 128-byte
+        // aligned (3.6.3); splitting at `buf_phys + split` keeps both aligned.
+        let split = if nbytes >= 256 {
+            (nbytes / 2) / 128 * 128
+        } else {
+            nbytes.min(128)
+        };
+        let e0 = split;
+        let e1 = nbytes - split;
+        let bdl = i.bdl_virt as *mut u64;
+        unsafe {
+            write_volatile(bdl, i.buf_phys);
+            write_volatile(bdl.add(1), ((BDL_IOC as u64) << 32) | (e0 as u64));
+            write_volatile(bdl.add(2), i.buf_phys + split as u64);
+            write_volatile(bdl.add(3), ((BDL_IOC as u64) << 32) | (e1 as u64));
+        }
+
+        // Reset the input stream (assert SRST, then deassert) while stopped.
+        // RUN must be clear before SRST is asserted (3.3.35, bit 0), which it
+        // is: every prior stop leaves RUN=0 and the tag in SDnCTL.
+        i.w32(ib + regs::SD_CTL, SD_CTL_SRST);
+        core::hint::spin_loop();
+        i.w32(ib + regs::SD_CTL, 0);
+
+        // Program the stream descriptor (CBL/LVI may only be written after a
+        // reset and with RUN=0, per 3.3.38/3.3.39).
+        i.w32(ib + regs::SD_BDPL, i.bdl_phys as u32);
+        i.w32(ib + regs::SD_BDPU, (i.bdl_phys >> 32) as u32);
+        i.w16(ib + regs::SD_LVI, 1);
+        i.w32(ib + regs::SD_CBL, nbytes as u32);
+        i.w16(ib + regs::SD_FMT, SD_FMT_48K_STEREO_16);
+
+        // Start DMA.  The input tag (2) matches the codec's ADC `SET_CONV`;
+        // as with output, a stop must preserve it in SDnCTL.
+        let mut irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
+        i.w8(ib + regs::SD_STS, SD_STS_BCIS);
+        i.w32(
+            ib + regs::SD_CTL,
+            SD_CTL_INPUT_STREAM_TAG | SD_CTL_RUN | SD_CTL_IOCE,
+        );
+
+        // Let the capture run for the full duration, then wait for both BDL
+        // entries to complete (IRQ count delta = 2, or two BCIS poll-clear
+        // cycles when no IRQ is wired) before draining the FIFO.  If no audio
+        // source is connected QEMU still delivers silence, so the DMA
+        // advances and the buffer fills; a still-missing completion is
+        // tolerated, mirroring `play`'s tolerance of a missing wrap.
+        let frames = dest.len() / CHANNELS;
+        let ms = (frames as u64) * 1000 / SAMPLE_RATE as u64;
+        crate::services::universal_timer::sleep_ms(ms);
+        let mut remaining = 2u64;
+        let deadline = crate::services::universal_timer::now_ns() + 500_000_000;
+        while remaining > 0 {
+            if !crate::services::universal_timer::wait_until_cond(deadline, &|| {
+                HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != irq_seen
+                    || i.r8(ib + regs::SD_STS) & SD_STS_BCIS != 0
+            }) {
+                break;
+            }
+            if HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != irq_seen {
+                let cur = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
+                let delta = cur - irq_seen;
+                irq_seen = cur;
+                remaining = remaining.saturating_sub(delta);
+            } else {
+                i.w8(ib + regs::SD_STS, SD_STS_BCIS);
+                remaining -= 1;
+            }
+        }
+        crate::services::universal_timer::sleep_ms(50);
+
+        // Copy the captured samples out of the live DMA buffer.
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                i.buf_virt as *const u8,
+                dest.as_mut_ptr() as *mut u8,
+                nbytes,
+            );
+        }
+
+        let lpib = i.r32(ib + regs::SD_LPIB);
+        SerialPort::puts("[audio] hda: captured ");
+        SerialPort::put_u64(nbytes as u64);
+        SerialPort::puts(" B (lpib=");
+        SerialPort::put_u64(lpib as u64);
+        SerialPort::puts(")\n");
+
+        // Stop DMA but keep the input stream tag in SDnCTL.
+        i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
+        Ok(())
+    }
+
+    /// Record PCM through a continuously-running BDL ring, mirroring
+    /// `play_stream`.  The ring geometry is programmed once; each completion
+    /// frees one slot, which is copied out into an owned chunk (the ring is
+    /// live DMA memory being overwritten by the controller) and handed to
+    /// `sink`.  The final chunk is trimmed to the exact requested size.
+    fn record_stream(
+        &self,
+        total_bytes: u32,
+        entry_bytes: usize,
+        sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
+    ) -> Result<u64, &'static str> {
+        use core::sync::atomic::Ordering;
+        if !self.cap_ready.load(Ordering::Acquire) {
+            return Err("capture not supported");
+        }
+        let i = self.inner.lock();
+        let ib = i.in_base;
+        let n = i.ring_entries;
+        let eb = entry_bytes;
+        let ring_cap = BUF_CAP / n;
+        if eb == 0 || eb > ring_cap || total_bytes == 0 {
+            return Err("bad stream params");
+        }
+        // Every ring slot must keep the 128-byte buffer alignment of 3.6.3.
+        if eb % 128 != 0 {
+            return Err("entry size not 128-byte aligned");
+        }
+
+        // Number of `eb`-sized entries the payload occupies.  Ring slots are
+        // all `eb` bytes long and CBL is the padded total, so the fixed
+        // geometry holds across ring wraps; the final slot's trailing capture
+        // is discarded by the trim below.
+        let needed = (total_bytes as u64).div_ceil(eb as u64) as usize;
+        let cbl = (needed as u64).saturating_mul(eb as u64) as u32;
+
+        let bdl = i.bdl_virt as *mut u64;
+        for k in 0..n {
+            let used = k < needed;
+            let len = if used { eb } else { 0 };
+            let flags = if used { BDL_IOC } else { 0 };
+            unsafe {
+                write_volatile(bdl.add(k * 2), i.buf_phys + (k as u64) * eb as u64);
+                write_volatile(bdl.add(k * 2 + 1), ((flags as u64) << 32) | (len as u64));
+            }
+        }
+
+        // Clear any stale completion, reset the stream, program the ring.
+        i.w8(ib + regs::SD_STS, SD_STS_BCIS);
+        i.w32(ib + regs::SD_CTL, SD_CTL_SRST);
+        core::hint::spin_loop();
+        i.w32(ib + regs::SD_CTL, 0);
+        i.w32(ib + regs::SD_BDPL, i.bdl_phys as u32);
+        i.w32(ib + regs::SD_BDPU, (i.bdl_phys >> 32) as u32);
+        i.w16(ib + regs::SD_LVI, (n - 1) as u16);
+        i.w32(ib + regs::SD_CBL, cbl);
+        i.w16(ib + regs::SD_FMT, SD_FMT_48K_STEREO_16);
+
+        // Start DMA.
+        let mut irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
+        i.w32(
+            ib + regs::SD_CTL,
+            SD_CTL_INPUT_STREAM_TAG | SD_CTL_RUN | SD_CTL_IOCE,
+        );
+
+        // Drain completions; completion `completed - 1` filled slot
+        // `(completed - 1) mod n`, which the controller will not revisit
+        // until the ring has cycled n entries later.
+        let mut completed: u64 = 0;
+        let mut recorded: u64 = 0;
+        while completed < needed as u64 {
+            let seen = irq_seen;
+            let deadline = crate::services::universal_timer::now_ns() + 1_000_000_000;
+            let got = crate::services::universal_timer::wait_until_cond(deadline, &|| {
+                HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != seen
+                    || i.r8(ib + regs::SD_STS) & SD_STS_BCIS != 0
+            });
+            if !got {
+                i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
+                return Err("capture stalled");
+            }
+            if HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != seen {
+                irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
+            } else {
+                i.w8(ib + regs::SD_STS, SD_STS_BCIS);
+            }
+            completed += 1;
+
+            let slot = ((completed - 1) % n as u64) as usize;
+            let bytes = if (completed as usize) == needed {
+                total_bytes as usize - (needed - 1) * eb
+            } else {
+                eb
+            };
+            let n_i16 = bytes / 2;
+            let mut chunk = alloc::vec![0i16; n_i16];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    (i.buf_virt + slot as u64 * eb as u64) as *const u8,
+                    chunk.as_mut_ptr() as *mut u8,
+                    bytes,
+                );
+            }
+            sink(chunk);
+            recorded += bytes as u64;
+        }
+
+        // Allow the codec FIFO to settle, then stop keeping the input tag.
+        crate::services::universal_timer::sleep_ms(20);
+        i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
+        Ok(recorded)
+    }
 }
 
 /// Bring up the controller at `dev` and return it as a leakable device.
@@ -614,9 +897,11 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
             buf_phys: buf.phys,
             buf_virt: buf.virt,
             out_base: 0,
+            in_base: 0,
             last_wp: 0,
             ring_entries: RING_ENTRIES,
         }),
+        cap_ready: core::sync::atomic::AtomicBool::new(false),
     });
     let audio: &'static HdaAudio = Box::leak(audio);
 
@@ -667,6 +952,10 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         let oss = (gcap >> 12) & 0x0f;
         let out_base = 0x80 + (iss as u32) * 0x20;
         i.out_base = out_base;
+        // Input streams live at descriptor 0 (register index < 4 is an input
+        // stream; QEMU decides direction by the register index, not a
+        // descriptor bit).  Armed only when a codec with an ADC is selected.
+        let in_base = 0x80u32;
         SerialPort::puts("[audio] hda: iss=");
         SerialPort::put_u64(iss as u64);
         SerialPort::puts(" oss=");
@@ -733,13 +1022,17 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         // probe each, and keep a usable one.  Prefer a codec with an analog
         // output (line-out/speaker/headphone) over a digital-only one such as
         // the Intel HDMI/DP function, which has no path to the speakers;
-        // digital is only a fallback.  QEMU's hda-output codec is analog, so
-        // its selection is unchanged.
+        // digital is only a fallback.  Among analog-output codecs, one that
+        // *also* has an ADC wins: with both `hda-output` (cad 0, no ADC) and
+        // `hda-duplex` (cad 1, DAC+ADC) attached, the first probed analog
+        // codec is output-only, so picking it would silently lose capture.
         SerialPort::puts("[audio] hda: states=0x");
         SerialPort::put_hex(sts as u64);
         SerialPort::puts("\n");
 
         let mut codec: Option<codec::Codec> = None;
+        // An analog-output codec that can also capture (two-way preference).
+        let mut duplex: Option<codec::Codec> = None;
         let mut digital: Option<codec::Codec> = None;
         for cad in 0..16u32 {
             if sts & (1 << cad) == 0 {
@@ -785,7 +1078,11 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
                         }
                         SerialPort::puts("\n");
                         if c.out_is_analog() {
-                            if codec.is_none() {
+                            if c.adc.is_some() {
+                                if duplex.is_none() {
+                                    duplex = Some(c);
+                                }
+                            } else if codec.is_none() {
                                 codec = Some(c);
                             }
                         } else if digital.is_none() {
@@ -802,37 +1099,57 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
                 }
             }
         }
-        let codec = codec.or(digital).ok_or("no usable codec")?;
+        let codec = duplex.or(codec).or(digital).ok_or("no usable codec")?;
 
-        // Bring up the output path (power, amps, pin, stream binding).  The
-        // input path is configured best-effort; capture is not exposed yet.
-        // An ALC256 whose widget walk was truncated gets its hardcoded analog
-        // path instead of the generic one.
+        // Bring up the output path (power, amps, pin, stream binding), then
+        // the input path when the codec has an ADC.  An ALC256 whose widget
+        // walk was truncated gets its hardcoded analog path instead of the
+        // generic one (and, lacking a hardcoded input binding, stays
+        // playback-only).  Capture is armed only when setup succeeds.
         if codec::is_realtek_alc256(codec.vendor) {
             SerialPort::puts("[audio] hda: alc256 hardcoded analog path\n");
             codec::setup_alc256_output(&mut *i, &codec, STREAM_TAG)?;
         } else {
             codec::setup_output(&mut *i, &codec, STREAM_TAG)?;
         }
-        let _ = codec::setup_input(&mut *i, &codec, INPUT_TAG);
+        let mut cap_ok = codec.adc.is_some();
+        if cap_ok {
+            match codec::setup_input(&mut *i, &codec, INPUT_TAG) {
+                Ok(()) => SerialPort::puts("[audio] hda: input path ready\n"),
+                Err(e) => {
+                    SerialPort::puts("[audio] hda: input path failed: ");
+                    SerialPort::puts(e);
+                    SerialPort::puts("\n");
+                    cap_ok = false;
+                }
+            }
+        }
+        audio.cap_ready.store(cap_ok, core::sync::atomic::Ordering::Release);
+        if cap_ok {
+            i.in_base = in_base;
+        }
 
         // Publish the registers the completion ISR needs (lock-free), then
         // enable stream-completion interrupts.  Best-effort: playback falls
         // back to polling BCIS if the route can't be established.
         HDA_MMIO.store(mmio, core::sync::atomic::Ordering::Release);
         HDA_OUT_BASE.store(out_base, core::sync::atomic::Ordering::Release);
+        if cap_ok {
+            HDA_IN_BASE.store(in_base, core::sync::atomic::Ordering::Release);
+        }
         #[cfg(target_arch = "x86_64")]
-        setup_stream_interrupt(dev, out_base);
+        setup_stream_interrupt(dev, out_base, in_base, cap_ok);
     }
 
     Ok(audio)
 }
 
-/// Enable stream-completion interrupts for the output stream: MSI when the
-/// controller exposes a capability, legacy INTx otherwise.  QEMU's intel-hda
-/// advertises MSI by default, so the MSI path is the normal one.
+/// Enable stream-completion interrupts for the output (and, when capture is
+/// armed, input) streams: MSI when the controller exposes a capability,
+/// legacy INTx otherwise.  QEMU's intel-hda advertises MSI by default, so the
+/// MSI path is the normal one.
 #[cfg(target_arch = "x86_64")]
-fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32) {
+fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32, in_base: u32, cap_ok: bool) {
     use crate::arch::x86_64::idt;
     use crate::pci::caps;
     use crate::drivers::serial::SerialPort;
@@ -872,8 +1189,13 @@ fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32) {
         return;
     }
 
-    // Gate the stream's completion interrupt and the global enable.
-    let intctl = (1 << stream_index) | (1 << 31);
+    // Gate completion interrupts for the output and (when armed) input
+    // streams, plus the global enable.
+    let mut intctl = (1 << stream_index) | (1 << 31);
+    if cap_ok {
+        let in_stream_index = (in_base - 0x80) / 0x20;
+        intctl |= 1 << in_stream_index;
+    }
     unsafe {
         let mmio = HDA_MMIO.load(core::sync::atomic::Ordering::Relaxed);
         core::ptr::write_volatile((mmio + global_regs::INTCTL as u64) as *mut u32, intctl);

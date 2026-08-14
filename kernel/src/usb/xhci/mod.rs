@@ -315,23 +315,36 @@ fn bind_slot(
 ) -> Result<Vec<BoundUsbDevice>, &'static str> {
     use crate::drivers::serial::SerialPort;
     use crate::usb::class::driver::{EndpointResource, InterfaceResources, UsbClassDriver};
-    use crate::usb::usb::{EP_TYPE_BULK, EP_TYPE_INTERRUPT};
+    use crate::usb::usb::{EP_TYPE_BULK, EP_TYPE_INTERRUPT, EP_TYPE_ISOCH};
 
     device::get_config_descriptor_full(slot, doorbell_va, slot.icc_phys, slot.icc_va)?;
 
+    // Debug-only isochronous transport exercise (usb_trace): configure any
+    // isochronous interface of this slot and fire a single isoch OUT TD.  No
+    // audio consumer driver exists, so without this hook the endpoints would
+    // never be configured at all.
+    #[cfg(feature = "usb_trace")]
+    try_isoch_transport_test(slot, cmd_ring, doorbell_va, dma);
+
     // Match every interface against the class-driver registry in one pass.
+    // Only alternate-setting-0 interfaces are binding targets; non-zero
+    // settings are retained solely for the isochronous transport path.
     let matched: Vec<(usize, &'static dyn UsbClassDriver)> = slot
         .interfaces
         .iter()
         .enumerate()
         .filter_map(|(idx, iface)| {
+            if iface.alt_setting != 0 {
+                return None;
+            }
             crate::usb::class::driver::find_driver(iface.class, iface.subclass, iface.protocol)
                 .map(|driver| (idx, driver))
         })
         .collect();
     if matched.is_empty() {
         // No registered driver wants this device; leave it unconfigured (no
-        // SET_CONFIGURATION, no endpoints).
+        // SET_CONFIGURATION, no endpoints) unless the isoch test configured
+        // it above.
         return Ok(Vec::new());
     }
 
@@ -346,11 +359,6 @@ fn bind_slot(
         let pos = slot.ep_rings.iter().position(|(d, _)| *d == dci)?;
         Some(slot.ep_rings.remove(pos))
     };
-    let to_resource =
-        |pair: Option<(u8, memory::TrbRing)>, mps: u16, interval: u8| -> Option<EndpointResource> {
-            pair.map(|(dci, ring)| EndpointResource { dci, mps, interval, ring })
-        };
-    let ep_meta = |ep: &device::UsbEndpoint| (ep.mps, ep.interval);
 
     for (idx, driver) in matched {
         // Copy the interface metadata out first so we can mutate slot.ep_rings
@@ -360,34 +368,30 @@ fn bind_slot(
         let mut bulk_out = None;
         let mut bulk_in = None;
         let mut interrupt_in = None;
+        let mut interrupt_out = None;
+        let mut isoch_out = None;
+        let mut isoch_in = None;
         for ep in &iface.endpoints {
             let ring = take_ring(slot, ep.dci);
+            let resource = ring.map(|(dci, ring)| EndpointResource {
+                dci,
+                mps: ep.mps,
+                interval: ep.interval,
+                max_burst: ep.max_burst,
+                mult: ep.mult,
+                max_esit_payload: ep.max_esit_payload,
+                ring,
+            });
             match (ep.ep_type, ep.dci & 1) {
-                (EP_TYPE_BULK, 0) => bulk_out = ring,
-                (EP_TYPE_BULK, _) => bulk_in = ring,
-                (EP_TYPE_INTERRUPT, _) => interrupt_in = ring,
+                (EP_TYPE_BULK, 0) => bulk_out = resource,
+                (EP_TYPE_BULK, _) => bulk_in = resource,
+                (EP_TYPE_INTERRUPT, 0) => interrupt_out = resource,
+                (EP_TYPE_INTERRUPT, _) => interrupt_in = resource,
+                (EP_TYPE_ISOCH, 0) => isoch_out = resource,
+                (EP_TYPE_ISOCH, _) => isoch_in = resource,
                 _ => {}
             }
         }
-
-        let (bulk_out_mps, _) = iface
-            .endpoints
-            .iter()
-            .find(|e| e.ep_type == EP_TYPE_BULK && e.dci & 1 == 0)
-            .map(ep_meta)
-            .unwrap_or((0, 0));
-        let (bulk_in_mps, _) = iface
-            .endpoints
-            .iter()
-            .find(|e| e.ep_type == EP_TYPE_BULK && e.dci & 1 == 1)
-            .map(ep_meta)
-            .unwrap_or((0, 0));
-        let (intr_mps, intr_interval) = iface
-            .endpoints
-            .iter()
-            .find(|e| e.ep_type == EP_TYPE_INTERRUPT && e.dci & 1 == 1)
-            .map(ep_meta)
-            .unwrap_or((0, 0));
 
         let res = InterfaceResources {
             slot_id: slot.slot_id,
@@ -396,9 +400,12 @@ fn bind_slot(
             iface_class: iface.class,
             iface_subclass: iface.subclass,
             iface_protocol: iface.protocol,
-            bulk_in: to_resource(bulk_in, bulk_in_mps, 0),
-            bulk_out: to_resource(bulk_out, bulk_out_mps, 0),
-            interrupt_in: to_resource(interrupt_in, intr_mps, intr_interval),
+            bulk_in,
+            bulk_out,
+            interrupt_in,
+            interrupt_out,
+            isoch_out,
+            isoch_in,
         };
 
         SerialPort::puts("[usbdrv] ");
@@ -425,6 +432,124 @@ fn bind_slot(
     }
 
     Ok(bound)
+}
+
+/// Debug-only isochronous transport exercise.  Finds the first interface of
+/// the slot that carries isochronous endpoints (a UAC1 audio streaming
+/// interface exposes them only at alternate setting >= 1), configures the
+/// endpoint, selects that alternate setting, and fires a single isoch OUT TRB
+/// so the xHCI transfer/completion path is exercised.  The (short)
+/// completion code is logged.  Compiled only with `usb_trace`; never a
+/// permanent consumer driver.
+#[cfg(feature = "usb_trace")]
+fn try_isoch_transport_test(
+    slot: &mut device::DeviceSlot,
+    cmd_ring: &mut memory::TrbRing,
+    doorbell_va: u64,
+    dma: &dyn DmaAllocator,
+) {
+    use crate::drivers::serial::SerialPort;
+    use crate::usb::usb::{EP_TYPE_ISOCH, SetupPacket};
+
+    let Some(idx) = slot
+        .interfaces
+        .iter()
+        .enumerate()
+        .find(|(_, i)| i.endpoints.iter().any(|e| e.ep_type == EP_TYPE_ISOCH))
+        .map(|(i, _)| i)
+    else {
+        return;
+    };
+    let (iface_num, alt_setting) = {
+        let iface = &slot.interfaces[idx];
+        (iface.iface_num, iface.alt_setting)
+    };
+
+    SerialPort::puts("[xhci] isoch transport test: iface ");
+    SerialPort::put_u64(iface_num as u64);
+    SerialPort::puts(" alt=");
+    SerialPort::put_u64(alt_setting as u64);
+    SerialPort::puts("\n");
+
+    // Configure the isochronous endpoint on the xHC first — this issues the
+    // required SET_CONFIGURATION on an unconfigured slot before the
+    // Configure Endpoint command.
+    let indices = alloc::vec![idx];
+    if let Err(e) = device::configure_device(slot, cmd_ring, doorbell_va, dma, &indices) {
+        SerialPort::puts("[xhci] isoch test configure failed: ");
+        SerialPort::puts(e);
+        SerialPort::puts("\n");
+        return;
+    }
+
+    // Select the endpoint's alternate setting so the device activates the
+    // isochronous endpoint (must follow SET_CONFIGURATION, which
+    // configure_device just issued).
+    if alt_setting > 0 {
+        let setup = SetupPacket::set_interface(iface_num as u16, alt_setting as u16);
+        if let Err(e) = device::submit_control_transfer(
+            &mut slot.ep0_ring,
+            doorbell_va,
+            slot.slot_id,
+            &setup,
+            0,
+            0,
+            false,
+        ) {
+            SerialPort::puts("[xhci] isoch test SET_INTERFACE failed: ");
+            SerialPort::puts(e);
+            SerialPort::puts("\n");
+            return;
+        }
+    }
+
+    let Some((dci, mps)) = slot.interfaces[idx]
+        .endpoints
+        .iter()
+        .find(|e| e.ep_type == EP_TYPE_ISOCH && e.dci & 1 == 0)
+        .map(|e| (e.dci, e.mps))
+    else {
+        SerialPort::puts("[xhci] isoch test: no isoch OUT endpoint\n");
+        return;
+    };
+    let slot_id = slot.slot_id;
+
+    let Some(out_ring) = device::find_ep_ring_mut(slot, dci) else {
+        SerialPort::puts("[xhci] isoch test: no ring for isoch OUT\n");
+        return;
+    };
+
+    let buf = match dma.alloc_page() {
+        Some(b) => b,
+        None => {
+            SerialPort::puts("[xhci] isoch test: OOM\n");
+            return;
+        }
+    };
+    unsafe { core::ptr::write_bytes(buf.virt as *mut u8, 0, 4096) };
+
+    match device::submit_isoch(
+        out_ring,
+        doorbell_va,
+        slot_id,
+        dci,
+        buf.phys,
+        mps as u32,
+        1_000_000_000,
+    ) {
+        Ok(cc) => {
+            SerialPort::puts("[xhci] isoch test OUT dci=");
+            SerialPort::put_u64(dci as u64);
+            SerialPort::puts(" cc=");
+            SerialPort::put_u64(cc as u64);
+            SerialPort::puts("\n");
+        }
+        Err(e) => {
+            SerialPort::puts("[xhci] isoch test failed: ");
+            SerialPort::puts(e);
+            SerialPort::puts("\n");
+        }
+    }
 }
 
 /// Poll the retained xHCI controller for queued port-change events and

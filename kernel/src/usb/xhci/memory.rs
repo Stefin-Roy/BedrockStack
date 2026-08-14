@@ -239,6 +239,61 @@ pub fn make_normal_trb(data_phys: u64, len: u32) -> Trb {
     Trb::new(data_phys, len & 0x1FFFF, control)
 }
 
+/// Like [`make_normal_trb`] but with explicit CHAIN/IOC control bits, for
+/// chained multi-TRB transfer descriptors (e.g. an isochronous TD larger than
+/// one burst): CHAIN=1 on every TRB of the TD except the last.
+pub fn make_normal_trb_flags(data_phys: u64, len: u32, chain: bool, ioc: bool) -> Trb {
+    let mut control = (TRB_TYPE_NORMAL as u32) << 10;
+    if chain {
+        control |= TRB_CHAIN;
+    }
+    if ioc {
+        control |= TRB_IOC;
+    }
+    Trb::new(data_phys, len & 0x1FFFF, control)
+}
+
+/// Build an isochronous TRB (spec Tables 6-32/33/34).  A single transfer may
+/// span multiple TRBs chained via CHAIN=1 (see [`make_normal_trb_flags`]).
+///
+/// * `frame_id` — 11-bit frame in which to schedule the transfer, meaningful
+///   only when `sia` (Schedule-Immediate-Activation) is clear.
+/// * `tbc` — TD toggle bit (isoch IN endpoints only; 0 for OUT).
+/// * `tlbpc` — last-burst-packet count (0 unless the TD exceeds one burst);
+///   for the common single-burst case it equals the TD Size / packet count.
+/// * `ioc` — interrupt-on-completion, so the (possibly overrun/underrun)
+///   completion code is observable.
+pub fn make_isoch_trb(
+    data_phys: u64,
+    len: u32,
+    frame_id: u16,
+    sia: bool,
+    tbc: bool,
+    tlbpc: u8,
+    ioc: bool,
+) -> Trb {
+    // dw2: Transfer Length (bits 0-16); TD Size @17-21 and Interrupter
+    // Target @22-31 are 0 (single-TD, interrupter 0).
+    let status: u32 = len & 0x1FFFF;
+    // dw3: TBC @7, TRB Status @8, BEI @9, Type @10-15, TLBPC @16-19,
+    // Frame ID @20-30, SIA @31.
+    let mut control = (TRB_TYPE_ISOCH as u32) << 10;
+    if tbc {
+        control |= 1 << 7;
+    }
+    if tlbpc != 0 {
+        control |= (tlbpc as u32 & 0xF) << 16;
+    }
+    control |= (frame_id as u32 & 0x7FF) << 20;
+    if sia {
+        control |= TRB_SIA;
+    }
+    if ioc {
+        control |= TRB_IOC;
+    }
+    Trb::new(data_phys, status, control)
+}
+
 pub fn make_no_op_command_trb() -> Trb {
     Trb::new(0, 0, (TRB_TYPE_NO_OP_COMMAND as u32) << 10 | TRB_IOC)
 }

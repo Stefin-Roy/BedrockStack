@@ -9,7 +9,9 @@
 //! - the **report byte length** by summing `Report Size × Report Count` over
 //!   every `Input` main item (output/feature items are not part of the input
 //!   report), rounded up to a byte boundary, plus one byte when a `Report
-//!   ID` global item is present.
+//!   ID` global item is present,
+//! - the **output report byte length** from the `Output` main items (the
+//!   keyboard LED report), computed the same way.
 //!
 //! Only short items are handled (long items `0xFE` are skipped).  Items are
 //! the HID short-item prefix byte: bits[1:0] = data size (0/1/2/4 bytes),
@@ -21,6 +23,9 @@ use crate::usb::class::hid::HidKind;
 pub struct HidReportInfo {
     /// Input report byte length (rounded up, +1 if a Report ID is present).
     pub report_len: usize,
+    /// Output report byte length (e.g. the keyboard LED report); 0 when the
+    /// descriptor has no Output items.
+    pub output_len: usize,
     /// The device kind decoded from the application collection usage.
     pub kind: HidKind,
 }
@@ -37,6 +42,7 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Option<HidReportInfo> {
     let mut report_count: u32 = 1;
     let mut has_report_id = false;
     let mut input_bits: u64 = 0;
+    let mut output_bits: u64 = 0;
     let mut kind: Option<HidKind> = None;
 
     let mut off = 0;
@@ -74,8 +80,14 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Option<HidReportInfo> {
                         input_bits += (report_size as u64) * (report_count as u64);
                         local_usage = 0;
                     }
-                    9 | 0xB => {
-                        // Output / Feature: not part of the input report.
+                    9 => {
+                        // Output: contributes to the output report (e.g. the
+                        // keyboard LED report).
+                        output_bits += (report_size as u64) * (report_count as u64);
+                        local_usage = 0;
+                    }
+                    0xB => {
+                        // Feature: part of neither report.
                         local_usage = 0;
                     }
                     0xA => {
@@ -120,7 +132,12 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Option<HidReportInfo> {
     if report_len == 0 || report_len > 4096 {
         return None;
     }
-    Some(HidReportInfo { report_len, kind })
+    let out_bytes = ((output_bits + 7) / 8) as usize;
+    let output_len = if has_report_id { out_bytes + 1 } else { out_bytes };
+    if output_len > 4096 {
+        return None;
+    }
+    Some(HidReportInfo { report_len, output_len, kind })
 }
 
 fn le_u32(data: &[u8]) -> u32 {

@@ -810,6 +810,64 @@ pub fn self_test() {
         Err(e) => log::warn!("unispace: read /input/kbd:get failed: {:?}", e),
     }
 
+    // /driver provider: the audio device surface.  The value is a live
+    // snapshot (ready state may be false on riscv64, where no controller
+    // exists); the blocking playback methods are only schema-probed here —
+    // invoking play_tone from boot context would hold the CPU for the tone's
+    // whole duration.
+    #[cfg(target_arch = "x86_64")]
+    {
+        out.clear();
+        match read("/driver/audio", &mut out, usize::MAX) {
+            Ok(()) => {
+                let s = &provider::driver::AUDIO_STATE;
+                match schema::decode_value(&out, s) {
+                    Ok(v) => {
+                        SerialPort::puts("read(/driver/audio) = ");
+                        SerialPort::puts(&schema::value_text(&v, s));
+                        SerialPort::puts("\n");
+                    }
+                    Err(e) => log::warn!("unispace: /driver/audio decode failed: {:?}", e),
+                }
+            }
+            Err(e) => log::warn!("unispace: read /driver/audio failed: {:?}", e),
+        }
+
+        out.clear();
+        match read("/driver/audio:play_tone", &mut out, usize::MAX) {
+            Ok(()) => match schema::decode_method_bytes(&out) {
+                Ok((name, input, output)) => {
+                    SerialPort::puts("read(/driver/audio:play_tone) = method ");
+                    SerialPort::puts(&name);
+                    SerialPort::puts(" in ");
+                    SerialPort::puts(&schema::text_of_owned(&input));
+                    SerialPort::puts(" out ");
+                    SerialPort::puts(&schema::text_of_owned(&output));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /driver/audio:play_tone decode failed: {:?}", e),
+            },
+            Err(e) => log::warn!("unispace: read /driver/audio:play_tone failed: {:?}", e),
+        }
+
+        out.clear();
+        match read("/driver/audio:play_pcm", &mut out, usize::MAX) {
+            Ok(()) => match schema::decode_method_bytes(&out) {
+                Ok((name, input, output)) => {
+                    SerialPort::puts("read(/driver/audio:play_pcm) = method ");
+                    SerialPort::puts(&name);
+                    SerialPort::puts(" in ");
+                    SerialPort::puts(&schema::text_of_owned(&input));
+                    SerialPort::puts(" out ");
+                    SerialPort::puts(&schema::text_of_owned(&output));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /driver/audio:play_pcm decode failed: {:?}", e),
+            },
+            Err(e) => log::warn!("unispace: read /driver/audio:play_pcm failed: {:?}", e),
+        }
+    }
+
     // Cleanup the exercise tree.
     let _ = write_method("/A/nos_test:unlink", &name_val("file"), s_create, &mut payload, &mut out);
     let _ = write_method("/A/nos_test:rmdir", &name_val("sub"), s_create, &mut payload, &mut out);

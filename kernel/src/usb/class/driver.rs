@@ -26,6 +26,14 @@ pub struct EndpointResource {
     /// xHCI endpoint-context Interval value (already converted per
     /// spec Table 6-12), not the raw USB `bInterval`.
     pub interval: u8,
+    /// Max Burst Size (xHCI context dw1:8-15): HS isoch/interrupt bits 12:11,
+    /// SS `bMaxBurst`.  0 for FS/LS.
+    pub max_burst: u8,
+    /// Endpoint-context Mult (SuperSpeed isochronous only); 0 otherwise.
+    pub mult: u8,
+    /// Max ESIT Payload (context dw4:16-31); informational for drivers —
+    /// the context was already built with it.  0 for bulk.
+    pub max_esit_payload: u16,
     pub ring: TrbRing,
 }
 
@@ -42,6 +50,9 @@ pub struct InterfaceResources {
     pub bulk_in: Option<EndpointResource>,
     pub bulk_out: Option<EndpointResource>,
     pub interrupt_in: Option<EndpointResource>,
+    pub interrupt_out: Option<EndpointResource>,
+    pub isoch_out: Option<EndpointResource>,
+    pub isoch_in: Option<EndpointResource>,
 }
 
 /// The device a class driver binds.  Block devices are registered with the
