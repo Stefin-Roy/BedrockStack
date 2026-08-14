@@ -11,6 +11,11 @@
 //!   - `mem`    — `read` yields the eager user-memory accounting
 //!     `{root, brk, stack_top, committed_pages, budget_pages}` from `mm::usermem`;
 //!   - `args`   — `read` yields the caller's `:spawn` argument string;
+//!   - `std`    — the task's standard streams: `std/in` is an append-only
+//!     input leaf, and `std/out`/`std/err` drain on `read` (pipe/monitor
+//!     semantics, capped at 64 KiB with the oldest bytes dropped so a chatty
+//!     task cannot exhaust the heap); their `:get` method blocks the calling
+//!     task until output is available (x86_64 only);
 //!   - `:exit`  — write `{code}` to terminate the current task (diverges);
 //!   - `:yield` — write `()` to cooperatively reschedule;
 //!   - `:kill`  — write `{pid}` to park another task for reaping;
@@ -26,7 +31,8 @@
 //! (they mutate the caller's CR3), so they are meaningful only on `/proc/self`
 //! regardless of which pid the path names.
 //!
-//! `ProcDir` stores only its `pid` — never a `&'static mut Task`. Dead tasks
+//! `ProcDir` stores only its `pid` and the three standard-stream handles —
+//! never a `&'static mut Task`. Dead tasks
 //! park as zombies and keep their `/proc` dir (so a parent can find and
 //! `:wait` them) until `reap_dead`/a consuming `:wait` detaches them, so a
 //! stale entry can never outlive its task.
@@ -166,7 +172,15 @@ fn pid_key(pid: u64) -> String {
 /// Register a live task's directory. Idempotent (a re-registration replaces
 /// the previous entry with a fresh `ProcDir` of the same pid).
 pub fn attach(pid: u64) {
-    procs().lock().insert(pid_key(pid), Arc::new(ProcDir { pid }));
+    procs().lock().insert(
+        pid_key(pid),
+        Arc::new(ProcDir {
+            pid,
+            stdin: StdStream::new("in"),
+            stdout: StdStream::new("out"),
+            stderr: StdStream::new("err"),
+        }),
+    );
 }
 
 /// Deregister a task's directory (called from `reap_dead` before the task
@@ -251,6 +265,9 @@ impl Object for ProcRoot {
 /// the scheduler and is freed at reap (after `detach`).
 struct ProcDir {
     pid: u64,
+    stdin: StdStream,
+    stdout: StdStream,
+    stderr: StdStream,
 }
 
 impl Object for ProcDir {
@@ -276,6 +293,9 @@ impl Object for ProcDir {
         if name == "args" {
             return Some(Arc::new(ArgsObject { pid: self.pid }) as Arc<dyn Object>);
         }
+        if name == "std" {
+            return Some(Arc::new(StdDir::of(self)) as Arc<dyn Object>);
+        }
         None
     }
 
@@ -291,6 +311,10 @@ impl Object for ProcDir {
         out.push(ListingEntry {
             name: String::from("args"),
             kind: ObjectKind::Service,
+        });
+        out.push(ListingEntry {
+            name: String::from("std"),
+            kind: ObjectKind::Dir,
         });
         Ok(())
     }
@@ -474,6 +498,191 @@ impl Object for ArgsObject {
 
     fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
         Err(UnispaceError::Unsupported)
+    }
+}
+
+// ── /proc/<pid>/std ────────────────────────────────────────────────
+
+/// Bounded per-process byte stream exposed as a unispace object. The value is
+/// a `Blob`; `read` drains up to `max` bytes (pipe/monitor semantics), `write`
+/// appends. The buffer is capped at `STREAM_CAP` bytes and overflow drops the
+/// OLDEST bytes (ring behavior) so one chatty process cannot exhaust the heap.
+const STREAM_CAP: usize = 64 * 1024;
+
+/// A cloneable handle to one of the task's standard streams (`in`/`out`/`err`).
+/// The buffer lives behind an `Arc<Mutex<Vec<u8>>>`, so a `StdDir` exposes the
+/// same live streams its `ProcDir` owns — writes through one handle are visible
+/// to every reader, and `attach` creates one `StdStream` per pid.
+#[derive(Clone)]
+struct StdStream {
+    name: &'static str,
+    buf: Arc<Mutex<Vec<u8>>>,
+}
+
+impl StdStream {
+    fn new(name: &'static str) -> Self {
+        StdStream {
+            name,
+            buf: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Append, dropping the oldest bytes once the cap is exceeded.
+    fn append(&self, bytes: &[u8]) {
+        let mut b = self.buf.lock();
+        b.extend_from_slice(bytes);
+        let excess = b.len().saturating_sub(STREAM_CAP);
+        if excess > 0 {
+            b.drain(..excess);
+        }
+    }
+
+    /// Remove and return up to `max` oldest bytes (a drain).
+    fn drain(&self, max: usize) -> Vec<u8> {
+        let mut b = self.buf.lock();
+        let n = core::cmp::min(max, b.len());
+        b.drain(..n).collect()
+    }
+}
+
+/// `:get` output: the stream's pending bytes (a `Blob`).
+static STD_METHODS: [MethodDesc; 1] = [MethodDesc {
+    name: "get",
+    input: &schema::SCHEMA_UNIT,
+    output: &schema::SCHEMA_BLOB,
+}];
+
+impl Object for StdStream {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Device
+    }
+
+    fn value_schema(&self) -> &'static Schema {
+        &schema::SCHEMA_BLOB
+    }
+
+    fn methods(&self) -> &'static [MethodDesc] {
+        &STD_METHODS
+    }
+
+    fn read_value(&self, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError> {
+        out.extend_from_slice(&self.drain(max));
+        Ok(())
+    }
+
+    fn write_value(&self, v: Value) -> Result<(), UnispaceError> {
+        let bytes = match v {
+            Value::Bytes(b) => b,
+            _ => return Err(UnispaceError::SchemaMismatch),
+        };
+        self.append(&bytes);
+        Ok(())
+    }
+
+    fn invoke(&self, method: usize, _v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+        match method {
+            0 => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    // Blocking get needs a running task to park; in pure kernel
+                    // context (no current task) it would busy-spin, so refuse.
+                    let pc = crate::smp::current_per_cpu();
+                    if pc.current_task.is_null() {
+                        return Err(UnispaceError::Unsupported);
+                    }
+                    // Blocking get: park until the stream yields bytes.
+                    loop {
+                        if self.buf.lock().is_empty() {
+                            crate::task::sleep_until(
+                                crate::services::universal_timer::now_ns().saturating_add(2_000_000),
+                            );
+                            continue;
+                        }
+                        let data = self.drain(STREAM_CAP);
+                        schema::encode_value(&Value::Bytes(data), &schema::SCHEMA_BLOB, out)?;
+                        return Ok(());
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
+                    let _ = out;
+                    Err(UnispaceError::Unsupported)
+                }
+            }
+            _ => Err(UnispaceError::MethodNotFound),
+        }
+    }
+}
+
+/// `/proc/<pid>/std`: the directory exposing the task's three streams. Each
+/// `resolve` clones the shared `Arc` handle, so reads/writes target the same
+/// buffers the `ProcDir` owns for the task's whole lifetime.
+struct StdDir {
+    input: StdStream,
+    output: StdStream,
+    err: StdStream,
+}
+
+impl StdDir {
+    fn of(p: &ProcDir) -> Self {
+        StdDir { input: p.stdin.clone(), output: p.stdout.clone(), err: p.stderr.clone() }
+    }
+}
+
+impl Object for StdDir {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Dir
+    }
+
+    fn value_schema(&self) -> &'static Schema {
+        &super::super::DIR_SCHEMA
+    }
+
+    fn methods(&self) -> &'static [MethodDesc] {
+        &[]
+    }
+
+    fn resolve(&self, name: &str) -> Option<Arc<dyn Object>> {
+        if name == "in" {
+            return Some(Arc::new(self.input.clone()) as Arc<dyn Object>);
+        }
+        if name == "out" {
+            return Some(Arc::new(self.output.clone()) as Arc<dyn Object>);
+        }
+        if name == "err" {
+            return Some(Arc::new(self.err.clone()) as Arc<dyn Object>);
+        }
+        None
+    }
+
+    fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
+        out.push(ListingEntry {
+            name: String::from("in"),
+            kind: ObjectKind::Device,
+        });
+        out.push(ListingEntry {
+            name: String::from("out"),
+            kind: ObjectKind::Device,
+        });
+        out.push(ListingEntry {
+            name: String::from("err"),
+            kind: ObjectKind::Device,
+        });
+        Ok(())
+    }
+
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
+        let mut entries = Vec::new();
+        self.list(&mut entries)?;
+        super::super::encode_listing(entries, out)
+    }
+
+    fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
+        Err(UnispaceError::Unsupported)
+    }
+
+    fn invoke(&self, _method: usize, _v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+        Err(UnispaceError::MethodNotFound)
     }
 }
 
