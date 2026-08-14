@@ -88,6 +88,14 @@ const PATH: &[u8] = b"/A/init/test\0";
 const MSG: &[u8] = b"hello from user space";
 const DEV: &[u8] = b"/driver/debugserial\0";
 const EXIT_PATH: &[u8] = b"/proc/self:exit\0";
+const SPAWN_PATH: &[u8] = b"/proc/self:spawn\0";
+const WAIT_PATH: &[u8] = b"/proc/self:wait\0";
+const ARGS_PATH: &[u8] = b"/proc/self/args\0";
+/// The INIT binary's ESP path as a `:spawn` payload string (no NUL — the
+/// schema payload is a length-prefixed string, not a C string).
+const SELF_ELF: &[u8] = b"/B/EFI/BEDROCK/INIT";
+/// The exit code the child uses to prove `:wait` retains and returns it.
+const CHILD_EXIT: u64 = 42;
 
 /// Pump `msg` out to COM1 via the debugserial device. Returns the -errno on
 /// failure so the caller can surface it on the wire too.
@@ -101,6 +109,99 @@ fn say(dev: &[u8], msg: &[u8]) -> Result<(), isize> {
     } else {
         Err(r)
     }
+}
+
+/// Read `/proc/self/args` and decode its `str` value into `buf`.  Returns the
+/// argument bytes on success, or the negative errno.
+fn read_self_args(buf: &mut [u8]) -> Result<&[u8], isize> {
+    let r = unsafe {
+        syscall(SYS_READ, ARGS_PATH.as_ptr() as usize, buf.as_mut_ptr() as usize, buf.len(), 0)
+    };
+    if r < 0 {
+        return Err(r);
+    }
+    let n = r as usize;
+    if n < 4 {
+        return Err(-1);
+    }
+    let len = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if 4 + len > n {
+        return Err(-1);
+    }
+    Ok(&buf[4..4 + len])
+}
+
+/// `write(/proc/self:spawn, {path: "/B/EFI/BEDROCK/INIT", args: "child"})`.
+/// On success writes the new pid to `out` and returns 0, else the -errno.
+fn spawn_child(out: &mut [u8; 8]) -> isize {
+    let args: &[u8] = b"child";
+    let mut payload = [0u8; 128];
+    let plen = SELF_ELF.len();
+    let alen = args.len();
+    let total = 8 + plen + alen;
+    if total > payload.len() {
+        return -(1);
+    }
+    payload[0..4].copy_from_slice(&(plen as u32).to_le_bytes());
+    payload[4..4 + plen].copy_from_slice(SELF_ELF);
+    payload[4 + plen..8 + plen].copy_from_slice(&(alen as u32).to_le_bytes());
+    payload[8 + plen..total].copy_from_slice(args);
+    let r = unsafe {
+        syscall(SYS_WRITE, SPAWN_PATH.as_ptr() as usize, payload.as_mut_ptr() as usize, total, 0)
+    };
+    if r < 0 {
+        return r;
+    }
+    if r < 8 {
+        return -(1);
+    }
+    out.copy_from_slice(&payload[..8]);
+    0
+}
+
+/// `write(/proc/self:wait, {pid})`; blocks until the child exits and returns
+/// its exit code on success (>= 0), else the -errno.
+fn wait_child(pid: u64) -> isize {
+    let mut payload = [0u8; 8];
+    payload.copy_from_slice(&pid.to_le_bytes());
+    let r = unsafe {
+        syscall(SYS_WRITE, WAIT_PATH.as_ptr() as usize, payload.as_mut_ptr() as usize, payload.len(), 0)
+    };
+    if r < 0 {
+        return r;
+    }
+    if r < 8 {
+        return -(1);
+    }
+    u64::from_le_bytes([
+        payload[0], payload[1], payload[2], payload[3],
+        payload[4], payload[5], payload[6], payload[7],
+    ]) as isize
+}
+
+/// Print `[user] <label> <decimal>\r\n` to COM1 via the debugserial device.
+fn say_num(dev: &[u8], label: &[u8], n: u64) {
+    let mut line = [0u8; 48];
+    let mut i = 0;
+    line[i..i + label.len()].copy_from_slice(label);
+    i += label.len();
+    let mut digits = [0u8; 20];
+    let mut d = 20;
+    let mut v = n;
+    if v == 0 {
+        digits[19] = b'0';
+        d = 19;
+    }
+    while v > 0 {
+        d -= 1;
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    line[i..i + (20 - d)].copy_from_slice(&digits[d..]);
+    i += 20 - d;
+    line[i] = b'\r';
+    line[i + 1] = b'\n';
+    let _ = say(dev, &line[..i + 2]);
 }
 
 /// Serialize a syscall failure as `FAIL n` + the complaint, then bail.
@@ -133,6 +234,20 @@ extern "C" fn exit_process(code: usize) -> ! {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn entry_main() -> usize {
+    // Role switch: the supervisor (no args) runs the demo and spawns a child
+    // to prove :spawn / :wait / exit-code retention end-to-end; the child
+    // (args == "child") verifies its arguments via /proc/self/args and exits
+    // with code CHILD_EXIT.
+    let mut abuf = [0u8; 64];
+    let args = match read_self_args(&mut abuf) {
+        Ok(a) => a,
+        Err(e) => fail(DEV, b"[user] read args ", e, 4),
+    };
+    if args == b"child".as_slice() {
+        let _ = say(DEV, b"[user] child: args verified\r\n");
+        exit_process(CHILD_EXIT as usize);
+    }
+
     // 1. Write a blob into the tmpfs file the kernel pre-created. The write
     //    buffer is consumed in place (output overwrites it, zero-filled), so
     //    the demo MSG copy lives on the stack; MSG itself stays intact for
@@ -161,6 +276,21 @@ pub extern "C" fn entry_main() -> usize {
     // 3. Prove a plain device path: these bytes hit COM1 right now.
     let _ = say(DEV, b"[user] hello from ring 3\r\n");
     let _ = say(DEV, b"[user] write/read ok\r\n");
+
+    // 4. Supervisor demo: spawn a copy of ourselves as a child (args="child"),
+    //    wait for it, and print its retained exit code.
+    let mut pidb = [0u8; 8];
+    let sres = spawn_child(&mut pidb);
+    if sres < 0 {
+        fail(DEV, b"[user] spawn ", sres, 5);
+    }
+    let pid = u64::from_le_bytes(pidb);
+    say_num(DEV, b"[user] spawned child pid=", pid);
+    let code = wait_child(pid);
+    if code < 0 {
+        fail(DEV, b"[user] wait ", code, 6);
+    }
+    say_num(DEV, b"[user] child exit code=", code as u64);
 
     0
 }
