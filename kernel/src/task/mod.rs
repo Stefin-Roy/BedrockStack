@@ -3,21 +3,23 @@
 //! A single global FIFO run queue of kernel tasks is switched by `switch_to`.
 //! The scheduler runs on the BSP only (APs idle in `ap_entry64`), so no
 //! per-CPU queues or cross-CPU locking are needed yet.  Tasks are
-//! `Box::leak`ed to `&'static mut`; exiting tasks are parked into `DEAD_TASKS`
-//! and reclaimed from the idle loop by `reap_dead` (root page tables,
-//! kernel stacks, and the task boxes).  The idle anchor is the run()/idle
-//! context, captured on the first switch away and restored when the queue
-//! empties.
+//! `Box::leak`ed to `&'static mut`; exiting tasks park as zombies in `ZOMBIES`
+//! (retaining their exit code and `/proc` directory) until a parent's `:wait`
+//! consumes them or their own parent dies, and `reap_dead` frees their root
+//! page tables, kernel stacks, and task boxes from the idle loop.  A parent
+//! that wants a child's exit code parks itself in `WAITERS` (the same pattern
+//! as `SLEEPING`).  The idle anchor is the run()/idle context, captured on the
+//! first switch away and restored when the queue empties.
 //!
 //! User-mode entry (`enter_userspace`) builds an iretq frame and an initial
-//! context pointing at `user_iret`; it is not exercised until a user program
-//! loader exists (Phase 6).
+//! context pointing at `user_iret`.
 
 mod switch;
 pub mod load;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::string::String;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -54,6 +56,17 @@ pub struct Task {
     pub root: u64,
     pub user_gs: u64,
     pub ctx: TaskContext,
+    /// Exit code retained while the task parks as a zombie (set by
+    /// `exit_current`, or `KILLED_EXIT_CODE` for a killed/faulted task),
+    /// consumed by a parent's `:wait`.
+    pub exit_code: u64,
+    /// The pid of the task that spawned this one (0 for kernel-launched tasks
+    /// such as INIT).  Only a task's parent may `:wait` on it.
+    pub parent_pid: u64,
+    /// Command-line arguments passed through `:spawn`'s `{path, args}` input,
+    /// readable by the task itself via `/proc/self/args`.  No entry-point ABI
+    /// change — the program fetches them like any other object.
+    pub args: String,
 }
 
 impl Task {
@@ -67,6 +80,9 @@ impl Task {
             root,
             user_gs,
             ctx,
+            exit_code: 0,
+            parent_pid: 0,
+            args: String::new(),
         }
     }
 }
@@ -134,15 +150,42 @@ static QUEUE: Mutex<VecDeque<&'static mut Task>> = Mutex::new(VecDeque::new());
 /// The task currently running on this CPU, or `None` when idle.
 static CURRENT: Mutex<Option<&'static mut Task>> = Mutex::new(None);
 
-/// Parked `Dead` tasks awaiting reclamation.
+/// Parked dead tasks (zombies) awaiting a parent's `:wait` or the death of
+/// their own parent.
 ///
 /// Pushed at every switch-away site for a Dead task, then drained by
 /// `reap_dead` from the idle loop.  A dead task cannot free its own stack
 /// (its CTX still points into it and the CPU parked on it), so teardown is
-/// deferred until the scheduler is back on the idle stack.  `reap_dead` only
-/// takes this lock (never `QUEUE`), and the idle loop never runs `schedule`,
-/// so there is no lock ordering against `QUEUE`.
-static DEAD_TASKS: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
+/// deferred until the scheduler is back on the idle stack.  A zombie is kept
+/// while its parent is still live (the parent may `:wait` it) and freed once
+/// its parent is gone.  `reap_dead` reads the other scheduler lists only while
+/// holding this one, and nothing acquires this lock while holding those, so
+/// there is no ordering cycle.
+static ZOMBIES: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
+
+/// Consumed zombies awaiting idle teardown: their exit code was collected by
+/// a parent's `:wait`, and `reap_dead` frees their user page tables, kernel
+/// stacks, `/proc` entries, and task boxes from the idle loop.
+///
+/// Teardown must not run from a user task's context — `destroy_root` issues a
+/// TLB shootdown whose APIC MMIO access requires the kernel root's address
+/// space (a user root does not map the APIC).  A consumed zombie is moved
+/// here (and is thus invisible to every scheduler scan), so the `:wait` and
+/// `/proc` paths treat it as already reaped, and only `reap_dead` — which runs
+/// on the idle stack under the kernel root — drains this queue.
+static RECLAIM: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
+
+/// Parked tasks awaiting a child's exit (`/proc/self:wait`), as `(task, pid)`
+/// keyed by the target pid.
+///
+/// A waiter is removed from the run queue at park time and lives here until
+/// its target parks into `ZOMBIES` — `park_zombie` then moves it back to
+/// `QUEUE` as `Ready`, where its resumed `:wait` activation consumes the
+/// zombie.  Never held together with `QUEUE`: `wake_waiters_for` drops the
+/// waiter list before locking the queue, and no `:wait` activation parks
+/// while holding it.  Only one task can wait on a given child (its parent),
+/// so there is at most one entry per target pid.
+static WAITERS: Mutex<Vec<(&'static mut Task, u64)>> = Mutex::new(Vec::new());
 
 /// Parked `ZzZ` tasks awaiting their wake deadline (absolute monotonic ns).
 ///
@@ -278,15 +321,24 @@ pub fn wake_sleepers() {
     }
 }
 
-/// Mark the current task Dead and switch to the next ready task. A Dead task
+/// Mark the current task Dead and switch to the next ready task.  The exit
+/// code is stored on the task (retained as a zombie until a parent's `:wait`
+/// consumes it or its parent dies), so a parent can collect it.  A Dead task
 /// is never requeued, so this never returns.
 pub fn exit_current(code: u64) -> ! {
     log::info!("[sched] task exit({})", code);
     SerialPort::puts("[sched] task exit(code=");
     SerialPort::put_u64(code);
     SerialPort::puts(")\n");
+    if let Some(t) = CURRENT.lock().as_mut() {
+        t.exit_code = code;
+    }
     kill_current()
 }
+
+/// Exit code stamped on a task that dies by `:kill` or a ring-3 fault rather
+/// than a normal `exit_current`, so a waiting parent can tell them apart.
+pub const KILLED_EXIT_CODE: u64 = 0xDEAD_BEEF;
 
 /// Park the current task forever. Marks it Dead and hands the scheduler to the
 /// next ready task (or idle). Never returns.
@@ -306,15 +358,19 @@ fn kill_current() -> ! {
 /// returns to the faulting user context.
 pub fn kill_user_fault() -> ! {
     SerialPort::puts("[sched] user fault — killing current task\n");
+    if let Some(t) = CURRENT.lock().as_mut() {
+        t.exit_code = KILLED_EXIT_CODE;
+    }
     kill_current()
 }
 
-/// Snapshot the state of `pid` (excluding reaped/dead-parked tasks).
+/// Snapshot the state of `pid` (excluding already-reaped tasks).
 ///
 /// The scheduler is cooperative and BSP-only, so every live task is exactly one
-/// of: the current task (`Running`, in `CURRENT`), a ready task in `QUEUE`, or
-/// a parked sleeper in `SLEEPING` (`ZzZ`). `DEAD_TASKS` zombies are excluded.
-/// The three locks are taken and read separately, never nested with each other.
+/// of: the current task (`Running`, in `CURRENT`), a ready task in `QUEUE`, a
+/// parked sleeper in `SLEEPING` (`ZzZ`), a parked waiter in `WAITERS` (`ZzZ`),
+/// or a zombie in `ZOMBIES` (`Dead`). The five locks are taken and read
+/// separately, never nested with each other.
 pub fn process_state(pid: u64) -> Option<TaskState> {
     {
         let cur = CURRENT.lock();
@@ -340,11 +396,27 @@ pub fn process_state(pid: u64) -> Option<TaskState> {
             }
         }
     }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid {
+                return Some(TaskState::ZzZ);
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid {
+                return Some(TaskState::Dead);
+            }
+        }
+    }
     None
 }
 
 /// Look up the eager user-memory table index (`vm`) of `pid`, mirroring the
-/// `process_state` scan of the three scheduler lists. `None` for a reaped or
+/// `process_state` scan of the five scheduler lists. `None` for a reaped or
 /// unknown pid, or a kernel-only task (`vm == 0`).
 pub fn task_vm(pid: u64) -> Option<usize> {
     {
@@ -371,6 +443,22 @@ pub fn task_vm(pid: u64) -> Option<usize> {
             }
         }
     }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid && t.vm != 0 {
+                return Some(t.vm);
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid && t.vm != 0 {
+                return Some(t.vm);
+            }
+        }
+    }
     None
 }
 
@@ -378,18 +466,22 @@ pub fn task_vm(pid: u64) -> Option<usize> {
 ///
 /// - `pid == current task`: the caller marks itself `Dead` and parks (never
 ///   returns), mirroring `kill_current`.
-/// - a task in `QUEUE` is removed (order preserved) and pushed to `DEAD_TASKS`;
-/// - a task in `SLEEPING` is removed and pushed to `DEAD_TASKS`;
+/// - a task in `QUEUE` is removed (order preserved) and parked into `ZOMBIES`;
+/// - a task in `SLEEPING` is removed and parked into `ZOMBIES`;
+/// - a task parked in `WAITERS` (waiting on a child) is removed and parked
+///   into `ZOMBIES`; its own children then orphan out on the next reap;
 /// - anything else (already reaped, or an unknown id) yields `Err(())`.
 ///
-/// Cooperative BSP-only: every live non-executing task is in `QUEUE` or
-/// `SLEEPING`, and the only `Running` task is the caller.
+/// Cooperative BSP-only: every live non-executing task is in `QUEUE`,
+/// `SLEEPING`, or `WAITERS`, and the only `Running` task is the caller.
 pub fn kill(pid: u64) -> Result<(), ()> {
     {
-        let cur = CURRENT.lock();
-        let is_self = cur.as_ref().map(|t| t.id == pid).unwrap_or(false);
-        drop(cur);
+        let is_self = {
+            let cur = CURRENT.lock();
+            cur.as_ref().map(|t| t.id == pid).unwrap_or(false)
+        };
         if is_self {
+            CURRENT.lock().as_mut().map(|t| t.exit_code = KILLED_EXIT_CODE);
             kill_current(); // diverges: marked Dead and parked, never returns
         }
     }
@@ -400,8 +492,9 @@ pub fn kill(pid: u64) -> Result<(), ()> {
             if q[i].id == pid {
                 if let Some(t) = q.remove(i) {
                     t.state = TaskState::Dead;
-                    drop(q); // DEAD_TASKS is never acquired while QUEUE is held
-                    DEAD_TASKS.lock().push(t);
+                    t.exit_code = KILLED_EXIT_CODE;
+                    drop(q); // ZOMBIES is never acquired while QUEUE is held
+                    park_zombie(t);
                     return Ok(());
                 }
             }
@@ -414,8 +507,22 @@ pub fn kill(pid: u64) -> Result<(), ()> {
             if s[i].1.id == pid {
                 let t = s.remove(i).1;
                 t.state = TaskState::Dead;
+                t.exit_code = KILLED_EXIT_CODE;
                 drop(s);
-                DEAD_TASKS.lock().push(t);
+                park_zombie(t);
+                return Ok(());
+            }
+        }
+    }
+    {
+        let mut w = WAITERS.lock();
+        for i in 0..w.len() {
+            if w[i].0.id == pid {
+                let t = w.remove(i).0;
+                t.state = TaskState::Dead;
+                t.exit_code = KILLED_EXIT_CODE;
+                drop(w);
+                park_zombie(t);
                 return Ok(());
             }
         }
@@ -430,36 +537,295 @@ pub fn set_kernel_stack_meta(top: u64) {
     crate::smp::current_per_cpu().syscall_rsp0 = top;
 }
 
-/// Reclaim parked dead tasks: destroy their private page tables, free their
-/// kernel stacks, and drop their `Task` boxes.
+// ── Zombies and :wait ──────────────────────────────────────────────
+
+/// Why a `:wait` could not proceed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitError {
+    /// The target pid does not exist (never spawned, or already reaped).
+    NotFound,
+    /// The target exists but is not a child of the caller.
+    NotChild,
+}
+
+/// Park a just-dead task into `ZOMBIES` and requeue any task waiting on it,
+/// which consumes it on the next run.
+fn park_zombie(task: &'static mut Task) {
+    let pid = task.id;
+    ZOMBIES.lock().push(task);
+    wake_waiters_for(pid);
+}
+
+/// Requeue every waiter parked on `pid` — called the moment `pid` parks into
+/// `ZOMBIES`.  The waiter's `:wait` activation re-checks on resume and
+/// consumes the zombie.  `WAITERS` is dropped before `QUEUE` is locked (the
+/// same discipline as `wake_sleepers`).
+fn wake_waiters_for(pid: u64) {
+    let mut due = Vec::new();
+    {
+        let mut w = WAITERS.lock();
+        let mut i = 0;
+        while i < w.len() {
+            if w[i].1 == pid {
+                due.push(w.remove(i).0);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if due.is_empty() {
+        return;
+    }
+    let mut q = QUEUE.lock();
+    for t in due {
+        t.state = TaskState::Ready;
+        q.push_back(t);
+    }
+}
+
+/// The recorded parent pid of `pid`, scanning every scheduler list.
+fn task_parent(pid: u64) -> Option<u64> {
+    if let Some(t) = CURRENT.lock().as_ref() {
+        if t.id == pid {
+            return Some(t.parent_pid);
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid {
+                return Some(t.parent_pid);
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid {
+                return Some(t.parent_pid);
+            }
+        }
+    }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid {
+                return Some(t.parent_pid);
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid {
+                return Some(t.parent_pid);
+            }
+        }
+    }
+    None
+}
+
+/// True if `pid` is parked in `ZOMBIES` (dead but not yet reaped).
+fn zombie_present(pid: u64) -> bool {
+    ZOMBIES.lock().iter().any(|t| t.id == pid)
+}
+
+/// True if `pid` is live: running, ready, sleeping, or parked waiting.
+fn pid_live(pid: u64) -> bool {
+    if let Some(t) = CURRENT.lock().as_ref() {
+        if t.id == pid {
+            return true;
+        }
+    }
+    if QUEUE.lock().iter().any(|t| t.id == pid) {
+        return true;
+    }
+    if SLEEPING.lock().iter().any(|(_, t)| t.id == pid) {
+        return true;
+    }
+    if WAITERS.lock().iter().any(|(t, _)| t.id == pid) {
+        return true;
+    }
+    false
+}
+
+/// Remove and return the zombie `pid`, if parked.
+fn take_zombie(pid: u64) -> Option<&'static mut Task> {
+    let mut zombies = ZOMBIES.lock();
+    let pos = zombies.iter().position(|t| t.id == pid)?;
+    Some(zombies.remove(pos))
+}
+
+/// Remove `pid` from `ZOMBIES`, return its exit code, and hand the zombie to
+/// `RECLAIM` for idle-loop teardown.  Teardown is deferred because
+/// `destroy_root` touches the APIC (TLB-shootdown IPIs), which is only mapped
+/// in the kernel root, never in a user task's root.  Once consumed, the pid is
+/// gone from every scheduler scan.
+fn consume_zombie(pid: u64) -> Option<u64> {
+    let task = take_zombie(pid)?;
+    let code = task.exit_code;
+    RECLAIM.lock().push(task);
+    Some(code)
+}
+
+/// Wait for `pid` (which must be a child of the caller) to exit and consume
+/// its exit code.  If the target is already parked as a zombie, its exit code
+/// is consumed immediately (teardown is deferred to `RECLAIM`/the idle loop);
+/// otherwise parks the caller in `WAITERS` until the target exits (the exit
+/// path requeues the waiter) and resumes, then re-checks.  Mirrors
+/// `sleep_until`: `WAITERS` is never held across `schedule`, and no scheduler
+/// list is touched from an ISR.
+pub fn wait(pid: u64) -> Result<u64, WaitError> {
+    let me = {
+        let cur = CURRENT.lock();
+        match cur.as_ref() {
+            Some(t) => t.id,
+            None => return Err(WaitError::NotFound),
+        }
+    };
+    // Relationship is checked once: a task's parent never changes, and only
+    // the parent may wait on a child (Unix wait() semantics, which also rules
+    // out wait-cycles — a task cannot be its own parent).
+    {
+        let parent = task_parent(pid);
+        if parent.is_none() && !zombie_present(pid) {
+            return Err(WaitError::NotFound);
+        }
+        if parent != Some(me) {
+            return Err(WaitError::NotChild);
+        }
+    }
+    loop {
+        if let Some(code) = consume_zombie(pid) {
+            return Ok(code);
+        }
+        if !zombie_present(pid) && !pid_live(pid) {
+            return Err(WaitError::NotFound);
+        }
+        let mut cur = CURRENT.lock();
+        if let Some(t) = cur.as_mut() {
+            t.state = TaskState::ZzZ;
+            let raw = &mut **t as *mut Task;
+            drop(cur);
+            WAITERS.lock().push((unsafe { &mut *raw }, pid));
+            schedule();
+            continue;
+        }
+        return Err(WaitError::NotFound);
+    }
+}
+
+/// The `:spawn` argument string recorded for `pid`, if the task still exists
+/// (live or zombie).  `/proc/self/args` is backed by this.
+pub fn task_args(pid: u64) -> Option<String> {
+    if let Some(t) = CURRENT.lock().as_ref() {
+        if t.id == pid {
+            return Some(t.args.clone());
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid {
+                return Some(t.args.clone());
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid {
+                return Some(t.args.clone());
+            }
+        }
+    }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid {
+                return Some(t.args.clone());
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid {
+                return Some(t.args.clone());
+            }
+        }
+    }
+    None
+}
+
+/// The retained exit code of a zombie `pid`, if any.
+pub fn task_exit_code(pid: u64) -> Option<u64> {
+    ZOMBIES.lock().iter().find(|t| t.id == pid).map(|t| t.exit_code)
+}
+
+/// Tear down one dead task: destroy its private page tables, free its kernel
+/// stack, release its user-memory registration, detach its `/proc` dir, and
+/// drop the task box.
+///
+/// Safe from any context as long as the task is not parked on its own stack —
+/// the idle reaper and a consuming `:wait` both qualify (the scheduler is
+/// BSP-only, so the dead root is never the active CR3).
+fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
+    let root = task.root;
+    if root != 0 && root != kernel_root() {
+        crate::mm::vmm::destroy_root(root, alloc);
+    }
+    if task.kstack_slot != usize::MAX {
+        free_kernel_stack(task.kstack_slot, alloc);
+    }
+    if task.vm != 0 {
+        // The region table alone is dropped — `destroy_root` already walked
+        // the page tables and freed every user leaf frame.
+        crate::mm::usermem::unregister(task.vm);
+    }
+    let raw = &mut *task as *mut Task;
+    crate::unispace::provider::proc::detach(task.id);
+    unsafe { drop(Box::from_raw(raw)); }
+}
+
+/// Reclaim dead tasks, freeing their user page tables, kernel stacks, and task
+/// boxes.
 ///
 /// Called from the idle loop, which runs on the boot stack under the kernel
-/// root — so the task being reaped is never the calling context, and its user
-/// root is no longer active on any CPU (the scheduler is BSP-only, and the
-/// park switch already reloaded CR3 to the kernel root, flushing the BSP's
-/// TLB of the dead root's entries).
+/// root — so the task being reaped is never the calling context, and the
+/// kernel root's address space (which maps the APIC MMIO needed by
+/// `destroy_root`'s TLB shootdown) is active.  Consumed zombies (exit codes
+/// already collected by a parent's `:wait`) are drained first and freed
+/// unconditionally; the rest are preserved while their parent is still live
+/// (the parent may `:wait` them) and freed once their parent is dead.  Reading
+/// the other scheduler lists while holding `ZOMBIES` is safe: nothing acquires
+/// `ZOMBIES` while holding those (see `park_zombie`/`kill`/`wait`), and
+/// `reap_dead` only runs in the idle loop.
 ///
 /// TSS.rsp0 may still point at a freed stack after this; that is safe because
 /// rsp0 is only consumed on a ring-3→ring-0 transition, and no user task runs
 /// while the BSP is idling.  The next task switch re-pins rsp0.
 pub fn reap_dead(alloc: &mut BitmapAllocator) {
-    let mut dead = DEAD_TASKS.lock();
-    for task in dead.drain(..) {
-        let root = task.root;
-        if root != 0 && root != kernel_root() {
-            crate::mm::vmm::destroy_root(root, alloc);
+    {
+        let mut reclaim = RECLAIM.lock();
+        for task in reclaim.drain(..) {
+            reap_one(task, alloc);
         }
-        if task.kstack_slot != usize::MAX {
-            free_kernel_stack(task.kstack_slot, alloc);
+    }
+    let mut free: Vec<&'static mut Task> = Vec::new();
+    {
+        let mut zombies = ZOMBIES.lock();
+        let mut i = 0;
+        while i < zombies.len() {
+            if zombies[i].parent_pid == 0 || !pid_live(zombies[i].parent_pid) {
+                free.push(zombies.remove(i));
+            } else {
+                i += 1;
+            }
         }
-        if task.vm != 0 {
-            // The region table alone is dropped — `destroy_root` already walked
-            // the page tables and freed every user leaf frame.
-            crate::mm::usermem::unregister(task.vm);
-        }
-        let raw = &mut *task as *mut Task;
-        crate::unispace::provider::proc::detach(task.id);
-        unsafe { drop(Box::from_raw(raw)); }
+    }
+    for task in free {
+        reap_one(task, alloc);
     }
 }
 
@@ -499,16 +865,16 @@ pub fn schedule() {
             match prev {
                 Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
                     // Park the current task and resume idle.  A Dead task is
-                    // pushed into DEAD_TASKS (after `drop(q)`, so DEAD_TASKS
-                    // is never acquired while QUEUE is held) for a later idle
-                    // loop reap; a ZzZ task is already registered in the
-                    // sleeping list, so it is simply left out of the queue.
-                    // `pctx` stays valid either way.
+                    // parked into ZOMBIES (after `drop(q)`, so ZOMBIES is
+                    // never acquired while QUEUE is held) for a later idle
+                    // loop reap or a parent's :wait; a ZzZ task is already
+                    // registered in the sleeping/waiter list, so it is simply
+                    // left out of the queue.  `pctx` stays valid either way.
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     drop(q);
                     if p.state == TaskState::Dead {
-                        DEAD_TASKS.lock().push(p);
+                        park_zombie(p);
                     }
                     unsafe { switch_to(pctx, idle_ctx(), root); }
                     return;
@@ -531,14 +897,14 @@ pub fn schedule() {
 
     match prev {
         // A Dead or ZzZ task may also switch straight to the next ready task
-        // (queue non-empty).  Only a Dead task is parked into DEAD_TASKS — a
-        // ZzZ task is already registered in the sleeping list — both dealt
-        // with after `drop(q)`.
+        // (queue non-empty).  Only a Dead task is parked into ZOMBIES — a
+        // ZzZ task is already registered in the sleeping/waiter list — both
+        // dealt with after `drop(q)`.
         Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             drop(q);
             if p.state == TaskState::Dead {
-                DEAD_TASKS.lock().push(p);
+                park_zombie(p);
             }
             unsafe { switch_to(pctx, next_ptr, next_root); }
         }

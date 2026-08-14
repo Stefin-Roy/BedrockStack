@@ -6,14 +6,18 @@
 //! absent in kernel context, where no task is running).
 //!
 //! Each `<pid>` dir exposes:
-//!   - `status` — `read` yields `{pid, state}` from the scheduler snapshot;
+//!   - `status` — `read` yields `{pid, state, exit_code}` from the scheduler
+//!     snapshot (`exit_code` is retained while the task is a zombie);
 //!   - `mem`    — `read` yields the eager user-memory accounting
 //!     `{root, brk, stack_top, committed_pages, budget_pages}` from `mm::usermem`;
+//!   - `args`   — `read` yields the caller's `:spawn` argument string;
 //!   - `:exit`  — write `{code}` to terminate the current task (diverges);
 //!   - `:yield` — write `()` to cooperatively reschedule;
 //!   - `:kill`  — write `{pid}` to park another task for reaping;
-//!   - `:spawn` — write `{path}` to fork a new process from an ELF on a
+//!   - `:spawn` — write `{path, args}` to fork a new process from an ELF on a
 //!     mounted filesystem;
+//!   - `:wait`  — write `{pid}` to block until a child exits and receive its
+//!     `{code}` (children only, Unix wait() semantics);
 //!   - `:brk`   — write `{new_break}` to grow/shrink/query the caller's break;
 //!   - `:mmap`  — write `{addr, len, prot}` to eagerly commit anonymous pages;
 //!   - `:munmap`— write `{addr, len}` to release whole anonymous regions.
@@ -23,8 +27,9 @@
 //! regardless of which pid the path names.
 //!
 //! `ProcDir` stores only its `pid` — never a `&'static mut Task`. Dead tasks
-//! are reaped with their boxes, and `detach` runs there, so a stale entry can
-//! never outlive its task.
+//! park as zombies and keep their `/proc` dir (so a parent can find and
+//! `:wait` them) until `reap_dead`/a consuming `:wait` detaches them, so a
+//! stale entry can never outlive its task.
 
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -46,10 +51,12 @@ static PROC_STATE_VARIANTS: [EnumVariant; 4] = [
     EnumVariant { name: "dead", value: 3 },
 ];
 
-/// `read(/proc/<pid>/status)`: `struct{ pid: u64, state: enum }`.
+/// `read(/proc/<pid>/status)`: `struct{ pid: u64, state: enum, exit_code: u64 }`.
+/// `exit_code` is the retained code of a zombie (0 for a live task).
 static STATUS: Schema = Schema::Struct(&[
     schema::Field { name: "pid", ty: &schema::SCHEMA_U64 },
     schema::Field { name: "state", ty: &Schema::Enum(&PROC_STATE_VARIANTS) },
+    schema::Field { name: "exit_code", ty: &schema::SCHEMA_U64 },
 ]);
 
 /// `read(/proc/<pid>/mem)`: eager user-memory snapshot from `mm::usermem`.
@@ -73,11 +80,11 @@ static KILL_INPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-/// `write(/proc/<pid>:spawn, { path })`.
-static SPAWN_INPUT: Schema = Schema::Struct(&[schema::Field {
-    name: "path",
-    ty: &schema::SCHEMA_STR,
-}]);
+/// `write(/proc/<pid>:spawn, { path, args })`.
+static SPAWN_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "path", ty: &schema::SCHEMA_STR },
+    schema::Field { name: "args", ty: &schema::SCHEMA_STR },
+]);
 
 /// `spawn` output: the new task's pid.
 static SPAWN_OUTPUT: Schema = Schema::Struct(&[schema::Field {
@@ -113,13 +120,26 @@ static MMAP_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-/// `write(/proc/self:munmap, { addr, len })` — release whole anonymous regions.
+/// `write(/proc/<pid>:munmap, { addr, len })` — release whole anonymous regions.
 static MUNMAP_INPUT: Schema = Schema::Struct(&[
     schema::Field { name: "addr", ty: &schema::SCHEMA_U64 },
     schema::Field { name: "len", ty: &schema::SCHEMA_U64 },
 ]);
 
-static PROC_METHODS: [MethodDesc; 7] = [
+/// `write(/proc/<pid>:wait, { pid })` — block until the target child exits and
+/// return its exit code.
+static WAIT_INPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "pid",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+/// `wait` output: the consumed exit code.
+static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "code",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+static PROC_METHODS: [MethodDesc; 8] = [
     MethodDesc { name: "exit", input: &EXIT_INPUT, output: &schema::SCHEMA_UNIT },
     MethodDesc { name: "yield", input: &schema::SCHEMA_UNIT, output: &schema::SCHEMA_UNIT },
     MethodDesc { name: "kill", input: &KILL_INPUT, output: &schema::SCHEMA_UNIT },
@@ -127,6 +147,7 @@ static PROC_METHODS: [MethodDesc; 7] = [
     MethodDesc { name: "brk", input: &BRK_INPUT, output: &BRK_OUTPUT },
     MethodDesc { name: "mmap", input: &MMAP_INPUT, output: &MMAP_OUTPUT },
     MethodDesc { name: "munmap", input: &MUNMAP_INPUT, output: &schema::SCHEMA_UNIT },
+    MethodDesc { name: "wait", input: &WAIT_INPUT, output: &WAIT_OUTPUT },
 ];
 
 // ── Registry ─────────────────────────────────────────────────────────
@@ -252,6 +273,9 @@ impl Object for ProcDir {
         if name == "mem" {
             return Some(Arc::new(MemObject { pid: self.pid }) as Arc<dyn Object>);
         }
+        if name == "args" {
+            return Some(Arc::new(ArgsObject { pid: self.pid }) as Arc<dyn Object>);
+        }
         None
     }
 
@@ -262,6 +286,10 @@ impl Object for ProcDir {
         });
         out.push(ListingEntry {
             name: String::from("mem"),
+            kind: ObjectKind::Service,
+        });
+        out.push(ListingEntry {
+            name: String::from("args"),
             kind: ObjectKind::Service,
         });
         Ok(())
@@ -294,7 +322,8 @@ impl Object for ProcDir {
             }
             3 => {
                 let path = arg_str(&v, 0)?;
-                spawn_proc(path, out)
+                let args = arg_str(&v, 1)?;
+                spawn_proc(path, args, out)
             }
             4 => {
                 // brk: grow/shrink/query the *current* task's break. Must run
@@ -318,6 +347,18 @@ impl Object for ProcDir {
                 let len = arg_u64(&v, 1)?;
                 mem_method(|vm, alloc| crate::mm::usermem::munmap(vm, addr, len, alloc))?;
                 Ok(())
+            }
+            7 => {
+                // wait: block until a *child* of the caller exits and consume
+                // its exit code.  Mirrors :kill — the path's pid is ignored;
+                // the target is named in the payload.
+                let target = arg_u64(&v, 0)?;
+                let code = crate::task::wait(target).map_err(|e| match e {
+                    crate::task::WaitError::NotChild => UnispaceError::InvalidArgument,
+                    crate::task::WaitError::NotFound => UnispaceError::NotFound,
+                })?;
+                let v = Value::Struct(vec![Value::U64(code)]);
+                schema::encode_value(&v, &WAIT_OUTPUT, out)
             }
             _ => Err(UnispaceError::MethodNotFound),
         }
@@ -355,7 +396,8 @@ impl Object for StatusObject {
             crate::task::TaskState::ZzZ => 2,
             crate::task::TaskState::Dead => 3,
         };
-        let v = Value::Struct(vec![Value::U64(self.pid), Value::Enum(disc)]);
+        let exit_code = crate::task::task_exit_code(self.pid).unwrap_or(0);
+        let v = Value::Struct(vec![Value::U64(self.pid), Value::Enum(disc), Value::U64(exit_code)]);
         schema::encode_value(&v, &STATUS, out)
     }
 
@@ -403,11 +445,45 @@ impl Object for MemObject {
     }
 }
 
+// ── /proc/<pid>/args ───────────────────────────────────────────────
+
+/// Service leaf: `read` yields the `:spawn` argument string of `self.pid`
+/// (read-only).  The entry-point ABI never changes — a program fetches its own
+/// arguments via `read(/proc/self/args)`.
+struct ArgsObject {
+    pid: u64,
+}
+
+impl Object for ArgsObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Service
+    }
+
+    fn value_schema(&self) -> &'static Schema {
+        &schema::SCHEMA_STR
+    }
+
+    fn methods(&self) -> &'static [MethodDesc] {
+        &[]
+    }
+
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
+        let args = crate::task::task_args(self.pid).ok_or(UnispaceError::NotFound)?;
+        schema::encode_value(&Value::Str(args), &schema::SCHEMA_STR, out)
+    }
+
+    fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
+        Err(UnispaceError::Unsupported)
+    }
+}
+
 // ── :spawn implementation ────────────────────────────────────────────
 
 /// Load `path` as an ELF, build its address space, and spawn it as a task.
-/// Mirrors the boot path in `task::load::load_init_from_esp`.
-fn spawn_proc(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+/// Mirrors the boot path in `task::load::load_init_from_esp`.  Records the
+/// spawner as the child's parent (via `current_pid`) and passes `args` through
+/// for the child to read at `/proc/self/args`.
+fn spawn_proc(path: &str, args: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     let mut elf = Vec::new();
     super::super::read(path, &mut elf, usize::MAX)?;
 
@@ -437,6 +513,8 @@ fn spawn_proc(path: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     );
     task.kstack_slot = slot;
     task.vm = vm;
+    task.args = String::from(args);
+    task.parent_pid = current_pid().unwrap_or(0);
     let pid = crate::task::spawn(task);
     attach(pid);
     let v = Value::Struct(vec![Value::U64(pid)]);
