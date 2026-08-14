@@ -927,8 +927,10 @@ pub fn schedule() {
 /// the kernel/user GS pair, then switches away from idle into the new task.
 ///
 /// Returns only when the launched task has exited and been parked back into
-/// idle (the resumed caller then owns the idle loop). A live task never
-/// returns through this function — it runs until `exit_current` parks it.
+/// idle (the resumed caller then owns the idle loop), at which point it
+/// returns the task's pid — not yet reaped, so its `/proc` dir still exists.
+/// A live task never returns through this function — it runs until
+/// `exit_current` parks it.
 pub fn enter_userspace(
     entry: u64,
     user_stack_top: u64,
@@ -936,7 +938,7 @@ pub fn enter_userspace(
     user_gs: u64,
     vm: usize,
     alloc: &mut BitmapAllocator,
-) {
+) -> u64 {
     // This task gets its own slot in the fixed kernel-stack window; the iretq
     // frame lives on top of it.
     let (kernel_stack_top, slot) = alloc_kernel_stack(alloc).expect("enter_userspace: no kernel stack slot");
@@ -968,6 +970,7 @@ pub fn enter_userspace(
     crate::unispace::provider::proc::attach(task.id);
     task.state = TaskState::Running;
     let t: &'static mut Task = Box::leak(Box::new(task));
+    let pid = t.id;
     let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
     set_kernel_stack_meta(kernel_stack_top);
     crate::smp::current_per_cpu().current_task = t as *mut Task as *mut core::ffi::c_void;
@@ -976,6 +979,20 @@ pub fn enter_userspace(
     unsafe {
         switch_to(idle_ctx(), ctx_ptr, root);
     }
+    // The scheduler reaches idle not only when the launched task exits, but
+    // whenever no task is ready — including while it is parked in a blocking
+    // syscall (e.g. `:wait` on a child it spawned). Keep idling until the
+    // launched task is actually Dead (parked in ZOMBIES) or reaped, so the
+    // caller — which reads back its `/proc` — never acts on half-written
+    // output. Its exit code is not consumed here; the caller drains its
+    // `/proc/<pid>/std/out` before any idle reaper detaches the dir.
+    loop {
+        match process_state(pid) {
+            Some(TaskState::Dead) | None => break,
+            _ => schedule(),
+        }
+    }
+    pid
 }
 
 // ── Boot smoke test ────────────────────────────────────────────────

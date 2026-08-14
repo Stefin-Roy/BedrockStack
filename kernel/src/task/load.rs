@@ -316,8 +316,9 @@ fn precreate(path: &str, name: &str, payload: &mut Vec<u8>, out: &mut Vec<u8>) {
 ///
 /// Pre-creates the `/A/init` dir and `/A/init/test` file the demo writes into,
 /// then starts INIT. When the task exits and parks back into idle, this
-/// function resumes here, reads `/A/init/test` back through unispace, and
-/// prints its bytes to serial — closing the write→read→exit→resume loop.
+/// function resumes here, reads `/A/init/test` back through unispace and
+/// prints its bytes to serial, and prints the task's stdout
+/// (`/proc/<pid>/std/out`) — closing the write→read→exit→resume loop.
 pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     let mut elf: Vec<u8> = Vec::new();
     if let Err(_) = unispace::read("/B/EFI/BEDROCK/INIT", &mut elf, usize::MAX) {
@@ -371,7 +372,21 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     SerialPort::put_hex(0x001B_0018_0000_0000u64);
     SerialPort::puts(" SCE=1\n");
 
-    crate::task::enter_userspace(entry, user_stack_top, root, 0, vm, alloc);
+    let pid = crate::task::enter_userspace(entry, user_stack_top, root, 0, vm, alloc);
+
+    // The INIT task exited and parked into idle; we resumed here. It is not
+    // yet reaped, so its `/proc` dir still exists — drain its stdout and
+    // print it to serial.
+    let mut stdout: Vec<u8> = Vec::new();
+    let spath = alloc::format!("/proc/{}/std/out", pid);
+    match crate::unispace::read(&spath, &mut stdout, usize::MAX) {
+        Ok(()) => {
+            SerialPort::puts("[sched] INIT stdout:\n");
+            SerialPort::puts(core::str::from_utf8(&stdout).unwrap_or("<non-utf8>"));
+            SerialPort::puts("\n");
+        }
+        Err(e) => log::warn!("[sched] read /proc/{}/std/out failed: {:?}", pid, e),
+    }
 
     // The INIT task exited and parked into idle; we resumed here. Read back
     // what it wrote to prove the write→read→exit→resume cycle end-to-end.
