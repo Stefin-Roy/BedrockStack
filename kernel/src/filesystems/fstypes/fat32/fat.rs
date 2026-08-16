@@ -17,8 +17,10 @@ impl Fat32SuperBlock {
         let mut cache = self.fat_cache.lock();
         let sector = cache.get_or_read(&*self.device, lba)?;
         let val = u32::from_le_bytes([
-            sector[offset as usize], sector[offset as usize + 1],
-            sector[offset as usize + 2], sector[offset as usize + 3],
+            sector[offset as usize],
+            sector[offset as usize + 1],
+            sector[offset as usize + 2],
+            sector[offset as usize + 3],
         ]);
         Ok(val & 0x0FFFFFFF)
     }

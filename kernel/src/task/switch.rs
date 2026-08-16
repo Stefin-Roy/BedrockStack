@@ -28,8 +28,14 @@ pub struct TaskContext {
 impl TaskContext {
     pub const fn zeroed() -> Self {
         TaskContext {
-            r15: 0, r14: 0, r13: 0, r12: 0,
-            rbx: 0, rbp: 0, rsp: 0, rip: 0,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbx: 0,
+            rbp: 0,
+            rsp: 0,
+            rip: 0,
             rflags: 0,
         }
     }
@@ -42,8 +48,14 @@ impl TaskContext {
     /// resumes with interrupts enabled, matching the boot-time state.
     pub const fn new(rsp: u64, rip: u64) -> Self {
         TaskContext {
-            r15: 0, r14: 0, r13: 0, r12: 0,
-            rbx: 0, rbp: 0, rsp, rip,
+            r15: 0,
+            r14: 0,
+            r13: 0,
+            r12: 0,
+            rbx: 0,
+            rbp: 0,
+            rsp,
+            rip,
             rflags: 0x202,
         }
     }

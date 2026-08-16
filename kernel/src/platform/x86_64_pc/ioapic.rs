@@ -47,7 +47,11 @@ fn ioapic_read(state: &IoApicState, reg: u32) -> u32 {
 
 /// Map the IOAPIC physical MMIO region into the virtual address space.
 fn map_ioapic_mmio(phys: u64) -> u64 {
-    crate::acpi::map_device_mmio(phys, 4096, PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE)
+    crate::acpi::map_device_mmio(
+        phys,
+        4096,
+        PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
+    )
 }
 
 /// Initialise the IOAPIC driver.

@@ -1,4 +1,3 @@
-
 pub enum IoBuffer<'a> {
     Buf(&'a mut [u8]),
     ConstBuf(&'a [u8]),

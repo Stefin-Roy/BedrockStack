@@ -13,8 +13,6 @@ impl X86Acpi {
     }
 }
 
-
-
 impl AcpiProvider for X86Acpi {
     fn interrupt_model(&self) -> &InterruptModel {
         &self.acpi.interrupt_model

@@ -37,7 +37,9 @@ impl FdTable {
 
     pub fn get(&self, fd: u32) -> Result<Arc<FileDescription>, VfsError> {
         let inner = self.inner.lock();
-        inner.fds.get(fd as usize)
+        inner
+            .fds
+            .get(fd as usize)
             .and_then(|s| s.as_ref())
             .cloned()
             .ok_or(VfsError::BadFileDescriptor)
@@ -58,7 +60,9 @@ impl FdTable {
     pub fn dup(&self, old_fd: u32) -> Result<u32, VfsError> {
         let entry = {
             let inner = self.inner.lock();
-            inner.fds.get(old_fd as usize)
+            inner
+                .fds
+                .get(old_fd as usize)
                 .and_then(|s| s.as_ref())
                 .cloned()
                 .ok_or(VfsError::BadFileDescriptor)?
@@ -76,7 +80,9 @@ impl FdTable {
     pub fn dup2(&self, old_fd: u32, new_fd: u32) -> Result<(), VfsError> {
         let entry = {
             let inner = self.inner.lock();
-            inner.fds.get(old_fd as usize)
+            inner
+                .fds
+                .get(old_fd as usize)
                 .and_then(|s| s.as_ref())
                 .cloned()
                 .ok_or(VfsError::BadFileDescriptor)?
@@ -91,6 +97,10 @@ impl FdTable {
 
     pub fn iter_active(&self) -> Vec<Arc<FileDescription>> {
         let inner = self.inner.lock();
-        inner.fds.iter().filter_map(|s| s.as_ref().cloned()).collect()
+        inner
+            .fds
+            .iter()
+            .filter_map(|s| s.as_ref().cloned())
+            .collect()
     }
 }

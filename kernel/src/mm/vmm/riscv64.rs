@@ -5,9 +5,9 @@
 //!   Level 1 (mid):  index bits 29:21  →  512 entries
 //!   Level 0 (leaf): index bits 20:12  →  512 entries (or 2 MiB megapage at L1)
 
-use core::arch::asm;
-use crate::mm::phys_alloc::BitmapAllocator;
 use super::PageFlags;
+use crate::mm::phys_alloc::BitmapAllocator;
+use core::arch::asm;
 
 // ── Page size constants ──────────────────────────────────────────────
 const _PAGE_SIZE: u64 = 4096;
@@ -100,13 +100,7 @@ fn page_flags_to_riscv(flags: PageFlags) -> u64 {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-pub fn map_4k(
-    root: u64,
-    alloc: &mut BitmapAllocator,
-    vaddr: u64,
-    paddr: u64,
-    flags: PageFlags,
-) {
+pub fn map_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
     let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let rf = page_flags_to_riscv(flags);
@@ -129,23 +123,23 @@ pub fn map_4k(
             l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(phys), PTE_V);
             l1.entries[idx0] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
         } else {
-            assert!(!l2.entries[idx1].is_leaf(),
-                "RISC-V map_4k: address 0x{:x} already mapped as 2M megapage", vaddr);
+            assert!(
+                !l2.entries[idx1].is_leaf(),
+                "RISC-V map_4k: address 0x{:x} already mapped as 2M megapage",
+                vaddr
+            );
             let l1 = pt_at_mut(l2.entries[idx1].ppn());
-            assert!(!l1.entries[idx0].is_valid(),
-                "RISC-V map_4k: double-map at 0x{:x}", vaddr);
+            assert!(
+                !l1.entries[idx0].is_valid(),
+                "RISC-V map_4k: double-map at 0x{:x}",
+                vaddr
+            );
             l1.entries[idx0] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
         }
     }
 }
 
-pub fn map_2m(
-    root: u64,
-    alloc: &mut BitmapAllocator,
-    vaddr: u64,
-    paddr: u64,
-    flags: PageFlags,
-) {
+pub fn map_2m(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
     let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let rf = page_flags_to_riscv(flags);
@@ -159,8 +153,11 @@ pub fn map_2m(
         l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
     } else {
         let l2 = pt_at_mut(root_pt.entries[idx2].ppn());
-        assert!(!l2.entries[idx1].is_valid(),
-            "RISC-V map_2m: double-map at 0x{:x}", vaddr);
+        assert!(
+            !l2.entries[idx1].is_valid(),
+            "RISC-V map_2m: double-map at 0x{:x}",
+            vaddr
+        );
         l2.entries[idx1] = PageTableEntry::new(paddr_to_ppn(paddr), rf);
     }
 }
@@ -283,6 +280,10 @@ pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
 /// stream and stack.
 pub unsafe fn activate(root: u64) {
     let satp = SATP_MODE_SV39 | paddr_to_ppn(root);
-    unsafe { asm!("csrw satp, {}", in(reg) satp); }
-    unsafe { asm!("sfence.vma"); }
+    unsafe {
+        asm!("csrw satp, {}", in(reg) satp);
+    }
+    unsafe {
+        asm!("sfence.vma");
+    }
 }

@@ -22,7 +22,9 @@ pub fn enumerate_all(segments: &[u16]) {
         scan_bus(segment, 0, &mut devices);
     }
     let leaked: &'static [PciDevice] = Box::leak(devices.into_boxed_slice());
-    unsafe { DEVICES = Some(leaked); }
+    unsafe {
+        DEVICES = Some(leaked);
+    }
 }
 
 fn scan_bus(segment: u16, bus: u8, devices: &mut Vec<PciDevice>) {

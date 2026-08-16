@@ -18,15 +18,15 @@
 //!   - Interrupt-driven completion with polling fallback
 //!   - Multi-port and multi-controller support
 
-use core::arch::asm;
-use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU32, AtomicBool, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::arch::asm;
+use core::ptr::{read_volatile, write_volatile};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spin::Mutex;
 
 use super::driver::StorageDriver;
-use super::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
+use super::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
 use crate::services::dma::DmaAllocator;
 
 const AHCI_MAX_SLOTS: usize = 32;
@@ -42,9 +42,13 @@ fn cache_flush_line(addr: *const u8) {
         CHECKED.store(true, Ordering::Relaxed);
     }
     if HAS_OPT.load(Ordering::Relaxed) {
-        unsafe { asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags)); }
+        unsafe {
+            asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags));
+        }
     } else {
-        unsafe { asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags)); }
+        unsafe {
+            asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+        }
     }
 }
 
@@ -91,7 +95,9 @@ const TFD_ERR: u32 = 1 << 0;
 const PRDT_IOC: u32 = 1 << 31;
 
 #[derive(Clone, Copy)]
-struct Hba { vaddr: u64 }
+struct Hba {
+    vaddr: u64,
+}
 
 impl Hba {
     fn r32(self, off: u32) -> u32 {
@@ -135,9 +141,13 @@ struct Slot {
 
 fn wait_ssts_det(hba: &Hba, p: u8) -> bool {
     use crate::services::universal_timer::{now_ns, wait_until_cond};
-    if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB { return true; }
+    if hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB {
+        return true;
+    }
     let deadline = now_ns() + 100_000_000;
-    wait_until_cond(deadline, &|| hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB)
+    wait_until_cond(deadline, &|| {
+        hba.pr32(p, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB
+    })
 }
 
 // ── Port state ──────────────────────────────────────────────────
@@ -185,7 +195,8 @@ fn handle_ahci_irq() {
         let is = port.hba.pr32(port.port, port_off::IS);
         if is != 0 {
             port.hba.pw32(port.port, port_off::IS, is);
-            port.irq_completed.store(1, core::sync::atomic::Ordering::Release);
+            port.irq_completed
+                .store(1, core::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -199,14 +210,20 @@ impl AhciPort {
         use crate::services::universal_timer::{now_ns, wait_until_cond};
 
         // Clear any stale IRQ flag before waiting.
-        self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
+        self.irq_completed
+            .store(0, core::sync::atomic::Ordering::Release);
 
         // HLT-based wait: yields to the AHCI IRQ / universal timer instead
         // of busy-spinning (which starves device emulation under TCG).
         let deadline = now_ns() + 5_000_000_000;
         let done = &|| {
-            if self.irq_completed.load(core::sync::atomic::Ordering::Acquire) != 0 {
-                self.irq_completed.store(0, core::sync::atomic::Ordering::Release);
+            if self
+                .irq_completed
+                .load(core::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                self.irq_completed
+                    .store(0, core::sync::atomic::Ordering::Release);
             }
             let ci = self.hba.pr32(self.port, port_off::CI);
             let sact = self.hba.pr32(self.port, port_off::SACT);
@@ -236,10 +253,18 @@ impl AhciPort {
         use crate::drivers::serial::SerialPort;
         SerialPort::puts("[ahci] ERR err=0x");
         SerialPort::put_hex(err as u64);
-        if err & 0x04 != 0 { SerialPort::puts(" ABRT"); }
-        if err & 0x10 != 0 { SerialPort::puts(" IDNF"); }
-        if err & 0x40 != 0 { SerialPort::puts(" UNC"); }
-        if err & 0x80 != 0 { SerialPort::puts(" WP"); }
+        if err & 0x04 != 0 {
+            SerialPort::puts(" ABRT");
+        }
+        if err & 0x10 != 0 {
+            SerialPort::puts(" IDNF");
+        }
+        if err & 0x40 != 0 {
+            SerialPort::puts(" UNC");
+        }
+        if err & 0x80 != 0 {
+            SerialPort::puts(" WP");
+        }
         SerialPort::puts(" serr=0x");
         SerialPort::put_hex(serr as u64);
         SerialPort::puts(" tfd=0x");
@@ -268,13 +293,16 @@ impl AhciPort {
     ///   bytes 4-6, 8-10: LBA (standard 48-bit)
     fn write_ncq_fis(&self, fis: *mut u32, lba: u64, count: u16, tag: u8, cmd: u8) {
         unsafe {
-            fis.add(0).write_volatile(0x8027u32 | (cmd as u32) << 16 | (count as u32) << 24);
-            fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (0x40 << 24));
+            fis.add(0)
+                .write_volatile(0x8027u32 | (cmd as u32) << 16 | (count as u32) << 24);
+            fis.add(1)
+                .write_volatile((lba as u32 & 0x00FF_FFFF) | (0x40 << 24));
             fis.add(2).write_volatile(
                 ((lba >> 24) as u32 & 0xFF)
-                | (((lba >> 32) as u32 & 0xFF) << 8)
-                | (((lba >> 40) as u32 & 0xFF) << 16)
-                | ((count as u32 >> 8) << 24));
+                    | (((lba >> 32) as u32 & 0xFF) << 8)
+                    | (((lba >> 40) as u32 & 0xFF) << 16)
+                    | ((count as u32 >> 8) << 24),
+            );
             fis.add(3).write_volatile(((tag as u32) << 3) | (0 << 24));
             fis.add(4).write_volatile(0);
         }
@@ -290,15 +318,19 @@ impl AhciPort {
                 // Keep the ATA task-file obsolete bits set as required by
                 // the controller's non-NCQ DMA-EXT path (0xE0 = LBA + the
                 // legacy high bits).  QEMU rejects 0x40 here with AMNF.
-                fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (0xE0 << 24));
+                fis.add(1)
+                    .write_volatile((lba as u32 & 0x00FF_FFFF) | (0xE0 << 24));
                 fis.add(2).write_volatile(
                     ((lba >> 24) as u32 & 0xFF)
-                    | (((lba >> 32) as u32 & 0xFF) << 8)
-                    | (((lba >> 40) as u32 & 0xFF) << 16));
-                fis.add(3).write_volatile((count as u32 & 0xFF) | ((count as u32 >> 8) << 8));
+                        | (((lba >> 32) as u32 & 0xFF) << 8)
+                        | (((lba >> 40) as u32 & 0xFF) << 16),
+                );
+                fis.add(3)
+                    .write_volatile((count as u32 & 0xFF) | ((count as u32 >> 8) << 8));
             } else {
                 let dev = 0xE0u32 | ((lba >> 24) as u32 & 0x0F);
-                fis.add(1).write_volatile((lba as u32 & 0x00FF_FFFF) | (dev << 24));
+                fis.add(1)
+                    .write_volatile((lba as u32 & 0x00FF_FFFF) | (dev << 24));
                 fis.add(2).write_volatile(0);
                 fis.add(3).write_volatile(count as u32 & 0xFF);
             }
@@ -307,13 +339,19 @@ impl AhciPort {
     }
 
     /// Build PRDT entries with translation caching.
-    fn build_prdt(&self, buf_vaddr: u64, size: usize, prdt_ptr: *mut PrdEntry) -> Result<usize, &'static str> {
+    fn build_prdt(
+        &self,
+        buf_vaddr: u64,
+        size: usize,
+        prdt_ptr: *mut PrdEntry,
+    ) -> Result<usize, &'static str> {
         let mut rem = size as isize;
         let mut off: isize = 0;
         let mut n = 0usize;
         while rem > 0 && n < self.max_prdt {
             let va = (buf_vaddr as isize + off) as u64;
-            let pa = crate::services::kernel_services().dma
+            let pa = crate::services::kernel_services()
+                .dma
                 .virt_to_phys(va)
                 .ok_or("PRDT translate fail")?;
             let skip = (va & 0xFFF) as usize;
@@ -330,7 +368,9 @@ impl AhciPort {
             rem -= chunk as isize;
             off += chunk as isize;
         }
-        if rem > 0 { return Err("PRDT entries exhausted"); }
+        if rem > 0 {
+            return Err("PRDT entries exhausted");
+        }
         Ok(n)
     }
 
@@ -338,7 +378,11 @@ impl AhciPort {
     fn alloc_slots(&self, count: usize) -> Result<u32, &'static str> {
         loop {
             let current = self.slot_alloc.load(core::sync::atomic::Ordering::Relaxed);
-            let mask = if self.n_slots >= 32 { !0u32 } else { (1u32 << self.n_slots) - 1 };
+            let mask = if self.n_slots >= 32 {
+                !0u32
+            } else {
+                (1u32 << self.n_slots) - 1
+            };
             let free = !current & mask;
             if (free.count_ones() as usize) < count {
                 return Err("not enough NCQ slots");
@@ -351,22 +395,36 @@ impl AhciPort {
                     found += 1;
                 }
             }
-            if self.slot_alloc.compare_exchange_weak(
-                current, current | mask,
-                core::sync::atomic::Ordering::AcqRel,
-                core::sync::atomic::Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .slot_alloc
+                .compare_exchange_weak(
+                    current,
+                    current | mask,
+                    core::sync::atomic::Ordering::AcqRel,
+                    core::sync::atomic::Ordering::Relaxed,
+                )
+                .is_ok()
+            {
                 return Ok(mask);
             }
         }
     }
 
     fn free_slots(&self, tag_mask: u32) {
-        self.slot_alloc.fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
+        self.slot_alloc
+            .fetch_and(!tag_mask, core::sync::atomic::Ordering::Release);
     }
 
     /// Prepare a command in the given slot.
-    fn prepare_cmd(&self, tag: u8, lba: u64, count: u32, buf_vaddr: u64, size: usize, is_write: bool) -> Result<(), &'static str> {
+    fn prepare_cmd(
+        &self,
+        tag: u8,
+        lba: u64,
+        count: u32,
+        buf_vaddr: u64,
+        size: usize,
+        is_write: bool,
+    ) -> Result<(), &'static str> {
         let ct_va = self.slots[tag as usize].ct_vaddr;
 
         unsafe {
@@ -401,7 +459,8 @@ impl AhciPort {
         } else {
             unsafe {
                 core::ptr::addr_of_mut!((*prdt_ptr).dba).write_volatile(self.scratch_paddr as u32);
-                core::ptr::addr_of_mut!((*prdt_ptr).dbau).write_volatile((self.scratch_paddr >> 32) as u32);
+                core::ptr::addr_of_mut!((*prdt_ptr).dbau)
+                    .write_volatile((self.scratch_paddr >> 32) as u32);
                 core::ptr::addr_of_mut!((*prdt_ptr)._rsvd).write_volatile(0);
                 core::ptr::addr_of_mut!((*prdt_ptr).dbc).write_volatile((size - 1) as u32);
             }
@@ -419,7 +478,8 @@ impl AhciPort {
         let hdr = (self.cl_vaddr + (tag as u64) * 32) as *mut CmdHeader;
         let w = if is_write { 1u32 << 6 } else { 0 };
         unsafe {
-            core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl).write_volatile(5u32 | w | (prdtl as u32) << 16);
+            core::ptr::addr_of_mut!((*hdr).cfl_w_prdtl)
+                .write_volatile(5u32 | w | (prdtl as u32) << 16);
             core::ptr::addr_of_mut!((*hdr).prdbc).write_volatile(0);
         }
 
@@ -434,7 +494,8 @@ impl AhciPort {
         // overwrite an outstanding bit: doing so would turn a retry into a
         // permanent wait for the original command.
         if self.hba.pr32(self.port, port_off::CI) & tag_mask != 0
-            || self.hba.pr32(self.port, port_off::SACT) & tag_mask != 0 {
+            || self.hba.pr32(self.port, port_off::SACT) & tag_mask != 0
+        {
             return Err("AHCI slot still active");
         }
         core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
@@ -453,19 +514,22 @@ impl AhciPort {
 
         // Stop port DMA
         let cmd = self.hba.pr32(self.port, port_off::CMD);
-        self.hba.pw32(self.port, port_off::CMD, cmd & !(CMD_ST | CMD_FRE));
+        self.hba
+            .pw32(self.port, port_off::CMD, cmd & !(CMD_ST | CMD_FRE));
         for _ in 0..1000 {
             let c = self.hba.pr32(self.port, port_off::CMD);
-            if c & (CMD_CR | CMD_FR) == 0 { break; }
+            if c & (CMD_CR | CMD_FR) == 0 {
+                break;
+            }
             core::hint::spin_loop();
         }
 
         // Save port registers that may be reset by COMRESET on some hardware.
-        let saved_clb  = self.hba.pr32(self.port, port_off::CLB);
+        let saved_clb = self.hba.pr32(self.port, port_off::CLB);
         let saved_clbu = self.hba.pr32(self.port, port_off::CLBU);
-        let saved_fb   = self.hba.pr32(self.port, port_off::FB);
-        let saved_fbu  = self.hba.pr32(self.port, port_off::FBU);
-        let saved_ie   = self.hba.pr32(self.port, port_off::IE);
+        let saved_fb = self.hba.pr32(self.port, port_off::FB);
+        let saved_fbu = self.hba.pr32(self.port, port_off::FBU);
+        let saved_ie = self.hba.pr32(self.port, port_off::IE);
 
         // Issue COMRESET via SCTL.DET = 1
         let sctl = self.hba.pr32(self.port, port_off::SCTL);
@@ -476,10 +540,9 @@ impl AhciPort {
         // Wait up to 100ms for device to re-establish
         use crate::services::universal_timer::{now_ns, wait_until_cond};
         let deadline = now_ns() + 100_000_000;
-        let established = wait_until_cond(
-            deadline,
-            &|| self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB,
-        );
+        let established = wait_until_cond(deadline, &|| {
+            self.hba.pr32(self.port, port_off::SSTS) & SSTS_DET_MASK == SSTS_DET_ESTAB
+        });
         if !established {
             SerialPort::puts("[ahci] port reset timeout\n");
             return Err("port reset timeout");
@@ -493,9 +556,16 @@ impl AhciPort {
 
         self.hba.pw32(self.port, port_off::SERR, !0);
         self.hba.pw32(self.port, port_off::IS, !0);
-        self.hba.pw32(self.port, port_off::CMD, CMD_SUD | CMD_POD | CMD_FRE);
-        for _ in 0..10 { core::hint::spin_loop(); }
-        self.hba.pw32(self.port, port_off::CMD, self.hba.pr32(self.port, port_off::CMD) | CMD_ST);
+        self.hba
+            .pw32(self.port, port_off::CMD, CMD_SUD | CMD_POD | CMD_FRE);
+        for _ in 0..10 {
+            core::hint::spin_loop();
+        }
+        self.hba.pw32(
+            self.port,
+            port_off::CMD,
+            self.hba.pr32(self.port, port_off::CMD) | CMD_ST,
+        );
 
         // Re-enable interrupts if they were previously enabled.
         if saved_ie != 0 {
@@ -512,7 +582,9 @@ impl AhciPort {
         let ct_va = self.slots[0].ct_vaddr;
 
         // Zero FIS + PRDT area
-        unsafe { core::ptr::write_bytes(ct_va as *mut u8, 0, 0x80 + self.max_prdt * 16); }
+        unsafe {
+            core::ptr::write_bytes(ct_va as *mut u8, 0, 0x80 + self.max_prdt * 16);
+        }
 
         // IDENTIFY DEVICE command (non-NCQ, uses standard Register H2D FIS)
         self.write_std_fis(ct_va as *mut u32, 0, 0u16, 0xEC);
@@ -521,7 +593,8 @@ impl AhciPort {
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
         unsafe {
             core::ptr::addr_of_mut!((*prdt_ptr).dba).write_volatile(self.scratch_paddr as u32);
-            core::ptr::addr_of_mut!((*prdt_ptr).dbau).write_volatile((self.scratch_paddr >> 32) as u32);
+            core::ptr::addr_of_mut!((*prdt_ptr).dbau)
+                .write_volatile((self.scratch_paddr >> 32) as u32);
             core::ptr::addr_of_mut!((*prdt_ptr)._rsvd).write_volatile(0);
             core::ptr::addr_of_mut!((*prdt_ptr).dbc).write_volatile(511 | PRDT_IOC);
         }
@@ -568,7 +641,11 @@ impl AhciPort {
                 self.model[i * 2 + 1] = (w & 0xFF) as u8;
             }
             for b in self.model.iter_mut().rev() {
-                if *b == b' ' || *b == 0 { *b = 0; } else { break; }
+                if *b == b' ' || *b == 0 {
+                    *b = 0;
+                } else {
+                    break;
+                }
             }
         }
 
@@ -581,9 +658,14 @@ impl AhciPort {
 impl BlockDevice for AhciPort {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
         let _guard = self.submit_lock.lock();
-        let n = reqs.len().min(if self.ncq { self.n_slots as usize } else { 1 });
+        let n = reqs
+            .len()
+            .min(if self.ncq { self.n_slots as usize } else { 1 });
         if n == 0 {
-            return Ok(IoCompletions { completed: 0, errors: 0 });
+            return Ok(IoCompletions {
+                completed: 0,
+                errors: 0,
+            });
         }
 
         // Allocate tags (NCQ or non-NCQ)
@@ -610,7 +692,10 @@ impl BlockDevice for AhciPort {
                     };
                     if buf_size < bytes {
                         err_mask |= 1 << tag;
-                    } else if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
+                    } else if self
+                        .prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write)
+                        .is_err()
+                    {
                         err_mask |= 1 << tag;
                     }
                     buf_ranges[idx] = (buf_vaddr, bytes as u64);
@@ -623,7 +708,10 @@ impl BlockDevice for AhciPort {
         let ok_mask = tag_mask & !err_mask;
         if ok_mask == 0 {
             self.free_slots(tag_mask);
-            return Ok(IoCompletions { completed: 0, errors: tag_mask });
+            return Ok(IoCompletions {
+                completed: 0,
+                errors: tag_mask,
+            });
         }
 
         // Flush the CPU cache for write buffers before DMA submission.
@@ -631,7 +719,9 @@ impl BlockDevice for AhciPort {
         if reqs[0].is_write {
             for i in 0..n {
                 let (va, sz) = buf_ranges[i];
-                if va == 0 || sz == 0 { continue; }
+                if va == 0 || sz == 0 {
+                    continue;
+                }
                 let end = va + sz;
                 let mut cl = va & !63u64;
                 while cl < end {
@@ -650,7 +740,9 @@ impl BlockDevice for AhciPort {
                 if !reqs[0].is_write {
                     for i in 0..n {
                         let (va, sz) = buf_ranges[i];
-                        if va == 0 || sz == 0 { continue; }
+                        if va == 0 || sz == 0 {
+                            continue;
+                        }
                         let end = va + sz;
                         let mut cl = va & !63u64;
                         while cl < end {
@@ -661,7 +753,10 @@ impl BlockDevice for AhciPort {
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
                 }
                 self.free_slots(tag_mask);
-                Ok(IoCompletions { completed: ok_mask, errors: err_mask })
+                Ok(IoCompletions {
+                    completed: ok_mask,
+                    errors: err_mask,
+                })
             }
             Err(e) => {
                 use crate::drivers::serial::SerialPort;
@@ -676,7 +771,9 @@ impl BlockDevice for AhciPort {
                 let mut retry_ok = ok_mask;
                 for i in 0..n {
                     let tag = tag_of[i];
-                    if err_mask & (1 << tag) != 0 { continue; }
+                    if err_mask & (1 << tag) != 0 {
+                        continue;
+                    }
                     let req = &reqs[i];
                     let bytes = (req.count as usize) * 512;
                     // SAFETY: Same as above — buffer lives until submit returns.
@@ -686,7 +783,10 @@ impl BlockDevice for AhciPort {
                         IoBuffer::Phys(pa, sz) => (*pa, *sz),
                     };
                     if buf_size >= bytes {
-                        if self.prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write).is_err() {
+                        if self
+                            .prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write)
+                            .is_err()
+                        {
                             err_mask |= 1 << tag;
                             retry_ok &= !(1 << tag);
                         }
@@ -697,12 +797,18 @@ impl BlockDevice for AhciPort {
                 }
                 if retry_ok == 0 {
                     self.free_slots(tag_mask);
-                    return Ok(IoCompletions { completed: 0, errors: tag_mask });
+                    return Ok(IoCompletions {
+                        completed: 0,
+                        errors: tag_mask,
+                    });
                 }
                 match self.submit_batch(retry_ok) {
                     Ok(()) => {
                         self.free_slots(tag_mask);
-                        Ok(IoCompletions { completed: ok_mask, errors: err_mask })
+                        Ok(IoCompletions {
+                            completed: ok_mask,
+                            errors: err_mask,
+                        })
                     }
                     Err(e2) => {
                         self.free_slots(tag_mask);
@@ -725,7 +831,10 @@ impl BlockDevice for AhciPort {
 
 // ── Initialisation ──────────────────────────────────────────────
 
-fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(
+    dev: &crate::pci::PciDevice,
+    dma: &dyn DmaAllocator,
+) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
     crate::pci::enable_device(dev);
     let base = match crate::pci::bar::bar(dev, 5) {
@@ -736,7 +845,9 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
         }
     };
 
-    let mmio = Hba { vaddr: dma.map_mmio(base, 0x1000)? };
+    let mmio = Hba {
+        vaddr: dma.map_mmio(base, 0x1000)?,
+    };
     let cap = mmio.r32(ghc::CAP);
     let n_ports = ((cap >> 17) & 0x1F) + 1;
     let pi = mmio.r32(ghc::PI);
@@ -744,7 +855,9 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
     let max_prdt_raw = (4096 - 0x80) / 16;
 
     let mmio_sz = (((0x100 + (n_ports as u64) * 0x80 + 0x80) + 0xFFF) & !0xFFF).max(0x1000);
-    let mmio = Hba { vaddr: dma.map_mmio(base, mmio_sz)? };
+    let mmio = Hba {
+        vaddr: dma.map_mmio(base, mmio_sz)?,
+    };
 
     let ver = mmio.r32(ghc::VS);
     SerialPort::puts("[ahci] controller ");
@@ -772,7 +885,9 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
     SerialPort::puts("[ahci] resetting HBA\n");
     mmio.w32(ghc::GHC, GHC_HR);
     for _ in 0..1000 {
-        if mmio.r32(ghc::GHC) & GHC_HR == 0 { break; }
+        if mmio.r32(ghc::GHC) & GHC_HR == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
     if mmio.r32(ghc::GHC) & GHC_HR != 0 {
@@ -785,7 +900,9 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
     let mut ports: Vec<Arc<dyn BlockDevice>> = Vec::new();
     let mut port_numbers: Vec<u8> = Vec::new();
     for p in 0u8..n_ports.min(32) as u8 {
-        if pi & (1 << p) == 0 { continue; }
+        if pi & (1 << p) == 0 {
+            continue;
+        }
 
         match init_one(p, &mmio, dma, max_prdt_raw.min(MAX_PRDT), n_slots_raw) {
             Ok(port) => {
@@ -819,7 +936,9 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
                 dev.interrupt_line as u32,
                 crate::acpi::Polarity::ActiveLow,
                 crate::acpi::TriggerMode::Level,
-            ).is_some() {
+            )
+            .is_some()
+            {
                 for &p in &port_numbers {
                     mmio.pw32(p, port_off::IE, 0x0000_0089);
                 }
@@ -831,14 +950,22 @@ fn init_controller(dev: &crate::pci::PciDevice, dma: &dyn DmaAllocator) -> Resul
 
     Ok(ports)
 }
-fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_raw: u32) -> Result<AhciPort, &'static str> {
+fn init_one(
+    p: u8,
+    hba: &Hba,
+    dma: &dyn DmaAllocator,
+    max_prdt: usize,
+    n_slots_raw: u32,
+) -> Result<AhciPort, &'static str> {
     let n_slots = (n_slots_raw as usize).min(AHCI_MAX_SLOTS) as u8;
 
     // Stop port DMA
     let cmd = hba.pr32(p, port_off::CMD);
     hba.pw32(p, port_off::CMD, cmd & !(CMD_ST | CMD_FRE));
     for _ in 0..1000 {
-        if hba.pr32(p, port_off::CMD) & (CMD_CR | CMD_FR) == 0 { break; }
+        if hba.pr32(p, port_off::CMD) & (CMD_CR | CMD_FR) == 0 {
+            break;
+        }
         core::hint::spin_loop();
     }
 
@@ -854,10 +981,16 @@ fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_r
     let sc_buf = dma.alloc_page().ok_or("OOM scratch")?;
 
     // Allocate per-slot Command Table pages
-    let mut slots = [Slot { ct_paddr: 0, ct_vaddr: 0 }; AHCI_MAX_SLOTS];
+    let mut slots = [Slot {
+        ct_paddr: 0,
+        ct_vaddr: 0,
+    }; AHCI_MAX_SLOTS];
     for s in 0..n_slots as usize {
         let ct_buf = dma.alloc_page().ok_or("OOM CT")?;
-        slots[s] = Slot { ct_paddr: ct_buf.phys, ct_vaddr: ct_buf.virt };
+        slots[s] = Slot {
+            ct_paddr: ct_buf.phys,
+            ct_vaddr: ct_buf.virt,
+        };
     }
 
     // Pre-initialise CmdHeaders for all slots
@@ -883,21 +1016,37 @@ fn init_one(p: u8, hba: &Hba, dma: &dyn DmaAllocator, max_prdt: usize, n_slots_r
     hba.pw32(p, port_off::SERR, !0);
     hba.pw32(p, port_off::IE, 0);
 
-    hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD);
-    for _ in 0..100 { core::hint::spin_loop(); }
+    hba.pw32(
+        p,
+        port_off::CMD,
+        hba.pr32(p, port_off::CMD) | CMD_SUD | CMD_POD,
+    );
+    for _ in 0..100 {
+        core::hint::spin_loop();
+    }
 
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_FRE);
     hba.pw32(p, port_off::CMD, hba.pr32(p, port_off::CMD) | CMD_ST);
 
-    if !wait_ssts_det(hba, p) { return Err("no device"); }
+    if !wait_ssts_det(hba, p) {
+        return Err("no device");
+    }
 
     let mut port = AhciPort {
-        hba: *hba, port: p,
-        _cl_paddr: cl_buf.phys, cl_vaddr: cl_buf.virt,
-        _rfis_paddr: rfis_buf.phys, _rfis_vaddr: rfis_buf.virt,
-        scratch_paddr: sc_buf.phys, scratch_vaddr: sc_buf.virt,
-        max_prdt, n_slots,
-        sector_count: 0, lba48: false, ncq: false, model: [0u8; 40],
+        hba: *hba,
+        port: p,
+        _cl_paddr: cl_buf.phys,
+        cl_vaddr: cl_buf.virt,
+        _rfis_paddr: rfis_buf.phys,
+        _rfis_vaddr: rfis_buf.virt,
+        scratch_paddr: sc_buf.phys,
+        scratch_vaddr: sc_buf.virt,
+        max_prdt,
+        n_slots,
+        sector_count: 0,
+        lba48: false,
+        ncq: false,
+        model: [0u8; 40],
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),

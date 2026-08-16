@@ -1,19 +1,21 @@
 use alloc::sync::Arc;
-use spin::Mutex;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::superblock::SuperBlock;
 
-pub mod tmpfs;
 pub mod fat32;
+pub mod tmpfs;
 
 pub trait FileSystem: Send + Sync {
     fn name(&self) -> &str;
-    fn mount(&self, device: Option<Arc<dyn BlockDevice>>)
-        -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>;
+    fn mount(
+        &self,
+        device: Option<Arc<dyn BlockDevice>>,
+    ) -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>;
 }
 
 static REGISTRY: Mutex<Vec<&'static dyn FileSystem>> = Mutex::new(Vec::new());

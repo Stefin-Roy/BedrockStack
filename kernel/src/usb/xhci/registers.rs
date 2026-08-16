@@ -48,8 +48,7 @@ pub const PORTSC_PLC: u32 = 1 << 22;
 pub const PORTSC_CEC: u32 = 1 << 23;
 
 pub const PORTSC_STATUS_BITS: u32 =
-    PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC |
-    PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
+    PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
 
 const MMIO_SIZE: u64 = 0x10000;
 
@@ -69,7 +68,11 @@ impl XhciRegisters {
         let op_base = mmio_va + caplength as u64;
 
         let rts_off_val = Self::read32_inner(mmio_va, 0x18) & !0x1F;
-        let runtime_off = if rts_off_val != 0 { rts_off_val } else { 0x8000 };
+        let runtime_off = if rts_off_val != 0 {
+            rts_off_val
+        } else {
+            0x8000
+        };
         let runtime_va = mmio_va + runtime_off as u64;
 
         let dboff = Self::read32_inner(mmio_va, 0x14) & !0x3;
@@ -84,11 +87,21 @@ impl XhciRegisters {
         })
     }
 
-    pub fn mmio_base(&self) -> u64 { self.mmio_va }
-    pub fn cap_length(&self) -> u8 { self.caplength }
-    pub fn op_base(&self) -> u64 { self.op_base }
-    pub fn doorbell_va(&self) -> u64 { self.doorbell_va }
-    pub fn runtime_va(&self) -> u64 { self.runtime_va }
+    pub fn mmio_base(&self) -> u64 {
+        self.mmio_va
+    }
+    pub fn cap_length(&self) -> u8 {
+        self.caplength
+    }
+    pub fn op_base(&self) -> u64 {
+        self.op_base
+    }
+    pub fn doorbell_va(&self) -> u64 {
+        self.doorbell_va
+    }
+    pub fn runtime_va(&self) -> u64 {
+        self.runtime_va
+    }
 
     fn read32_inner(base: u64, offset: u64) -> u32 {
         unsafe { core::ptr::read_volatile((base + offset) as *const u32) }
@@ -136,7 +149,8 @@ pub fn read_cap_data32(base: u64, offset: u64, reg: u16) -> u32 {
 pub fn read_protocol_string(base: u64, offset: u64) -> [u8; 20] {
     let mut buf = [0u8; 20];
     for (i, chunk) in buf.chunks_exact_mut(4).enumerate() {
-        let word = unsafe { core::ptr::read_volatile((base + offset + 4 + (i as u64) * 4) as *const u32) };
+        let word =
+            unsafe { core::ptr::read_volatile((base + offset + 4 + (i as u64) * 4) as *const u32) };
         chunk.copy_from_slice(&word.to_le_bytes());
     }
     buf
@@ -145,17 +159,29 @@ pub fn read_protocol_string(base: u64, offset: u64) -> [u8; 20] {
 pub struct HcsParams1(u32);
 
 impl HcsParams1 {
-    pub fn from(raw: u32) -> Self { HcsParams1(raw) }
-    pub fn max_slots(&self) -> u8 { (self.0 & 0xFF) as u8 }
-    pub fn max_intrs(&self) -> u16 { ((self.0 >> 8) & 0x7FF) as u16 }
-    pub fn max_ports(&self) -> u8 { ((self.0 >> 24) & 0xFF) as u8 }
+    pub fn from(raw: u32) -> Self {
+        HcsParams1(raw)
+    }
+    pub fn max_slots(&self) -> u8 {
+        (self.0 & 0xFF) as u8
+    }
+    pub fn max_intrs(&self) -> u16 {
+        ((self.0 >> 8) & 0x7FF) as u16
+    }
+    pub fn max_ports(&self) -> u8 {
+        ((self.0 >> 24) & 0xFF) as u8
+    }
 }
 
 pub struct HcsParams2(u32);
 
 impl HcsParams2 {
-    pub fn from(raw: u32) -> Self { HcsParams2(raw) }
-    pub fn erst_max(&self) -> u8 { ((self.0 >> 4) & 0xF) as u8 }
+    pub fn from(raw: u32) -> Self {
+        HcsParams2(raw)
+    }
+    pub fn erst_max(&self) -> u8 {
+        ((self.0 >> 4) & 0xF) as u8
+    }
     pub fn scratchpad_bufs(&self) -> u16 {
         // HCSPARAMS2: bits 31:27 = Max Scratchpad Buffers Lo, bits 26:22 = Hi.
         // The register value is the Hi field shifted above the Lo field.
@@ -168,10 +194,18 @@ impl HcsParams2 {
 pub struct HccParams1(u32);
 
 impl HccParams1 {
-    pub fn from(raw: u32) -> Self { HccParams1(raw) }
-    pub fn ac64(&self) -> bool { self.0 & (1 << 0) != 0 }
-    pub fn csz(&self) -> bool { self.0 & (1 << 2) != 0 }
-    pub fn xecp(&self) -> u16 { ((self.0 >> 16) as u16) << 2 }
+    pub fn from(raw: u32) -> Self {
+        HccParams1(raw)
+    }
+    pub fn ac64(&self) -> bool {
+        self.0 & (1 << 0) != 0
+    }
+    pub fn csz(&self) -> bool {
+        self.0 & (1 << 2) != 0
+    }
+    pub fn xecp(&self) -> u16 {
+        ((self.0 >> 16) as u16) << 2
+    }
 }
 
 pub struct PortRegisterSet {
@@ -181,7 +215,10 @@ pub struct PortRegisterSet {
 
 impl PortRegisterSet {
     pub fn new(mmio_va: u64, caplength: u8) -> Self {
-        PortRegisterSet { mmio_va, caplength: caplength as u64 }
+        PortRegisterSet {
+            mmio_va,
+            caplength: caplength as u64,
+        }
     }
 
     fn port_off(&self, port_num: u8) -> u64 {
@@ -208,7 +245,10 @@ impl Erst {
     pub fn new(dma: &dyn DmaAllocator) -> Result<Self, &'static str> {
         let buf = dma.alloc_page().ok_or("OOM for ERST")?;
         unsafe { core::ptr::write_bytes(buf.virt as *mut u8, 0, 16) }
-        Ok(Erst { seg_phys: buf.phys, seg_va: buf.virt })
+        Ok(Erst {
+            seg_phys: buf.phys,
+            seg_va: buf.virt,
+        })
     }
 }
 
@@ -235,6 +275,11 @@ impl EventRing {
             core::ptr::write_volatile((seg_ptr.add(12)) as *mut u32, 0);
         }
 
-        Ok(EventRing { phys: buf.phys, virt: buf.virt, trb_count, dequeue_index: 0 })
+        Ok(EventRing {
+            phys: buf.phys,
+            virt: buf.virt,
+            trb_count,
+            dequeue_index: 0,
+        })
     }
 }

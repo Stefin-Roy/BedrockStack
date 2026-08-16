@@ -5,9 +5,9 @@ pub mod enumerate;
 pub mod msi;
 pub mod msix;
 
-use alloc::vec::Vec;
-use crate::mm::phys_alloc::BitmapAllocator;
 use crate::acpi::PciConfigRegions;
+use crate::mm::phys_alloc::BitmapAllocator;
+use alloc::vec::Vec;
 
 /// A discovered PCI(e) device / function.
 #[derive(Debug, Clone, Copy)]
@@ -76,7 +76,11 @@ pub fn enable_device(dev: &PciDevice) {
     let pci_cfg = crate::services::kernel_services().pci_cfg;
     let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
     pci_cfg.write16(
-        dev.segment, dev.bus, dev.device, dev.function, 0x04,
+        dev.segment,
+        dev.bus,
+        dev.device,
+        dev.function,
+        0x04,
         cmd | (1 << 1) | (1 << 2),
     );
 }

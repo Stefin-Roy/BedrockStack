@@ -3,8 +3,6 @@ use super::super::pci_device::{Bar, PciCapability, PciDevice, PciDeviceManager};
 
 pub struct RiscvPciDevice;
 
-
-
 impl PciDeviceManager for RiscvPciDevice {
     fn devices(&self) -> &[PciDevice] {
         &[]
@@ -22,7 +20,14 @@ impl PciDeviceManager for RiscvPciDevice {
         &super::super::ecam_pci_config::EcamPciConfig
     }
 
-    fn configure_msi(&self, _dev: &PciDevice, _cap: &PciCapability, _vector: u8, _dest_apic_id: u8) {}
+    fn configure_msi(
+        &self,
+        _dev: &PciDevice,
+        _cap: &PciCapability,
+        _vector: u8,
+        _dest_apic_id: u8,
+    ) {
+    }
 
     fn disable_msi(&self, _dev: &PciDevice, _cap: &PciCapability) {}
 
@@ -35,7 +40,8 @@ impl PciDeviceManager for RiscvPciDevice {
         _table_entries: u16,
         _vector: u8,
         _dest_apic_id: u8,
-    ) {}
+    ) {
+    }
 
     fn program_msix_entry(
         &self,
@@ -45,17 +51,34 @@ impl PciDeviceManager for RiscvPciDevice {
         _entry_index: u16,
         _vector: u8,
         _dest_apic_id: u8,
-    ) {}
+    ) {
+    }
 
     fn disable_msix(&self, _dev: &PciDevice, _cap: &PciCapability) {}
 
-    fn msix_table_info(&self, _dev: &PciDevice, _cap: &PciCapability) -> crate::pci::msix::MsixInfo {
-        crate::pci::msix::MsixInfo { table_size: 0, bir: 0, table_offset: 0, pba_bir: 0, pba_offset: 0 }
+    fn msix_table_info(
+        &self,
+        _dev: &PciDevice,
+        _cap: &PciCapability,
+    ) -> crate::pci::msix::MsixInfo {
+        crate::pci::msix::MsixInfo {
+            table_size: 0,
+            bir: 0,
+            table_offset: 0,
+            pba_bir: 0,
+            pba_offset: 0,
+        }
     }
 
-    fn read_config_u8(&self, _dev: &PciDevice, _off: u16) -> u8 { 0 }
-    fn read_config_u16(&self, _dev: &PciDevice, _off: u16) -> u16 { 0 }
-    fn read_config_u32(&self, _dev: &PciDevice, _off: u16) -> u32 { 0 }
+    fn read_config_u8(&self, _dev: &PciDevice, _off: u16) -> u8 {
+        0
+    }
+    fn read_config_u16(&self, _dev: &PciDevice, _off: u16) -> u16 {
+        0
+    }
+    fn read_config_u32(&self, _dev: &PciDevice, _off: u16) -> u32 {
+        0
+    }
     fn write_config_u8(&self, _dev: &PciDevice, _off: u16, _val: u8) {}
     fn write_config_u16(&self, _dev: &PciDevice, _off: u16, _val: u16) {}
     fn write_config_u32(&self, _dev: &PciDevice, _off: u16, _val: u32) {}

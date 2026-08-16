@@ -30,7 +30,10 @@ impl Framebuffer {
         shadow_addr: u64,
     ) -> Self {
         assert!(bpp > 0, "framebuffer bytes per pixel must be nonzero");
-        assert!(width <= stride, "width must be <= stride (pixels per scanline)");
+        assert!(
+            width <= stride,
+            "width must be <= stride (pixels per scanline)"
+        );
 
         // NOTE (Phase D): `addr` and `shadow_addr` are mapped VIRTUAL
         // addresses (never physical).  The framebuffer is reachable through
@@ -129,13 +132,21 @@ impl Framebuffer {
         let row = y.checked_mul(self.stride)?.checked_mul(bpp)?;
         let col = x.checked_mul(bpp)?;
         let off = row.checked_add(col)?;
-        if off < self.total_bytes() { Some(off) } else { None }
+        if off < self.total_bytes() {
+            Some(off)
+        } else {
+            None
+        }
     }
 
     fn checked_row_offset(&self, y: usize) -> Option<usize> {
         let bpp = self.bpp_usize();
         let off = y.checked_mul(self.stride)?.checked_mul(bpp)?;
-        if off < self.total_bytes() { Some(off) } else { None }
+        if off < self.total_bytes() {
+            Some(off)
+        } else {
+            None
+        }
     }
 
     fn row_bytes(&self) -> usize {
@@ -172,9 +183,13 @@ impl Framebuffer {
         let y2 = self.dirty_y2;
         let bpp = self.bpp_usize();
         for y in y1..y2 {
-            let Some(off) = self.checked_offset(x1, y) else { continue };
+            let Some(off) = self.checked_offset(x1, y) else {
+                continue;
+            };
             let count = (x2 - x1) * bpp;
-            if off + count > self.total_bytes() { continue; }
+            if off + count > self.total_bytes() {
+                continue;
+            }
             unsafe {
                 core::ptr::copy_nonoverlapping(self.shadow.add(off), self.fb_ptr.add(off), count);
             }
@@ -218,7 +233,9 @@ impl Display for Framebuffer {
         if self.shadow.is_null() || x >= self.width || y >= self.height {
             return false;
         }
-        let Some(offset) = self.checked_offset(x, y) else { return false; };
+        let Some(offset) = self.checked_offset(x, y) else {
+            return false;
+        };
         let pixel = color.to_pixel_bytes(self.pixel_format);
         let bpp = self.bpp_usize();
         unsafe {
@@ -239,14 +256,18 @@ impl Display for Framebuffer {
             if py >= self.height {
                 break;
             }
-            let Some(off) = self.checked_offset(x, py) else { continue };
+            let Some(off) = self.checked_offset(x, py) else {
+                continue;
+            };
             let mut col = 0;
             while col < w {
                 let px = x + col;
                 if px >= self.width {
                     break;
                 }
-                unsafe { write_pixel_bytes(self.shadow, off + col * bpp, bpp, &pixel); }
+                unsafe {
+                    write_pixel_bytes(self.shadow, off + col * bpp, bpp, &pixel);
+                }
                 col += 1;
             }
         }
@@ -261,18 +282,22 @@ impl Display for Framebuffer {
             return;
         }
         let row_bytes = self.row_bytes();
-        let Some(src_off) = self.checked_row_offset(rows) else { return };
+        let Some(src_off) = self.checked_row_offset(rows) else {
+            return;
+        };
         let copy_rows = self.height - rows;
-        let Some(copy_bytes) = copy_rows.checked_mul(row_bytes) else { return };
-        if src_off + copy_bytes > self.total_bytes() { return; }
+        let Some(copy_bytes) = copy_rows.checked_mul(row_bytes) else {
+            return;
+        };
+        if src_off + copy_bytes > self.total_bytes() {
+            return;
+        }
         let zero_bytes = rows * row_bytes;
-        if copy_bytes + zero_bytes > self.total_bytes() { return; }
+        if copy_bytes + zero_bytes > self.total_bytes() {
+            return;
+        }
         unsafe {
-            core::ptr::copy(
-                self.shadow.add(src_off),
-                self.shadow,
-                copy_bytes,
-            );
+            core::ptr::copy(self.shadow.add(src_off), self.shadow, copy_bytes);
             core::ptr::write_bytes(self.shadow.add(copy_bytes), 0, zero_bytes);
         }
         self.mark_dirty(0, 0, self.width, self.height);
@@ -341,7 +366,9 @@ pub(crate) unsafe fn draw_glyph_raw(
             } else {
                 bg_pixel
             };
-            unsafe { write_pixel_bytes(base, col * bpp, bpp, &pixel); }
+            unsafe {
+                write_pixel_bytes(base, col * bpp, bpp, &pixel);
+            }
         }
     }
     true

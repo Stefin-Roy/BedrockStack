@@ -1,17 +1,17 @@
-pub mod registers;
-pub mod memory;
 pub mod command;
-pub mod event;
-pub mod ports;
-pub mod device;
 pub mod context;
+pub mod device;
+pub mod event;
+pub mod memory;
+pub mod ports;
+pub mod registers;
 
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::pci::PciDevice;
 use crate::services::dma::{DmaAllocator, DmaBuffer};
 use crate::usb::class::driver::BoundUsbDevice;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
 
 /// Information retained only while xHCI validates a newly enabled MSI-X
 /// route.  If the device raises an event but no LAPIC vector arrives, we can
@@ -49,9 +49,7 @@ struct XhciControllerState {
 
 static CONTROLLER: spin::Mutex<Option<XhciControllerState>> = spin::Mutex::new(None);
 
-pub fn init_all(
-    pci_devices: &[PciDevice],
-) -> Vec<Arc<dyn BlockDevice>> {
+pub fn init_all(pci_devices: &[PciDevice]) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
     let dma: &'static dyn DmaAllocator = crate::services::kernel_services().dma;
     let mut usb_block_devices = Vec::new();
@@ -81,7 +79,10 @@ pub fn init_all(
     usb_block_devices
 }
 
-fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
+fn init_controller(
+    dev: &PciDevice,
+    dma: &'static dyn DmaAllocator,
+) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str> {
     use crate::drivers::serial::SerialPort;
 
     crate::pci::enable_device(dev);
@@ -166,7 +167,12 @@ fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Ve
         }
     }
 
-    event::set_event_ring_info(er_buf.virt, er_buf.phys, er_buf.trb_count as u32, er_buf.dequeue_index);
+    event::set_event_ring_info(
+        er_buf.virt,
+        er_buf.phys,
+        er_buf.trb_count as u32,
+        er_buf.dequeue_index,
+    );
     event::set_erdp_register_va(rt_va);
     event::set_op_base_va(regs.op_base());
 
@@ -182,16 +188,17 @@ fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Ve
         core::ptr::write_volatile(imod_off as *mut u32, 0u32);
     }
 
-    regs.write_op32(registers::OP_USBCMD,
-        registers::USBCMD_RUN | registers::USBCMD_INTE | registers::USBCMD_HSEE);
+    regs.write_op32(
+        registers::OP_USBCMD,
+        registers::USBCMD_RUN | registers::USBCMD_INTE | registers::USBCMD_HSEE,
+    );
 
     {
         use crate::services::universal_timer::{now_ns, wait_until_cond};
         let deadline = now_ns() + 500_000_000;
-        let running = wait_until_cond(
-            deadline,
-            &|| regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0,
-        );
+        let running = wait_until_cond(deadline, &|| {
+            regs.read_op32(registers::OP_USBSTS) & registers::USBSTS_HCH == 0
+        });
         if !running {
             SerialPort::puts("[xhci] start timeout\n");
         }
@@ -248,8 +255,14 @@ fn init_controller(dev: &PciDevice, dma: &'static dyn DmaAllocator) -> Result<Ve
         SerialPort::puts("\n");
     }
 
-    let mut dev_mgr = enumerate_initial_ports(&mut usb_ports, &mut cmd_ring, dma,
-        regs.doorbell_va(), ctx_size, max_slots);
+    let mut dev_mgr = enumerate_initial_ports(
+        &mut usb_ports,
+        &mut cmd_ring,
+        dma,
+        regs.doorbell_va(),
+        ctx_size,
+        max_slots,
+    );
 
     // Verify message-interrupt delivery with a No-Op command.
     verify_message_interrupt_delivery(&mut cmd_ring, regs.doorbell_va(), &regs, dev, msix_fallback);
@@ -582,7 +595,11 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
 
         let port_state = {
             let ports = ctrl.ports.lock();
-            ports.ports.iter().find(|p| p.port_num == port_id).map(|p| (p.connected, p.enabled, p.speed))
+            ports
+                .ports
+                .iter()
+                .find(|p| p.port_num == port_id)
+                .map(|p| (p.connected, p.enabled, p.speed))
         };
 
         match port_state {
@@ -616,7 +633,11 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
             Some((true, true, speed)) => {
                 let (name, major, minor) = match protocol_cap_for_port(ctrl, port_id) {
                     Some(cap) => {
-                        let n = cap.name.iter().position(|&b| b == 0).unwrap_or(cap.name.len());
+                        let n = cap
+                            .name
+                            .iter()
+                            .position(|&b| b == 0)
+                            .unwrap_or(cap.name.len());
                         let name = core::str::from_utf8(&cap.name[..n]).unwrap_or("?");
                         (name, cap.rev_major, cap.rev_minor)
                     }
@@ -637,7 +658,9 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
                 if slots.slots.iter().any(|s| s.port_num == port_id) {
                     continue;
                 }
-                if let Err(e) = slots.enumerate_port(&mut cmd, ctrl.doorbell_va, ctrl.dma, port_id, speed) {
+                if let Err(e) =
+                    slots.enumerate_port(&mut cmd, ctrl.doorbell_va, ctrl.dma, port_id, speed)
+                {
                     SerialPort::puts("[xhci]  port ");
                     SerialPort::put_u64(port_id as u64);
                     SerialPort::puts(" enum failed: ");
@@ -667,7 +690,10 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
     new_devices
 }
 
-fn protocol_cap_for_port<'a>(ctrl: &'a XhciControllerState, port_num: u8) -> Option<&'a ProtocolCap> {
+fn protocol_cap_for_port<'a>(
+    ctrl: &'a XhciControllerState,
+    port_num: u8,
+) -> Option<&'a ProtocolCap> {
     ctrl.protocol_caps
         .iter()
         .find(|c| port_num >= c.port_offset && port_num < c.port_offset + c.port_count)
@@ -705,7 +731,8 @@ fn verify_message_interrupt_delivery(
     // Snapshot the controller before polling/acknowledging the event.  IP=1
     // together with USBSTS.EINT=1 proves that the xHC requested an interrupt;
     // if no CPU vector arrived, the fault is below the driver (PCI/QEMU/APIC).
-    let iman_before_poll = unsafe { core::ptr::read_volatile((_regs.runtime_va() + 0x20) as *const u32) };
+    let iman_before_poll =
+        unsafe { core::ptr::read_volatile((_regs.runtime_va() + 0x20) as *const u32) };
     let usbsts_before_poll = _regs.read_op32(registers::OP_USBSTS);
     SerialPort::puts("[xhci] irq snapshot: IF=");
     SerialPort::put_u64(crate::arch::CurrentArch::are_interrupts_enabled() as u64);
@@ -853,10 +880,9 @@ fn controller_reset(regs: &registers::XhciRegisters) {
     regs.write_op32(registers::OP_USBCMD, cmd | registers::USBCMD_HCRST);
     use crate::services::universal_timer::{now_ns, wait_until_cond};
     let deadline = now_ns() + 500_000_000;
-    let done = wait_until_cond(
-        deadline,
-        &|| regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0,
-    );
+    let done = wait_until_cond(deadline, &|| {
+        regs.read_op32(registers::OP_USBCMD) & registers::USBCMD_HCRST == 0
+    });
     if !done {
         SerialPort::puts("[xhci] reset timeout\n");
     }
@@ -878,15 +904,21 @@ fn alloc_scratchpad_array(
     let entry_size = if ac64 { 8usize } else { 4 };
     let total = spbuf_cnt as usize * entry_size;
     let pages = (total + 4095) / 4096;
-    let buf = dma.alloc_contiguous(pages).ok_or("OOM for scratchpad array")?;
+    let buf = dma
+        .alloc_contiguous(pages)
+        .ok_or("OOM for scratchpad array")?;
     unsafe { core::ptr::write_bytes(buf.virt as *mut u8, 0, buf.size) };
     for i in 0..spbuf_cnt as usize {
         let scratch = dma.alloc_page().ok_or("OOM for scratchpad buffer")?;
         let entry_va = buf.virt + (i * entry_size) as u64;
         if ac64 {
-            unsafe { core::ptr::write_volatile(entry_va as *mut u64, scratch.phys); }
+            unsafe {
+                core::ptr::write_volatile(entry_va as *mut u64, scratch.phys);
+            }
         } else {
-            unsafe { core::ptr::write_volatile(entry_va as *mut u32, scratch.phys as u32); }
+            unsafe {
+                core::ptr::write_volatile(entry_va as *mut u32, scratch.phys as u32);
+            }
         }
     }
     Ok(buf)
@@ -900,8 +932,8 @@ fn setup_interrupts(
     _ac64: bool,
 ) -> Option<MsixFallback> {
     use crate::arch::x86_64::idt;
-    use crate::pci::caps;
     use crate::drivers::serial::SerialPort;
+    use crate::pci::caps;
 
     let bsp_apic_id = unsafe {
         let lapic = crate::platform::x86_64_pc::apic::lapic_base();
@@ -993,7 +1025,9 @@ fn setup_interrupts(
                 dev.interrupt_line as u32,
                 crate::acpi::Polarity::ActiveLow,
                 crate::acpi::TriggerMode::Level,
-            ).is_some() {
+            )
+            .is_some()
+            {
                 unsafe {
                     core::ptr::write_volatile((rt_va + 0x20) as *mut u32, registers::IMAN_IE);
                 }
@@ -1018,7 +1052,9 @@ fn enumerate_initial_ports(
     let mut mgr = DeviceSlotManager::new(ctx_size, max_slots);
     for port in &usb_ports.ports {
         if port.enabled && port.connected {
-            if let Err(e) = mgr.enumerate_port(cmd_ring, doorbell_va, dma, port.port_num, port.speed) {
+            if let Err(e) =
+                mgr.enumerate_port(cmd_ring, doorbell_va, dma, port.port_num, port.speed)
+            {
                 use crate::drivers::serial::SerialPort;
                 SerialPort::puts("[xhci]  port ");
                 SerialPort::put_u64(port.port_num as u64);

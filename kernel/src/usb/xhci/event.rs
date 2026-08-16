@@ -47,7 +47,9 @@ fn erdp_ptr(paddr: u64, dequeue_index: u16) -> u64 {
 
 pub fn drain_pending_and_clear_intr() {
     let er_vaddr = XHCI_ER_VADDR.load(Ordering::Relaxed);
-    if er_vaddr == 0 { return; }
+    if er_vaddr == 0 {
+        return;
+    }
     consume_pending_events();
     let op_va = XHCI_OP_VA.load(Ordering::Relaxed);
     if op_va != 0 {
@@ -290,7 +292,8 @@ pub fn consume_pending_events() {
                     SerialPort::put_u64((control & 1) as u64);
                     SerialPort::puts("\n");
                 });
-                let state = (slot_id as u64) | ((cc as u64) << 8) | ((param as u64) << 16) | (1u64 << 63);
+                let state =
+                    (slot_id as u64) | ((cc as u64) << 8) | ((param as u64) << 16) | (1u64 << 63);
                 LAST_CMD_STATE.store(state, Ordering::Release);
             }
             34 => {

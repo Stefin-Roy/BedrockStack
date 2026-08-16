@@ -11,10 +11,14 @@ macro_rules! fat_trace {
     };
 }
 
-use super::mount::Fat32SuperBlock;
 use super::fat::EOC_MARKER;
+use super::mount::Fat32SuperBlock;
 
-pub(super) fn read_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &mut [u8]) -> Result<(), VfsError> {
+pub(super) fn read_cluster(
+    sb: &Fat32SuperBlock,
+    cluster: u32,
+    buf: &mut [u8],
+) -> Result<(), VfsError> {
     let lba = sb.bpb.cluster_to_lba(cluster);
     fat_trace!({
         crate::drivers::serial::dump_puts("[DBG:fat32] read_cluster clus=0x");
@@ -26,7 +30,11 @@ pub(super) fn read_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &mut [u8]) -
     read_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }
 
-pub(super) fn write_cluster(sb: &Fat32SuperBlock, cluster: u32, buf: &[u8]) -> Result<(), VfsError> {
+pub(super) fn write_cluster(
+    sb: &Fat32SuperBlock,
+    cluster: u32,
+    buf: &[u8],
+) -> Result<(), VfsError> {
     let lba = sb.bpb.cluster_to_lba(cluster);
     write_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }
@@ -38,12 +46,16 @@ pub(super) fn zero_cluster(sb: &Fat32SuperBlock, cluster: u32) -> Result<(), Vfs
 
 impl Fat32SuperBlock {
     pub fn chain_len(&self, start: u32) -> Result<u32, VfsError> {
-        if start == 0 || start >= EOC_MARKER { return Ok(0); }
+        if start == 0 || start >= EOC_MARKER {
+            return Ok(0);
+        }
         let mut n = 1u32;
         let mut c = start;
         loop {
             let next = self.read_fat_entry(c)?;
-            if next >= EOC_MARKER { break; }
+            if next >= EOC_MARKER {
+                break;
+            }
             c = next;
             n += 1;
             if n > self.bpb.total_clus + 2 {
@@ -58,7 +70,9 @@ impl Fat32SuperBlock {
         let mut _iters = 0u32;
         loop {
             let next = self.read_fat_entry(tail)?;
-            if next >= EOC_MARKER { break; }
+            if next >= EOC_MARKER {
+                break;
+            }
             tail = next;
             _iters += 1;
             if _iters > self.bpb.total_clus + 2 {
@@ -82,7 +96,9 @@ impl Fat32SuperBlock {
         let mut c = start;
         for _ in 0..keep - 1 {
             let next = self.read_fat_entry(c)?;
-            if next >= EOC_MARKER { return Ok(()); }
+            if next >= EOC_MARKER {
+                return Ok(());
+            }
             c = next;
         }
         let next = self.read_fat_entry(c)?;

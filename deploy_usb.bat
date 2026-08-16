@@ -21,9 +21,13 @@ echo [2/4] Building bootloader (release, features: cpu_slow)...
 cargo build --target x86_64-unknown-uefi -p boot --features cpu_slow --release
 if %errorlevel% neq 0 exit /b %errorlevel%
 
-REM Build user INIT (release)
+ REM Build user INIT (release)
 echo [3/4] Building user init (release)...
 cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+REM Build DOOM game (release)
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Copy to USB folder
@@ -34,6 +38,12 @@ mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%TARGET_DIR%\x86_64-unknown-uefi\release\boot.efi" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
 copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\user" "%USB_DIR%\EFI\BEDROCK\INIT"
+copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\doom" "%USB_DIR%\EFI\BEDROCK\DOOM"
+if exist "data\freedoom1.wad" (
+    copy /Y "data\freedoom1.wad" "%USB_DIR%\EFI\BEDROCK\FREEDOOM.WAD"
+) else (
+    echo WARNING: data\freedoom1.wad not found - DOOM will need an IWAD
+)
 call :copy_chime
 echo Done. Copy contents of USB\ to your ESP.
 goto :done
@@ -46,6 +56,10 @@ if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/3] Building user init (release)...
 cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+if %errorlevel% neq 0 exit /b %errorlevel%
+
+REM Build DOOM game (release)
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [3/3] Creating GRUB standalone image and copying to USB folder...
@@ -123,6 +137,12 @@ mkdir "%USB_DIR%\EFI\BEDROCK"
 copy /Y "%GRUB_EFI%" "%USB_DIR%\EFI\BOOT\BOOTX64.EFI"
 copy /Y "%TARGET_DIR%\x86_64-unknown-none\release\kernel" "%USB_DIR%\EFI\BEDROCK\KERNEL"
 copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\user" "%USB_DIR%\EFI\BEDROCK\INIT"
+copy /Y "%TARGET_DIR%\x86_64-bedrock-user\release\doom" "%USB_DIR%\EFI\BEDROCK\DOOM"
+if exist "data\freedoom1.wad" (
+    copy /Y "data\freedoom1.wad" "%USB_DIR%\EFI\BEDROCK\FREEDOOM.WAD"
+) else (
+    echo WARNING: data\freedoom1.wad not found - DOOM will need an IWAD
+)
 call :copy_chime
 echo Done. Copy contents of USB\ to your ESP (boot via UEFI GRUB which loads kernel via multiboot2).
 goto :done

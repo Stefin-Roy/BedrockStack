@@ -1,6 +1,6 @@
-use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
 use crate::KernelLayout;
+use crate::mm::phys_alloc::BitmapAllocator;
+use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 
 const PAGE_SIZE: u64 = 4096;
 const PAGE_2M: u64 = 512 * 4096;

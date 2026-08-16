@@ -3,34 +3,36 @@
 extern crate alloc;
 
 pub mod acpi;
+pub mod acpi_log;
 pub mod arch;
 #[cfg(target_arch = "x86_64")]
 pub mod audio;
 pub mod boot;
+pub mod display;
 pub mod drivers;
-pub mod filesystems;
 #[cfg(target_arch = "riscv64")]
 pub mod dtb;
-pub mod acpi_log;
+pub mod filesystems;
 pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
 pub mod mm;
 pub mod pci;
 pub mod platform;
-#[cfg(target_arch = "x86_64")]
-pub mod usb;
-pub mod smp;
 pub mod services;
+pub mod smp;
 #[cfg(target_arch = "x86_64")]
 pub mod task;
 pub mod unispace;
+#[cfg(target_arch = "x86_64")]
+pub mod usb;
 
 use acpi::AcpiSubsystem;
 use arch::CurrentArch;
 use boot::{FramebufferInfo, MemoryRegion};
 use framebuffer::Framebuffer;
 
+use crate::drivers::serial::SerialPort;
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use mm::vmm;
@@ -217,14 +219,18 @@ impl Kernel {
 
     /// Access the service container (panics if not yet initialised).
     fn svc(&self) -> &crate::services::KernelServices {
-        self.services.as_ref().expect("KernelServices not initialised")
+        self.services
+            .as_ref()
+            .expect("KernelServices not initialised")
     }
 
     pub fn init(&mut self) {
         // The physical allocator was moved during `Kernel::new()`; re-point
         // the stashed heap/DMA pointer before any code path can need it.
         heap::set_phys_allocator(&mut self.allocator);
-        unsafe { crate::smp::early_init_bsp(); }
+        unsafe {
+            crate::smp::early_init_bsp();
+        }
         self.switch_to_higher_half();
         crate::mm::layout::verify_layout();
 
@@ -247,7 +253,10 @@ impl Kernel {
         self.init_ioapic();
 
         // Build the service container for driver dispatch.
-        let acpi_static = self.acpi.as_ref().map(|a| unsafe { &*(a as *const crate::acpi::AcpiSubsystem) });
+        let acpi_static = self
+            .acpi
+            .as_ref()
+            .map(|a| unsafe { &*(a as *const crate::acpi::AcpiSubsystem) });
         let svc = alloc::boxed::Box::new(crate::services::init_services(
             self.page_table_root,
             &mut self.allocator as *mut _,
@@ -263,9 +272,8 @@ impl Kernel {
         self.init_framebuffer_shadow();
 
         // Initialise SMP — discover and start Application Processors.
-        let ncpus = unsafe {
-            crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc())
-        };
+        let ncpus =
+            unsafe { crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc()) };
         log::info!("SMP: {} CPU(s) online", ncpus);
         crate::drivers::serial::SerialPort::puts("[init] SMP done, enabling interrupts\n");
 
@@ -281,7 +289,15 @@ impl Kernel {
     /// for the lifetime of the kernel and `Framebuffer` keeps no ownership.
     fn init_framebuffer_shadow(&mut self) {
         let size = self.framebuffer.total_bytes();
-        log::info!("framebuffer shadow: {size} B via direct heap alloc");
+        log::info!(
+            "framebuffer: phys=0x{:x} {}x{} stride={} bpp={} ({} B shadow via heap)",
+            self.fb_phys,
+            self.framebuffer.width(),
+            self.framebuffer.height(),
+            self.framebuffer.stride(),
+            self.framebuffer.bpp(),
+            size
+        );
         // Direct kernel-heap allocation: the global allocator (set up in
         // `heap::init` during `init()`) serves this from the guard-mapped,
         // NX heap arena — exactly what `Framebuffer::set_shadow_va` expects.
@@ -289,6 +305,12 @@ impl Kernel {
         let va = shadow.as_mut_ptr() as u64;
         core::mem::forget(shadow);
         self.framebuffer.set_shadow_va(va);
+
+        // Point the framebuffer at the higher-half FB window (x86_64) and
+        // snapshot it for the `/dev/fb` device; riscv64 keeps the identity VA.
+        #[cfg(target_arch = "x86_64")]
+        self.framebuffer.set_fb_va(crate::mm::layout::FB_VADDR_BASE);
+        crate::display::register(&self.framebuffer);
     }
 
     /// Parse the ACPI interrupt model and initialise I/O APIC(s).
@@ -354,7 +376,6 @@ impl Kernel {
     }
 
     pub fn run(&mut self) -> ! {
-
         // The physical allocator was moved from the stack of `new()` into
         // `self.allocator`, leaving the raw pointer stashed by `heap::init`
         // dangling.  Re-point it at the final (stable) address.
@@ -390,34 +411,27 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         {
             crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::arch::x86_64::idt::vec34_count());
             crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::usb::xhci::event::irq_count());
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
 
         #[cfg(target_arch = "x86_64")]
-        let mut block_devices = crate::filesystems::blockdriver::driver::init_all(
-            crate::pci::devices(),
-        );
+        let mut block_devices =
+            crate::filesystems::blockdriver::driver::init_all(crate::pci::devices());
 
         #[cfg(target_arch = "x86_64")]
         {
             crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::arch::x86_64::idt::vec34_count());
             crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::usb::xhci::event::irq_count());
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
 
         #[cfg(target_arch = "x86_64")]
-        let usb_block_devices = crate::usb::xhci::init_all(
-            crate::pci::devices(),
-        );
+        let usb_block_devices = crate::usb::xhci::init_all(crate::pci::devices());
 
         // Audio subsystem — probes PCI for an Intel HD Audio controller.
         #[cfg(target_arch = "x86_64")]
@@ -477,11 +491,9 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         {
             crate::drivers::serial::SerialPort::puts("\n=== vec34=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::arch::x86_64::idt::vec34_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::arch::x86_64::idt::vec34_count());
             crate::drivers::serial::SerialPort::puts(" xhci_irq=");
-            crate::drivers::serial::SerialPort::put_u64(
-                crate::usb::xhci::event::irq_count());
+            crate::drivers::serial::SerialPort::put_u64(crate::usb::xhci::event::irq_count());
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
 
@@ -519,6 +531,10 @@ impl Kernel {
             crate::task::init(self.page_table_root);
             #[cfg(feature = "selftest")]
             crate::task::smoke_test(&mut self.allocator);
+            // Playback pump: a kernel task that drains the audio request queue
+            // through the streaming DMA ring (gapless, non-blocking callers).
+            // No-op when no audio device came up.
+            crate::audio::spawn_pump(&mut self.allocator);
         }
 
         // Phase 6: load \EFI\BEDROCK\INIT from the ESP (via the unispace /B
@@ -587,9 +603,7 @@ fn find_bitmap_region(memory_map: &[MemoryRegion]) -> (u64, u64) {
     // Fall back to the largest usable region overall (may be above 4 GiB
     // on systems with no low-memory RAM, e.g. certain NUMA configs).
     for region in memory_map {
-        if region.kind == crate::boot::MemoryRegionKind::Usable
-            && region.size > best.1
-        {
+        if region.kind == crate::boot::MemoryRegionKind::Usable && region.size > best.1 {
             best = (region.base, region.size);
         }
     }

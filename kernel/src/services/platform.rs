@@ -1,4 +1,3 @@
-
 pub trait PlatformControl: Send + Sync {
     fn shutdown(&self) -> !;
     fn reset(&self) -> !;

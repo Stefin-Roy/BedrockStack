@@ -55,12 +55,12 @@ impl Object for DebugSerialObject {
 /// `/driver/audio` — the audio subsystem's device surface.
 ///
 /// The value is a snapshot of the live playback/capture state.  The two
-/// methods drive the existing blocking engine: `:play_tone{freq, ms}` and
-/// `:play_pcm{pcm}` (little-endian interleaved 16-bit signed stereo, 48 kHz).
-/// Playback occupies the single hardware device for its whole duration and
-/// HLTs the calling CPU (the engine's blocking waits yield via HLT), so this
-/// surface is strictly single-consumer.  x86_64-only: the `audio` crate
-/// module is not compiled on riscv64.
+/// methods queue playback for the kernel pump task: `:play_tone{freq, ms}`
+/// and `:play_pcm{pcm}` (little-endian interleaved 16-bit signed stereo,
+/// 48 kHz).  Both return immediately — the pump plays the queued samples
+/// gaplessly through the HDA streaming ring, chaining back-to-back requests
+/// with no seam — so no caller ever parks the CPU (old blocking behaviour).
+/// x86_64-only: the `audio` crate module is not compiled on riscv64.
 #[cfg(target_arch = "x86_64")]
 struct AudioObject;
 
@@ -68,36 +68,62 @@ struct AudioObject;
 /// `{present:false, name:""}` when no controller initialised.
 #[cfg(target_arch = "x86_64")]
 pub static AUDIO_STATE: Schema = Schema::Struct(&[
-    Field { name: "present", ty: &schema::SCHEMA_BOOL },
-    Field { name: "name", ty: &schema::SCHEMA_STR },
-    Field { name: "sample_rate", ty: &schema::SCHEMA_U32 },
-    Field { name: "channels", ty: &schema::SCHEMA_U32 },
-    Field { name: "can_record", ty: &schema::SCHEMA_BOOL },
+    Field {
+        name: "present",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "name",
+        ty: &schema::SCHEMA_STR,
+    },
+    Field {
+        name: "sample_rate",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "channels",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "can_record",
+        ty: &schema::SCHEMA_BOOL,
+    },
 ]);
 
 /// `write(/driver/audio:play_tone, {freq, ms})`.
 #[cfg(target_arch = "x86_64")]
 static PLAY_TONE_IN: Schema = Schema::Struct(&[
-    Field { name: "freq", ty: &schema::SCHEMA_U32 },
-    Field { name: "ms", ty: &schema::SCHEMA_U64 },
+    Field {
+        name: "freq",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "ms",
+        ty: &schema::SCHEMA_U64,
+    },
 ]);
 
 /// `write(/driver/audio:play_pcm, {pcm})` — raw little-endian interleaved
-/// `i16` stereo samples at 48 kHz.
+/// `i16` stereo samples at 48 kHz.  Queued for the pump; any length is
+/// accepted (the ring streams it).
 #[cfg(target_arch = "x86_64")]
 static PLAY_PCM_IN: Schema = Schema::Struct(&[Field {
     name: "pcm",
     ty: &schema::SCHEMA_BYTES,
 }]);
 
-/// Playback staging buffer limit (see `hda.rs`): 256 KiB.
-#[cfg(target_arch = "x86_64")]
-const PLAY_STAGING_LIMIT: usize = 0x40000;
-
 #[cfg(target_arch = "x86_64")]
 static AUDIO_METHODS: [MethodDesc; 2] = [
-    MethodDesc { name: "play_tone", input: &PLAY_TONE_IN, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "play_pcm", input: &PLAY_PCM_IN, output: &schema::SCHEMA_UNIT },
+    MethodDesc {
+        name: "play_tone",
+        input: &PLAY_TONE_IN,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "play_pcm",
+        input: &PLAY_PCM_IN,
+        output: &schema::SCHEMA_UNIT,
+    },
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -158,14 +184,14 @@ impl Object for AudioObject {
                     Some(Value::Bytes(b)) => b,
                     _ => return Err(UnispaceError::SchemaMismatch),
                 };
-                if pcm.is_empty() || pcm.len() % 2 != 0 || pcm.len() > PLAY_STAGING_LIMIT {
+                if pcm.is_empty() || pcm.len() % 2 != 0 {
                     return Err(UnispaceError::InvalidArgument);
                 }
                 let mut samples = alloc::vec::Vec::with_capacity(pcm.len() / 2);
                 for pair in pcm.chunks_exact(2) {
                     samples.push(i16::from_le_bytes([pair[0], pair[1]]));
                 }
-                crate::audio::play_pcm(&samples).map_err(unsupported)?;
+                crate::audio::enqueue_playback(samples).map_err(unsupported)?;
                 Ok(())
             }
             _ => Err(UnispaceError::MethodNotFound),

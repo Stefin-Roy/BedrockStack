@@ -33,7 +33,7 @@
 //! stolen by the ISR or interleaved with live scancodes.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
 use spin::Mutex;
 use x86_64::instructions::interrupts;
@@ -135,7 +135,8 @@ impl SpScRing {
             return None;
         }
         let byte = unsafe { *self.buf[tail].get() };
-        self.tail.store((tail + 1) % RAW_CAPACITY, Ordering::Release);
+        self.tail
+            .store((tail + 1) % RAW_CAPACITY, Ordering::Release);
         Some(byte)
     }
 }
@@ -165,7 +166,8 @@ fn status() -> u8 {
 /// `timeout_ms` elapses.  Deadlines come from the TSC clock so the wait is
 /// wall-clock based, not CPU-frequency dependent.
 fn wait_status(mask: u8, want_set: bool, timeout_ms: u64) -> bool {
-    let deadline = crate::services::universal_timer::now_ns().saturating_add(timeout_ms * 1_000_000);
+    let deadline =
+        crate::services::universal_timer::now_ns().saturating_add(timeout_ms * 1_000_000);
     loop {
         if (status() & mask != 0) == want_set {
             return true;
@@ -318,8 +320,7 @@ fn reset_device() -> ResetOutcome {
         if !matches!(send_dev_byte(DEV_RESET), DevResp::Ack) {
             return ResetOutcome::Failed;
         }
-        let deadline =
-            crate::services::universal_timer::now_ns().saturating_add(1_000_000_000);
+        let deadline = crate::services::universal_timer::now_ns().saturating_add(1_000_000_000);
         loop {
             if crate::services::universal_timer::now_ns() >= deadline {
                 return ResetOutcome::Timeout;
@@ -330,7 +331,7 @@ fn reset_device() -> ResetOutcome {
                     return ResetOutcome::Failed;
                 }
                 Some(_) => continue, // stray or ID bytes following BAT
-                None => continue, // nothing yet — keep waiting
+                None => continue,    // nothing yet — keep waiting
             }
         }
     }
@@ -370,7 +371,10 @@ fn identify_device() -> [u8; 2] {
 /// in-interrupt caller holding the very lock this function takes).
 fn runtime_dev_command(bytes: &[u8]) -> bool {
     let _guard = CMD_LOCK.lock();
-    debug_assert!(interrupts::are_enabled(), "runtime_dev_command called from interrupt context");
+    debug_assert!(
+        interrupts::are_enabled(),
+        "runtime_dev_command called from interrupt context"
+    );
     let prev_if = interrupts::are_enabled();
     interrupts::disable();
     // Drain stale bytes (possibly left by the ISR before IF was cleared)
@@ -798,6 +802,14 @@ fn submit_decoded(decoded: Decoded) {
         Decoded::Press(code) => (code, 1),
         Decoded::Release(code) => (code, 0),
     };
+    #[cfg(feature = "ps2_trace")]
+    {
+        SerialPort::puts("[ps2] submit code=");
+        SerialPort::put_u64(code.code() as u64);
+        SerialPort::puts(" value=");
+        SerialPort::put_u64(value as u64);
+        SerialPort::puts("\n");
+    }
     let ev = InputEvent::new(id, InputType::Key, code.code(), value);
     crate::input::submit_event(ev);
 }
@@ -809,6 +821,12 @@ fn submit_decoded(decoded: Decoded) {
 pub fn poll_device() {
     loop {
         if let Some(byte) = RAW_QUEUE.pop() {
+            #[cfg(feature = "ps2_trace")]
+            {
+                SerialPort::puts("[ps2] raw byte=0x");
+                SerialPort::put_u64(byte as u64);
+                SerialPort::puts("\n");
+            }
             if let Some(decoded) = decode_byte(byte) {
                 submit_decoded(decoded);
             }
@@ -1053,7 +1071,8 @@ fn resolve_gsi() -> (u32, crate::acpi::Polarity, crate::acpi::TriggerMode) {
 /// IOAPIC cannot route the GSI.
 fn setup_irq() -> bool {
     let (gsi, polarity, trigger) = resolve_gsi();
-    let Some(vector) = crate::platform::x86_64_pc::ioapic::enable_irq(gsi, polarity, trigger) else {
+    let Some(vector) = crate::platform::x86_64_pc::ioapic::enable_irq(gsi, polarity, trigger)
+    else {
         SerialPort::puts("[ps2] IOAPIC routing failed -- falling back to polled mode\n");
         return false;
     };

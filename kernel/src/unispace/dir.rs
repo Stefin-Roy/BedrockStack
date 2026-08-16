@@ -6,7 +6,7 @@ use hashbrown::HashMap;
 use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::schema::{MethodDesc, Schema, Value};
-use super::{ListingEntry, Object, ObjectKind, UnispaceError, DIR_SCHEMA};
+use super::{DIR_SCHEMA, ListingEntry, Object, ObjectKind, UnispaceError};
 
 /// A provider-side map-backed directory.  The unispace root `/` is one of
 /// these; providers may instantiate their own for static subtrees.  This is a
@@ -53,7 +53,10 @@ impl Object for SimpleDir {
         let mut names: Vec<String> = children.keys().cloned().collect();
         names.sort();
         for n in names {
-            let kind = children.get(&n).map(|o| o.kind()).unwrap_or(ObjectKind::Service);
+            let kind = children
+                .get(&n)
+                .map(|o| o.kind())
+                .unwrap_or(ObjectKind::Service);
             out.push(ListingEntry { name: n, kind });
         }
         Ok(())

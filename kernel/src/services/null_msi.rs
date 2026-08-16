@@ -2,8 +2,6 @@ use super::msi::MsiAllocator;
 
 pub struct NullMsi;
 
-
-
 impl MsiAllocator for NullMsi {
     fn allocate_device_vector(&self, _handler: fn()) -> Option<u8> {
         None

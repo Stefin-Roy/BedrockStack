@@ -135,7 +135,9 @@ impl BitmapAllocator {
         );
 
         if 0 < total_frames {
-            unsafe { *bitmap.add(0) |= 1; }
+            unsafe {
+                *bitmap.add(0) |= 1;
+            }
         }
 
         SerialPort::puts("[alloc] done\n");
@@ -234,7 +236,9 @@ impl BitmapAllocator {
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
                     "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",
-                    addr, self.kernel_start, self.kernel_end
+                    addr,
+                    self.kernel_start,
+                    self.kernel_end
                 );
                 return Some(addr);
             }
@@ -258,7 +262,9 @@ impl BitmapAllocator {
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
                     "alloc: frame {:#x} is within kernel image [{:#x}, {:#x})",
-                    addr, self.kernel_start, self.kernel_end
+                    addr,
+                    self.kernel_start,
+                    self.kernel_end
                 );
                 return Some(addr);
             }
@@ -278,12 +284,18 @@ impl BitmapAllocator {
         let next_free = inner.next_free;
         // Scan from next_free to end-of-bitmap, then wrap around from 0.
         for offset in [next_free, 0] {
-            let end = if offset == 0 { next_free } else { self.total_frames };
+            let end = if offset == 0 {
+                next_free
+            } else {
+                self.total_frames
+            };
             let mut run_start = offset;
             let mut run_len = 0;
             for i in offset..end {
                 if self.is_free(i) {
-                    if run_len == 0 { run_start = i; }
+                    if run_len == 0 {
+                        run_start = i;
+                    }
                     run_len += 1;
                     if run_len >= count {
                         for j in run_start..run_start + count {
@@ -295,7 +307,10 @@ impl BitmapAllocator {
                         debug_assert!(
                             end_addr <= self.kernel_start || addr >= self.kernel_end,
                             "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
-                            addr, end_addr, self.kernel_start, self.kernel_end
+                            addr,
+                            end_addr,
+                            self.kernel_start,
+                            self.kernel_end
                         );
                         return Some(addr);
                     }
@@ -356,11 +371,15 @@ impl BitmapAllocator {
     }
 
     fn set_used(&self, idx: usize) {
-        unsafe { *self.bitmap_ptr().add(idx / 8) |= 1 << (idx % 8); }
+        unsafe {
+            *self.bitmap_ptr().add(idx / 8) |= 1 << (idx % 8);
+        }
     }
 
     fn set_free(&self, idx: usize) {
-        unsafe { *self.bitmap_ptr().add(idx / 8) &= !(1 << (idx % 8)); }
+        unsafe {
+            *self.bitmap_ptr().add(idx / 8) &= !(1 << (idx % 8));
+        }
     }
 }
 
@@ -387,8 +406,6 @@ fn clear_region(bitmap: *mut u8, region: &MemoryRegion, total_frames: usize) {
 // ── Service provider traits ───────────────────────────────────────────
 use crate::services::phys_mem::PhysicalMemoryAllocator;
 
-
-
 impl PhysicalMemoryAllocator for BitmapAllocator {
     fn alloc_frames(&mut self, count: usize) -> Result<u64, ()> {
         if count == 1 {
@@ -399,7 +416,9 @@ impl PhysicalMemoryAllocator for BitmapAllocator {
     }
 
     fn free_frames(&mut self, addr: u64, _count: usize) {
-        unsafe { self.free(addr); }
+        unsafe {
+            self.free(addr);
+        }
     }
 
     fn reserve_region(&mut self, start: u64, end: u64) {

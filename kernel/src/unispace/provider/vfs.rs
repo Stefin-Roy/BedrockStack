@@ -3,15 +3,13 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+use crate::filesystems::vfs::DRIVE_MAP;
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::types::FileType;
-use crate::filesystems::vfs::DRIVE_MAP;
 
 use super::super::schema::{self, MethodDesc, Schema, Value};
-use super::super::{
-    ListingEntry, Object, ObjectKind, UnispaceError, DIR_SCHEMA, KIND_VARIANTS,
-};
+use super::super::{DIR_SCHEMA, KIND_VARIANTS, ListingEntry, Object, ObjectKind, UnispaceError};
 
 // ── Method schemas ─────────────────────────────────────────────────────
 
@@ -56,16 +54,46 @@ pub static STAT_OUTPUT: Schema = Schema::Struct(&[
 ]);
 
 static DIR_METHODS: [MethodDesc; 5] = [
-    MethodDesc { name: "create", input: &CREATE_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "mkdir", input: &CREATE_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "rmdir", input: &CREATE_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "unlink", input: &CREATE_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "rename", input: &RENAME_INPUT, output: &schema::SCHEMA_UNIT },
+    MethodDesc {
+        name: "create",
+        input: &CREATE_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "mkdir",
+        input: &CREATE_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "rmdir",
+        input: &CREATE_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "unlink",
+        input: &CREATE_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "rename",
+        input: &RENAME_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
 ];
 
 static FILE_METHODS: [MethodDesc; 2] = [
-    MethodDesc { name: "stat", input: &schema::SCHEMA_UNIT, output: &STAT_OUTPUT },
-    MethodDesc { name: "truncate", input: &TRUNCATE_INPUT, output: &schema::SCHEMA_UNIT },
+    // Input is SCHEMA_BLOB (not UNIT) so a caller can pass a nonzero-length
+    // write buffer and still receive the encoded stat bytes back.
+    MethodDesc {
+        name: "stat",
+        input: &schema::SCHEMA_BLOB,
+        output: &STAT_OUTPUT,
+    },
+    MethodDesc {
+        name: "truncate",
+        input: &TRUNCATE_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
 ];
 
 // ── Provider registration ──────────────────────────────────────────────

@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 
-use super::{crc32, read_sector, read_sectors, PartitionInfo, SECTOR_SIZE};
+use super::{PartitionInfo, SECTOR_SIZE, crc32, read_sector, read_sectors};
 
 #[repr(C, packed)]
 struct GptHeader {
@@ -71,7 +71,10 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
         .checked_mul(entry_size)
         .ok_or("GPT entry table too large")?;
     let sector_count = (total_bytes + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    if entry_lba.checked_add(sector_count as u64).is_none_or(|end| end > device.sector_count()) {
+    if entry_lba
+        .checked_add(sector_count as u64)
+        .is_none_or(|end| end > device.sector_count())
+    {
         return Err("GPT entry table out of device range");
     }
     let mut entries_buf = alloc::vec![0u8; sector_count * SECTOR_SIZE];
@@ -84,7 +87,9 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
         if offset + 128 > entries_buf.len() {
             break;
         }
-        let entry = unsafe { core::ptr::read_unaligned(entries_buf.as_ptr().add(offset) as *const GptEntry) };
+        let entry = unsafe {
+            core::ptr::read_unaligned(entries_buf.as_ptr().add(offset) as *const GptEntry)
+        };
 
         if entry.partition_type_guid == [0u8; 16] {
             continue;
@@ -105,7 +110,11 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
             partition_type: None,
             guid_type: Some(entry.partition_type_guid),
             guid_unique: Some(entry.unique_guid),
-            name: if name_str.is_empty() { None } else { Some(name_str) },
+            name: if name_str.is_empty() {
+                None
+            } else {
+                Some(name_str)
+            },
             is_extended: false,
         });
     }
@@ -127,9 +136,9 @@ fn decode_utf16_le(units: &[u16; 36]) -> String {
                     let u2 = u16::from_le(units[i + 1]);
                     if (0xDC00..=0xDFFF).contains(&u2) {
                         let cp = ((u as u32 - 0xD800) << 10) | (u2 as u32 - 0xDC00) | 0x1_0000;
-                        result.push(core::char::from_u32(cp).unwrap_or(
-                            core::char::REPLACEMENT_CHARACTER,
-                        ));
+                        result.push(
+                            core::char::from_u32(cp).unwrap_or(core::char::REPLACEMENT_CHARACTER),
+                        );
                         i += 2;
                         continue;
                     }
@@ -140,9 +149,9 @@ fn decode_utf16_le(units: &[u16; 36]) -> String {
                 result.push(core::char::REPLACEMENT_CHARACTER);
             }
             _ => {
-                result.push(core::char::from_u32(u as u32).unwrap_or(
-                    core::char::REPLACEMENT_CHARACTER,
-                ));
+                result.push(
+                    core::char::from_u32(u as u32).unwrap_or(core::char::REPLACEMENT_CHARACTER),
+                );
             }
         }
         i += 1;

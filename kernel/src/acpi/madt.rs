@@ -1,16 +1,33 @@
-use alloc::vec::Vec;
-use spin::Mutex;
 use crate::acpi::platform::{
-    AcpiError, Apic, InterruptModel, IoApic, Polarity, Processor, ProcessorInfo,
-    ProcessorState, TriggerMode,
+    AcpiError, Apic, InterruptModel, IoApic, Polarity, Processor, ProcessorInfo, ProcessorState,
+    TriggerMode,
 };
 use crate::drivers::serial::SerialPort;
+use alloc::vec::Vec;
 use log::info;
+use spin::Mutex;
 
-fn r8(buf: &[u8], off: usize) -> u8 { buf[off] }
-fn r16(buf: &[u8], off: usize) -> u16 { u16::from_le_bytes([buf[off], buf[off + 1]]) }
-fn r32(buf: &[u8], off: usize) -> u32 { u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) }
-fn r64(buf: &[u8], off: usize) -> u64 { u64::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]) }
+fn r8(buf: &[u8], off: usize) -> u8 {
+    buf[off]
+}
+fn r16(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+fn r32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+fn r64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
 
 /// A MADT Interrupt Source Override (type 2) entry.
 #[derive(Clone, Copy, Debug)]
@@ -38,7 +55,11 @@ pub fn irq_override(irq: u8) -> Option<(u32, Polarity, TriggerMode)> {
         .map(|o| (o.gsi, o.polarity, o.trigger))
 }
 
-pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptModel, Option<ProcessorInfo>), AcpiError> {
+pub fn parse_madt(
+    vaddr: u64,
+    phys_addr: u64,
+    length: u32,
+) -> Result<(InterruptModel, Option<ProcessorInfo>), AcpiError> {
     let initial_raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, length as usize) };
 
     SerialPort::puts("[madt] parse_madt called: vaddr=");
@@ -75,7 +96,8 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
         SerialPort::put_hex(new_vaddr);
         SerialPort::puts("\n");
 
-        let new_raw = unsafe { core::slice::from_raw_parts(new_vaddr as *const u8, length as usize) };
+        let new_raw =
+            unsafe { core::slice::from_raw_parts(new_vaddr as *const u8, length as usize) };
 
         SerialPort::puts("[madt] re-mapped first_bytes=");
         for i in 0..4 {
@@ -133,9 +155,20 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
                     let apic_id = r8(raw, offset + 3);
                     let flags = r32(raw, offset + 4);
                     let enabled = (flags & 1) != 0;
-                    let state = if enabled { ProcessorState::Enabled } else { ProcessorState::Disabled };
-                    info!("[madt] type 0 (Local APIC): apic_id={} enabled={}", apic_id, enabled);
-                    xapic_processors.push(Processor { local_apic_id: apic_id as u32, state, is_ap: has_boot_xapic });
+                    let state = if enabled {
+                        ProcessorState::Enabled
+                    } else {
+                        ProcessorState::Disabled
+                    };
+                    info!(
+                        "[madt] type 0 (Local APIC): apic_id={} enabled={}",
+                        apic_id, enabled
+                    );
+                    xapic_processors.push(Processor {
+                        local_apic_id: apic_id as u32,
+                        state,
+                        is_ap: has_boot_xapic,
+                    });
                     has_boot_xapic = true;
                 }
             }
@@ -148,9 +181,20 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
                     let apic_id = r32(raw, offset + 4);
                     let flags = r32(raw, offset + 8);
                     let enabled = (flags & 1) != 0;
-                    let state = if enabled { ProcessorState::Enabled } else { ProcessorState::Disabled };
-                    info!("[madt] type 9 (x2APIC): apic_id={} enabled={}", apic_id, enabled);
-                    x2apic_processors.push(Processor { local_apic_id: apic_id, state, is_ap: has_boot_x2apic });
+                    let state = if enabled {
+                        ProcessorState::Enabled
+                    } else {
+                        ProcessorState::Disabled
+                    };
+                    info!(
+                        "[madt] type 9 (x2APIC): apic_id={} enabled={}",
+                        apic_id, enabled
+                    );
+                    x2apic_processors.push(Processor {
+                        local_apic_id: apic_id,
+                        state,
+                        is_ap: has_boot_x2apic,
+                    });
                     has_boot_x2apic = true;
                 }
             }
@@ -229,8 +273,8 @@ pub fn parse_madt(vaddr: u64, phys_addr: u64, length: u32) -> Result<(InterruptM
     // entries as legacy compatibility stubs with APIC ID 0.  Prefer the
     // x2APIC list only when it actually carries a nonzero ID; otherwise fall
     // back to the xAPIC entries rather than discarding valid processors.
-    let x2apic_valid = !x2apic_processors.is_empty()
-        && x2apic_processors.iter().any(|p| p.local_apic_id != 0);
+    let x2apic_valid =
+        !x2apic_processors.is_empty() && x2apic_processors.iter().any(|p| p.local_apic_id != 0);
     let mut processors = if x2apic_valid {
         info!("[madt] using x2APIC (type 9) processor entries");
         x2apic_processors

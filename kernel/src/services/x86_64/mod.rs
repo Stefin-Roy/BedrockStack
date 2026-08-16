@@ -1,17 +1,17 @@
-pub mod x86_interrupts;
-pub mod x86_platform;
-pub mod x86_cpu;
-pub mod x86_msi;
-pub mod x86_serial;
-pub mod x86_pci_device;
 pub mod x86_acpi;
+pub mod x86_cpu;
+pub mod x86_interrupts;
+pub mod x86_msi;
+pub mod x86_pci_device;
+pub mod x86_platform;
+pub mod x86_serial;
 
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
+use crate::services::KernelServices;
 use crate::services::acpi::AcpiProvider;
 use crate::services::dma::DmaAllocator;
 use crate::services::pci_device::PciDeviceManager;
-use crate::services::KernelServices;
 
 pub fn x86_services(
     root: u64,

@@ -66,9 +66,18 @@ pub unsafe fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
 fn is_intel() -> bool {
     let (_, ebx, edx, ecx) = unsafe { cpuid(0, 0) };
     let vendor: [u8; 12] = [
-        ebx as u8, (ebx >> 8) as u8, (ebx >> 16) as u8, (ebx >> 24) as u8,
-        edx as u8, (edx >> 8) as u8, (edx >> 16) as u8, (edx >> 24) as u8,
-        ecx as u8, (ecx >> 8) as u8, (ecx >> 16) as u8, (ecx >> 24) as u8,
+        ebx as u8,
+        (ebx >> 8) as u8,
+        (ebx >> 16) as u8,
+        (ebx >> 24) as u8,
+        edx as u8,
+        (edx >> 8) as u8,
+        (edx >> 16) as u8,
+        (edx >> 24) as u8,
+        ecx as u8,
+        (ecx >> 8) as u8,
+        (ecx >> 16) as u8,
+        (ecx >> 24) as u8,
     ];
     &vendor == b"GenuineIntel"
 }

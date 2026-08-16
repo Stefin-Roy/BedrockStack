@@ -24,7 +24,6 @@ core::arch::global_asm!(
     ".pushsection .text.trampoline, \"ax\"",
     ".globl _trampoline_start",
     "_trampoline_start:",
-
     ".code16",
     "cli",
     "cld",
@@ -33,72 +32,58 @@ core::arch::global_asm!(
     "mov  es, ax",
     "mov  ss, ax",
     "mov  sp, 0x7000",
-
     "in   al, 0x92",
     "or   al, 2",
     "out  0x92, al",
-
     ".byte 0x0f, 0x01, 0x16",
     // 16-bit displacement to the GDTR block, relative to the COPY at 0x8000
     // (`_trampoline_gdt_ptr - _trampoline_start` is a section-local offset,
     // identical in high or low — only the + 0x8000 makes it a low address).
     ".word _trampoline_gdt_ptr - _trampoline_start + 0x8000",
-
     "mov  eax, cr0",
     "or   al, 1",
     "mov  cr0, eax",
-
     ".byte 0xea",
     ".word (_trampoline_pm - _trampoline_start + 0x8000) & 0xFFFF",
     ".word 0x08",
-
     ".code32",
     "_trampoline_pm:",
     "mov  ax, 0x10",
     "mov  ds, ax",
     "mov  es, ax",
     "mov  ss, ax",
-
     // Load CR3 *before* enabling paging (32-bit mode).  On INIT+SIPI the AP's
     // CR3 is 0 (from reset); enabling paging without a valid PML4 would fault.
     // We load again in 64-bit mode below in case the value was truncated.
     "mov  eax, [0x8700]",
     "mov  cr3, eax",
-
     // Set full CR4 matching BSP: DE|PAE|MCE|PGE|OSFXSR|OSXMMEXCPT = 0x6E8
     "mov  eax, (1 << 3) | (1 << 5) | (1 << 6) | (1 << 7) | (1 << 9) | (1 << 10)",
     "mov  cr4, eax",
-
     "mov  ecx, 0xC0000080",
     "rdmsr",
-    "or   eax, 1 << 8",                   // LME
+    "or   eax, 1 << 8", // LME
     "wrmsr",
-
     "mov  eax, cr0",
     "or   eax, 0x80000000",
     "mov  cr0, eax",
-
     // Now LMA = 1 (set automatically when paging enabled with LME=1), so we
     // can safely set NXE (IA32_EFER[11]) without a #GP.
     "mov  ecx, 0xC0000080",
     "rdmsr",
-    "or   eax, 1 << 11",                  // NXE
+    "or   eax, 1 << 11", // NXE
     "wrmsr",
-
     // The trampoline data (0x8700–0x872F) is identity-mapped in the kernel
     // page table, so it is still accessible here in compatibility mode.
     "mov  eax, [0x8728]",
     "push 0x18",
     "push eax",
     "retf",
-
     ".code64",
     "_trampoline_lm:",
-
     // Re-load CR3 with the full 64-bit value in case step above truncated it.
     "mov  rax, [0x8700]",
     "mov  cr3, rax",
-
     // Fix CR0: clear CD (bit 30) and NW (bit 29); set WP (bit 16), MP (bit 1),
     // and NE (bit 5) to match BSP.  The trampoline reset leaves cache disabled
     // (CD=1) which causes #GP from CLFLUSH and other instructions on some CPUs.
@@ -106,34 +91,28 @@ core::arch::global_asm!(
     "and  ebx, 0x9FFFFFFF",
     "or   ebx, (1 << 1) | (1 << 5) | (1 << 16)",
     "mov  cr0, rbx",
-
     // Atomically claim a boot index from the shared counter at 0x8CF8.
     // lock xadd exchanges [counter] with rbx then adds them:
     //   tmp = [counter]; [counter] = tmp + rbx; rbx = tmp
     // So rbx gets the old counter value = this AP's index.
     "mov  rbx, 1",
     "lock xadd qword ptr [0x8CF8], rbx",
-
     // Index into per-AP records at 0x8D00 + index * 32.
     "shl  rbx, 5",
     "add  rbx, 0x8D00",
-
     // Load stack_top from record offset 8 and set RSP.
     "mov  rsp, [rbx + 8]",
     "and  rsp, -16",
     "sub  rsp, 8",
-
     // Set GS.base from per_cpu_ptr at record offset 0.
     "mov  ecx, 0xC0000101",
     "mov  rax, [rbx]",
     "mov  rdx, rax",
     "shr  rdx, 32",
     "wrmsr",
-
     // Jump into Rust — ap_entry64 uses current_per_cpu() directly.
     "mov  rax, [0x8710]",
     "jmp  rax",
-
     ".balign 8",
     "_trampoline_gdt:",
     ".quad 0x0000000000000000",
@@ -141,7 +120,6 @@ core::arch::global_asm!(
     ".quad 0x00CF92000000FFFF",
     ".quad 0x00AF9A000000FFFF",
     "_trampoline_gdt_end:",
-
     ".balign 4",
     "_trampoline_gdt_ptr:",
     ".word _trampoline_gdt_end - _trampoline_gdt - 1",
@@ -149,7 +127,6 @@ core::arch::global_asm!(
     // (both symbols live in the high `.text.trampoline` section), so + 0x8000
     // is the correct LOW linear address of the copied GDT in real mode.
     ".long _trampoline_gdt - _trampoline_start + 0x8000",
-
     ".globl _trampoline_end",
     "_trampoline_end:",
     ".popsection",
@@ -215,16 +192,18 @@ pub unsafe fn start_aps(
         }
     }
     // Reset atomic boot counter at 0x8CF8 (before the record area).
-    unsafe { *(0x8CF8 as *mut u64) = 0; }
+    unsafe {
+        *(0x8CF8 as *mut u64) = 0;
+    }
 
     // Write shared trampoline data once (cr3, entry, lm_entry are the same for all APs).
     unsafe {
         data.write(TrampolineData {
             cr3: page_table_root,
-            stack_top: 0,          // unused — AP self-configures
+            stack_top: 0, // unused — AP self-configures
             entry,
-            per_cpu_ptr: 0,        // unused — AP self-identifies
-            started_flag_addr: 0,  // unused
+            per_cpu_ptr: 0,       // unused — AP self-identifies
+            started_flag_addr: 0, // unused
             lm_entry: lm_phys,
         });
     }
@@ -263,7 +242,8 @@ pub unsafe fn start_aps(
         }
         started_ok = 0;
         for ap in aps {
-            if crate::smp::AP_READY[ap.cpu_id as usize].ready
+            if crate::smp::AP_READY[ap.cpu_id as usize]
+                .ready
                 .load(core::sync::atomic::Ordering::Acquire)
             {
                 started_ok += 1;
@@ -273,7 +253,8 @@ pub unsafe fn start_aps(
     }
 
     for ap in aps {
-        if crate::smp::AP_READY[ap.cpu_id as usize].ready
+        if crate::smp::AP_READY[ap.cpu_id as usize]
+            .ready
             .load(core::sync::atomic::Ordering::Acquire)
         {
             SerialPort::puts("[trampoline] AP ");
@@ -296,7 +277,9 @@ pub extern "C" fn ap_entry64() -> ! {
 
     // Signal ready immediately — APs never write to .idt (fixed in Arch::init_ap),
     // so there is no race with protect_idt() on the BSP.
-    crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
+    crate::smp::AP_READY[cpu_id as usize]
+        .ready
+        .store(true, core::sync::atomic::Ordering::Release);
     crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
 
     SerialPort::puts("[AP] cpu ");

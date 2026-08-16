@@ -7,9 +7,9 @@
 //! SLP_TYP is never guessed, it is either read from the invoked `\_S5` method
 //! or the PM1 shutdown path is refused.
 
+use ::aml::{AmlContext, AmlError, AmlName, AmlValue, DebugVerbosity, value::Args};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use ::aml::{value::Args, AmlContext, AmlError, AmlName, AmlValue, DebugVerbosity};
 
 use super::handler::AmlHandler;
 use super::tables::SdtEntry;
@@ -46,7 +46,11 @@ pub fn init_aml_ctx(entries: &[SdtEntry], dsdt_fallback: u64) -> Result<AmlConte
 
     for e in entries.iter().filter(|e| e.signature == sig(b"SSDT")) {
         if let Err(err) = ctx.parse_table(table_body(e)) {
-            log::error!("ACPI: SSDT at 0x{:x} failed to parse: {:?}", e.phys_addr, err);
+            log::error!(
+                "ACPI: SSDT at 0x{:x} failed to parse: {:?}",
+                e.phys_addr,
+                err
+            );
         }
     }
     Ok(ctx)

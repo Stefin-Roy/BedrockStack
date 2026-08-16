@@ -1,4 +1,3 @@
-
 pub trait PhysicalMemoryAllocator: Send + Sync {
     fn alloc_frames(&mut self, count: usize) -> Result<u64, ()>;
     fn free_frames(&mut self, addr: u64, count: usize);

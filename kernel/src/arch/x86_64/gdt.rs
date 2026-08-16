@@ -5,12 +5,12 @@
 //! with a corrupt/overflowed stack would escalate straight to a triple fault.
 
 use core::mem::MaybeUninit;
-use x86_64::instructions::segmentation::{Segment, CS, DS, ES, SS};
+use x86_64::VirtAddr;
+use x86_64::instructions::segmentation::{CS, DS, ES, SS, Segment};
 use x86_64::instructions::tables::load_tss;
 use x86_64::registers::segmentation::SegmentSelector;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable};
 use x86_64::structures::tss::TaskStateSegment;
-use x86_64::VirtAddr;
 
 use crate::smp::{MAX_CPUS, current_cpu_id};
 
@@ -33,7 +33,8 @@ static mut CPU_TSS: [MaybeUninit<TaskStateSegment>; MAX_CPUS] = [MaybeUninit::un
 /// Per-CPU GDT objects (contains a per-CPU TSS entry).
 ///
 /// The GDT heap-buffer stays alive because the struct is stored here.
-static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] = [const { MaybeUninit::uninit() }; MAX_CPUS];
+static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] =
+    [const { MaybeUninit::uninit() }; MAX_CPUS];
 
 /// Selector for the user code segment (0x28, DPL3). Written once by the first
 /// CPU through `init()` — always the BSP, since it runs before any AP is woken.
@@ -88,17 +89,19 @@ pub fn init() {
     tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
 
     // Store TSS at a stable address *before* creating the GDT descriptor.
-    unsafe { CPU_TSS[cpu_id].write(tss); }
+    unsafe {
+        CPU_TSS[cpu_id].write(tss);
+    }
     let tss_ref = unsafe { &*CPU_TSS[cpu_id].as_ptr() };
 
     // ── build per-CPU GDT ───────────────────────────────────────────
     let mut gdt = GlobalDescriptorTable::new();
-    let code_sel = gdt.append(Descriptor::kernel_code_segment());      // 0x08
-    let data_sel = gdt.append(Descriptor::kernel_data_segment());      // 0x10
+    let code_sel = gdt.append(Descriptor::kernel_code_segment()); // 0x08
+    let data_sel = gdt.append(Descriptor::kernel_data_segment()); // 0x10
     let syscall_kernel_cs = gdt.append(Descriptor::kernel_code_segment()); // 0x18 (SYSCALL landing CS)
-    let user_data_sel = gdt.append(Descriptor::user_data_segment());   // 0x20
-    let user_code_sel = gdt.append(Descriptor::user_code_segment());   // 0x28
-    let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref));        // 0x30
+    let user_data_sel = gdt.append(Descriptor::user_data_segment()); // 0x20
+    let user_code_sel = gdt.append(Descriptor::user_code_segment()); // 0x28
+    let tss_sel = gdt.append(Descriptor::tss_segment(tss_ref)); // 0x30
 
     unsafe {
         CPU_GDT[cpu_id].write(gdt);

@@ -103,11 +103,7 @@ fn queue() -> &'static InputQueue {
 }
 
 /// Register an input device.  Returns the UInputL-owned device id.
-pub fn register_device(
-    name: &'static str,
-    capabilities: u32,
-    poll: Option<fn()>,
-) -> u32 {
+pub fn register_device(name: &'static str, capabilities: u32, poll: Option<fn()>) -> u32 {
     let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
     DEVICES.lock().push(InputDevice {
         id,
@@ -147,7 +143,11 @@ pub fn device_names() -> Vec<&'static str> {
 /// Snapshot of every registered device (`id`, `name`, `capabilities`).  The
 /// unispace `/input` provider reads this to describe devices to ring 3.
 pub fn device_snapshot() -> Vec<(u32, &'static str, u32)> {
-    DEVICES.lock().iter().map(|d| (d.id, d.name, d.capabilities)).collect()
+    DEVICES
+        .lock()
+        .iter()
+        .map(|d| (d.id, d.name, d.capabilities))
+        .collect()
 }
 
 /// Submit an event from a driver.  The core stamps the timestamp (the driver

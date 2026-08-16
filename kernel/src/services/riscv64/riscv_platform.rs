@@ -1,11 +1,9 @@
 use core::arch::asm;
 
-use crate::arch::riscv64::sbi;
 use super::super::platform::PlatformControl;
+use crate::arch::riscv64::sbi;
 
 pub struct RiscvPlatform;
-
-
 
 impl PlatformControl for RiscvPlatform {
     fn shutdown(&self) -> ! {
@@ -17,20 +15,28 @@ impl PlatformControl for RiscvPlatform {
     }
 
     fn halt(&self) {
-        unsafe { asm!("wfi"); }
+        unsafe {
+            asm!("wfi");
+        }
     }
 
     fn disable_interrupts(&self) {
-        unsafe { asm!("csrci sstatus, 2"); }
+        unsafe {
+            asm!("csrci sstatus, 2");
+        }
     }
 
     fn enable_interrupts(&self) {
-        unsafe { asm!("csrsi sstatus, 2"); }
+        unsafe {
+            asm!("csrsi sstatus, 2");
+        }
     }
 
     fn are_interrupts_enabled(&self) -> bool {
         let stval: u64;
-        unsafe { asm!("csrr {}, sstatus", out(reg) stval); }
+        unsafe {
+            asm!("csrr {}, sstatus", out(reg) stval);
+        }
         (stval & 2) != 0
     }
 }

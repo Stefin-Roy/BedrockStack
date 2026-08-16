@@ -24,8 +24,8 @@
 //! `hw/audio/hda-codec-common.h`).  QEMU quirks that must not be relied upon
 //! as "real" behaviour are flagged inline.
 
-use alloc::vec::Vec;
 use crate::drivers::serial::SerialPort;
+use alloc::vec::Vec;
 
 // ── Widget types (7.3.4.5) ──────────────────────────────────────────
 pub const WIDGET_AUD_OUT: u32 = 0x0;
@@ -147,7 +147,9 @@ const ALC_EAPD_VERB_CONTROL: u32 = 9;
 /// the index re-selected before each access as Linux does).
 fn alc_coef_clear_bit(s: &mut dyn VerbSender, c: &Codec, idx: u32, bit: u32) {
     let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx);
-    let old = s.verb(c.cad, RTL_COEF_NID, VERB_GET_PROC_COEF, 0).unwrap_or(0);
+    let old = s
+        .verb(c.cad, RTL_COEF_NID, VERB_GET_PROC_COEF, 0)
+        .unwrap_or(0);
     let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx);
     let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_PROC_COEF, old & !(1 << bit));
 }
@@ -213,8 +215,7 @@ pub const STREAM_FMT_48K_STEREO_16: u16 = 0x11;
 /// Implemented by the controller (`hda::Inner`) which owns the CORB/RIRB
 /// rings.  Commands are strictly serialised.
 pub trait VerbSender {
-    fn verb(&mut self, cad: u32, nid: u32, v: u32, payload: u32)
-        -> Result<u32, &'static str>;
+    fn verb(&mut self, cad: u32, nid: u32, v: u32, payload: u32) -> Result<u32, &'static str>;
 }
 
 /// Assemble an HDA command.
@@ -317,7 +318,9 @@ pub fn probe(s: &mut dyn VerbSender, cad: u32) -> Result<Codec, &'static str> {
     if vendor == 0 || vendor == 0xFFFF_FFFF {
         return Err("codec not present");
     }
-    let subsystem = s.verb(cad, 0, VERB_GET_PARAM, PARAM_SUBSYSTEM_ID).unwrap_or(0);
+    let subsystem = s
+        .verb(cad, 0, VERB_GET_PARAM, PARAM_SUBSYSTEM_ID)
+        .unwrap_or(0);
     let rev = s.verb(cad, 0, VERB_GET_PARAM, PARAM_REV_ID).unwrap_or(0);
 
     // Node 0 → function groups → pick the audio function group.
@@ -333,7 +336,9 @@ pub fn probe(s: &mut dyn VerbSender, cad: u32) -> Result<Codec, &'static str> {
     SerialPort::puts("\n");
     let mut fg = None;
     for n in fg_start..fg_start + fg_count {
-        let ft = s.verb(cad, n, VERB_GET_PARAM, PARAM_FUNCTION_TYPE).unwrap_or(u32::MAX);
+        let ft = s
+            .verb(cad, n, VERB_GET_PARAM, PARAM_FUNCTION_TYPE)
+            .unwrap_or(u32::MAX);
         SerialPort::puts("[audio] codec ");
         SerialPort::put_u64(cad as u64);
         SerialPort::puts(" fg nid=");
@@ -362,8 +367,12 @@ pub fn probe(s: &mut dyn VerbSender, cad: u32) -> Result<Codec, &'static str> {
     let wcount = (wnc >> 16) & 0xFF;
     // Amplifier capabilities default to the audio function group's; widgets
     // that set `WCAP_AMP_OVRD` override them with their own.
-    let afg_amp_in = s.verb(cad, fg, VERB_GET_PARAM, PARAM_AMP_IN_CAP).unwrap_or(0);
-    let afg_amp_out = s.verb(cad, fg, VERB_GET_PARAM, PARAM_AMP_OUT_CAP).unwrap_or(0);
+    let afg_amp_in = s
+        .verb(cad, fg, VERB_GET_PARAM, PARAM_AMP_IN_CAP)
+        .unwrap_or(0);
+    let afg_amp_out = s
+        .verb(cad, fg, VERB_GET_PARAM, PARAM_AMP_OUT_CAP)
+        .unwrap_or(0);
     let mut widgets = Vec::new();
     for n in wstart..wstart + wcount {
         let Ok(wcap) = s.verb(cad, n, VERB_GET_PARAM, PARAM_AUDIO_WIDGET_CAP) else {
@@ -396,8 +405,12 @@ pub fn probe(s: &mut dyn VerbSender, cad: u32) -> Result<Codec, &'static str> {
             _ => {}
         }
         if wcap & WCAP_AMP_OVRD != 0 {
-            w.amp_in = s.verb(cad, n, VERB_GET_PARAM, PARAM_AMP_IN_CAP).unwrap_or(w.amp_in);
-            w.amp_out = s.verb(cad, n, VERB_GET_PARAM, PARAM_AMP_OUT_CAP).unwrap_or(w.amp_out);
+            w.amp_in = s
+                .verb(cad, n, VERB_GET_PARAM, PARAM_AMP_IN_CAP)
+                .unwrap_or(w.amp_in);
+            w.amp_out = s
+                .verb(cad, n, VERB_GET_PARAM, PARAM_AMP_OUT_CAP)
+                .unwrap_or(w.amp_out);
         }
         if wcap & WCAP_CONN_LIST != 0 {
             w.nconns = read_conns(s, cad, n, &mut w.conns);
@@ -436,7 +449,9 @@ pub fn probe(s: &mut dyn VerbSender, cad: u32) -> Result<Codec, &'static str> {
 /// semantics).  This makes the stored list the *effective* connections, which
 /// is also what `SET_CONNECT_SEL` indices refer to.
 fn read_conns(s: &mut dyn VerbSender, cad: u32, nid: u32, out: &mut [u32; MAX_CONNS]) -> u32 {
-    let len = s.verb(cad, nid, VERB_GET_PARAM, PARAM_CONNLIST_LEN).unwrap_or(0);
+    let len = s
+        .verb(cad, nid, VERB_GET_PARAM, PARAM_CONNLIST_LEN)
+        .unwrap_or(0);
     let count = (len & 0x7F) as usize;
     let long = len & 0x80 != 0;
     let step = if long { 2usize } else { 4usize };
@@ -543,7 +558,9 @@ fn reach_converter(
     for _ in 0..8 {
         let mut next: Vec<u32> = Vec::new();
         for &nid in &frontier {
-            let Some(w) = widgets.iter().find(|w| w.nid == nid) else { continue };
+            let Some(w) = widgets.iter().find(|w| w.nid == nid) else {
+                continue;
+            };
             for &c in w.conns[..w.nconns as usize].iter() {
                 if c == 0 {
                     continue;
@@ -635,13 +652,17 @@ fn reach_in_pin(widgets: &[Widget], adc: u32) -> Option<(u32, Vec<(u32, usize)>)
     for _ in 0..8 {
         let mut next: Vec<u32> = Vec::new();
         for &nid in &frontier {
-            let Some(w) = widgets.iter().find(|w| w.nid == nid) else { continue };
+            let Some(w) = widgets.iter().find(|w| w.nid == nid) else {
+                continue;
+            };
             for &c in w.conns[..w.nconns as usize].iter() {
                 if c == 0 || visited.iter().any(|v| *v == c) {
                     continue;
                 }
                 visited.push(c);
-                let Some(cw) = widgets.iter().find(|w| w.nid == c) else { continue };
+                let Some(cw) = widgets.iter().find(|w| w.nid == c) else {
+                    continue;
+                };
                 if cw.wtype() == WIDGET_PIN {
                     if cw.pincap & PINCAP_IN != 0 {
                         // Reconstruct pin → … → adc (already source-first).
@@ -690,19 +711,24 @@ fn unmute_amp(
     cap: u32,
     index: usize,
 ) {
-    let supported = if output { wcap & WCAP_OUT_AMP } else { wcap & WCAP_IN_AMP };
+    let supported = if output {
+        wcap & WCAP_OUT_AMP
+    } else {
+        wcap & WCAP_IN_AMP
+    };
     if supported == 0 {
         return;
     }
-    let dir = if output { AMP_SET_OUTPUT } else { AMP_SET_INPUT };
+    let dir = if output {
+        AMP_SET_OUTPUT
+    } else {
+        AMP_SET_INPUT
+    };
     // Full, unmuted gain = the number of steps the (effective) amp capability
     // advertises — never a blind 0x7F.
     let gain = (cap & AMPCAP_NUM_STEPS) >> 8;
-    let payload = dir
-        | AMP_SET_LEFT
-        | AMP_SET_RIGHT
-        | (((index as u32) << 8) & AMP_INDEX_MASK)
-        | gain;
+    let payload =
+        dir | AMP_SET_LEFT | AMP_SET_RIGHT | (((index as u32) << 8) & AMP_INDEX_MASK) | gain;
     let _ = s.verb(c.cad, nid, VERB_SET_AMP_GAIN_MUTE, payload);
 }
 
@@ -786,7 +812,11 @@ pub fn setup_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &
 /// DAC and both pin output amps at full gain, enable the speaker pin
 /// (0x707 = 0x40) and its EAPD (0x70C = 0x02) plus the headphone pin
 /// (0x707 = 0xC0), then bind the DAC to `tag`.
-pub fn setup_alc256_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &'static str> {
+pub fn setup_alc256_output(
+    s: &mut dyn VerbSender,
+    c: &Codec,
+    tag: u32,
+) -> Result<(), &'static str> {
     let _ = s.verb(c.cad, c.fg, VERB_SET_POWER_STATE, PWR_D0);
     for nid in [RTL_ALC256_DAC, RTL_ALC256_SPKR_PIN, RTL_ALC256_HP_PIN] {
         let _ = s.verb(c.cad, nid, VERB_SET_POWER_STATE, PWR_D0);
@@ -795,10 +825,20 @@ pub fn setup_alc256_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Resul
     // Full-gain, unmuted output amp (index 0) on the converter and both pins.
     let amp = AMP_SET_OUTPUT | AMP_SET_LEFT | AMP_SET_RIGHT | 0x7F;
     let _ = s.verb(c.cad, RTL_ALC256_DAC, VERB_SET_AMP_GAIN_MUTE, amp);
-    let _ = s.verb(c.cad, RTL_ALC256_SPKR_PIN, VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT_EN);
+    let _ = s.verb(
+        c.cad,
+        RTL_ALC256_SPKR_PIN,
+        VERB_SET_PIN_WIDGET_CONTROL,
+        PIN_OUT_EN,
+    );
     let _ = s.verb(c.cad, RTL_ALC256_SPKR_PIN, VERB_SET_EAPD_BTLENABLE, EAPD_EN);
     let _ = s.verb(c.cad, RTL_ALC256_SPKR_PIN, VERB_SET_AMP_GAIN_MUTE, amp);
-    let _ = s.verb(c.cad, RTL_ALC256_HP_PIN, VERB_SET_PIN_WIDGET_CONTROL, PIN_OUT_EN | PIN_HP_EN);
+    let _ = s.verb(
+        c.cad,
+        RTL_ALC256_HP_PIN,
+        VERB_SET_PIN_WIDGET_CONTROL,
+        PIN_OUT_EN | PIN_HP_EN,
+    );
     let _ = s.verb(c.cad, RTL_ALC256_HP_PIN, VERB_SET_AMP_GAIN_MUTE, amp);
     s.verb(c.cad, RTL_ALC256_DAC, VERB_SET_CONV, (tag << 4) | 0)?;
     s.verb(c.cad, RTL_ALC256_DAC, VERB_SET_STREAM_FORMAT, c.fmt as u32)?;

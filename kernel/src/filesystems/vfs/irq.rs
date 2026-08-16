@@ -7,7 +7,9 @@ pub struct IrqMutex<T> {
 
 impl<T> IrqMutex<T> {
     pub const fn new(val: T) -> Self {
-        IrqMutex { inner: Mutex::new(val) }
+        IrqMutex {
+            inner: Mutex::new(val),
+        }
     }
 
     pub fn lock(&self) -> IrqGuard<'_, T> {

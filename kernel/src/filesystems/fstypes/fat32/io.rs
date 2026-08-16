@@ -8,13 +8,23 @@ macro_rules! fat_trace {
     };
 }
 
-pub(super) fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &mut [u8]) -> Result<(), VfsError> {
+pub(super) fn read_sectors(
+    device: &dyn BlockDevice,
+    lba: u64,
+    count: u32,
+    buf: &mut [u8],
+) -> Result<(), VfsError> {
     fat_trace!({
         use core::fmt::Write;
         let mut port = crate::drivers::serial::SerialPort::new();
         write!(port, "[DBG:io] read lba=0x{:x} count={}\n", lba, count).ok();
     });
-    let req = IoRequest { lba, count, buffer: IoBuffer::Buf(buf), is_write: false };
+    let req = IoRequest {
+        lba,
+        count,
+        buffer: IoBuffer::Buf(buf),
+        is_write: false,
+    };
     let c = device.submit(&[req]).map_err(|_| {
         crate::drivers::serial::SerialPort::puts("[fat32] read_sectors submit err lba=");
         crate::drivers::serial::SerialPort::put_hex(lba);
@@ -34,13 +44,23 @@ pub(super) fn read_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: 
     Ok(())
 }
 
-pub(super) fn write_sectors(device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), VfsError> {
+pub(super) fn write_sectors(
+    device: &dyn BlockDevice,
+    lba: u64,
+    count: u32,
+    buf: &[u8],
+) -> Result<(), VfsError> {
     fat_trace!({
         use core::fmt::Write;
         let mut port = crate::drivers::serial::SerialPort::new();
         write!(port, "[DBG:io] write lba=0x{:x} count={}\n", lba, count).ok();
     });
-    let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
+    let req = IoRequest {
+        lba,
+        count,
+        buffer: IoBuffer::ConstBuf(buf),
+        is_write: true,
+    };
     let c = device.submit(&[req]).map_err(|_| {
         crate::drivers::serial::SerialPort::puts("[fat32] write_sectors submit err lba=");
         crate::drivers::serial::SerialPort::put_hex(lba);

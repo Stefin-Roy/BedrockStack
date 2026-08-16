@@ -8,15 +8,10 @@ pub enum Bar {
     Unused,
 
     /// Memory-mapped I/O BAR.
-    Memory {
-        addr: u64,
-        prefetchable: bool,
-    },
+    Memory { addr: u64, prefetchable: bool },
 
     /// Port I/O BAR.
-    Io {
-        port: u32,
-    },
+    Io { port: u32 },
 }
 
 /// Decode a PCI BAR slot into its semantic type and address.
@@ -38,13 +33,19 @@ pub fn bar(dev: &PciDevice, index: usize) -> Bar {
 
     let p = raw & 8 != 0;
     match raw & 0x06 {
-        0 => Bar::Memory { addr: (raw & 0xFFFF_FFF0) as u64, prefetchable: p },
+        0 => Bar::Memory {
+            addr: (raw & 0xFFFF_FFF0) as u64,
+            prefetchable: p,
+        },
         4 => {
             if index == 5 {
                 return Bar::Unused;
             }
             let upper = dev.bars[index + 1] as u64;
-            Bar::Memory { addr: (raw as u64 & 0xFFFF_FFF0) | (upper << 32), prefetchable: p }
+            Bar::Memory {
+                addr: (raw as u64 & 0xFFFF_FFF0) | (upper << 32),
+                prefetchable: p,
+            }
         }
         _ => Bar::Unused,
     }

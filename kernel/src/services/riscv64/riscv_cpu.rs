@@ -1,13 +1,11 @@
 use alloc::vec::Vec;
 
+use super::super::cpu::CpuManager;
 use crate::acpi::AcpiSubsystem;
 use crate::arch::riscv64::sbi;
 use crate::smp::ApContext;
-use super::super::cpu::CpuManager;
 
 pub struct RiscvCpu;
-
-
 
 impl CpuManager for RiscvCpu {
     fn current_cpu_id(&self) -> u32 {
@@ -50,15 +48,9 @@ impl CpuManager for RiscvCpu {
         Vec::new()
     }
 
-    unsafe fn wake_aps(
-        &self,
-        page_table_root: u64,
-        aps: &[ApContext],
-    ) -> usize {
+    unsafe fn wake_aps(&self, page_table_root: u64, aps: &[ApContext]) -> usize {
         let alloc = crate::mm::heap::get_phys_allocator_mut();
-        unsafe {
-            crate::arch::riscv64::trampoline::start_aps(alloc, page_table_root, aps)
-        }
+        unsafe { crate::arch::riscv64::trampoline::start_aps(alloc, page_table_root, aps) }
     }
 }
 

@@ -1,9 +1,7 @@
-use core::arch::asm;
 use super::super::platform::PlatformControl;
+use core::arch::asm;
 
 pub struct X86Platform;
-
-
 
 impl PlatformControl for X86Platform {
     fn shutdown(&self) -> ! {
@@ -15,7 +13,9 @@ impl PlatformControl for X86Platform {
         unsafe {
             asm!("out dx, ax", in("dx") pm1a_port, in("ax") val, options(nomem, nostack, preserves_flags));
         }
-        loop { unsafe { asm!("cli; hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { asm!("cli; hlt", options(nomem, nostack)) }
+        }
     }
 
     fn reset(&self) -> ! {
@@ -30,7 +30,9 @@ impl PlatformControl for X86Platform {
             }
             asm!("out dx, al", in("dx") 0x64u16, in("al") 0xFEu8, options(nomem, nostack, preserves_flags));
         }
-        loop { unsafe { asm!("cli; hlt", options(nomem, nostack)) } }
+        loop {
+            unsafe { asm!("cli; hlt", options(nomem, nostack)) }
+        }
     }
 
     fn halt(&self) {

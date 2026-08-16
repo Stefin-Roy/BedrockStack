@@ -1,5 +1,5 @@
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use crate::services::KernelServices;
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// SMP initialization guard — prevents double-init which would double-start APs,
 /// leak stacks, and corrupt the CPU counter.
@@ -11,10 +11,22 @@ static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 /// The BSP transitions 0→2 in `early_init_bsp`; APs transition 0→1 in
 /// `smp::init` then 1→2 in their respective `ap_entry`.
 static CPU_STATES: [AtomicU8; MAX_CPUS] = [
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
-    AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
+    AtomicU8::new(0),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,13 +48,21 @@ impl From<u8> for CpuState {
 
 /// Read the current state of a CPU.
 pub fn cpu_state(cpu_id: u32) -> CpuState {
-    assert!((cpu_id as usize) < MAX_CPUS, "cpu_state: cpu {} out of range", cpu_id);
+    assert!(
+        (cpu_id as usize) < MAX_CPUS,
+        "cpu_state: cpu {} out of range",
+        cpu_id
+    );
     CpuState::from(CPU_STATES[cpu_id as usize].load(Ordering::Acquire))
 }
 
 /// Transition a CPU's online state.
 pub(crate) fn set_cpu_state(cpu_id: u32, new_state: CpuState) {
-    assert!((cpu_id as usize) < MAX_CPUS, "set_cpu_state: cpu {} out of range", cpu_id);
+    assert!(
+        (cpu_id as usize) < MAX_CPUS,
+        "set_cpu_state: cpu {} out of range",
+        cpu_id
+    );
     let new_val = match new_state {
         CpuState::Offline => 0,
         CpuState::Starting => 1,
@@ -58,22 +78,54 @@ pub struct ApReady {
 }
 
 pub static AP_READY: [ApReady; MAX_CPUS] = [
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
-    ApReady { ready: AtomicBool::new(false) },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
+    ApReady {
+        ready: AtomicBool::new(false),
+    },
 ];
 
 /// Per-CPU data structure.
@@ -108,22 +160,182 @@ pub const MAX_CPUS: usize = 16;
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
 
 static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 0, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 1, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 2, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 3, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 4, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 5, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 6, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 7, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 8, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 9, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 10, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 11, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 12, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 13, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 14, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
-    PerCpu { self_ptr: core::ptr::null(), cpu_id: 15, apic_id: 0, is_bsp: false, started: AtomicU64::new(0), stack_top: 0, serial_locked: AtomicU64::new(0), syscall_rsp0: 0, current_task: core::ptr::null_mut() },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 0,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 1,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 2,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 3,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 4,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 5,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 6,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 7,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 8,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 9,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 10,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 11,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 12,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 13,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 14,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
+    PerCpu {
+        self_ptr: core::ptr::null(),
+        cpu_id: 15,
+        apic_id: 0,
+        is_bsp: false,
+        started: AtomicU64::new(0),
+        stack_top: 0,
+        serial_locked: AtomicU64::new(0),
+        syscall_rsp0: 0,
+        current_task: core::ptr::null_mut(),
+    },
 ];
 
 #[cfg(target_arch = "x86_64")]
@@ -146,10 +358,22 @@ pub fn current_per_cpu() -> &'static mut PerCpu {
 
 #[cfg(debug_assertions)]
 static SLOT_BUSY: [AtomicU32; MAX_CPUS] = [
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
-    AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 
 /// Mutable access to one per-CPU slot.
@@ -162,7 +386,11 @@ fn slot_mut(index: usize) -> &'static mut PerCpu {
     #[cfg(debug_assertions)]
     {
         let prev = SLOT_BUSY[index].fetch_add(1, Ordering::AcqRel);
-        assert!(prev == 0, "smp: slot {} re-entrant mutable access (missing slot_release)", index);
+        assert!(
+            prev == 0,
+            "smp: slot {} re-entrant mutable access (missing slot_release)",
+            index
+        );
     }
     unsafe { &mut PER_CPU_SLOTS[index] }
 }
@@ -235,12 +463,16 @@ pub unsafe fn early_init_bsp() {
 pub fn set_gs_base(addr: u64) {
     use x86_64::registers::model_specific::Msr;
     const IA32_GS_BASE: u32 = 0xC0000101;
-    unsafe { Msr::new(IA32_GS_BASE).write(addr); }
+    unsafe {
+        Msr::new(IA32_GS_BASE).write(addr);
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
 fn set_tp(pc: *const PerCpu) {
-    unsafe { core::arch::asm!("mv tp, {}", in(reg) pc); }
+    unsafe {
+        core::arch::asm!("mv tp, {}", in(reg) pc);
+    }
 }
 
 /// Fill in the hardware ID (APIC ID / hart ID) for the BSP.
@@ -315,7 +547,11 @@ pub unsafe fn init(
         pc.stack_top = stack_top;
         slot_release(cpu_id as usize);
 
-        ap_list.push(ApContext { cpu_id, hardware_id, stack_top });
+        ap_list.push(ApContext {
+            cpu_id,
+            hardware_id,
+            stack_top,
+        });
 
         SerialPort::puts("[smp] AP: cpu_id=");
         SerialPort::put_u64(cpu_id as u64);

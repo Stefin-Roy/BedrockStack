@@ -1,7 +1,7 @@
 use spin::{Mutex, Once};
 
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE};
+use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 
 pub struct DmaBuffer {
     pub phys: u64,
@@ -87,13 +87,14 @@ impl KernelDma {
     }
 }
 
-
-
 impl DmaAllocator for KernelDma {
     fn map_mmio(&self, paddr: u64, size: u64) -> Result<u64, &'static str> {
         let page_aligned = (size + 4095) & !4095;
         let mut inner = self.inner.lock();
-        let va = inner.next_vaddr.checked_sub(page_aligned).ok_or("DMA: address space exhausted (overflow)")?;
+        let va = inner
+            .next_vaddr
+            .checked_sub(page_aligned)
+            .ok_or("DMA: address space exhausted (overflow)")?;
         if va < self.vaddr_floor {
             return Err("DMA: address space exhausted");
         }
@@ -130,7 +131,11 @@ impl DmaAllocator for KernelDma {
             PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
         );
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096) }
-        Some(DmaBuffer { phys, virt: va, size: 4096 })
+        Some(DmaBuffer {
+            phys,
+            virt: va,
+            size: 4096,
+        })
     }
 
     fn alloc_contiguous(&self, count: usize) -> Option<DmaBuffer> {
@@ -151,6 +156,10 @@ impl DmaAllocator for KernelDma {
             PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
         );
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
-        Some(DmaBuffer { phys, virt: va, size: size as usize })
+        Some(DmaBuffer {
+            phys,
+            virt: va,
+            size: size as usize,
+        })
     }
 }

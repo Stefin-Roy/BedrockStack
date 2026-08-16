@@ -2,8 +2,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 
-use crate::filesystems::vfs::irq::IrqMutex;
 use super::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
+use crate::filesystems::vfs::irq::IrqMutex;
 
 const CACHE_SIZE: usize = 4096;
 
@@ -37,7 +37,9 @@ impl BlockCache {
         }
         let target = CACHE_SIZE - CACHE_SIZE / 4;
         while self.sectors.len() > target {
-            if self.clock.is_empty() { break; }
+            if self.clock.is_empty() {
+                break;
+            }
             if self.clock_hand >= self.clock.len() {
                 self.clock_hand = 0;
             }
@@ -50,9 +52,16 @@ impl BlockCache {
     fn read(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&[u8; 512], ()> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; 512];
-            let req = IoRequest { lba, count: 1, buffer: IoBuffer::Buf(&mut buf), is_write: false };
+            let req = IoRequest {
+                lba,
+                count: 1,
+                buffer: IoBuffer::Buf(&mut buf),
+                is_write: false,
+            };
             let c = device.submit(&[req]).map_err(|_| ())?;
-            if !c.all_ok() { return Err(()); }
+            if !c.all_ok() {
+                return Err(());
+            }
             self.maybe_evict();
             self.sectors.insert(lba, CachedSector { data: buf });
             self.clock.push(lba);
@@ -60,19 +69,41 @@ impl BlockCache {
         Ok(&self.sectors.get(&lba).unwrap().data)
     }
 
-    fn read_raw(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf_ptr: *mut u8, buf_len: usize) -> Result<(), ()> {
+    fn read_raw(
+        &mut self,
+        device: &dyn BlockDevice,
+        lba: u64,
+        count: u32,
+        buf_ptr: *mut u8,
+        buf_len: usize,
+    ) -> Result<(), ()> {
         debug_assert!(count <= 1, "multi-sector reads bypass the cache in read_io");
         let data = self.read(device, lba)?;
         let copy_len = 512usize.min(buf_len);
-        unsafe { core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len); }
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), buf_ptr, copy_len);
+        }
         Ok(())
     }
 
-    fn write(&mut self, device: &dyn BlockDevice, lba: u64, count: u32, buf: &[u8]) -> Result<(), ()> {
+    fn write(
+        &mut self,
+        device: &dyn BlockDevice,
+        lba: u64,
+        count: u32,
+        buf: &[u8],
+    ) -> Result<(), ()> {
         // Write-through to device first
-        let req = IoRequest { lba, count, buffer: IoBuffer::ConstBuf(buf), is_write: true };
+        let req = IoRequest {
+            lba,
+            count,
+            buffer: IoBuffer::ConstBuf(buf),
+            is_write: true,
+        };
         let c = device.submit(&[req]).map_err(|_| ())?;
-        if !c.all_ok() { return Err(()); }
+        if !c.all_ok() {
+            return Err(());
+        }
         // Only update cache after successful write
         if count <= 1 && buf.len() == 512 {
             let mut sector = [0u8; 512];
@@ -110,8 +141,16 @@ impl CachedDevice {
                 }
                 _ => return Err(()),
             };
-            let req = IoRequest { lba: r.lba, count: r.count, buffer, is_write: false };
-            let c = self.inner.submit(core::slice::from_ref(&req)).map_err(|_| ())?;
+            let req = IoRequest {
+                lba: r.lba,
+                count: r.count,
+                buffer,
+                is_write: false,
+            };
+            let c = self
+                .inner
+                .submit(core::slice::from_ref(&req))
+                .map_err(|_| ())?;
             return if c.all_ok() { Ok(()) } else { Err(()) };
         }
         let (buf_ptr, buf_len) = match &r.buffer {

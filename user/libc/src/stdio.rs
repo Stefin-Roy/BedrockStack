@@ -6,11 +6,17 @@ use crate::errno;
 use crate::syscall;
 use crate::syscall::{read_path, write_path};
 
+// These buffers live in `.bss`, not on the fixed 32 KiB user stack.  The libc
+// surface is single-threaded today, so one read and one write scratch buffer
+// are sufficient for large file transfers.
+static mut FREAD_SCRATCH: [u8; crate::IO_CHUNK_BYTES] = [0; crate::IO_CHUNK_BYTES];
+static mut FWRITE_SCRATCH: [u8; crate::IO_CHUNK_BYTES] = [0; crate::IO_CHUNK_BYTES];
+
 // ── fd-based streams ──────────────────────────────────────────────────
 
 /// POSIX `write(1|2, ...)`: `/proc/self/std/out|err`. The kernel consumes the
 /// syscall buffer in place (zero-filling it), so `syscall::write_data` chunk-
-/// copies through a stack scratch and the caller's buffer stays intact.
+/// copies through static scratch storage and the caller's buffer stays intact.
 #[unsafe(no_mangle)]
 pub extern "C" fn write(fd: c_int, buf: *const c_void, len: usize) -> isize {
     let path: &[u8] = match fd {
@@ -99,7 +105,10 @@ struct Fmt {
 
 impl Fmt {
     fn new() -> Self {
-        Fmt { buf: [0; 512], pos: 0 }
+        Fmt {
+            buf: [0; 512],
+            pos: 0,
+        }
     }
     fn push(&mut self, b: u8) {
         if self.pos < self.buf.len() {
@@ -331,7 +340,17 @@ static mut FILE_USED: [bool; FILE_POOL] = [false; FILE_POOL];
 
 /// Parse `mode`, returning `(readable, writable, append, truncate)`.
 fn parse_mode(m: &[u8]) -> Option<(bool, bool, bool, bool)> {
-    match m {
+    // Strip any 'b' (binary) flag: our streams are byte-oriented, so the flag
+    // is a no-op. Handles "rb", "wb", "ab", "rb+", "r+b", etc.
+    let mut base = [0u8; 4];
+    let mut n = 0usize;
+    for &c in m {
+        if c != b'b' && n < base.len() {
+            base[n] = c;
+            n += 1;
+        }
+    }
+    match &base[..n] {
         b"r" => Some((true, false, false, false)),
         b"w" => Some((false, true, false, true)),
         b"a" => Some((false, true, true, false)),
@@ -423,7 +442,10 @@ pub extern "C" fn fread(buf: *mut c_void, size: usize, count: usize, f: *mut FIL
         }
         let path = fref.path;
         let plen = fref.plen;
-        let mut data = [0u8; 256];
+        let data = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(FREAD_SCRATCH) as *mut u8,
+            crate::IO_CHUNK_BYTES,
+        );
         let mut got = 0usize;
         while got < want {
             let chunk = core::cmp::min(want - got, data.len());
@@ -466,7 +488,10 @@ pub extern "C" fn fwrite(buf: *const c_void, size: usize, count: usize, f: *mut 
         let plen = fref.plen;
         let base = fref.offset;
         let data = core::slice::from_raw_parts(buf as *const u8, want);
-        let mut scratch = [0u8; 256];
+        let scratch = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(FWRITE_SCRATCH) as *mut u8,
+            crate::IO_CHUNK_BYTES,
+        );
         let mut done = 0usize;
         while done < want {
             let n = core::cmp::min(want - done, scratch.len());
@@ -476,7 +501,7 @@ pub extern "C" fn fwrite(buf: *const c_void, size: usize, count: usize, f: *mut 
             } else {
                 (base + done as u64) << 8
             };
-            let r = write_path(&path[..plen + 1], &mut scratch, n, flags);
+            let r = write_path(&path[..plen + 1], scratch, n, flags);
             if r < 0 {
                 errno::set((-r) as c_int);
                 break;
@@ -488,6 +513,22 @@ pub extern "C" fn fwrite(buf: *const c_void, size: usize, count: usize, f: *mut 
         }
         done / size
     }
+}
+
+/// File size in bytes via the VFS file object's `stat` method. The response is
+/// packed LE: `{ino:u64, size:u64, kind:u32, mtime:u64}` (28 bytes), so the size
+/// sits at `buf[8..16]`. The method input is a blob so a nonzero write buffer
+/// round-trips the output back to us.
+fn file_size(f: &FILE) -> Option<u64> {
+    let mut tp = [0u8; 140];
+    tp[..f.plen].copy_from_slice(&f.path[..f.plen]);
+    tp[f.plen..f.plen + 6].copy_from_slice(b":stat\0");
+    let mut buf = [0u8; 32];
+    let r = unsafe { write_path(&tp[..f.plen + 6], &mut buf, 32, 0) };
+    if r < 16 {
+        return None;
+    }
+    Some(u64::from_le_bytes(buf[8..16].try_into().ok()?))
 }
 
 #[unsafe(no_mangle)]
@@ -507,8 +548,18 @@ pub extern "C" fn fseek(f: *mut FILE, offset: c_long, whence: c_int) -> c_int {
                 fref.offset = (fref.offset as i64 + offset).max(0) as u64;
                 0
             }
+            2 => match file_size(fref) {
+                Some(base) => {
+                    fref.offset = (base as i64 + offset).max(0) as u64;
+                    0
+                }
+                None => {
+                    errno::set(22); // EINVAL
+                    -1
+                }
+            },
             _ => {
-                errno::set(22); // SEEK_END unsupported without a stat here
+                errno::set(22); // EINVAL
                 -1
             }
         }

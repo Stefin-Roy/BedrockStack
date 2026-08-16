@@ -38,11 +38,13 @@ use crate::input::mouse::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT, REL_WHEEL, REL_X, REL
 use crate::services::dma::DmaAllocator;
 use crate::usb::class::driver::{BoundUsbDevice, InterfaceResources, UsbClassDriver};
 use crate::usb::class::hid_report;
+use crate::usb::usb::{
+    CLASS_HID, DESC_HID, DESC_REPORT, HID_PROTOCOL_MOUSE, HID_SUBCLASS_BOOT, SetupPacket,
+};
 use crate::usb::xhci::command;
 use crate::usb::xhci::device;
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing};
-use crate::usb::usb::{CLASS_HID, DESC_HID, DESC_REPORT, HID_PROTOCOL_MOUSE, HID_SUBCLASS_BOOT, SetupPacket};
 
 /// Boot keyboard report: modifier byte, reserved byte, 6 key usages.
 const HID_BOOT_KBD_REPORT_LEN: u32 = 8;
@@ -117,7 +119,8 @@ impl UsbClassDriver for HidDriver {
 
         // Decide the report format before moving `res.interrupt_in` (the
         // generic path borrows `res` for the EP0 descriptor fetches).
-        let (kind, report_len, output_len, absolute_pointer) = if res.iface_subclass == HID_SUBCLASS_BOOT
+        let (kind, report_len, output_len, absolute_pointer) = if res.iface_subclass
+            == HID_SUBCLASS_BOOT
             && res.iface_protocol != crate::usb::usb::HID_PROTOCOL_NONE
         {
             // Boot path: select the protocol on EP0, then decode the fixed
@@ -125,13 +128,18 @@ impl UsbClassDriver for HidDriver {
             // The boot keyboard output report is the single LED byte; boot
             // mice have no output report.
             let (kind, len, out_len) = match res.iface_protocol {
-                crate::usb::usb::HID_PROTOCOL_KEYBOARD => {
-                    (HidKind::Keyboard, HID_BOOT_KBD_REPORT_LEN, HID_BOOT_KBD_OUTPUT_LEN)
-                }
+                crate::usb::usb::HID_PROTOCOL_KEYBOARD => (
+                    HidKind::Keyboard,
+                    HID_BOOT_KBD_REPORT_LEN,
+                    HID_BOOT_KBD_OUTPUT_LEN,
+                ),
                 HID_PROTOCOL_MOUSE => (HidKind::Mouse, HID_BOOT_MOUSE_REPORT_LEN, 0),
                 _ => return Err("unsupported HID boot protocol"),
             };
-            let setup = SetupPacket::set_protocol(crate::usb::usb::HID_PROTOCOL_NONE as u16, res.iface_num as u16);
+            let setup = SetupPacket::set_protocol(
+                crate::usb::usb::HID_PROTOCOL_NONE as u16,
+                res.iface_num as u16,
+            );
             device::submit_control_transfer(
                 ep0_ring,
                 res.doorbell_va,
@@ -147,7 +155,8 @@ impl UsbClassDriver for HidDriver {
             // the kind and report lengths; the report is interpreted
             // boot-style, so a pointer decodes absolute coordinates.
             let scratch = dma.alloc_page().ok_or("OOM for HID descriptor page")?;
-            let (kind, len, out_len) = fetch_report_info(ep0_ring, &res, scratch.phys, scratch.virt)?;
+            let (kind, len, out_len) =
+                fetch_report_info(ep0_ring, &res, scratch.phys, scratch.virt)?;
             (kind, len, out_len, kind == HidKind::Mouse)
         };
 
@@ -160,7 +169,13 @@ impl UsbClassDriver for HidDriver {
             return Err("one USB HID mouse already bound");
         }
 
-        if !event::register_transfer_target(res.slot_id, ep.dci, report_page.virt, report_len, (1 << 1) | (1 << 13)) {
+        if !event::register_transfer_target(
+            res.slot_id,
+            ep.dci,
+            report_page.virt,
+            report_len,
+            (1 << 1) | (1 << 13),
+        ) {
             return Err("transfer target table full");
         }
 
@@ -173,7 +188,13 @@ impl UsbClassDriver for HidDriver {
         if output_len > 0 {
             if let Some(oep) = res.interrupt_out {
                 let page = dma.alloc_page().ok_or("OOM for HID LED page")?;
-                if event::register_transfer_target(res.slot_id, oep.dci, page.virt, output_len, (1 << 1) | (1 << 13)) {
+                if event::register_transfer_target(
+                    res.slot_id,
+                    oep.dci,
+                    page.virt,
+                    output_len,
+                    (1 << 1) | (1 << 13),
+                ) {
                     led_phys = page.phys;
                     led_va = page.virt;
                     out_dci = oep.dci;
@@ -258,7 +279,15 @@ fn fetch_report_info(
     buf_va: u64,
 ) -> Result<(HidKind, u32, u32), &'static str> {
     let setup = SetupPacket::get_descriptor_interface(DESC_HID, 0, res.iface_num as u16, 9);
-    device::submit_control_transfer(ep0_ring, res.doorbell_va, res.slot_id, &setup, buf_phys, 9, true)?;
+    device::submit_control_transfer(
+        ep0_ring,
+        res.doorbell_va,
+        res.slot_id,
+        &setup,
+        buf_phys,
+        9,
+        true,
+    )?;
     let hid = unsafe { core::slice::from_raw_parts(buf_va as *const u8, 9) };
     if hid[0] < 9 || hid[1] != DESC_HID {
         return Err("bad HID descriptor");
@@ -268,7 +297,8 @@ fn fetch_report_info(
         return Err("bad HID report descriptor length");
     }
 
-    let setup = SetupPacket::get_descriptor_interface(DESC_REPORT, 0, res.iface_num as u16, report_len);
+    let setup =
+        SetupPacket::get_descriptor_interface(DESC_REPORT, 0, res.iface_num as u16, report_len);
     device::submit_control_transfer(
         ep0_ring,
         res.doorbell_va,
@@ -279,12 +309,16 @@ fn fetch_report_info(
         true,
     )?;
     let rd = unsafe { core::slice::from_raw_parts(buf_va as *const u8, report_len as usize) };
-    let info = hid_report::parse_report_descriptor(rd).ok_or("unrecognized HID report descriptor")?;
+    let info =
+        hid_report::parse_report_descriptor(rd).ok_or("unrecognized HID report descriptor")?;
     Ok((info.kind, info.report_len as u32, info.output_len as u32))
 }
 
 fn arm_read(inner: &mut HidDeviceInner) {
-    inner.ring.enqueue(&memory::make_normal_trb(inner.report_phys, inner.report_len));
+    inner.ring.enqueue(&memory::make_normal_trb(
+        inner.report_phys,
+        inner.report_len,
+    ));
     inner.ring.flush();
     command::ring_doorbell(inner.doorbell_va, inner.slot_id, inner.dci);
 }
@@ -429,7 +463,9 @@ fn hid_mouse_poll() {
         return;
     }
 
-    let report = unsafe { core::slice::from_raw_parts(inner.report_va as *const u8, inner.report_len as usize) };
+    let report = unsafe {
+        core::slice::from_raw_parts(inner.report_va as *const u8, inner.report_len as usize)
+    };
 
     let (buttons, dx, dy, wheel) = if inner.absolute_pointer {
         let x = report.get(0).copied().unwrap_or(0);

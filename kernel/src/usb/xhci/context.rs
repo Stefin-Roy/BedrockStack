@@ -87,8 +87,7 @@ fn init_ep_context(
     write32(
         base,
         0x00,
-        ((interval as u32) & 0xFF) << EP_INTERVAL_SHIFT
-            | ((mult as u32) & 0x3) << EP_MULT_SHIFT,
+        ((interval as u32) & 0xFF) << EP_INTERVAL_SHIFT | ((mult as u32) & 0x3) << EP_MULT_SHIFT,
     );
     // dw1: CErr | EP Type | Max Burst Size (spec Table 6-8, dw1:8-15) |
     // Max Packet Size.
@@ -127,7 +126,20 @@ pub fn init_icc_for_address_device(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0, 0, 0);
+    init_ep_context(
+        icc_va,
+        ctx_size,
+        1,
+        EP_TYPE_CONTROL,
+        mps,
+        dequeue_phys,
+        3,
+        8,
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 /// Build an Input Control Context for an Evaluate Context command that
@@ -144,7 +156,20 @@ pub fn init_icc_for_evaluate_ep0(
     write32(icc_va, 0x00, 0);
     write32(icc_va, 0x04, 0x3);
     init_slot_context(icc_va, speed, port_num, 1);
-    init_ep_context(icc_va, ctx_size, 1, EP_TYPE_CONTROL, mps, dequeue_phys, 3, 8, 0, 0, 0, 0);
+    init_ep_context(
+        icc_va,
+        ctx_size,
+        1,
+        EP_TYPE_CONTROL,
+        mps,
+        dequeue_phys,
+        3,
+        8,
+        0,
+        0,
+        0,
+        0,
+    );
 }
 
 /// Build an Input Control Context for a Configure Endpoint command that

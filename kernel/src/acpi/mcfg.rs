@@ -1,10 +1,16 @@
-use alloc::vec::Vec;
 use crate::acpi::platform::{AcpiError, PciConfigRegions, PciMcfgRegion};
+use alloc::vec::Vec;
 
 fn r64(buf: &[u8], off: usize) -> u64 {
     u64::from_le_bytes([
-        buf[off], buf[off + 1], buf[off + 2], buf[off + 3],
-        buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7],
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
     ])
 }
 

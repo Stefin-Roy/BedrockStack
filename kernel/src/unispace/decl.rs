@@ -127,7 +127,11 @@ impl Declare {
             descs,
             read: self.read,
             write: self.write,
-            children: if self.children { Some(SimpleDir::new()) } else { None },
+            children: if self.children {
+                Some(SimpleDir::new())
+            } else {
+                None
+            },
         })
     }
 }
@@ -190,7 +194,10 @@ impl Object for DeclaredObject {
     }
 
     fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
-        let m = self.methods.get(method).ok_or(UnispaceError::MethodNotFound)?;
+        let m = self
+            .methods
+            .get(method)
+            .ok_or(UnispaceError::MethodNotFound)?;
         (m.handler)(&v, out)
     }
 

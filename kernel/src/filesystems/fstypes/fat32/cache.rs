@@ -1,5 +1,5 @@
-use hashbrown::{HashMap, HashSet};
 use alloc::vec::Vec;
+use hashbrown::{HashMap, HashSet};
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
@@ -28,7 +28,11 @@ impl FatCache {
         }
     }
 
-    pub fn get_or_read(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&[u8; SECTOR_SIZE], VfsError> {
+    pub fn get_or_read(
+        &mut self,
+        device: &dyn BlockDevice,
+        lba: u64,
+    ) -> Result<&[u8; SECTOR_SIZE], VfsError> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
@@ -39,7 +43,11 @@ impl FatCache {
         Ok(self.sectors.get(&lba).unwrap())
     }
 
-    pub fn get_or_read_mut(&mut self, device: &dyn BlockDevice, lba: u64) -> Result<&mut [u8; SECTOR_SIZE], VfsError> {
+    pub fn get_or_read_mut(
+        &mut self,
+        device: &dyn BlockDevice,
+        lba: u64,
+    ) -> Result<&mut [u8; SECTOR_SIZE], VfsError> {
         if !self.sectors.contains_key(&lba) {
             let mut buf = [0u8; SECTOR_SIZE];
             read_sectors(device, lba, 1, &mut buf)?;
@@ -59,7 +67,12 @@ impl FatCache {
             if is_mirrored {
                 for fat_num in 1..bpb.num_fats {
                     let local_idx = (lba - bpb.fat_sector_lba(0, 0)) % bpb.fat_sz32 as u64;
-                    write_sectors(device, bpb.fat_sector_lba(fat_num, local_idx as u32), 1, data)?;
+                    write_sectors(
+                        device,
+                        bpb.fat_sector_lba(fat_num, local_idx as u32),
+                        1,
+                        data,
+                    )?;
                 }
             }
         }
@@ -73,7 +86,9 @@ impl FatCache {
         }
         let target = MAX_FAT_CACHE_ENTRIES - MAX_FAT_CACHE_ENTRIES / 4;
         while self.sectors.len() > target {
-            if self.clock.is_empty() { break; }
+            if self.clock.is_empty() {
+                break;
+            }
             if self.clock_hand >= self.clock.len() {
                 self.clock_hand = 0;
             }

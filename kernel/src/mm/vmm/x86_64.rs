@@ -13,8 +13,8 @@ use x86_64::structures::paging::{
 };
 use x86_64::{PhysAddr as XPhysAddr, VirtAddr};
 
-use crate::mm::phys_alloc::BitmapAllocator;
 use super::PageFlags;
+use crate::mm::phys_alloc::BitmapAllocator;
 
 // ── Frame-allocator adapter ─────────────────────────────────────────
 
@@ -52,8 +52,8 @@ fn page_flags_to_x86(flags: PageFlags) -> PageTableFlags {
         // Need BOTH PCD and PWT for UC (PAT index 3 = 0 × 4 + 2 × 1 + 1 × 1).
         // With only PCD (bit 4), PAT index = 2 → WT (Write-Through),
         // which allows cache hits on reads giving stale data.
-        f |= PageTableFlags::NO_CACHE;         // PCD
-        f |= PageTableFlags::WRITE_THROUGH;    // PWT
+        f |= PageTableFlags::NO_CACHE; // PCD
+        f |= PageTableFlags::WRITE_THROUGH; // PWT
     }
     if flags.contains(PageFlags::WRITE_COMBINING) {
         // PAT index 1 (001): PWT=1, PCD=0, PAT=0
@@ -74,7 +74,9 @@ pub fn init_pat_wc() {
     let val = unsafe { msr.read() };
     // Entry 1 is bits 15:8. Change byte 1 to 01h (WC).
     let new_val = (val & !(0xFF << 8)) | (0x01u64 << 8);
-    unsafe { msr.write(new_val); }
+    unsafe {
+        msr.write(new_val);
+    }
 }
 
 /// Table flags for newly-allocated intermediate page-table entries.
@@ -96,13 +98,7 @@ fn table_flags_for(leaf: PageTableFlags) -> PageTableFlags {
 
 // ── Public API ──────────────────────────────────────────────────────
 
-pub fn map_4k(
-    root: u64,
-    alloc: &mut BitmapAllocator,
-    vaddr: u64,
-    paddr: u64,
-    flags: PageFlags,
-) {
+pub fn map_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
     let _guard = super::lock();
     // A brand-new higher-half PML4 slot must be fanned out to every clone.
     let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
@@ -115,7 +111,13 @@ pub fn map_4k(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags_for(x86_flags), &mut frame_alloc)
+            .map_to_with_table_flags(
+                page,
+                frame,
+                x86_flags,
+                table_flags_for(x86_flags),
+                &mut frame_alloc,
+            )
             .expect("x86_64 4KiB map failed")
             .flush();
     }
@@ -126,13 +128,7 @@ pub fn map_4k(
     }
 }
 
-pub fn map_2m(
-    root: u64,
-    alloc: &mut BitmapAllocator,
-    vaddr: u64,
-    paddr: u64,
-    flags: PageFlags,
-) {
+pub fn map_2m(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
     let _guard = super::lock();
     let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
     let mut mapper = mapper_at(root);
@@ -144,7 +140,13 @@ pub fn map_2m(
 
     unsafe {
         mapper
-            .map_to_with_table_flags(page, frame, x86_flags, table_flags_for(x86_flags), &mut frame_alloc)
+            .map_to_with_table_flags(
+                page,
+                frame,
+                x86_flags,
+                table_flags_for(x86_flags),
+                &mut frame_alloc,
+            )
             .expect("x86_64 2MiB map failed")
             .flush();
     }
@@ -201,7 +203,9 @@ unsafe fn read_pte(table: *mut u64, index: usize) -> u64 {
 
 #[inline]
 unsafe fn write_pte(table: *mut u64, index: usize, value: u64) {
-    unsafe { *table.add(index & 0x1FF) = value; }
+    unsafe {
+        *table.add(index & 0x1FF) = value;
+    }
 }
 
 /// True if every one of the 512 entries in the table at physical `frame` is
@@ -342,7 +346,9 @@ fn reclaim_empty_tables(root: u64, pending: &mut super::PendingFrames, vaddr: u6
 
 pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     let mapper = mapper_at(root);
-    mapper.translate_addr(VirtAddr::new(vaddr)).map(|p| p.as_u64())
+    mapper
+        .translate_addr(VirtAddr::new(vaddr))
+        .map(|p| p.as_u64())
 }
 
 /// Manual 4-level page-table walk returning `(physical, is_user, is_writable)`.
@@ -395,7 +401,11 @@ pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
     }
     user_ok &= e2 & USER != 0;
     if e2 & PS != 0 {
-        return Some((pte_frame(e2) | (vaddr & 0x1F_FFFF), user_ok, e2 & WRITABLE != 0));
+        return Some((
+            pte_frame(e2) | (vaddr & 0x1F_FFFF),
+            user_ok,
+            e2 & WRITABLE != 0,
+        ));
     }
 
     let pt = pte_deref(pte_frame(e2));
@@ -403,7 +413,11 @@ pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
     if e3 & PRESENT == 0 {
         return None;
     }
-    Some((pte_frame(e3) | (vaddr & 0xFFF), user_ok & (e3 & USER != 0), e3 & WRITABLE != 0))
+    Some((
+        pte_frame(e3) | (vaddr & 0xFFF),
+        user_ok & (e3 & USER != 0),
+        e3 & WRITABLE != 0,
+    ))
 }
 
 /// PS (huge-page) bit position in a level-2/3 entry.
@@ -494,7 +508,9 @@ pub fn destroy_root(root: u64, alloc: &mut BitmapAllocator) {
     super::flush_tlb();
     super::shootdown_tlb();
     for f in frames {
-        unsafe { alloc.free(f); }
+        unsafe {
+            alloc.free(f);
+        }
     }
     super::unregister_clone_root(root);
 }
@@ -513,9 +529,7 @@ pub fn make_read_only(root: u64, vaddr: u64) {
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     // Reconstruct flags matching what leaf_flags() would have set for
     // .data/.bss (READ | WRITE | NO_EXECUTE) minus WRITABLE.
-    let flags = PageTableFlags::PRESENT
-        | PageTableFlags::ACCESSED
-        | PageTableFlags::NO_EXECUTE;
+    let flags = PageTableFlags::PRESENT | PageTableFlags::ACCESSED | PageTableFlags::NO_EXECUTE;
     unsafe {
         mapper
             .update_flags(page, flags)
@@ -603,5 +617,7 @@ pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
 /// stream and stack.
 pub unsafe fn activate(root: u64) {
     let frame = PhysFrame::containing_address(XPhysAddr::new(root));
-    unsafe { Cr3::write(frame, Cr3Flags::empty()); }
+    unsafe {
+        Cr3::write(frame, Cr3Flags::empty());
+    }
 }

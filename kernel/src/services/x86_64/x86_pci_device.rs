@@ -3,8 +3,6 @@ use super::super::pci_device::{Bar, PciCapability, PciDevice, PciDeviceManager};
 
 pub struct X86PciDevice;
 
-
-
 impl PciDeviceManager for X86PciDevice {
     fn devices(&self) -> &[PciDevice] {
         crate::pci::devices()
@@ -40,7 +38,15 @@ impl PciDeviceManager for X86PciDevice {
         vector: u8,
         dest_apic_id: u8,
     ) {
-        crate::pci::msix::enable(dev, cap, bar_va, pba_va, table_entries, vector, dest_apic_id);
+        crate::pci::msix::enable(
+            dev,
+            cap,
+            bar_va,
+            pba_va,
+            table_entries,
+            vector,
+            dest_apic_id,
+        );
     }
 
     fn program_msix_entry(

@@ -1,5 +1,5 @@
-pub mod plic;
 pub mod htif;
+pub mod plic;
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -13,5 +13,9 @@ pub fn set_dtb_ptr(ptr: *const u8) {
 /// Retrieve the DTB pointer, or null if not set.
 pub fn get_dtb_ptr() -> Option<*const u8> {
     let val = DTB_PTR.load(Ordering::Relaxed);
-    if val == 0 { None } else { Some(val as *const u8) }
+    if val == 0 {
+        None
+    } else {
+        Some(val as *const u8)
+    }
 }

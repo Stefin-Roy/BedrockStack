@@ -8,6 +8,8 @@ cpu_slow = []
 forceslowlogging = []
 fat_trace = []
 usb_trace = []
+ps2_trace = []
+heap_trace = []
 kernelmb2 = []
 selftest = []
 

@@ -1,3 +1,4 @@
+pub mod dev;
 pub mod driver;
 pub mod input;
 #[cfg(target_arch = "x86_64")]
@@ -11,6 +12,7 @@ use super::UnispaceError;
 
 /// Register all unispace providers.  Called once after VFS init.
 pub fn register_all() -> Result<(), UnispaceError> {
+    dev::register()?;
     vfs::register()?;
     sys::register()?;
     driver::register()?;

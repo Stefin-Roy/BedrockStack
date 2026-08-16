@@ -137,20 +137,29 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
                 }
             }
             _ => {
-                panic!("unhandled interrupt: scause={:#x}, sepc={:#x}", scause, frame.sepc);
+                panic!(
+                    "unhandled interrupt: scause={:#x}, sepc={:#x}",
+                    scause, frame.sepc
+                );
             }
         }
     } else {
         let exception = scause;
         match exception {
             12 | 13 | 15 => {
-                panic!("page fault: scause={:#x}, sepc={:#x}, stval={:#x}", scause, frame.sepc, stval);
+                panic!(
+                    "page fault: scause={:#x}, sepc={:#x}, stval={:#x}",
+                    scause, frame.sepc, stval
+                );
             }
             2 => {
                 panic!("illegal instruction: sepc={:#x}", frame.sepc);
             }
             _ => {
-                panic!("unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}", scause, frame.sepc, stval);
+                panic!(
+                    "unhandled exception: scause={:#x}, sepc={:#x}, stval={:#x}",
+                    scause, frame.sepc, stval
+                );
             }
         }
     }

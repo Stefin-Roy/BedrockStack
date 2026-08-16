@@ -4,13 +4,13 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
-use uefi::prelude::*;
-use uefi::boot::AllocateType;
 use uefi::CStr16;
+use uefi::boot::AllocateType;
+use uefi::fs::FileSystem;
 use uefi::mem::memory_map::{MemoryMap, MemoryType};
+use uefi::prelude::*;
 use uefi::proto::console::gop::{GraphicsOutput, PixelBitmask, PixelFormat as UefiPixelFormat};
 use uefi::proto::console::text::Output;
-use uefi::fs::FileSystem;
 
 mod allocator;
 mod elf;
@@ -88,7 +88,10 @@ fn main() -> Status {
     log_msg(&mut output, "[boot] Framebuffer OK\n");
 
     // 3. Load kernel ELF from disk (allocates a large OS_DATA buffer).
-    log_msg(&mut output, "[boot] Reading kernel from disk: \\EFI\\BEDROCK\\KERNEL\n");
+    log_msg(
+        &mut output,
+        "[boot] Reading kernel from disk: \\EFI\\BEDROCK\\KERNEL\n",
+    );
 
     let kernel_data = load_file_from_disk(cstr16!(r"\EFI\BEDROCK\KERNEL").into());
     SerialPort::puts("[boot] Kernel file read: ");
@@ -97,7 +100,8 @@ fn main() -> Status {
     log_msg(&mut output, "[boot] Kernel read from disk\n");
 
     log_msg(&mut output, "[boot] Parsing ELF and loading segments...\n");
-    let entry = unsafe { elf::load_elf(&kernel_data).expect("FATAL: kernel ELF corrupt or invalid") };
+    let entry =
+        unsafe { elf::load_elf(&kernel_data).expect("FATAL: kernel ELF corrupt or invalid") };
     SerialPort::puts("[boot] Kernel entry: 0x");
     SerialPort::put_hex(entry);
     SerialPort::puts("\n");
@@ -108,7 +112,10 @@ fn main() -> Status {
     //    exit_boot_services so that these allocations (and the kernel image)
     //    are reflected correctly and the kernel never hands out frames that
     //    hold its own stack / hand-off data.
-    log_msg(&mut output, "[boot] Allocating transfer buffers (OS_DATA)...\n");
+    log_msg(
+        &mut output,
+        "[boot] Allocating transfer buffers (OS_DATA)...\n",
+    );
 
     // Estimate capacity for the region list from the current map, with generous
     // slack for entries added/split by our own allocations before
@@ -128,13 +135,10 @@ fn main() -> Status {
     // stack overflow faults (caught by the double-fault IST) instead of silently
     // corrupting adjacent memory. OS_DATA keeps it reserved after exit.
     let stack_pages = STACK_SIZE / PAGE_SIZE + 1; // +1 guard page
-    let stack_base = uefi::boot::allocate_pages(
-        AllocateType::AnyPages,
-        allocator::OS_DATA,
-        stack_pages,
-    )
-    .expect("FATAL: kernel stack allocation failed (insufficient memory)")
-    .as_ptr() as usize;
+    let stack_base =
+        uefi::boot::allocate_pages(AllocateType::AnyPages, allocator::OS_DATA, stack_pages)
+            .expect("FATAL: kernel stack allocation failed (insufficient memory)")
+            .as_ptr() as usize;
     let stack_guard = stack_base as u64; // lowest page is the guard
     let stack_region_top = stack_base + stack_pages * PAGE_SIZE;
 
@@ -201,7 +205,15 @@ fn main() -> Status {
     }
 
     unsafe {
-        jump_to_kernel(entry, stack_top, regions_ptr, regions_len, fb_ptr, stack_guard, rsdp_addr);
+        jump_to_kernel(
+            entry,
+            stack_top,
+            regions_ptr,
+            regions_len,
+            fb_ptr,
+            stack_guard,
+            rsdp_addr,
+        );
     }
 }
 
@@ -260,10 +272,7 @@ fn parse_bitmask(bm: &PixelBitmask) -> (PixelFormat, u8) {
         tz % 8 == 0 && width <= 8
     };
 
-    if !mask_aligned(bm.red)
-        || !mask_aligned(bm.green)
-        || !mask_aligned(bm.blue)
-    {
+    if !mask_aligned(bm.red) || !mask_aligned(bm.green) || !mask_aligned(bm.blue) {
         SerialPort::puts("[boot] WARNING: non-byte-aligned pixel bitmask (red=0x");
         SerialPort::put_hex(bm.red as u64);
         SerialPort::puts(" green=0x");
@@ -333,14 +342,18 @@ fn get_framebuffer_info() -> FramebufferInfo {
             if let Some(ref bm) = mode.pixel_bitmask() {
                 parse_bitmask(bm)
             } else {
-                SerialPort::puts("[boot] WARNING: GOP Bitmask without pixel_bitmask() -- using BGR 32bpp\n");
+                SerialPort::puts(
+                    "[boot] WARNING: GOP Bitmask without pixel_bitmask() -- using BGR 32bpp\n",
+                );
                 (PixelFormat::Bgr, 4)
             }
         }
         // BltOnly provides NO linear framebuffer address — let the kernel
         // run without a framebuffer rather than crashing at boot time.
         UefiPixelFormat::BltOnly => {
-            SerialPort::puts("[boot] GOP is BltOnly (no linear framebuffer) -- continuing without framebuffer\n");
+            SerialPort::puts(
+                "[boot] GOP is BltOnly (no linear framebuffer) -- continuing without framebuffer\n",
+            );
             return FramebufferInfo::zeroed();
         }
     };
@@ -365,7 +378,9 @@ fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
         Ok(s) => s,
         Err(_) => {
             SerialPort::puts("[boot] FATAL: ESP file system protocol unavailable\n");
-            loop { core::hint::spin_loop() }
+            loop {
+                core::hint::spin_loop()
+            }
         }
     };
     let mut fs = FileSystem::new(ss);
@@ -373,7 +388,9 @@ fn load_file_from_disk(path: &uefi::fs::Path) -> Vec<u8> {
         Ok(data) => data,
         Err(_) => {
             SerialPort::puts("[boot] FATAL: kernel not found at \\EFI\\BEDROCK\\KERNEL\n");
-            loop { core::hint::spin_loop() }
+            loop {
+                core::hint::spin_loop()
+            }
         }
     }
 }

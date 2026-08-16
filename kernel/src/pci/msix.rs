@@ -1,9 +1,9 @@
 use core::ptr::{read_volatile, write_volatile};
 use spin::Mutex;
 
+use super::PciDevice;
 use super::bar::Bar;
 use super::caps::{self, PciCapability};
-use super::PciDevice;
 use crate::drivers::serial::SerialPort;
 
 fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
@@ -96,7 +96,13 @@ pub fn table_info(dev: &PciDevice, cap: &PciCapability) -> MsixInfo {
     let pba_bir = (pba & 0x7) as usize;
     let pba_offset = (pba & 0xFFFF_FFF8) as u64;
 
-    MsixInfo { table_size, bir, table_offset, pba_bir, pba_offset }
+    MsixInfo {
+        table_size,
+        bir,
+        table_offset,
+        pba_bir,
+        pba_offset,
+    }
 }
 
 /// Enable MSI-X for a device.
@@ -181,9 +187,13 @@ pub fn enable(
 
     // Ensure table writes are visible before we touch config space.
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("fence", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("fence", options(nostack, preserves_flags));
+    }
 
     SerialPort::puts("[msix] enabled: vector=");
     SerialPort::put_u64(vector as u64);
@@ -220,9 +230,13 @@ pub fn enable(
         }
     }
     #[cfg(target_arch = "x86_64")]
-    unsafe { core::arch::asm!("mfence", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
     #[cfg(target_arch = "riscv64")]
-    unsafe { core::arch::asm!("fence", options(nostack, preserves_flags)); }
+    unsafe {
+        core::arch::asm!("fence", options(nostack, preserves_flags));
+    }
     let enabled_mc = caps::read_u16(dev, cap, 2);
     caps::write_u16(dev, cap, 2, enabled_mc & !MC_FUNCTION_MASK);
 }

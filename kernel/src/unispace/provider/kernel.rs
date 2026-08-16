@@ -37,9 +37,21 @@ pub static UNTIL_INPUT: Schema = Schema::Struct(&[schema::Field {
 }]);
 
 static TIMER_METHODS: [MethodDesc; 3] = [
-    MethodDesc { name: "sleep", input: &SLEEP_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "sleep_ms", input: &SLEEP_MS_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "until", input: &UNTIL_INPUT, output: &schema::SCHEMA_UNIT },
+    MethodDesc {
+        name: "sleep",
+        input: &SLEEP_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "sleep_ms",
+        input: &SLEEP_MS_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "until",
+        input: &UNTIL_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
 ];
 
 /// Register the `/kernel` system (x86_64 only — the blocking methods walk the
@@ -75,9 +87,9 @@ impl Object for TimerObject {
         let arg = arg_u64(&v, 0)?;
         let now = crate::services::universal_timer::now_ns();
         match method {
-            0 => crate::task::sleep_until(now.saturating_add(arg)),        // sleep(ns)
+            0 => crate::task::sleep_until(now.saturating_add(arg)), // sleep(ns)
             1 => crate::task::sleep_until(now.saturating_add(arg.saturating_mul(1_000_000))), // sleep_ms(ms)
-            2 => crate::task::sleep_until(arg),                            // until(deadline_ns)
+            2 => crate::task::sleep_until(arg), // until(deadline_ns)
             _ => return Err(UnispaceError::MethodNotFound),
         }
         Ok(())
