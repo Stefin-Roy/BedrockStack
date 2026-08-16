@@ -102,7 +102,11 @@ fn register_all() {
 }
 
 /// Return the first driver whose `probe` matches the interface, or `None`.
-pub fn find_driver(iface_class: u8, subclass: u8, protocol: u8) -> Option<&'static dyn UsbClassDriver> {
+pub fn find_driver(
+    iface_class: u8,
+    subclass: u8,
+    protocol: u8,
+) -> Option<&'static dyn UsbClassDriver> {
     register_all();
     let registry = REGISTRY.lock();
     registry

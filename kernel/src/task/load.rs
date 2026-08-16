@@ -20,7 +20,7 @@ use alloc::vec::Vec;
 use crate::drivers::serial::SerialPort;
 use crate::mm::layout::to_physmap;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{clone_high_half, PageFlags, Vmm};
+use crate::mm::vmm::{PageFlags, Vmm, clone_high_half};
 use crate::unispace;
 use crate::unispace::provider::vfs::CREATE_INPUT;
 use crate::unispace::schema::{self, Value};
@@ -139,7 +139,11 @@ fn parse_segments(elf: &[u8]) -> Result<Vec<Segment>, &'static str> {
     let mut segs: Vec<Segment> = Vec::new();
     for i in 0..e_phnum {
         let ph_off = e_phoff
-            .checked_add((i as u64).checked_mul(e_phentsize as u64).ok_or("phnum overflow")?)
+            .checked_add(
+                (i as u64)
+                    .checked_mul(e_phentsize as u64)
+                    .ok_or("phnum overflow")?,
+            )
             .ok_or("phoff overflow")?;
         let ph_off = ph_off as usize;
         if ph_off.checked_add(e_phentsize).ok_or("phdr overflow")? > elf.len() {
@@ -165,9 +169,17 @@ fn parse_segments(elf: &[u8]) -> Result<Vec<Segment>, &'static str> {
         if end_in_file > elf.len() {
             return Err("Segment data out of bounds");
         }
-        p_vaddr.checked_add(p_memsz).ok_or("segment vaddr overflow")?;
+        p_vaddr
+            .checked_add(p_memsz)
+            .ok_or("segment vaddr overflow")?;
 
-        segs.push(Segment { vaddr: p_vaddr, memsz: p_memsz, filesz: p_filesz, offset: p_offset, flags: p_flags });
+        segs.push(Segment {
+            vaddr: p_vaddr,
+            memsz: p_memsz,
+            filesz: p_filesz,
+            offset: p_offset,
+            flags: p_flags,
+        });
     }
     if segs.is_empty() {
         return Err("No loadable segments");
@@ -226,9 +238,7 @@ fn map_segment(
 
         if seg_start < seg.filesz {
             let n = core::cmp::min(seg.filesz - seg_start, 4096 - page_offset);
-            let src = elf
-                .as_ptr()
-                .wrapping_add((seg.offset + seg_start) as usize);
+            let src = elf.as_ptr().wrapping_add((seg.offset + seg_start) as usize);
             unsafe {
                 core::ptr::copy_nonoverlapping(src, dst.add(page_offset as usize), n as usize);
             }
@@ -266,7 +276,12 @@ pub fn create_process(
     let mut va = stack_base;
     while va < USER_STACK_TOP {
         let phys = alloc.alloc().ok_or("OOM mapping user stack")?;
-        vmm.map_4k(alloc, va, phys, PageFlags::USER | PageFlags::READ | PageFlags::WRITE);
+        vmm.map_4k(
+            alloc,
+            va,
+            phys,
+            PageFlags::USER | PageFlags::READ | PageFlags::WRITE,
+        );
         unsafe {
             core::ptr::write_bytes(to_physmap(phys) as *mut u8, 0, 4096);
         }
@@ -294,7 +309,8 @@ pub fn create_process(
         }
     }
     let stack_flags = PageFlags::USER | PageFlags::READ | PageFlags::WRITE;
-    let vm = crate::mm::usermem::register(root, image_floor, image_top, USER_STACK_TOP, stack_flags);
+    let vm =
+        crate::mm::usermem::register(root, image_floor, image_top, USER_STACK_TOP, stack_flags);
 
     Ok((root, e_entry, USER_STACK_TOP, vm))
 }
@@ -305,7 +321,13 @@ pub fn create_process(
 /// failure is ignored — the file just needs to be present before ring 3 runs.
 fn precreate(path: &str, name: &str, payload: &mut Vec<u8>, out: &mut Vec<u8>) {
     payload.clear();
-    if schema::encode_value(&Value::Struct(vec![Value::Str(String::from(name))]), &CREATE_INPUT, payload).is_ok() {
+    if schema::encode_value(
+        &Value::Struct(vec![Value::Str(String::from(name))]),
+        &CREATE_INPUT,
+        payload,
+    )
+    .is_ok()
+    {
         let _ = unispace::write(path, payload, out);
     }
 }

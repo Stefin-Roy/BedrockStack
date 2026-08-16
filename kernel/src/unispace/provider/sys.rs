@@ -3,8 +3,8 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use super::super::schema::{self, Schema, Value};
 use super::super::dir::SimpleDir;
+use super::super::schema::{self, Schema, Value};
 use super::super::{Object, ObjectKind, UnispaceError};
 
 pub static PHYS_MEM: Schema = Schema::Struct(&[

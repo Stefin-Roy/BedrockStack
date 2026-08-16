@@ -1,4 +1,3 @@
-
 pub trait PciConfigSpace: Send + Sync {
     fn read8(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u8;
     fn read16(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u16;

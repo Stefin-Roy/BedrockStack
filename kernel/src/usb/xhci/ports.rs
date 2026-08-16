@@ -1,6 +1,9 @@
-use alloc::vec::Vec;
+use super::registers::{
+    PORTSC_CCS, PORTSC_PED, PORTSC_PP, PORTSC_PR, PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT,
+    PORTSC_STATUS_BITS, PortRegisterSet,
+};
 use crate::drivers::serial::SerialPort;
-use super::registers::{PortRegisterSet, PORTSC_CCS, PORTSC_PED, PORTSC_PR, PORTSC_PP, PORTSC_SPEED_MASK, PORTSC_SPEED_SHIFT, PORTSC_STATUS_BITS};
+use alloc::vec::Vec;
 
 pub struct UsbPort {
     pub port_num: u8,
@@ -60,7 +63,11 @@ impl UsbPorts {
                 self.ports[i].speed = speed as u8;
 
                 let speed_str = match speed {
-                    1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
+                    1 => "FS",
+                    2 => "LS",
+                    3 => "HS",
+                    4 => "SS",
+                    _ => "?",
                 };
                 SerialPort::puts("[xhci] port ");
                 SerialPort::put_u64(port_num as u64);
@@ -87,7 +94,8 @@ impl UsbPorts {
                 // PORTSC_PED is RW1C – never write 1 back or the port
                 // is instantly disabled.  Mask it out here so we only
                 // clear the change bits (17..23) without touching PED.
-                self.port_regs.write_portsc(port_num, portsc_now & !PORTSC_PED);
+                self.port_regs
+                    .write_portsc(port_num, portsc_now & !PORTSC_PED);
             }
         }
         Ok(())
@@ -100,13 +108,15 @@ impl UsbPorts {
         let portsc = self.port_regs.read_portsc(port_num);
         // Mask out PED (RW1C) and change bits (RW1C) so the write doesn't
         // accidentally disable the port or clear unhandled status flags.
-        self.port_regs.write_portsc(port_num, (portsc & !(PORTSC_PED | PORTSC_STATUS_BITS)) | PORTSC_PR);
+        self.port_regs.write_portsc(
+            port_num,
+            (portsc & !(PORTSC_PED | PORTSC_STATUS_BITS)) | PORTSC_PR,
+        );
 
         let deadline = crate::services::universal_timer::now_ns() + 500_000_000;
-        let pr_cleared = crate::services::universal_timer::wait_until_cond(
-            deadline,
-            &|| self.port_regs.read_portsc(port_num) & PORTSC_PR == 0,
-        );
+        let pr_cleared = crate::services::universal_timer::wait_until_cond(deadline, &|| {
+            self.port_regs.read_portsc(port_num) & PORTSC_PR == 0
+        });
         if !pr_cleared {
             return Err("port reset timeout");
         }
@@ -119,7 +129,11 @@ impl UsbPorts {
             self.ports[idx].speed = speed as u8;
 
             let speed_str = match speed {
-                1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
+                1 => "FS",
+                2 => "LS",
+                3 => "HS",
+                4 => "SS",
+                _ => "?",
             };
             SerialPort::puts("[xhci] port ");
             SerialPort::put_u64(port_num as u64);
@@ -147,7 +161,11 @@ impl UsbPorts {
                 let speed = (portsc & PORTSC_SPEED_MASK) >> PORTSC_SPEED_SHIFT;
                 self.ports[idx].speed = speed as u8;
                 let speed_str = match speed {
-                    1 => "FS", 2 => "LS", 3 => "HS", 4 => "SS", _ => "?",
+                    1 => "FS",
+                    2 => "LS",
+                    3 => "HS",
+                    4 => "SS",
+                    _ => "?",
                 };
                 SerialPort::puts("[xhci] port ");
                 SerialPort::put_u64(port_num as u64);
@@ -181,7 +199,8 @@ impl UsbPorts {
         let portsc_final = self.port_regs.read_portsc(port_num);
         let status_bits = portsc_final & PORTSC_STATUS_BITS;
         if status_bits != 0 {
-            self.port_regs.write_portsc(port_num, portsc_final & !PORTSC_PED);
+            self.port_regs
+                .write_portsc(port_num, portsc_final & !PORTSC_PED);
         }
 
         Ok(())

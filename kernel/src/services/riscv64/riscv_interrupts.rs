@@ -1,10 +1,10 @@
 use core::sync::atomic::{AtomicPtr, Ordering};
 
-use crate::platform::riscv_virt::plic;
 use super::super::interrupts::InterruptManager;
+use crate::platform::riscv_virt::plic;
 
 const NUM_PLIC_SOURCES: usize = 127;
-static PLIC_HANDLERS: [AtomicPtr<fn()>; NUM_PLIC_SOURCES] = 
+static PLIC_HANDLERS: [AtomicPtr<fn()>; NUM_PLIC_SOURCES] =
     [const { AtomicPtr::new(core::ptr::null_mut()) }; NUM_PLIC_SOURCES];
 
 pub fn dispatch_external() {
@@ -21,8 +21,6 @@ pub fn dispatch_external() {
 }
 
 pub struct RiscvInterrupts;
-
-
 
 impl InterruptManager for RiscvInterrupts {
     fn register_handler(&self, vector: u8, handler: fn()) {
@@ -45,8 +43,7 @@ impl InterruptManager for RiscvInterrupts {
         plic::disable_irq(vector as u32);
     }
 
-    fn eoi(&self) {
-    }
+    fn eoi(&self) {}
 }
 
 static RISCV_INTERRUPTS: RiscvInterrupts = RiscvInterrupts;

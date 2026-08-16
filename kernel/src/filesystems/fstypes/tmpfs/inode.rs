@@ -14,8 +14,12 @@ static NEXT_INO: AtomicU64 = AtomicU64::new(2);
 const ROOT_INO: u64 = 1;
 
 pub(super) enum TmpfsEntry {
-    File { data: Mutex<Vec<u8>> },
-    Dir { children: Mutex<HashMap<String, Arc<TmpfsInode>>> },
+    File {
+        data: Mutex<Vec<u8>>,
+    },
+    Dir {
+        children: Mutex<HashMap<String, Arc<TmpfsInode>>>,
+    },
 }
 
 pub(super) struct TmpfsInode {
@@ -235,7 +239,13 @@ impl InodeOps for TmpfsInode {
         }
     }
 
-    fn file_type(&self) -> FileType { self.file_type }
-    fn ino(&self) -> u64 { self.ino }
-    fn size(&self) -> u64 { self.size.load(Ordering::Relaxed) }
+    fn file_type(&self) -> FileType {
+        self.file_type
+    }
+    fn ino(&self) -> u64 {
+        self.ino
+    }
+    fn size(&self) -> u64 {
+        self.size.load(Ordering::Relaxed)
+    }
 }

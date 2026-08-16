@@ -1,5 +1,5 @@
-use super::caps::{self, PciCapability};
 use super::PciDevice;
+use super::caps::{self, PciCapability};
 use crate::drivers::serial::SerialPort;
 
 fn cfg() -> &'static dyn crate::services::pci_config::PciConfigSpace {
@@ -75,7 +75,11 @@ pub fn enable(dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8
     let pci_cfg = cfg();
     let cmd = pci_cfg.read16(dev.segment, dev.bus, dev.device, dev.function, 0x04);
     pci_cfg.write16(
-        dev.segment, dev.bus, dev.device, dev.function, 0x04,
+        dev.segment,
+        dev.bus,
+        dev.device,
+        dev.function,
+        0x04,
         cmd | (1 << 1) | (1 << 2) | (1 << 10),
     );
 

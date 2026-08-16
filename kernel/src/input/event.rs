@@ -58,12 +58,7 @@ impl InputEvent {
         }
     }
 
-    pub const fn new(
-        device_id: u32,
-        type_: InputType,
-        code: u32,
-        value: i32,
-    ) -> Self {
+    pub const fn new(device_id: u32, type_: InputType, code: u32, value: i32) -> Self {
         InputEvent {
             timestamp: 0,
             device_id,

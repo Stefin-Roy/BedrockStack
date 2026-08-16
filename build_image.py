@@ -55,6 +55,27 @@ def find_user(profile):
     return None
 
 
+def find_doom(profile):
+    """Locate the built DOOM game binary for the given profile."""
+    candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", profile_dir(profile), "doom")
+    if os.path.exists(candidate):
+        return candidate
+    # Fall back to the other common profile directory.
+    for alt in ("debug", "release"):
+        candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", alt, "doom")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
+def find_wad():
+    """Locate the Freedoom IWAD (optional; the image still builds without it)."""
+    wad = os.path.join(WORKSPACE, "data", "freedoom1.wad")
+    if os.path.exists(wad):
+        return wad
+    return None
+
+
 def run(cmd, **kwargs):
     print(f"  {' '.join(cmd)}")
     result = subprocess.run(cmd, cwd=WORKSPACE, **kwargs)
@@ -127,6 +148,18 @@ def create_fat32_with_mtools(efi_binary_path, profile):
         print(f"  INIT (user) copied: {user_path}")
     else:
         print("  WARNING: user INIT binary not found")
+    doom_path = find_doom(profile)
+    if doom_path:
+        run(["mcopy", "-i", OUTPUT_IMG, doom_path, "::/EFI/BEDROCK/DOOM"])
+        print(f"  DOOM game copied: {doom_path}")
+    else:
+        print("  WARNING: DOOM binary not found")
+    wad_path = find_wad()
+    if wad_path:
+        run(["mcopy", "-i", OUTPUT_IMG, wad_path, "::/EFI/BEDROCK/FREEDOOM.WAD"])
+        print(f"  Freedoom IWAD copied: {wad_path}")
+    else:
+        print("  WARNING: data/freedoom1.wad not found - DOOM will need an IWAD")
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
         run(["mcopy", "-i", OUTPUT_IMG, wav_path, "::/EFI/BEDROCK/STARTUP.WAV"])
@@ -161,6 +194,20 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
         print(f"  INIT (user) copied: {user_path}")
     else:
         print("  WARNING: user INIT binary not found")
+
+    doom_path = find_doom(profile)
+    if doom_path:
+        shutil.copy2(doom_path, os.path.join(efi_bedrock_dir, "DOOM"))
+        print(f"  DOOM game copied: {doom_path}")
+    else:
+        print("  WARNING: DOOM binary not found")
+
+    wad_path = find_wad()
+    if wad_path:
+        shutil.copy2(wad_path, os.path.join(efi_bedrock_dir, "FREEDOOM.WAD"))
+        print(f"  Freedoom IWAD copied: {wad_path}")
+    else:
+        print("  WARNING: data/freedoom1.wad not found - DOOM will need an IWAD")
 
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
@@ -304,6 +351,20 @@ def create_gpt_image(boot_path, kernel_path):
         print("  WARNING: user INIT binary not found - skipping /EFI/BEDROCK/INIT")
         user_init_copy = ""
 
+    doom_path = find_doom("dev")
+    if doom_path:
+        doom_copy = f"mcopy -i '{esp_img_wsl}' '{to_wsl(doom_path)}' ::/EFI/BEDROCK/DOOM; "
+    else:
+        print("  WARNING: DOOM binary not found - skipping /EFI/BEDROCK/DOOM")
+        doom_copy = ""
+
+    wad_path = find_wad()
+    if wad_path:
+        wad_copy = f"mcopy -i '{esp_img_wsl}' '{to_wsl(wad_path)}' ::/EFI/BEDROCK/FREEDOOM.WAD; "
+    else:
+        print("  WARNING: data/freedoom1.wad not found - DOOM will need an IWAD")
+        wad_copy = ""
+
     wav_path = os.path.join(WORKSPACE, "Sounds", "startup.wav")
     if os.path.exists(wav_path):
         wav_wsl = to_wsl(wav_path)
@@ -322,6 +383,8 @@ def create_gpt_image(boot_path, kernel_path):
         f"mcopy -i '{esp_img_wsl}' '{boot_wsl}' ::/EFI/BOOT/BOOTX64.EFI; "
         f"mcopy -i '{esp_img_wsl}' '{kernel_wsl}' ::/EFI/BEDROCK/KERNEL; "
         + user_init_copy
+        + doom_copy
+        + wad_copy
         + wav_copy
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BEDROCK"

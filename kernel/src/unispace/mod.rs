@@ -190,7 +190,12 @@ pub trait Object: Send + Sync {
     /// bearing intent on an object that does not implement it fails loudly
     /// instead of silently behaving like a plain value read. Providers that
     /// want semantics (e.g. the VFS file object: read-at offset) override this.
-    fn read_value_flags(&self, out: &mut Vec<u8>, max: usize, flags: u64) -> Result<(), UnispaceError> {
+    fn read_value_flags(
+        &self,
+        out: &mut Vec<u8>,
+        max: usize,
+        flags: u64,
+    ) -> Result<(), UnispaceError> {
         if flags != 0 {
             Err(UnispaceError::Unsupported)
         } else {
@@ -234,10 +239,22 @@ pub trait Object: Send + Sync {
 // ── Shared schema for directory listings ───────────────────────────────
 
 pub(crate) static KIND_VARIANTS: [schema::EnumVariant; 4] = [
-    schema::EnumVariant { name: "file", value: 0 },
-    schema::EnumVariant { name: "dir", value: 1 },
-    schema::EnumVariant { name: "device", value: 2 },
-    schema::EnumVariant { name: "service", value: 3 },
+    schema::EnumVariant {
+        name: "file",
+        value: 0,
+    },
+    schema::EnumVariant {
+        name: "dir",
+        value: 1,
+    },
+    schema::EnumVariant {
+        name: "device",
+        value: 2,
+    },
+    schema::EnumVariant {
+        name: "service",
+        value: 3,
+    },
 ];
 
 static DIR_SCHEMA_ENTRY: Schema = Schema::Struct(&[
@@ -290,12 +307,7 @@ fn root() -> &'static Arc<SimpleDir> {
 
 /// Attach a system's root object at `/name`.
 pub fn register(name: &str, obj: Arc<dyn Object>) -> Result<(), UnispaceError> {
-    if name.is_empty()
-        || name.contains('/')
-        || name.contains(':')
-        || name == "."
-        || name == ".."
-    {
+    if name.is_empty() || name.contains('/') || name.contains(':') || name == "." || name == ".." {
         return Err(UnispaceError::InvalidPath);
     }
     root().insert(name, obj);
@@ -564,7 +576,10 @@ pub fn self_test() {
     out.clear();
     match read("/proc/self", &mut out, usize::MAX) {
         Ok(()) => log::warn!("unispace: read /proc/self unexpectedly succeeded"),
-        Err(e) => log::info!("unispace: read /proc/self -> {:?} (expected, no task yet)", e),
+        Err(e) => log::info!(
+            "unispace: read /proc/self -> {:?} (expected, no task yet)",
+            e
+        ),
     }
 
     // Method input schema on a folder: read(/A:mkdir).
@@ -591,7 +606,11 @@ pub fn self_test() {
         Ok(()) => match schema::decode_object_bytes(&out) {
             Ok((kind, value, methods)) => {
                 SerialPort::puts("read(/sys:desc) = kind ");
-                SerialPort::puts(ObjectKind::from_tag(kind).map(|k| k.as_str()).unwrap_or("?"));
+                SerialPort::puts(
+                    ObjectKind::from_tag(kind)
+                        .map(|k| k.as_str())
+                        .unwrap_or("?"),
+                );
                 SerialPort::puts(" value ");
                 SerialPort::puts(&schema::text_of_owned(&value));
                 SerialPort::puts(" methods ");
@@ -608,17 +627,35 @@ pub fn self_test() {
     let name_val = |n: &str| Value::Struct(vec![Value::Str(String::from(n))]);
     let s_create: &'static Schema = &provider::vfs::CREATE_INPUT;
 
-    match write_method("/A:mkdir", &name_val("nos_test"), s_create, &mut payload, &mut out) {
+    match write_method(
+        "/A:mkdir",
+        &name_val("nos_test"),
+        s_create,
+        &mut payload,
+        &mut out,
+    ) {
         Ok(()) => SerialPort::puts("write(/A:mkdir {nos_test}) = ok\n"),
         Err(e) => log::warn!("unispace: mkdir nos_test failed: {:?}", e),
     }
 
-    match write_method("/A/nos_test:mkdir", &name_val("sub"), s_create, &mut payload, &mut out) {
+    match write_method(
+        "/A/nos_test:mkdir",
+        &name_val("sub"),
+        s_create,
+        &mut payload,
+        &mut out,
+    ) {
         Ok(()) => SerialPort::puts("write(/A/nos_test:mkdir {sub}) = ok\n"),
         Err(e) => log::warn!("unispace: mkdir sub failed: {:?}", e),
     }
 
-    match write_method("/A/nos_test:create", &name_val("file"), s_create, &mut payload, &mut out) {
+    match write_method(
+        "/A/nos_test:create",
+        &name_val("file"),
+        s_create,
+        &mut payload,
+        &mut out,
+    ) {
         Ok(()) => SerialPort::puts("write(/A/nos_test:create {file}) = ok\n"),
         Err(e) => log::warn!("unispace: create file failed: {:?}", e),
     }
@@ -812,9 +849,9 @@ pub fn self_test() {
 
     // /driver provider: the audio device surface.  The value is a live
     // snapshot (ready state may be false on riscv64, where no controller
-    // exists); the blocking playback methods are only schema-probed here —
-    // invoking play_tone from boot context would hold the CPU for the tone's
-    // whole duration.
+    // exists); the playback methods are only schema-probed here — invoking
+    // them from boot context runs before the pump task exists and would fall
+    // back to the blocking one-shot path for the tone's whole duration.
     #[cfg(target_arch = "x86_64")]
     {
         out.clear();
@@ -868,10 +905,109 @@ pub fn self_test() {
         }
     }
 
+    // /dev provider: the framebuffer device.  The fb is registered during
+    // `Kernel::init()` — before `register_all()` — so `present` is true on
+    // both arches at self-test time.
+    out.clear();
+    match read("/dev", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_value(&out, &DIR_SCHEMA) {
+            Ok(v) => {
+                SerialPort::puts("read(/dev) = ");
+                SerialPort::puts(&schema::value_text(&v, &DIR_SCHEMA));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: /dev listing decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /dev failed: {:?}", e),
+    }
+
+    out.clear();
+    match read("/dev/fb:mode", &mut out, usize::MAX) {
+        Ok(()) => match schema::decode_method_bytes(&out) {
+            Ok((name, input, output)) => {
+                SerialPort::puts("read(/dev/fb:mode) = method ");
+                SerialPort::puts(&name);
+                SerialPort::puts(" in ");
+                SerialPort::puts(&schema::text_of_owned(&input));
+                SerialPort::puts(" out ");
+                SerialPort::puts(&schema::text_of_owned(&output));
+                SerialPort::puts("\n");
+            }
+            Err(e) => log::warn!("unispace: /dev/fb:mode schema decode failed: {:?}", e),
+        },
+        Err(e) => log::warn!("unispace: read /dev/fb:mode schema failed: {:?}", e),
+    }
+
+    out.clear();
+    match write("/dev/fb:mode", &[], &mut out) {
+        Ok(()) => {
+            let s = &provider::dev::FB_MODE;
+            match schema::decode_value(&out, s) {
+                Ok(v) => {
+                    SerialPort::puts("write(/dev/fb:mode) = ");
+                    SerialPort::puts(&schema::value_text(&v, s));
+                    SerialPort::puts("\n");
+                }
+                Err(e) => log::warn!("unispace: /dev/fb:mode decode failed: {:?}", e),
+            }
+        }
+        Err(e) => log::warn!("unispace: write /dev/fb:mode failed: {:?}", e),
+    }
+
+    // Framebuffer pixel round-trip: write 16 bytes at offset 0, read them
+    // back, then `:clear` and confirm the window zeroed.
+    let mut payload = vec![0u8; 16];
+    for (i, b) in payload.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    out.clear();
+    match write("/dev/fb", &payload, &mut out) {
+        Ok(()) => SerialPort::puts("write(/dev/fb, 16B@0) = ok\n"),
+        Err(e) => log::warn!("unispace: /dev/fb write failed: {:?}", e),
+    }
+    out.clear();
+    match read("/dev/fb", &mut out, 16) {
+        Ok(()) if out == payload => SerialPort::puts("read(/dev/fb, 16B@0) = ok (match)\n"),
+        Ok(()) => log::warn!("unispace: /dev/fb readback mismatch ({} bytes)", out.len()),
+        Err(e) => log::warn!("unispace: /dev/fb read failed: {:?}", e),
+    }
+    out.clear();
+    match write("/dev/fb:clear", &[], &mut out) {
+        Ok(()) => {
+            out.clear();
+            match read("/dev/fb", &mut out, 16) {
+                Ok(()) if out.iter().all(|&b| b == 0) => {
+                    SerialPort::puts("write(/dev/fb:clear) = ok (zeroed)\n")
+                }
+                Ok(()) => log::warn!("unispace: /dev/fb not zeroed after :clear"),
+                Err(e) => log::warn!("unispace: /dev/fb read after :clear failed: {:?}", e),
+            }
+        }
+        Err(e) => log::warn!("unispace: /dev/fb:clear failed: {:?}", e),
+    }
+
     // Cleanup the exercise tree.
-    let _ = write_method("/A/nos_test:unlink", &name_val("file"), s_create, &mut payload, &mut out);
-    let _ = write_method("/A/nos_test:rmdir", &name_val("sub"), s_create, &mut payload, &mut out);
-    match write_method("/A:rmdir", &name_val("nos_test"), s_create, &mut payload, &mut out) {
+    let _ = write_method(
+        "/A/nos_test:unlink",
+        &name_val("file"),
+        s_create,
+        &mut payload,
+        &mut out,
+    );
+    let _ = write_method(
+        "/A/nos_test:rmdir",
+        &name_val("sub"),
+        s_create,
+        &mut payload,
+        &mut out,
+    );
+    match write_method(
+        "/A:rmdir",
+        &name_val("nos_test"),
+        s_create,
+        &mut payload,
+        &mut out,
+    ) {
         Ok(()) => SerialPort::puts("write(/A:rmdir {nos_test}) = ok\n"),
         Err(e) => log::warn!("unispace: rmdir nos_test failed: {:?}", e),
     }
@@ -882,9 +1018,10 @@ pub fn self_test() {
     // hand-written struct), connects it at a deep path (auto-creating the
     // intermediate dir), exercises it, then disconnects it.
     let obj = decl::Declare::new(ObjectKind::Service)
-        .value(schema::owned_struct(vec![
-            (String::from("value"), schema::OwnedSchema::U64),
-        ]))
+        .value(schema::owned_struct(vec![(
+            String::from("value"),
+            schema::OwnedSchema::U64,
+        )]))
         .read(|out, _max| {
             let v = Value::Struct(vec![Value::U64(42)]);
             schema::encode_value_owned(
@@ -902,7 +1039,11 @@ pub fn self_test() {
                     Value::U64(n) => *n,
                     _ => return Err(UnispaceError::SchemaMismatch),
                 };
-                schema::encode_value_owned(&Value::U64(n.saturating_add(1)), &schema::OwnedSchema::U64, out)
+                schema::encode_value_owned(
+                    &Value::U64(n.saturating_add(1)),
+                    &schema::OwnedSchema::U64,
+                    out,
+                )
             },
         )
         .build();
@@ -946,7 +1087,11 @@ pub fn self_test() {
         Ok(()) => match schema::decode_object_bytes(&out) {
             Ok((kind, value, methods)) => {
                 SerialPort::puts("read(/test/sub/obj:desc) = kind ");
-                SerialPort::puts(ObjectKind::from_tag(kind).map(|k| k.as_str()).unwrap_or("?"));
+                SerialPort::puts(
+                    ObjectKind::from_tag(kind)
+                        .map(|k| k.as_str())
+                        .unwrap_or("?"),
+                );
                 SerialPort::puts(" value ");
                 SerialPort::puts(&schema::text_of_owned(&value));
                 SerialPort::puts(" methods=");
@@ -973,7 +1118,10 @@ pub fn self_test() {
 
     match write("/test/sub/obj", b"junk-not-a-u64", &mut out) {
         Ok(()) => log::warn!("unispace: write /test/sub/obj unexpectedly succeeded"),
-        Err(e) => log::info!("unispace: write /test/sub/obj -> {:?} (expected SchemaMismatch)", e),
+        Err(e) => log::info!(
+            "unispace: write /test/sub/obj -> {:?} (expected SchemaMismatch)",
+            e
+        ),
     }
 
     match disconnect("/test/sub/obj") {
@@ -984,14 +1132,22 @@ pub fn self_test() {
 
     out.clear();
     match read("/test/sub/obj", &mut out, usize::MAX) {
-        Ok(()) => log::warn!("unispace: read /test/sub/obj after disconnect unexpectedly succeeded"),
-        Err(e) => log::info!("unispace: read /test/sub/obj after disconnect -> {:?} (expected)", e),
+        Ok(()) => {
+            log::warn!("unispace: read /test/sub/obj after disconnect unexpectedly succeeded")
+        }
+        Err(e) => log::info!(
+            "unispace: read /test/sub/obj after disconnect -> {:?} (expected)",
+            e
+        ),
     }
 
     // Refuse to connect inside an immutable provider tree (VFS /A).
     match connect("/A/forced", decl::Declare::new(ObjectKind::File).build()) {
         Ok(()) => log::warn!("unispace: connect /A/forced unexpectedly succeeded"),
-        Err(e) => log::info!("unispace: connect /A/forced -> {:?} (expected Unsupported)", e),
+        Err(e) => log::info!(
+            "unispace: connect /A/forced -> {:?} (expected Unsupported)",
+            e
+        ),
     }
 
     SerialPort::puts("[unispace] self-test done\n");

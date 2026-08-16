@@ -52,20 +52,26 @@ fn send_ipi_raw(dest_apic_id: u32, icr_low: u32) {
 
 fn rdmsr(msr: u32) -> u64 {
     let (low, high): (u32, u32);
-    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack)); }
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high, options(nomem, nostack));
+    }
     (low as u64) | ((high as u64) << 32)
 }
 
 fn wrmsr(msr: u32, val: u64) {
     let low = val as u32;
     let high = (val >> 32) as u32;
-    unsafe { asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack)); }
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high, options(nomem, nostack));
+    }
 }
 
 fn rdtsc() -> u64 {
     let lo: u32;
     let hi: u32;
-    unsafe { asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)); }
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack));
+    }
     (lo as u64) | ((hi as u64) << 32)
 }
 
@@ -82,8 +88,13 @@ fn lapic_write(reg: u32, val: u32) {
     if X2APIC_MODE.load(Ordering::Relaxed) {
         wrmsr(x2apic_msr(reg), val as u64);
     } else {
-        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
-        unsafe { (addr as *mut u32).write_volatile(val); }
+        // Higher-half device window: present under the kernel root *and* every
+        // cloned task root, so `apic_eoi` works when an IRQ fires on the
+        // process CR3 (the low identity window is absent from task roots).
+        let addr = crate::mm::layout::LAPIC_VADDR_BASE + reg as u64;
+        unsafe {
+            (addr as *mut u32).write_volatile(val);
+        }
     }
 }
 
@@ -91,7 +102,7 @@ fn lapic_read(reg: u32) -> u32 {
     if X2APIC_MODE.load(Ordering::Relaxed) {
         rdmsr(x2apic_msr(reg)) as u32
     } else {
-        let addr = LAPIC_BASE.load(Ordering::Relaxed) + reg as u64;
+        let addr = crate::mm::layout::LAPIC_VADDR_BASE + reg as u64;
         unsafe { (addr as *const u32).read_volatile() }
     }
 }
@@ -121,7 +132,9 @@ pub struct PollTimeout {
 
 impl PollTimeout {
     pub fn new(ms: u64) -> Self {
-        Self { deadline_ns: tsc_now_ns() + ms * 1_000_000 }
+        Self {
+            deadline_ns: tsc_now_ns() + ms * 1_000_000,
+        }
     }
 
     pub fn expired(&self) -> bool {
@@ -163,8 +176,7 @@ pub fn tsc_now_ns() -> u64 {
     let secs = delta / hz;
     let remainder = delta % hz;
 
-    let ns = secs * 1_000_000_000
-        + (remainder * 1_000_000_000) / hz;
+    let ns = secs * 1_000_000_000 + (remainder * 1_000_000_000) / hz;
     ns
 }
 
@@ -259,7 +271,10 @@ pub const IPI_HALT: u8 = 51;
 pub const IPI_TIMER: u8 = 52;
 
 pub fn send_resched(cpu_id: u8) {
-    send_ipi(crate::smp::per_cpu_by_id(cpu_id as u32).apic_id, IPI_RESCHEDULE);
+    send_ipi(
+        crate::smp::per_cpu_by_id(cpu_id as u32).apic_id,
+        IPI_RESCHEDULE,
+    );
 }
 
 pub fn send_tlb_shootdown(cpu_id: u8) {
@@ -272,7 +287,8 @@ pub const TIMER_HZ: u64 = 1000;
 pub const TIMER_PERIOD_MS: u32 = (1000 / TIMER_HZ) as u32;
 
 /// Calibrated APIC timer count shared between BSP and APs.
-pub(crate) static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+pub(crate) static BSP_TIMER_COUNT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
 
 /// Calibrated TSC frequency in Hz.
 pub(crate) static TSC_HZ: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);

@@ -1,8 +1,8 @@
-pub mod riscv_interrupts;
-pub mod riscv_platform;
-pub mod riscv_cpu;
-pub mod riscv_pci_device;
 pub mod riscv_acpi;
+pub mod riscv_cpu;
+pub mod riscv_interrupts;
+pub mod riscv_pci_device;
+pub mod riscv_platform;
 
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;

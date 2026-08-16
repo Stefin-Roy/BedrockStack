@@ -40,7 +40,13 @@ fn ecall(extension: u64, function: u64, arg0: u64, arg1: u64, arg2: u64) -> (i64
 }
 
 pub fn console_putchar(c: u8) {
-    ecall(SBI_EXT_LEGACY, SBI_EXT_LEGACY_CONSOLE_PUTCHAR, c as u64, 0, 0);
+    ecall(
+        SBI_EXT_LEGACY,
+        SBI_EXT_LEGACY_CONSOLE_PUTCHAR,
+        c as u64,
+        0,
+        0,
+    );
 }
 
 pub fn console_getchar() -> i32 {
@@ -54,7 +60,11 @@ pub fn set_timer(stime_value: u64) {
 
 pub fn shutdown() -> ! {
     ecall(SBI_EXT_LEGACY, SBI_EXT_LEGACY_SHUTDOWN, 0, 0, 0);
-    loop { unsafe { asm!("wfi"); } }
+    loop {
+        unsafe {
+            asm!("wfi");
+        }
+    }
 }
 
 pub fn send_ipi(hart_mask: u64) {
@@ -62,13 +72,33 @@ pub fn send_ipi(hart_mask: u64) {
 }
 
 pub fn system_reset() -> ! {
-    ecall(SBI_EXT_SRST, SRST_FUNCTION, SRST_TYPE_SHUTDOWN, SRST_REASON_NONE, 0);
-    loop { unsafe { asm!("wfi"); } }
+    ecall(
+        SBI_EXT_SRST,
+        SRST_FUNCTION,
+        SRST_TYPE_SHUTDOWN,
+        SRST_REASON_NONE,
+        0,
+    );
+    loop {
+        unsafe {
+            asm!("wfi");
+        }
+    }
 }
 
 pub fn cold_reboot() -> ! {
-    ecall(SBI_EXT_SRST, SRST_FUNCTION, SRST_TYPE_COLD_REBOOT, SRST_REASON_NONE, 0);
-    loop { unsafe { asm!("wfi"); } }
+    ecall(
+        SBI_EXT_SRST,
+        SRST_FUNCTION,
+        SRST_TYPE_COLD_REBOOT,
+        SRST_REASON_NONE,
+        0,
+    );
+    loop {
+        unsafe {
+            asm!("wfi");
+        }
+    }
 }
 
 pub fn probe_extension(extension_id: u64) -> bool {
@@ -80,12 +110,22 @@ pub fn probe_extension(extension_id: u64) -> bool {
 /// `hart_id` is the hart to start, `start_addr` is a physical address,
 /// `priv` is passed in `a1`.
 pub fn hart_start(hart_id: u64, start_addr: u64, priv_val: u64) -> bool {
-    let (error, _) = ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_START, hart_id, start_addr, priv_val);
+    let (error, _) = ecall(
+        SBI_EXT_HSM,
+        SBI_EXT_HSM_HART_START,
+        hart_id,
+        start_addr,
+        priv_val,
+    );
     error == 0
 }
 
 /// Stop the current hart via SBI HSM.  Does not return.
 pub fn hart_stop() -> ! {
     ecall(SBI_EXT_HSM, SBI_EXT_HSM_HART_STOP, 0, 0, 0);
-    loop { unsafe { core::arch::asm!("wfi"); } }
+    loop {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
 }

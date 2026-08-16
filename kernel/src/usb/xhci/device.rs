@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use crate::drivers::serial::SerialPort;
 use crate::services::dma::DmaAllocator;
 use crate::usb::usb;
@@ -11,6 +10,7 @@ use crate::usb::xhci::command;
 use crate::usb::xhci::context::{self, EndpointConfig};
 use crate::usb::xhci::event;
 use crate::usb::xhci::memory::{self, TrbRing};
+use alloc::vec::Vec;
 
 /// A USB interface parsed from the configuration descriptor.  Endpoints carry
 /// the xHCI endpoint-context fields so the Configure Endpoint command can be
@@ -107,7 +107,9 @@ fn usb_interval_to_context(speed: u8, ep_type: u8, binterval: u8) -> u8 {
         // FS isoch bInterval is a base-2 exponent of 1 ms frames:
         // `2^(bInterval-1) ms`.  Valid context range is 3-18.  HS/SS isoch
         // uses the `2^(b-1) * 125us` formula (the `_` arm below).
-        (usb::SPEED_FS | usb::SPEED_LS, usb::EP_TYPE_ISOCH) => (binterval as u32 + 2).clamp(3, 18) as u8,
+        (usb::SPEED_FS | usb::SPEED_LS, usb::EP_TYPE_ISOCH) => {
+            (binterval as u32 + 2).clamp(3, 18) as u8
+        }
         // FS/LS interrupt bInterval is in 1 ms frames.  The service interval
         // (in 125us microframes) must be a power of two; round the frame
         // count up and take log2.  Valid context range is 3-10.
@@ -189,7 +191,11 @@ pub fn submit_control_transfer(
     ep0_ring.enqueue(&memory::make_setup_stage_trb(&setup_raw, trt));
 
     if data_len > 0 {
-        ep0_ring.enqueue(&memory::make_data_stage_trb(data_phys, data_len as u32, dir_in));
+        ep0_ring.enqueue(&memory::make_data_stage_trb(
+            data_phys,
+            data_len as u32,
+            dir_in,
+        ));
     }
 
     ep0_ring.enqueue(&memory::make_status_stage_trb(dir_in));
@@ -254,7 +260,14 @@ pub fn get_config_descriptor_full(
     }
 
     let setup_full = SetupPacket::get_descriptor(usb::DESC_CONFIG, 0, 0, total_len as u16);
-    submit_control(slot, doorbell_va, &setup_full, data_phys, total_len as u16, true)?;
+    submit_control(
+        slot,
+        doorbell_va,
+        &setup_full,
+        data_phys,
+        total_len as u16,
+        true,
+    )?;
 
     let cfg_buf = unsafe { core::slice::from_raw_parts(data_va as *const u8, total_len) };
     let limit = cfg_buf.len();
@@ -342,11 +355,9 @@ pub fn get_config_descriptor_full(
                     };
                     // Skip the default control pipe (EP0) and out-of-range DCIs.
                     if record && ep_num != 0 && ep_num <= 15 {
-                        if let Some(iface) = slot
-                            .interfaces
-                            .iter_mut()
-                            .find(|i| i.iface_num == cur_iface_num && i.alt_setting == cur_alt_setting)
-                        {
+                        if let Some(iface) = slot.interfaces.iter_mut().find(|i| {
+                            i.iface_num == cur_iface_num && i.alt_setting == cur_alt_setting
+                        }) {
                             let usb_ep = UsbEndpoint {
                                 dci,
                                 ep_type,
@@ -415,7 +426,8 @@ pub fn get_config_descriptor_full(
     // Drop non-zero alternate settings that carried no recordable endpoints
     // (a UAC streaming alt 1 with no isoch endpoints would otherwise pollute
     // the list the drivers and Configure Endpoint scan).
-    slot.interfaces.retain(|i| i.alt_setting == 0 || !i.endpoints.is_empty());
+    slot.interfaces
+        .retain(|i| i.alt_setting == 0 || !i.endpoints.is_empty());
 
     if cfg!(feature = "usb_trace") {
         SerialPort::puts("[xhci]  ");
@@ -442,13 +454,27 @@ fn endpoint_max_burst(speed: u8, _ep_type: u8, ep: &EndpointDescriptor, ss_burst
 fn endpoint_max_esit(speed: u8, ep_type: u8, ep: &EndpointDescriptor, ss_esit: u16) -> u16 {
     match (speed, ep_type) {
         (usb::SPEED_FS, usb::EP_TYPE_ISOCH) => ep.max_packet_size(),
-        (usb::SPEED_HS, usb::EP_TYPE_ISOCH) => {
-            ep.max_packet_size().saturating_mul(ep.hs_burst() as u16 + 1)
+        (usb::SPEED_HS, usb::EP_TYPE_ISOCH) => ep
+            .max_packet_size()
+            .saturating_mul(ep.hs_burst() as u16 + 1),
+        (usb::SPEED_SS, usb::EP_TYPE_ISOCH) => {
+            if ss_esit != 0 {
+                ss_esit
+            } else {
+                ep.max_packet_size()
+            }
         }
-        (usb::SPEED_SS, usb::EP_TYPE_ISOCH) => if ss_esit != 0 { ss_esit } else { ep.max_packet_size() },
         (usb::SPEED_FS | usb::SPEED_LS, usb::EP_TYPE_INTERRUPT) => ep.max_packet_size(),
-        (usb::SPEED_HS, usb::EP_TYPE_INTERRUPT) => ep.max_packet_size().saturating_mul(ep.hs_burst() as u16 + 1),
-        (usb::SPEED_SS, usb::EP_TYPE_INTERRUPT) => if ss_esit != 0 { ss_esit } else { ep.max_packet_size() },
+        (usb::SPEED_HS, usb::EP_TYPE_INTERRUPT) => ep
+            .max_packet_size()
+            .saturating_mul(ep.hs_burst() as u16 + 1),
+        (usb::SPEED_SS, usb::EP_TYPE_INTERRUPT) => {
+            if ss_esit != 0 {
+                ss_esit
+            } else {
+                ep.max_packet_size()
+            }
+        }
         _ => 0,
     }
 }
@@ -512,7 +538,11 @@ pub fn configure_device(
                 // Isochronous endpoints report no transaction errors, so CErr
                 // must be 0 (xHCI §6.2.3.2); everything else uses the
                 // default 3 retries.
-                cerr: if ep.ep_type == usb::EP_TYPE_ISOCH { 0 } else { 3 },
+                cerr: if ep.ep_type == usb::EP_TYPE_ISOCH {
+                    0
+                } else {
+                    3
+                },
                 avg_trb_len: if ep.ep_type == usb::EP_TYPE_BULK {
                     3072
                 } else {
@@ -530,7 +560,13 @@ pub fn configure_device(
     // Only push to slot.ep_rings once all allocations succeeded.
     slot.ep_rings.extend(ring_pairs);
 
-    context::init_icc_for_configure_endpoint(icc_va, ctx_size, slot.speed, slot.port_num, &endpoints);
+    context::init_icc_for_configure_endpoint(
+        icc_va,
+        ctx_size,
+        slot.speed,
+        slot.port_num,
+        &endpoints,
+    );
 
     command::submit_configure_endpoint(cmd_ring, doorbell_va, slot.icc_phys, slot.slot_id, false)?;
 
@@ -629,14 +665,20 @@ pub fn find_ep_ring(slot: &DeviceSlot, dci: u8) -> Option<&TrbRing> {
     if dci == 1 {
         return Some(&slot.ep0_ring);
     }
-    slot.ep_rings.iter().find(|(d, _)| *d == dci).map(|(_, r)| r)
+    slot.ep_rings
+        .iter()
+        .find(|(d, _)| *d == dci)
+        .map(|(_, r)| r)
 }
 
 pub fn find_ep_ring_mut(slot: &mut DeviceSlot, dci: u8) -> Option<&mut TrbRing> {
     if dci == 1 {
         return Some(&mut slot.ep0_ring);
     }
-    slot.ep_rings.iter_mut().find(|(d, _)| *d == dci).map(|(_, r)| r)
+    slot.ep_rings
+        .iter_mut()
+        .find(|(d, _)| *d == dci)
+        .map(|(_, r)| r)
 }
 
 pub struct DeviceSlotManager {
@@ -697,12 +739,26 @@ impl DeviceSlotManager {
         };
 
         unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
-        context::init_icc_for_address_device(icc_buf.virt, self.ctx_size, speed, port_num, mps, ep0_ring.phys);
+        context::init_icc_for_address_device(
+            icc_buf.virt,
+            self.ctx_size,
+            speed,
+            port_num,
+            mps,
+            ep0_ring.phys,
+        );
         command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, bsr)?;
 
         let mut slot = DeviceSlot::new(
-            slot_id, port_num, speed, self.ctx_size, mps,
-            icc_buf.phys, icc_buf.virt, ep0_ring, address,
+            slot_id,
+            port_num,
+            speed,
+            self.ctx_size,
+            mps,
+            icc_buf.phys,
+            icc_buf.virt,
+            ep0_ring,
+            address,
         );
 
         if bsr {
@@ -711,12 +767,24 @@ impl DeviceSlotManager {
             // xHC may mishandle the split transfer on some implementations.
             let setup8 = SetupPacket::get_descriptor(usb::DESC_DEVICE, 0, 0, 8);
             submit_control(&mut slot, doorbell_va, &setup8, desc_buf.phys, 8, true)?;
-            let desc_mps_raw = unsafe { core::ptr::read_volatile((desc_buf.virt + 7) as *const u8) };
-            let real_mps = if desc_mps_raw < 8 { 8 } else { desc_mps_raw as u16 };
+            let desc_mps_raw =
+                unsafe { core::ptr::read_volatile((desc_buf.virt + 7) as *const u8) };
+            let real_mps = if desc_mps_raw < 8 {
+                8
+            } else {
+                desc_mps_raw as u16
+            };
 
             // Re-address with correct MPS and real device address (BSR=0).
             unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
-            context::init_icc_for_address_device(icc_buf.virt, self.ctx_size, speed, port_num, real_mps, slot.ep0_ring.phys);
+            context::init_icc_for_address_device(
+                icc_buf.virt,
+                self.ctx_size,
+                speed,
+                port_num,
+                real_mps,
+                slot.ep0_ring.phys,
+            );
             command::submit_address_device(cmd_ring, doorbell_va, icc_buf.phys, slot_id, false)?;
             slot.address = self.next_address;
             slot.mps = real_mps;
@@ -735,7 +803,14 @@ impl DeviceSlotManager {
         let real_mps = if desc_mps < 8 { 8 } else { desc_mps as u16 };
         if real_mps != slot.mps {
             unsafe { core::ptr::write_bytes(icc_buf.virt as *mut u8, 0, 4096) };
-            context::init_icc_for_evaluate_ep0(icc_buf.virt, self.ctx_size, speed, port_num, real_mps, slot.ep0_ring.phys);
+            context::init_icc_for_evaluate_ep0(
+                icc_buf.virt,
+                self.ctx_size,
+                speed,
+                port_num,
+                real_mps,
+                slot.ep0_ring.phys,
+            );
             command::submit_evaluate_context(cmd_ring, doorbell_va, icc_buf.phys, slot_id)?;
             slot.mps = real_mps;
         }

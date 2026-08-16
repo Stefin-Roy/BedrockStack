@@ -29,9 +29,7 @@ fn register_all() {
     register(&super::ahci::AhciDriver);
 }
 
-pub fn init_all(
-    pci_devices: &[PciDevice],
-) -> Vec<Arc<dyn BlockDevice>> {
+pub fn init_all(pci_devices: &[PciDevice]) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
 
     register_all();

@@ -27,11 +27,19 @@ impl Pm1ControlRegisters {
             Pm1ControlBit::SleepEnable => 1 << 13,
         };
         let mut val = gas_read16(&self.pm1a)?;
-        if set { val |= mask; } else { val &= !mask; }
+        if set {
+            val |= mask;
+        } else {
+            val &= !mask;
+        }
         gas_write16(&self.pm1a, val)?;
         if let Some(ref pm1b) = self.pm1b {
             let mut valb = gas_read16(pm1b)?;
-            if set { valb |= mask; } else { valb &= !mask; }
+            if set {
+                valb |= mask;
+            } else {
+                valb &= !mask;
+            }
             gas_write16(pm1b, valb)?;
         }
         Ok(())
@@ -47,9 +55,24 @@ pub struct FadtFields {
     pub dsdt_addr: u32,
 }
 
-fn r8(buf: &[u8], off: usize) -> u8 { buf[off] }
-fn r32(buf: &[u8], off: usize) -> u32 { u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) }
-fn r64(buf: &[u8], off: usize) -> u64 { u64::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3], buf[off + 4], buf[off + 5], buf[off + 6], buf[off + 7]]) }
+fn r8(buf: &[u8], off: usize) -> u8 {
+    buf[off]
+}
+fn r32(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+fn r64(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
 
 fn read_gas(buf: &[u8], off: usize) -> Gas {
     Gas {
@@ -86,7 +109,11 @@ pub fn parse_fadt(vaddr: u64, length: u32) -> Result<FadtFields, AcpiError> {
     let (reset_gas, reset_value, reset_supported) = if len >= 132 {
         let g = read_gas(raw, 116);
         let v = r8(raw, 128);
-        (if g.address != 0 { Some(g) } else { None }, v, (flags & (1 << 10)) != 0)
+        (
+            if g.address != 0 { Some(g) } else { None },
+            v,
+            (flags & (1 << 10)) != 0,
+        )
     } else {
         (None, 0, false)
     };

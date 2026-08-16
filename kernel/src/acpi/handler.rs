@@ -8,8 +8,8 @@
 //! paths. All methods are infallible by trait contract; unmapped ECAM regions
 //! return all-ones (empty config space) rather than failing.
 
-use spin::Mutex;
 use ::aml::Handler;
+use spin::Mutex;
 
 use crate::mm::vmm::PageFlags;
 
@@ -121,15 +121,39 @@ impl Handler for AmlHandler {
         crate::pci::ecam::read_u32(segment, bus, device, function, offset)
     }
 
-    fn write_pci_u8(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u8) {
+    fn write_pci_u8(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u8,
+    ) {
         crate::pci::ecam::write_u8(segment, bus, device, function, offset, value)
     }
 
-    fn write_pci_u16(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u16) {
+    fn write_pci_u16(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u16,
+    ) {
         crate::pci::ecam::write_u16(segment, bus, device, function, offset, value)
     }
 
-    fn write_pci_u32(&self, segment: u16, bus: u8, device: u8, function: u8, offset: u16, value: u32) {
+    fn write_pci_u32(
+        &self,
+        segment: u16,
+        bus: u8,
+        device: u8,
+        function: u8,
+        offset: u16,
+        value: u32,
+    ) {
         crate::pci::ecam::write_u32(segment, bus, device, function, offset, value)
     }
 

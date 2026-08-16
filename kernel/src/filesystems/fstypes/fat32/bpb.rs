@@ -96,7 +96,9 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
 
     let total_sectors = {
         let sz16 = u16::from_le_bytes([sector[0x13], sector[0x14]]);
-        if sz16 != 0 { sz16 as u64 } else {
+        if sz16 != 0 {
+            sz16 as u64
+        } else {
             u32::from_le_bytes([sector[0x20], sector[0x21], sector[0x22], sector[0x23]]) as u64
         }
     };
@@ -122,9 +124,17 @@ pub(super) fn parse_bpb(device: &dyn BlockDevice) -> Result<Bpb, VfsError> {
     let ext_flags = u16::from_le_bytes([sector[0x28], sector[0x29]]);
 
     Ok(Bpb {
-        bytes_per_sec, sec_per_clus, rsvd_sec_cnt, num_fats,
-        fat_sz32, root_clus, fsinfo_sec,
-        byts_per_clus, first_data_sec, total_clus, ext_flags,
+        bytes_per_sec,
+        sec_per_clus,
+        rsvd_sec_cnt,
+        num_fats,
+        fat_sz32,
+        root_clus,
+        fsinfo_sec,
+        byts_per_clus,
+        first_data_sec,
+        total_clus,
+        ext_flags,
     })
 }
 
@@ -135,13 +145,15 @@ impl Bpb {
     }
 
     pub fn active_fat_idx(&self) -> u8 {
-        if self.ext_flags & 0x80 != 0 { (self.ext_flags & 0x0F) as u8 } else { 0 }
+        if self.ext_flags & 0x80 != 0 {
+            (self.ext_flags & 0x0F) as u8
+        } else {
+            0
+        }
     }
 
     pub fn fat_sector_lba(&self, fat_num: u8, sector_idx: u32) -> u64 {
-        self.rsvd_sec_cnt as u64
-            + (fat_num as u64) * self.fat_sz32 as u64
-            + sector_idx as u64
+        self.rsvd_sec_cnt as u64 + (fat_num as u64) * self.fat_sz32 as u64 + sector_idx as u64
     }
 
     pub fn fat_entry_position(&self, cluster: u32) -> Result<(u32, u32), VfsError> {

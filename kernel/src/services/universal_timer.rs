@@ -1,10 +1,10 @@
+use super::clockevent::Clockevent;
+use super::clocksource::Clocksource;
+use super::timer_queue::{TimerEntry, TimerQueue};
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 use spin::Once;
-use super::clockevent::Clockevent;
-use super::clocksource::Clocksource;
-use super::timer_queue::{TimerEntry, TimerQueue};
 
 // ── Interrupt-safe lock wrapper ───────────────────────────────────
 // Disables local IRQs while the inner Mutex is held, so the timer ISR
@@ -16,7 +16,9 @@ struct IrqSafeLock<T> {
 
 impl<T> IrqSafeLock<T> {
     const fn new(val: T) -> Self {
-        IrqSafeLock { inner: Mutex::new(val) }
+        IrqSafeLock {
+            inner: Mutex::new(val),
+        }
     }
 
     fn lock(&self) -> IrqSafeGuard<'_, T> {
@@ -24,7 +26,10 @@ impl<T> IrqSafeLock<T> {
         if was_enabled {
             crate::arch::CurrentArch::disable_interrupts();
         }
-        IrqSafeGuard { guard: Some(self.inner.lock()), was_enabled }
+        IrqSafeGuard {
+            guard: Some(self.inner.lock()),
+            was_enabled,
+        }
     }
 }
 
@@ -126,10 +131,7 @@ pub struct UniversalTimerImpl {
 }
 
 impl UniversalTimerImpl {
-    pub fn new(
-        clocksource: &'static dyn Clocksource,
-        clockevent: &'static dyn Clockevent,
-    ) -> Self {
+    pub fn new(clocksource: &'static dyn Clocksource, clockevent: &'static dyn Clockevent) -> Self {
         UniversalTimerImpl {
             clocksource,
             clockevent,
@@ -178,12 +180,13 @@ impl UniversalTimerImpl {
     }
 }
 
-
-
 impl UniversalTimer for UniversalTimerImpl {
     fn set(&self, deadline_ns: u64, callback: TimerCallback, context: *mut u8) -> TimerId {
         let cpu = crate::smp::current_cpu_id();
-        let id = TimerId { cpu, seq: self.next_seq.fetch_add(1, Ordering::Relaxed) };
+        let id = TimerId {
+            cpu,
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
+        };
         let mut queue = self.bases[cpu as usize].queue.lock();
         let old_next = queue.next_deadline();
         queue.insert(TimerEntry::new(id, deadline_ns, None, callback, context));
@@ -197,10 +200,19 @@ impl UniversalTimer for UniversalTimerImpl {
         let now = self.clocksource.now_ns();
         let deadline_ns = now.saturating_add(interval_ns);
         let cpu = crate::smp::current_cpu_id();
-        let id = TimerId { cpu, seq: self.next_seq.fetch_add(1, Ordering::Relaxed) };
+        let id = TimerId {
+            cpu,
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
+        };
         let mut queue = self.bases[cpu as usize].queue.lock();
         let old_next = queue.next_deadline();
-        queue.insert(TimerEntry::new(id, deadline_ns, Some(interval_ns), callback, context));
+        queue.insert(TimerEntry::new(
+            id,
+            deadline_ns,
+            Some(interval_ns),
+            callback,
+            context,
+        ));
         if old_next != queue.next_deadline() {
             self.reprogram(&mut queue);
         }
@@ -214,8 +226,7 @@ impl UniversalTimer for UniversalTimerImpl {
         // Re-arm locally only if we own the base.  A remote cancel never
         // re-arms: the owner's timer is still armed for the (removed)
         // earliest and re-arms itself on the next tick.
-        if removed && old_next != queue.next_deadline() && id.cpu == crate::smp::current_cpu_id()
-        {
+        if removed && old_next != queue.next_deadline() && id.cpu == crate::smp::current_cpu_id() {
             self.reprogram(&mut queue);
         }
         removed
@@ -231,7 +242,10 @@ impl UniversalTimer for UniversalTimerImpl {
             queue.remove(id)?
         };
 
-        let new_id = TimerId { cpu: target_cpu, seq: self.next_seq.fetch_add(1, Ordering::Relaxed) };
+        let new_id = TimerId {
+            cpu: target_cpu,
+            seq: self.next_seq.fetch_add(1, Ordering::Relaxed),
+        };
         let mut entry = entry;
         entry.id = new_id;
 
@@ -263,7 +277,10 @@ impl UniversalTimer for UniversalTimerImpl {
 fn send_reschedule_ipi(cpu: u32) {
     // cpu -> APIC id translation (cpu ids and APIC ids do not coincide).
     let apic_id = crate::smp::per_cpu_by_id(cpu).apic_id;
-    crate::platform::x86_64_pc::apic::send_ipi(apic_id, crate::platform::x86_64_pc::apic::IPI_TIMER);
+    crate::platform::x86_64_pc::apic::send_ipi(
+        apic_id,
+        crate::platform::x86_64_pc::apic::IPI_TIMER,
+    );
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -318,7 +335,9 @@ fn universal_timer_ipi_tick() {
 ///
 /// Panics if `early_init()` has not been called.
 pub fn universal_timer() -> &'static dyn UniversalTimer {
-    *UNIVERSAL_TIMER.get().expect("UniversalTimer not initialised — call early_init() first")
+    *UNIVERSAL_TIMER
+        .get()
+        .expect("UniversalTimer not initialised — call early_init() first")
 }
 
 /// True once `early_init()` has run and the singleton is usable.
@@ -328,7 +347,9 @@ pub fn is_ready() -> bool {
 
 /// Convenience: return the raw impl pointer for the ISR tick handler.
 pub fn universal_timer_impl() -> &'static UniversalTimerImpl {
-    *UNIVERSAL_TIMER.get().expect("UniversalTimer not initialised")
+    *UNIVERSAL_TIMER
+        .get()
+        .expect("UniversalTimer not initialised")
 }
 
 // ── Blocking waits ────────────────────────────────────────────────
@@ -392,6 +413,32 @@ pub fn wait_until_cond(deadline_ns: u64, done: &dyn Fn() -> bool) -> bool {
         while !wake.load(Ordering::SeqCst) {
             crate::arch::CurrentArch::halt();
         }
+    }
+}
+
+/// Cooperative sibling of [`wait_until_cond`]: when a task context exists
+/// (the audio pump parks as a scheduler task), park the current task in
+/// `slice_ns` slices instead of HLTing the CPU, so the rest of the system
+/// keeps flowing while the audio DMA runs on its own.  `done()` is
+/// re-evaluated every slice — a completion is serviced within one slice
+/// without depending on an ISR wake.  Falls back to [`wait_until_cond`] in
+/// boot context (no current task), where there is nothing to schedule and
+/// HLT is correct.
+pub fn wait_until_cond_coop(deadline_ns: u64, slice_ns: u64, done: &dyn Fn() -> bool) -> bool {
+    if crate::smp::current_per_cpu().current_task.is_null() {
+        return wait_until_cond(deadline_ns, done);
+    }
+    loop {
+        if done() {
+            return true;
+        }
+        let now = universal_timer().now_ns();
+        if now >= deadline_ns {
+            // One last chance — the condition may have just become true.
+            return done();
+        }
+        let slice = slice_ns.min(deadline_ns - now).max(1);
+        crate::task::sleep_current(slice);
     }
 }
 

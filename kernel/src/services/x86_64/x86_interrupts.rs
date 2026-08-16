@@ -1,9 +1,7 @@
-use crate::platform::x86_64_pc::{apic, ioapic};
 use super::super::interrupts::InterruptManager;
+use crate::platform::x86_64_pc::{apic, ioapic};
 
 pub struct X86Interrupts;
-
-
 
 impl InterruptManager for X86Interrupts {
     fn register_handler(&self, vector: u8, handler: fn()) {

@@ -110,10 +110,5 @@ pub fn read_epoch_secs() -> Option<u64> {
     }
 
     let days = crate::services::wallclock::days_from_civil(year, month, day);
-    Some(
-        days * 86400
-            + (t.hour as u64) * 3600
-            + (t.min as u64) * 60
-            + t.sec as u64,
-    )
+    Some(days * 86400 + (t.hour as u64) * 3600 + (t.min as u64) * 60 + t.sec as u64)
 }

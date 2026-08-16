@@ -6,7 +6,7 @@
 
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::smp::{ApContext, per_cpu_by_id, current_per_cpu};
+use crate::smp::{ApContext, current_per_cpu, per_cpu_by_id};
 
 pub const TRAMPOLINE_ADDR: u64 = 0x8000;
 const DATA_OFFSET: u64 = 0x700; // trampoline data at 0x8700
@@ -66,7 +66,9 @@ pub unsafe fn start_aps(
     let satp = (8u64 << 60) | (page_table_root >> 12);
 
     // Write shared trampoline data once (satp, entry are same for all APs).
-    unsafe { data.write(TrampolineData { satp, entry }); }
+    unsafe {
+        data.write(TrampolineData { satp, entry });
+    }
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 
     // Phase 1: Start all harts via SBI HSM
@@ -91,7 +93,8 @@ pub unsafe fn start_aps(
     while started_ok < aps.len() {
         started_ok = 0;
         for ap in aps {
-            if crate::smp::AP_READY[ap.cpu_id as usize].ready
+            if crate::smp::AP_READY[ap.cpu_id as usize]
+                .ready
                 .load(core::sync::atomic::Ordering::Acquire)
             {
                 started_ok += 1;
@@ -104,7 +107,8 @@ pub unsafe fn start_aps(
     }
 
     for ap in aps {
-        if crate::smp::AP_READY[ap.cpu_id as usize].ready
+        if crate::smp::AP_READY[ap.cpu_id as usize]
+            .ready
             .load(core::sync::atomic::Ordering::Acquire)
         {
             SerialPort::puts("[trampoline] AP ");
@@ -142,7 +146,9 @@ pub extern "C" fn ap_entry_riscv() -> ! {
     SerialPort::puts(" online\n");
 
     // Mark started — own cache line, no lock.
-    crate::smp::AP_READY[cpu_id as usize].ready.store(true, core::sync::atomic::Ordering::Release);
+    crate::smp::AP_READY[cpu_id as usize]
+        .ready
+        .store(true, core::sync::atomic::Ordering::Release);
     crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
 
     // Per-CPU arch init (trap vectors, PLIC, SIE).

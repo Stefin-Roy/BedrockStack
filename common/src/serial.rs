@@ -24,7 +24,9 @@ impl<B: IoBackend> fmt::Write for SerialPort<B> {
 
 impl<B: IoBackend> SerialPort<B> {
     pub fn new() -> Self {
-        Self { _phantom: core::marker::PhantomData }
+        Self {
+            _phantom: core::marker::PhantomData,
+        }
     }
 
     /// Initialize COM1 at 115200 baud, 8N1.
@@ -71,7 +73,11 @@ impl<B: IoBackend> SerialPort<B> {
         while val > 0 {
             i -= 1;
             let digit = (val & 0xF) as u8;
-            buf[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+            buf[i] = if digit < 10 {
+                b'0' + digit
+            } else {
+                b'a' + digit - 10
+            };
             val >>= 4;
         }
         Self::puts(core::str::from_utf8(&buf[i..]).unwrap_or("???"));
@@ -142,7 +148,9 @@ pub mod riscv64 {
 
         fn write_reg(offset: u16, val: u8) {
             let addr = (UART_BASE + offset as u64) as *mut u8;
-            unsafe { addr.write_volatile(val); }
+            unsafe {
+                addr.write_volatile(val);
+            }
         }
     }
 

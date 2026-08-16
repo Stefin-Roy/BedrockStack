@@ -1,4 +1,3 @@
-
 pub trait MsiAllocator: Send + Sync {
     fn allocate_device_vector(&self, handler: fn()) -> Option<u8>;
     fn release_device_vector(&self, vector: u8);

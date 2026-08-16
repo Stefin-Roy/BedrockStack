@@ -15,7 +15,18 @@ pub struct DriveMount {
 }
 
 impl DriveMount {
-    pub fn new(id: u64, root: Arc<Dentry>, sb: Arc<SuperBlock>, device: Option<Arc<dyn BlockDevice>>) -> Self {
-        DriveMount { id, root, sb, device, covered: IrqMutex::new(None) }
+    pub fn new(
+        id: u64,
+        root: Arc<Dentry>,
+        sb: Arc<SuperBlock>,
+        device: Option<Arc<dyn BlockDevice>>,
+    ) -> Self {
+        DriveMount {
+            id,
+            root,
+            sb,
+            device,
+            covered: IrqMutex::new(None),
+        }
     }
 }

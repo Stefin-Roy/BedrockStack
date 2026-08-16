@@ -7,11 +7,11 @@ pub mod trap;
 
 pub struct Riscv64;
 
-use core::arch::asm;
+use crate::KernelLayout;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::Vmm;
 use crate::platform::riscv_virt::plic;
-use crate::KernelLayout;
+use core::arch::asm;
 
 impl Riscv64 {
     pub fn init() {
@@ -19,11 +19,14 @@ impl Riscv64 {
         trap::init();
         // Set BSP's APIC/hart ID before PLIC init so scontext() can read it.
         crate::smp::set_bsp_hardware_id(
-            crate::platform::riscv_virt::plic::HART_ID.load(core::sync::atomic::Ordering::Relaxed) as u32
+            crate::platform::riscv_virt::plic::HART_ID.load(core::sync::atomic::Ordering::Relaxed)
+                as u32,
         );
         crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: PLIC\n");
         plic::init();
-        crate::drivers::serial::SerialPort::puts("[arch] riscv64 init: enabling supervisor interrupts\n");
+        crate::drivers::serial::SerialPort::puts(
+            "[arch] riscv64 init: enabling supervisor interrupts\n",
+        );
         unsafe {
             asm!("csrw sie, {}", in(reg) trap::MIE_SEIE | trap::MIE_SSIE | trap::MIE_STIE);
         }
@@ -40,20 +43,28 @@ impl Riscv64 {
     }
 
     pub fn halt() {
-        unsafe { asm!("wfi"); }
+        unsafe {
+            asm!("wfi");
+        }
     }
 
     pub fn disable_interrupts() {
-        unsafe { asm!("csrci sstatus, 2"); }
+        unsafe {
+            asm!("csrci sstatus, 2");
+        }
     }
 
     pub fn enable_interrupts() {
-        unsafe { asm!("csrsi sstatus, 2"); }
+        unsafe {
+            asm!("csrsi sstatus, 2");
+        }
     }
 
     pub fn are_interrupts_enabled() -> bool {
         let stval: u64;
-        unsafe { asm!("csrr {}, sstatus", out(reg) stval); }
+        unsafe {
+            asm!("csrr {}, sstatus", out(reg) stval);
+        }
         (stval & 2) != 0
     }
 
@@ -66,8 +77,14 @@ impl Riscv64 {
         fb_stride: usize,
         fb_bpp: u8,
     ) -> Vmm {
-        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride, fb_bpp)
+        paging::setup(
+            allocator,
+            layout,
+            stack_guard,
+            fb_addr,
+            fb_height,
+            fb_stride,
+            fb_bpp,
+        )
     }
-
-
 }

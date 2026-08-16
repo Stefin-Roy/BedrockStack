@@ -1,13 +1,11 @@
 use alloc::vec::Vec;
 
+use super::super::cpu::CpuManager;
 use crate::acpi::AcpiSubsystem;
 use crate::platform::x86_64_pc::apic;
 use crate::smp::ApContext;
-use super::super::cpu::CpuManager;
 
 pub struct X86Cpu;
-
-
 
 impl CpuManager for X86Cpu {
     fn current_cpu_id(&self) -> u32 {
@@ -33,15 +31,9 @@ impl CpuManager for X86Cpu {
         acpi.cpus.clone()
     }
 
-    unsafe fn wake_aps(
-        &self,
-        page_table_root: u64,
-        aps: &[ApContext],
-    ) -> usize {
+    unsafe fn wake_aps(&self, page_table_root: u64, aps: &[ApContext]) -> usize {
         let alloc = crate::mm::heap::get_phys_allocator_mut();
-        unsafe {
-            crate::arch::x86_64::trampoline::start_aps(alloc, page_table_root, aps)
-        }
+        unsafe { crate::arch::x86_64::trampoline::start_aps(alloc, page_table_root, aps) }
     }
 }
 

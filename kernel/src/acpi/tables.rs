@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use crate::acpi::platform::AcpiError;
+use alloc::vec::Vec;
 
 fn sig(s: &[u8; 4]) -> u32 {
     u32::from_le_bytes(*s)
@@ -14,8 +14,11 @@ fn map_region(paddr: u64, size: u64) -> u64 {
     let aligned = paddr - offset;
     let total = size + offset;
     let pages = (total + 0xFFF) & !0xFFF;
-    let vaddr = crate::acpi::map_device_mmio(aligned, pages,
-        crate::mm::vmm::PageFlags::READ | crate::mm::vmm::PageFlags::WRITE);
+    let vaddr = crate::acpi::map_device_mmio(
+        aligned,
+        pages,
+        crate::mm::vmm::PageFlags::READ | crate::mm::vmm::PageFlags::WRITE,
+    );
     vaddr + offset
 }
 
@@ -44,7 +47,8 @@ pub fn parse_tables_from_data(rsdp_data: &[u8]) -> Result<Vec<SdtEntry>, AcpiErr
 
     let revision = rsdp_data[15];
 
-    let rsdt_addr_u32 = u32::from_le_bytes([rsdp_data[16], rsdp_data[17], rsdp_data[18], rsdp_data[19]]);
+    let rsdt_addr_u32 =
+        u32::from_le_bytes([rsdp_data[16], rsdp_data[17], rsdp_data[18], rsdp_data[19]]);
 
     let length = if revision >= 2 {
         if rsdp_data.len() < 24 {
@@ -57,8 +61,14 @@ pub fn parse_tables_from_data(rsdp_data: &[u8]) -> Result<Vec<SdtEntry>, AcpiErr
 
     let xsdt_addr_u64 = if revision >= 2 && rsdp_data.len() >= 32 {
         u64::from_le_bytes([
-            rsdp_data[24], rsdp_data[25], rsdp_data[26], rsdp_data[27],
-            rsdp_data[28], rsdp_data[29], rsdp_data[30], rsdp_data[31],
+            rsdp_data[24],
+            rsdp_data[25],
+            rsdp_data[26],
+            rsdp_data[27],
+            rsdp_data[28],
+            rsdp_data[29],
+            rsdp_data[30],
+            rsdp_data[31],
         ])
     } else {
         0
@@ -217,7 +227,11 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
     };
 
     if hdr_len < 36 || hdr_len > 0x0100_0000 {
-        log::warn!("ACPI table at 0x{:x}: invalid header length {}", phys_addr, hdr_len);
+        log::warn!(
+            "ACPI table at 0x{:x}: invalid header length {}",
+            phys_addr,
+            hdr_len
+        );
         return Ok(None);
     }
 
@@ -233,13 +247,23 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
     let sig_bytes: [u8; 4] = [raw[0], raw[1], raw[2], raw[3]];
     // Only care about tables we actually parse
     let sig_u32 = u32::from_le_bytes(sig_bytes);
-    let keep_sigs = [sig(b"FACP"), sig(b"APIC"), sig(b"MCFG"), sig(b"DSDT"), sig(b"SSDT")];
+    let keep_sigs = [
+        sig(b"FACP"),
+        sig(b"APIC"),
+        sig(b"MCFG"),
+        sig(b"DSDT"),
+        sig(b"SSDT"),
+    ];
     if !keep_sigs.contains(&sig_u32) {
         return Ok(None);
     }
 
-    log::info!("ACPI: found table {:?} at 0x{:x} ({})",
-        core::str::from_utf8(&sig_bytes).unwrap_or("????"), phys_addr, hdr_len);
+    log::info!(
+        "ACPI: found table {:?} at 0x{:x} ({})",
+        core::str::from_utf8(&sig_bytes).unwrap_or("????"),
+        phys_addr,
+        hdr_len
+    );
 
     Ok(Some(SdtEntry {
         signature: sig_u32,
@@ -260,7 +284,11 @@ pub fn map_sdt_bytes(phys_addr: u64, expected_sig: &[u8; 4]) -> Option<&'static 
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
     };
     if hdr_len < 36 || hdr_len > 0x0100_0000 {
-        log::warn!("ACPI table at 0x{:x}: invalid header length {}", phys_addr, hdr_len);
+        log::warn!(
+            "ACPI table at 0x{:x}: invalid header length {}",
+            phys_addr,
+            hdr_len
+        );
         return None;
     }
     let vaddr = map_region(phys_addr, hdr_len as u64);

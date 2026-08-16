@@ -51,12 +51,11 @@ pub extern "sysv64" fn kernel_main(
     SerialPort::puts("[kernel] Pointers OK\n");
 
     let framebuffer = unsafe { &*framebuffer_ptr };
-    let memory_map = unsafe {
-        core::slice::from_raw_parts(memory_map_ptr, memory_map_len)
-    };
+    let memory_map = unsafe { core::slice::from_raw_parts(memory_map_ptr, memory_map_len) };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr, None) };
+    let mut kernel =
+        unsafe { kernel::Kernel::new(memory_map, framebuffer, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     kernel.run();
@@ -179,7 +178,7 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
                 (core::ptr::read_volatile(dtb_ptr) as u32) << 24
                     | (core::ptr::read_volatile(dtb_ptr.add(1)) as u32) << 16
                     | (core::ptr::read_volatile(dtb_ptr.add(2)) as u32) << 8
-                    | (core::ptr::read_volatile(dtb_ptr.add(3)) as u32)
+                    | (core::ptr::read_volatile(dtb_ptr.add(3)) as u32),
             )
         });
     } else {
@@ -198,13 +197,17 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
     };
 
     static FB_INFO: FramebufferInfo = FramebufferInfo {
-        address: 0, width: 0, height: 0, stride: 0,
+        address: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
         pixel_format: PixelFormat::Bgr,
         bpp: 4,
     };
 
     SerialPort::puts("[kernel] Creating Kernel struct...\n");
-    let mut kernel = unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr, None) };
+    let mut kernel =
+        unsafe { kernel::Kernel::new(memory_map, &FB_INFO, stack_guard, rsdp_addr, None) };
     SerialPort::puts("[kernel] Init...\n");
     kernel.init();
     kernel.run();

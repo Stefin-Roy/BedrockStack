@@ -101,6 +101,7 @@ echo [fullrun] Boot built successfully.
 echo.
 
 call :build_user
+call :build_doom
 
 echo [3/4] Creating FAT32 disk image...
 echo --- image creation --- >> "%LOG_FILE%"
@@ -366,6 +367,7 @@ echo [fullrun] GRUB standalone image ready.
 echo.
 
 call :build_user
+call :build_doom
 
 echo [3/3] Creating disk image...
 echo --- image creation --- >> "%LOG_FILE%"
@@ -441,6 +443,22 @@ if %USERERR% neq 0 (
 )
 echo user build OK >> "%LOG_FILE%"
 echo [fullrun] User init built successfully.
+echo.
+exit /b 0
+
+:build_doom
+echo [user] Building DOOM game (x86_64-bedrock-user, debug)...
+echo --- doom build --- >> "%LOG_FILE%"
+echo %date% %time% >> "%LOG_FILE%"
+cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom 2>&1
+set DOOMERR=%errorlevel%
+if %DOOMERR% neq 0 (
+    echo [fullrun] ERROR: doom build failed with exit code %DOOMERR%
+    echo doom build FAILED: exit %DOOMERR% >> "%LOG_FILE%"
+    exit /b 1
+)
+echo doom build OK >> "%LOG_FILE%"
+echo [fullrun] DOOM game built successfully.
 echo.
 exit /b 0
 

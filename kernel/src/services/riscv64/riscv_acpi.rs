@@ -6,8 +6,6 @@ use super::super::acpi::{AcpiProvider, InterruptModel, PciConfigRegions, Platfor
 
 pub struct RiscvAcpi;
 
-
-
 impl AcpiProvider for RiscvAcpi {
     fn interrupt_model(&self) -> &InterruptModel {
         &InterruptModel::Unknown
@@ -15,7 +13,9 @@ impl AcpiProvider for RiscvAcpi {
 
     fn pci_config_regions(&self) -> &PciConfigRegions {
         static EMPTY: spin::Once<PciConfigRegions> = spin::Once::new();
-        EMPTY.call_once(|| PciConfigRegions { regions: Vec::new() })
+        EMPTY.call_once(|| PciConfigRegions {
+            regions: Vec::new(),
+        })
     }
 
     fn platform_info(&self) -> Option<&PlatformInfo> {

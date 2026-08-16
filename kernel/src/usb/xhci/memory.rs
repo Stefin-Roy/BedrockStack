@@ -1,5 +1,5 @@
-use core::sync::atomic::{fence, Ordering};
 use crate::services::dma::DmaAllocator;
+use core::sync::atomic::{Ordering, fence};
 
 pub const TRB_TYPE_NORMAL: u8 = 1;
 pub const TRB_TYPE_SETUP_STAGE: u8 = 2;
@@ -77,7 +77,11 @@ pub struct Trb {
 
 impl Trb {
     pub fn new(parameter: u64, status: u32, control: u32) -> Self {
-        Trb { parameter, status, control }
+        Trb {
+            parameter,
+            status,
+            control,
+        }
     }
 
     pub fn trb_type(&self) -> u8 {
@@ -185,7 +189,11 @@ pub fn make_setup_stage_trb(setup: &[u8; 8], trt: u32) -> Trb {
     let param = u64::from_le_bytes([
         setup[0], setup[1], setup[2], setup[3], setup[4], setup[5], setup[6], setup[7],
     ]);
-    Trb::new(param, 8, (TRB_TYPE_SETUP_STAGE as u32) << 10 | ((trt & 3) << 16) | TRB_IDT)
+    Trb::new(
+        param,
+        8,
+        (TRB_TYPE_SETUP_STAGE as u32) << 10 | ((trt & 3) << 16) | TRB_IDT,
+    )
 }
 
 pub fn make_data_stage_trb(phys: u64, len: u32, dir_in: bool) -> Trb {

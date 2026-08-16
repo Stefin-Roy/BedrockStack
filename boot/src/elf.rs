@@ -154,7 +154,9 @@ pub unsafe fn load_elf(elf_data: &[u8]) -> Result<u64, &'static str> {
         if end_in_file > elf_data.len() {
             return Err("Segment data out of bounds");
         }
-        let seg_end = p_paddr.checked_add(p_memsz).ok_or("segment paddr overflow")?;
+        let seg_end = p_paddr
+            .checked_add(p_memsz)
+            .ok_or("segment paddr overflow")?;
 
         if p_memsz > 0 {
             span_lo = span_lo.min(p_paddr);

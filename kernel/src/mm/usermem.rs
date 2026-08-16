@@ -403,7 +403,9 @@ fn commit_pages(
             for &c in mapped.iter().rev() {
                 if let Some(p) = vmm.translate(c) {
                     vmm.unmap_4k(alloc, c);
-                    unsafe { alloc.free(p); }
+                    unsafe {
+                        alloc.free(p);
+                    }
                 }
             }
             return Err(());
@@ -428,7 +430,9 @@ fn release_pages(vmm: &mut Vmm, alloc: &mut BitmapAllocator, vaddr: u64, npages:
     for _ in 0..npages {
         if let Some(phys) = vmm.translate(va) {
             vmm.unmap_4k(alloc, va);
-            unsafe { alloc.free(phys); }
+            unsafe {
+                alloc.free(phys);
+            }
         }
         va += PAGE;
     }

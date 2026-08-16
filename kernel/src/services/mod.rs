@@ -1,41 +1,41 @@
-pub mod clocksource;
+pub mod acpi;
+pub mod block_device;
 pub mod clockevent;
-pub mod timer_queue;
-pub mod universal_timer;
-pub mod interrupts;
-pub mod phys_mem;
-pub mod virt_mem;
-pub mod serial;
-pub mod platform;
+pub mod clocksource;
 pub mod cpu;
-pub mod pci_config;
+pub mod dma;
 pub mod ecam_pci_config;
+pub mod interrupts;
 pub mod msi;
 pub mod null_msi;
-pub mod dma;
-pub mod block_device;
+pub mod pci_config;
 pub mod pci_device;
-pub mod acpi;
+pub mod phys_mem;
+pub mod platform;
+pub mod serial;
+pub mod timer_queue;
+pub mod universal_timer;
+pub mod virt_mem;
 pub mod wallclock;
 
-#[cfg(target_arch = "x86_64")]
-pub mod x86_64;
 #[cfg(target_arch = "riscv64")]
 pub mod riscv64;
+#[cfg(target_arch = "x86_64")]
+pub mod x86_64;
 
 use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 
-use universal_timer::UniversalTimer;
-use interrupts::InterruptManager;
-use serial::SerialConsole;
-use platform::PlatformControl;
-use cpu::CpuManager;
-use pci_config::PciConfigSpace;
-use msi::MsiAllocator;
-use dma::DmaAllocator;
-use pci_device::PciDeviceManager;
 use acpi::AcpiProvider;
+use cpu::CpuManager;
+use dma::DmaAllocator;
+use interrupts::InterruptManager;
+use msi::MsiAllocator;
+use pci_config::PciConfigSpace;
+use pci_device::PciDeviceManager;
+use platform::PlatformControl;
+use serial::SerialConsole;
+use universal_timer::UniversalTimer;
 
 /// Container for all arch-independent kernel service providers.
 ///
@@ -86,5 +86,7 @@ pub fn set_global(svc: &'static KernelServices) {
 ///
 /// Panics if called before `set_global`.
 pub fn kernel_services() -> &'static KernelServices {
-    *GLOBAL_SERVICES.get().expect("KernelServices global not set")
+    *GLOBAL_SERVICES
+        .get()
+        .expect("KernelServices global not set")
 }

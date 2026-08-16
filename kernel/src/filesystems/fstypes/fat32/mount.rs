@@ -2,18 +2,19 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::string::String;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use hashbrown::HashMap;
 use spin::Mutex;
 
 use crate::filesystems::blockdriver::block_cache::CachedDevice;
 use crate::filesystems::blockdriver::traits::BlockDevice;
+use crate::filesystems::fstypes::FileSystem;
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
-use crate::filesystems::vfs::superblock::{SuperBlock, SuperOps, StatFs};
+use crate::filesystems::vfs::superblock::{StatFs, SuperBlock, SuperOps};
 use crate::filesystems::vfs::types::FileType;
-use crate::filesystems::fstypes::FileSystem;
 
-use super::bpb::{Bpb, parse_bpb, SECTOR_SIZE};
+use super::bpb::{Bpb, SECTOR_SIZE, parse_bpb};
 use super::cache::FatCache;
 use super::io::read_sectors;
 
@@ -25,12 +26,58 @@ pub struct Fat32SuperBlock {
     /// Stable inode numbers keyed by (parent directory cluster, entry name).
     /// FAT has no inode table, so the identity is the namespace location.
     pub(crate) ino_map: Mutex<HashMap<(u32, String), u64>>,
+    /// Shared chain metadata. Unispace resolves paths into fresh inode views,
+    /// so a per-inode chain cache would be discarded after every syscall.
+    pub(crate) chain_cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
     pub(crate) next_alloc_hint: Mutex<u32>,
     pub(crate) free_clus_count: AtomicU32,
     pub(crate) volume_dirty: AtomicBool,
 }
 
 impl Fat32SuperBlock {
+    /// Return a file's cluster chain, building it once per first-cluster key.
+    pub(crate) fn chain_for(&self, first: u32) -> Result<Arc<Vec<u32>>, VfsError> {
+        if first < 2 || first >= super::fat::EOC_MARKER {
+            return Ok(Arc::new(Vec::new()));
+        }
+
+        // Keep the cache lock while building. This prevents concurrent first
+        // reads from walking the same large FAT chain and allocating duplicate
+        // vectors.
+        let mut cache = self.chain_cache.lock();
+        if let Some(chain) = cache.get(&first) {
+            return Ok(Arc::clone(chain));
+        }
+
+        let mut chain = Vec::new();
+        let mut c = first;
+        let mut count: u32 = 0;
+        loop {
+            chain.push(c);
+            let next = self.read_fat_entry(c)?;
+            if next >= super::fat::EOC_MARKER {
+                break;
+            }
+            c = next;
+            count += 1;
+            if count > self.bpb.total_clus + 2 {
+                return Err(VfsError::IOError);
+            }
+        }
+
+        let chain = Arc::new(chain);
+        cache.insert(first, Arc::clone(&chain));
+        Ok(chain)
+    }
+
+    /// Invalidate a chain before its FAT links are changed or its clusters
+    /// are released. A zero first cluster has no cache entry.
+    pub(crate) fn invalidate_chain(&self, first: u32) {
+        if first != 0 {
+            self.chain_cache.lock().remove(&first);
+        }
+    }
+
     /// Stable inode number for an entry.  Allocates on first sight so the same
     /// (parent, name) always maps to the same number, whichever VFS API asks.
     pub fn ino_for(&self, parent_clus: u32, name: &str) -> u64 {
@@ -44,7 +91,9 @@ impl Fat32SuperBlock {
     }
 
     pub fn set_volume_dirty_flag(&self) -> Result<(), VfsError> {
-        if self.volume_dirty.load(Ordering::Relaxed) { return Ok(()); }
+        if self.volume_dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut sector = [0u8; SECTOR_SIZE];
         read_sectors(&*self.device, 0, 1, &mut sector)?;
         sector[0x41] |= 1;
@@ -54,7 +103,9 @@ impl Fat32SuperBlock {
     }
 
     pub fn clear_volume_dirty_flag(&self) -> Result<(), VfsError> {
-        if !self.volume_dirty.load(Ordering::Relaxed) { return Ok(()); }
+        if !self.volume_dirty.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         let mut sector = [0u8; SECTOR_SIZE];
         read_sectors(&*self.device, 0, 1, &mut sector)?;
         sector[0x41] &= !1u8;
@@ -98,14 +149,17 @@ impl SuperOps for Fat32SuperBlock {
 pub struct Fat32FileSystem;
 
 impl FileSystem for Fat32FileSystem {
-    fn name(&self) -> &str { "fat32" }
+    fn name(&self) -> &str {
+        "fat32"
+    }
 
-    fn mount(&self, device: Option<Arc<dyn BlockDevice>>)
-             -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>
-    {
-        use crate::filesystems::vfs::inode::Inode;
-        use super::inode::Fat32Inode;
+    fn mount(
+        &self,
+        device: Option<Arc<dyn BlockDevice>>,
+    ) -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError> {
         use super::fat::FSINFO_LEAD_SIG;
+        use super::inode::Fat32Inode;
+        use crate::filesystems::vfs::inode::Inode;
 
         let dev = device.ok_or(VfsError::InvalidDevice)?;
         let cached = CachedDevice::new(dev.clone());
@@ -125,6 +179,7 @@ impl FileSystem for Fat32FileSystem {
             fat_cache: Mutex::new(FatCache::new()),
             next_ino: AtomicU64::new(2),
             ino_map: Mutex::new(HashMap::new()),
+            chain_cache: Mutex::new(HashMap::new()),
             next_alloc_hint: Mutex::new(2),
             free_clus_count: AtomicU32::new(0),
             volume_dirty: AtomicBool::new(false),
@@ -141,7 +196,8 @@ impl FileSystem for Fat32FileSystem {
                 if sector[0..4] == FSINFO_LEAD_SIG.to_le_bytes()
                     && sector[484..488] == FSINFO_STRUCT_SIG.to_le_bytes()
                 {
-                    let hint = u32::from_le_bytes([sector[492], sector[493], sector[494], sector[495]]);
+                    let hint =
+                        u32::from_le_bytes([sector[492], sector[493], sector[494], sector[495]]);
                     if hint >= 2 && hint < 2 + bpb.total_clus {
                         *sb.next_alloc_hint.lock() = hint;
                     }
@@ -167,8 +223,6 @@ impl FileSystem for Fat32FileSystem {
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
             write_lock: Mutex::new(()),
-            chain_cache: Mutex::new(None),
-            chain_cache_dirty: AtomicBool::new(false),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(Inode::new(root_ops.clone()));

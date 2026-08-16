@@ -2,9 +2,9 @@ use core::sync::atomic::Ordering;
 
 use crate::filesystems::vfs::error::VfsError;
 
-use super::io::read_sectors;
 use super::bpb::SECTOR_SIZE;
 use super::fat::{EOC_MARKER, FREE_CLUSTER, FSINFO_LEAD_SIG, FSINFO_STRUCT_SIG, FSINFO_TRAIL_SIG};
+use super::io::read_sectors;
 
 macro_rules! fat_trace {
     ($($arg:tt)*) => {
@@ -17,7 +17,9 @@ use super::mount::Fat32SuperBlock;
 
 impl Fat32SuperBlock {
     pub fn alloc_cluster(&self) -> Result<u32, VfsError> {
-        fat_trace!(crate::drivers::serial::SerialPort::puts("[DBG:fat32] alloc_cluster\n"));
+        fat_trace!(crate::drivers::serial::SerialPort::puts(
+            "[DBG:fat32] alloc_cluster\n"
+        ));
         let mut hint = self.next_alloc_hint.lock();
         let n = self.bpb.total_clus;
         for i in 0..n {
@@ -75,7 +77,9 @@ impl Fat32SuperBlock {
     }
 
     pub fn write_fsinfo(&self) -> Result<(), VfsError> {
-        if !self.bpb.fsinfo_is_valid() { return Ok(()); }
+        if !self.bpb.fsinfo_is_valid() {
+            return Ok(());
+        }
         let sec = self.bpb.fsinfo_sec as u64;
         let mut buf = [0u8; SECTOR_SIZE];
         read_sectors(&*self.device, sec, 1, &mut buf)?;

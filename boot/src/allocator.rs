@@ -47,7 +47,9 @@ unsafe impl GlobalAlloc for OsDataAllocator {
 
         let aligned = (base + size_of::<usize>() + align - 1) & !(align - 1);
         // Store the original pool pointer just below the aligned address.
-        unsafe { *((aligned - size_of::<usize>()) as *mut usize) = base; }
+        unsafe {
+            *((aligned - size_of::<usize>()) as *mut usize) = base;
+        }
         aligned as *mut u8
     }
 

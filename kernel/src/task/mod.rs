@@ -14,8 +14,8 @@
 //! User-mode entry (`enter_userspace`) builds an iretq frame and an initial
 //! context pointing at `user_iret`.
 
-mod switch;
 pub mod load;
+mod switch;
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
@@ -139,7 +139,9 @@ fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
         let va = base + (i as u64) * 4096;
         if let Some(phys) = vmm.translate(va) {
             vmm.unmap_4k(alloc, va);
-            unsafe { alloc.free(phys); }
+            unsafe {
+                alloc.free(phys);
+            }
         }
     }
 }
@@ -236,11 +238,7 @@ pub fn current_vm() -> Option<usize> {
     }
     let t = unsafe { &*(pc.current_task as *const Task) };
     let vm = t.vm;
-    if vm == 0 {
-        None
-    } else {
-        Some(vm)
-    }
+    if vm == 0 { None } else { Some(vm) }
 }
 
 /// Enqueue a task for the scheduler. Returns its id.
@@ -481,7 +479,10 @@ pub fn kill(pid: u64) -> Result<(), ()> {
             cur.as_ref().map(|t| t.id == pid).unwrap_or(false)
         };
         if is_self {
-            CURRENT.lock().as_mut().map(|t| t.exit_code = KILLED_EXIT_CODE);
+            CURRENT
+                .lock()
+                .as_mut()
+                .map(|t| t.exit_code = KILLED_EXIT_CODE);
             kill_current(); // diverges: marked Dead and parked, never returns
         }
     }
@@ -760,7 +761,11 @@ pub fn task_args(pid: u64) -> Option<String> {
 
 /// The retained exit code of a zombie `pid`, if any.
 pub fn task_exit_code(pid: u64) -> Option<u64> {
-    ZOMBIES.lock().iter().find(|t| t.id == pid).map(|t| t.exit_code)
+    ZOMBIES
+        .lock()
+        .iter()
+        .find(|t| t.id == pid)
+        .map(|t| t.exit_code)
 }
 
 /// Tear down one dead task: destroy its private page tables, free its kernel
@@ -785,7 +790,9 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
     }
     let raw = &mut *task as *mut Task;
     crate::unispace::provider::proc::detach(task.id);
-    unsafe { drop(Box::from_raw(raw)); }
+    unsafe {
+        drop(Box::from_raw(raw));
+    }
 }
 
 /// Reclaim dead tasks, freeing their user page tables, kernel stacks, and task
@@ -876,7 +883,9 @@ pub fn schedule() {
                     if p.state == TaskState::Dead {
                         park_zombie(p);
                     }
-                    unsafe { switch_to(pctx, idle_ctx(), root); }
+                    unsafe {
+                        switch_to(pctx, idle_ctx(), root);
+                    }
                     return;
                 }
                 Some(p) => {
@@ -906,18 +915,24 @@ pub fn schedule() {
             if p.state == TaskState::Dead {
                 park_zombie(p);
             }
-            unsafe { switch_to(pctx, next_ptr, next_root); }
+            unsafe {
+                switch_to(pctx, next_ptr, next_root);
+            }
         }
         Some(p) => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             p.state = TaskState::Ready;
             q.push_back(p);
             drop(q);
-            unsafe { switch_to(pctx, next_ptr, next_root); }
+            unsafe {
+                switch_to(pctx, next_ptr, next_root);
+            }
         }
         None => {
             drop(q);
-            unsafe { switch_to(idle_ctx(), next_ptr, next_root); }
+            unsafe {
+                switch_to(idle_ctx(), next_ptr, next_root);
+            }
         }
     }
 }
@@ -941,16 +956,17 @@ pub fn enter_userspace(
 ) -> u64 {
     // This task gets its own slot in the fixed kernel-stack window; the iretq
     // frame lives on top of it.
-    let (kernel_stack_top, slot) = alloc_kernel_stack(alloc).expect("enter_userspace: no kernel stack slot");
+    let (kernel_stack_top, slot) =
+        alloc_kernel_stack(alloc).expect("enter_userspace: no kernel stack slot");
     // 5-word iretq frame at the top of the kernel stack (RIP, CS, RFLAGS,
     // RSP, SS) — `user_iret` pops exactly this.
     let frame_base = kernel_stack_top - 40;
     unsafe {
-        *(frame_base as *mut u64) = entry;          // RIP
-        *(frame_base as *mut u64).add(1) = 0x2B;    // user CS
-        *(frame_base as *mut u64).add(2) = 0x202;   // RFLAGS: IF set
+        *(frame_base as *mut u64) = entry; // RIP
+        *(frame_base as *mut u64).add(1) = 0x2B; // user CS
+        *(frame_base as *mut u64).add(2) = 0x202; // RFLAGS: IF set
         *(frame_base as *mut u64).add(3) = user_stack_top;
-        *(frame_base as *mut u64).add(4) = 0x23;    // user SS
+        *(frame_base as *mut u64).add(4) = 0x23; // user SS
     }
 
     // Kernel GS pair: GS.base = PerCpu, KERNEL_GS_BASE = user GS. `user_iret`
@@ -989,7 +1005,20 @@ pub fn enter_userspace(
     loop {
         match process_state(pid) {
             Some(TaskState::Dead) | None => break,
-            _ => schedule(),
+            _ => {
+                // Requeue sleepers whose deadline has passed.  Without this,
+                // a kernel task parked via sleep_current (e.g. the audio
+                // pump) alongside a parked INIT would leave the scheduler
+                // with nothing ready, and this idle loop would spin forever
+                // waking nobody — a permanent freeze.
+                wake_sleepers();
+                schedule();
+                // Park until the earliest sleeping deadline so the loop
+                // doesn't hot-spin while only sleepers remain.
+                if let Some(d) = earliest_sleep_deadline() {
+                    crate::services::universal_timer::wait_until(d.saturating_add(1));
+                }
+            }
         }
     }
     pid
@@ -1039,12 +1068,16 @@ pub fn smoke_test(alloc: &mut BitmapAllocator) {
     let (top_b, slot_b) = alloc_kernel_stack(alloc).expect("smoke: kernel stack slots exhausted");
     // Entry RSP must be 8 mod 16 (SysV callee entry) — top minus 8.
     let mut ta = Task::new(
-        top_a, root, 0,
+        top_a,
+        root,
+        0,
         TaskContext::new(top_a - 8, smoke_task_a as *const () as usize as u64),
     );
     ta.kstack_slot = slot_a;
     let mut tb = Task::new(
-        top_b, root, 0,
+        top_b,
+        root,
+        0,
         TaskContext::new(top_b - 8, smoke_task_b as *const () as usize as u64),
     );
     tb.kstack_slot = slot_b;

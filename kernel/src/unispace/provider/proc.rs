@@ -51,27 +51,63 @@ use super::super::{ListingEntry, Object, ObjectKind, UnispaceError};
 
 /// Scheduler task states, in wire order (matches `TaskState`).
 static PROC_STATE_VARIANTS: [EnumVariant; 4] = [
-    EnumVariant { name: "ready", value: 0 },
-    EnumVariant { name: "running", value: 1 },
-    EnumVariant { name: "zzz", value: 2 },
-    EnumVariant { name: "dead", value: 3 },
+    EnumVariant {
+        name: "ready",
+        value: 0,
+    },
+    EnumVariant {
+        name: "running",
+        value: 1,
+    },
+    EnumVariant {
+        name: "zzz",
+        value: 2,
+    },
+    EnumVariant {
+        name: "dead",
+        value: 3,
+    },
 ];
 
 /// `read(/proc/<pid>/status)`: `struct{ pid: u64, state: enum, exit_code: u64 }`.
 /// `exit_code` is the retained code of a zombie (0 for a live task).
 static STATUS: Schema = Schema::Struct(&[
-    schema::Field { name: "pid", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "state", ty: &Schema::Enum(&PROC_STATE_VARIANTS) },
-    schema::Field { name: "exit_code", ty: &schema::SCHEMA_U64 },
+    schema::Field {
+        name: "pid",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "state",
+        ty: &Schema::Enum(&PROC_STATE_VARIANTS),
+    },
+    schema::Field {
+        name: "exit_code",
+        ty: &schema::SCHEMA_U64,
+    },
 ]);
 
 /// `read(/proc/<pid>/mem)`: eager user-memory snapshot from `mm::usermem`.
 static MEM: Schema = Schema::Struct(&[
-    schema::Field { name: "root", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "brk", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "stack_top", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "committed_pages", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "budget_pages", ty: &schema::SCHEMA_U64 },
+    schema::Field {
+        name: "root",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "brk",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "stack_top",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "committed_pages",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "budget_pages",
+        ty: &schema::SCHEMA_U64,
+    },
 ]);
 
 /// `write(/proc/<pid>:exit, { code })`.
@@ -88,8 +124,14 @@ static KILL_INPUT: Schema = Schema::Struct(&[schema::Field {
 
 /// `write(/proc/<pid>:spawn, { path, args })`.
 static SPAWN_INPUT: Schema = Schema::Struct(&[
-    schema::Field { name: "path", ty: &schema::SCHEMA_STR },
-    schema::Field { name: "args", ty: &schema::SCHEMA_STR },
+    schema::Field {
+        name: "path",
+        ty: &schema::SCHEMA_STR,
+    },
+    schema::Field {
+        name: "args",
+        ty: &schema::SCHEMA_STR,
+    },
 ]);
 
 /// `spawn` output: the new task's pid.
@@ -115,9 +157,18 @@ static BRK_OUTPUT: Schema = Schema::Struct(&[schema::Field {
 /// `write(/proc/self:mmap, { addr, len, prot })` — eagerly commit `len` zeroed
 /// anonymous pages. `{addr: 0}` picks the first free gap above the break.
 static MMAP_INPUT: Schema = Schema::Struct(&[
-    schema::Field { name: "addr", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "len", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "prot", ty: &schema::SCHEMA_U64 },
+    schema::Field {
+        name: "addr",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "len",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "prot",
+        ty: &schema::SCHEMA_U64,
+    },
 ]);
 
 /// `mmap` output: the mapping base.
@@ -128,8 +179,14 @@ static MMAP_OUTPUT: Schema = Schema::Struct(&[schema::Field {
 
 /// `write(/proc/<pid>:munmap, { addr, len })` — release whole anonymous regions.
 static MUNMAP_INPUT: Schema = Schema::Struct(&[
-    schema::Field { name: "addr", ty: &schema::SCHEMA_U64 },
-    schema::Field { name: "len", ty: &schema::SCHEMA_U64 },
+    schema::Field {
+        name: "addr",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "len",
+        ty: &schema::SCHEMA_U64,
+    },
 ]);
 
 /// `write(/proc/<pid>:wait, { pid })` — block until the target child exits and
@@ -146,14 +203,46 @@ static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
 }]);
 
 static PROC_METHODS: [MethodDesc; 8] = [
-    MethodDesc { name: "exit", input: &EXIT_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "yield", input: &schema::SCHEMA_UNIT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "kill", input: &KILL_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "spawn", input: &SPAWN_INPUT, output: &SPAWN_OUTPUT },
-    MethodDesc { name: "brk", input: &BRK_INPUT, output: &BRK_OUTPUT },
-    MethodDesc { name: "mmap", input: &MMAP_INPUT, output: &MMAP_OUTPUT },
-    MethodDesc { name: "munmap", input: &MUNMAP_INPUT, output: &schema::SCHEMA_UNIT },
-    MethodDesc { name: "wait", input: &WAIT_INPUT, output: &WAIT_OUTPUT },
+    MethodDesc {
+        name: "exit",
+        input: &EXIT_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "yield",
+        input: &schema::SCHEMA_UNIT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "kill",
+        input: &KILL_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "spawn",
+        input: &SPAWN_INPUT,
+        output: &SPAWN_OUTPUT,
+    },
+    MethodDesc {
+        name: "brk",
+        input: &BRK_INPUT,
+        output: &BRK_OUTPUT,
+    },
+    MethodDesc {
+        name: "mmap",
+        input: &MMAP_INPUT,
+        output: &MMAP_OUTPUT,
+    },
+    MethodDesc {
+        name: "munmap",
+        input: &MUNMAP_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "wait",
+        input: &WAIT_INPUT,
+        output: &WAIT_OUTPUT,
+    },
 ];
 
 // ── Registry ─────────────────────────────────────────────────────────
@@ -226,9 +315,17 @@ impl Object for ProcRoot {
     fn resolve(&self, name: &str) -> Option<Arc<dyn Object>> {
         if name == "self" {
             let cur = current_pid()?;
-            return procs().lock().get(&pid_key(cur)).cloned().map(|p| p as Arc<dyn Object>);
+            return procs()
+                .lock()
+                .get(&pid_key(cur))
+                .cloned()
+                .map(|p| p as Arc<dyn Object>);
         }
-        procs().lock().get(name).cloned().map(|p| p as Arc<dyn Object>)
+        procs()
+            .lock()
+            .get(name)
+            .cloned()
+            .map(|p| p as Arc<dyn Object>)
     }
 
     fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
@@ -236,10 +333,16 @@ impl Object for ProcRoot {
         let mut names: Vec<String> = guard.keys().cloned().collect();
         names.sort();
         for n in names {
-            out.push(ListingEntry { name: n, kind: ObjectKind::Dir });
+            out.push(ListingEntry {
+                name: n,
+                kind: ObjectKind::Dir,
+            });
         }
         if current_pid().is_some() {
-            out.push(ListingEntry { name: String::from("self"), kind: ObjectKind::Dir });
+            out.push(ListingEntry {
+                name: String::from("self"),
+                kind: ObjectKind::Dir,
+            });
         }
         Ok(())
     }
@@ -421,7 +524,11 @@ impl Object for StatusObject {
             crate::task::TaskState::Dead => 3,
         };
         let exit_code = crate::task::task_exit_code(self.pid).unwrap_or(0);
-        let v = Value::Struct(vec![Value::U64(self.pid), Value::Enum(disc), Value::U64(exit_code)]);
+        let v = Value::Struct(vec![
+            Value::U64(self.pid),
+            Value::Enum(disc),
+            Value::U64(exit_code),
+        ]);
         schema::encode_value(&v, &STATUS, out)
     }
 
@@ -594,7 +701,8 @@ impl Object for StdStream {
                     loop {
                         if self.buf.lock().is_empty() {
                             crate::task::sleep_until(
-                                crate::services::universal_timer::now_ns().saturating_add(2_000_000),
+                                crate::services::universal_timer::now_ns()
+                                    .saturating_add(2_000_000),
                             );
                             continue;
                         }
@@ -625,7 +733,11 @@ struct StdDir {
 
 impl StdDir {
     fn of(p: &ProcDir) -> Self {
-        StdDir { input: p.stdin.clone(), output: p.stdout.clone(), err: p.stderr.clone() }
+        StdDir {
+            input: p.stdin.clone(),
+            output: p.stdout.clone(),
+            err: p.stderr.clone(),
+        }
     }
 }
 
@@ -697,8 +809,8 @@ fn spawn_proc(path: &str, args: &str, out: &mut Vec<u8>) -> Result<(), UnispaceE
     super::super::read(path, &mut elf, usize::MAX)?;
 
     let alloc = crate::mm::heap::get_phys_allocator_mut();
-    let (root, entry, user_stack_top, vm) = crate::task::load::create_process(&elf, alloc)
-        .map_err(|_| UnispaceError::DecodeError)?;
+    let (root, entry, user_stack_top, vm) =
+        crate::task::load::create_process(&elf, alloc).map_err(|_| UnispaceError::DecodeError)?;
 
     let (kernel_stack_top, slot) =
         crate::task::alloc_kernel_stack(alloc).ok_or(UnispaceError::Unsupported)?;

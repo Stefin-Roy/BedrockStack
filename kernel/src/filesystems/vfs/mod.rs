@@ -1,8 +1,8 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use alloc::string::String;
 
 use crate::filesystems::fstypes;
 
@@ -108,7 +108,10 @@ pub fn init() -> Result<(), VfsError> {
 
     // Set CWD to A> root
     let root = DRIVE_MAP.lookup('A')?.root.clone();
-    *CWD.lock() = Some(CurrentWorkingDirectory { drive: 'A', dentry: root });
+    *CWD.lock() = Some(CurrentWorkingDirectory {
+        drive: 'A',
+        dentry: root,
+    });
 
     VFS_INIT.store(true, Ordering::SeqCst);
     log::info!("VFS: A> (tmpfs) ready");
@@ -250,7 +253,10 @@ pub fn chdir(path: &str) -> Result<(), VfsError> {
         }
     }
     let mut cwd = CWD.lock();
-    *cwd = Some(CurrentWorkingDirectory { drive: letter, dentry });
+    *cwd = Some(CurrentWorkingDirectory {
+        drive: letter,
+        dentry,
+    });
     Ok(())
 }
 
@@ -302,7 +308,9 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
 
     let existing = {
         let inode_lock = parent.inode.lock();
-        inode_lock.as_ref().and_then(|p| p.ops.lookup(&leaf_name).ok())
+        inode_lock
+            .as_ref()
+            .and_then(|p| p.ops.lookup(&leaf_name).ok())
     };
 
     // O_EXCL: fail if file already exists
@@ -329,8 +337,7 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
                 None => {
                     let cd = Dentry::new(&leaf_name, Some(inode.clone()));
                     *cd.parent.lock() = Arc::downgrade(&parent);
-                    let parent_ino = parent.inode.lock()
-                        .as_ref().map(|i| i.ino).unwrap_or(0);
+                    let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
                     dcache().insert(parent_ino, leaf_name.clone(), Arc::downgrade(&cd));
                     children.insert(leaf_name.clone(), cd);
                 }
@@ -359,15 +366,19 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
             let inode = Arc::new(Inode::new(child_ops));
             let child_dentry = Dentry::new(&leaf_name, Some(inode.clone()));
             *child_dentry.parent.lock() = Arc::downgrade(&parent);
-            parent.children.lock().insert(leaf_name.clone(), child_dentry.clone());
-            let parent_ino = parent.inode.lock()
-                .as_ref().map(|i| i.ino).unwrap_or(0);
+            parent
+                .children
+                .lock()
+                .insert(leaf_name.clone(), child_dentry.clone());
+            let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
             dcache().insert(parent_ino, leaf_name.clone(), Arc::downgrade(&child_dentry));
             inode
         }
     };
 
-    let fd_dentry = parent.children.lock()
+    let fd_dentry = parent
+        .children
+        .lock()
         .get(&leaf_name)
         .cloned()
         .ok_or(VfsError::NotFound)?;
@@ -435,7 +446,9 @@ pub fn seek(fd: u32, whence: SeekFrom) -> Result<u64, VfsError> {
     let new_pos = match whence {
         SeekFrom::Start(o) => o as i64,
         SeekFrom::Current(o) => (*pos as i64).checked_add(o).ok_or(VfsError::InvalidInput)?,
-        SeekFrom::End(o) => (file.inode.ops.size() as i64).checked_add(o).ok_or(VfsError::InvalidInput)?,
+        SeekFrom::End(o) => (file.inode.ops.size() as i64)
+            .checked_add(o)
+            .ok_or(VfsError::InvalidInput)?,
     };
     if new_pos < 0 {
         return Err(VfsError::InvalidInput);
@@ -463,17 +476,22 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
     *child.parent.lock() = Arc::downgrade(&parent);
     parent.children.lock().insert(name.clone(), child.clone());
 
-    let parent_ino = parent.inode.lock()
-        .as_ref().map(|i| i.ino).unwrap_or(0);
+    let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
     dcache().insert(parent_ino, name, Arc::downgrade(&child));
     Ok(())
 }
 
 pub fn rmdir(path: &str) -> Result<(), VfsError> {
     let (parent, name) = resolve_parent(path)?;
-    if name == "." || name == ".." { return Err(VfsError::InvalidInput); }
-    let parent_ino = parent.inode.lock()
-        .as_ref().map(|i| i.ino).ok_or(VfsError::NotFound)?;
+    if name == "." || name == ".." {
+        return Err(VfsError::InvalidInput);
+    }
+    let parent_ino = parent
+        .inode
+        .lock()
+        .as_ref()
+        .map(|i| i.ino)
+        .ok_or(VfsError::NotFound)?;
 
     // Signal the child inode that it will be unlinked, before dropping the
     // dentry reference (which may drop the inode if no handles are open).
@@ -507,21 +525,29 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, VfsError> {
     let mut entries = inode.ops.readdir()?;
 
     // Prepend . and ..
-    let parent_ino = dentry.parent.lock()
+    let parent_ino = dentry
+        .parent
+        .lock()
         .upgrade()
         .and_then(|p| p.inode.lock().as_ref().map(|i| i.ino))
         .unwrap_or(inode.ino);
 
-    entries.insert(0, DirEntry {
-        ino: parent_ino,
-        name: String::from(".."),
-        file_type: FileType::Directory,
-    });
-    entries.insert(0, DirEntry {
-        ino: inode.ino,
-        name: String::from("."),
-        file_type: FileType::Directory,
-    });
+    entries.insert(
+        0,
+        DirEntry {
+            ino: parent_ino,
+            name: String::from(".."),
+            file_type: FileType::Directory,
+        },
+    );
+    entries.insert(
+        0,
+        DirEntry {
+            ino: inode.ino,
+            name: String::from("."),
+            file_type: FileType::Directory,
+        },
+    );
 
     Ok(entries)
 }
@@ -532,8 +558,12 @@ pub fn readdir(path: &str) -> Result<Vec<DirEntry>, VfsError> {
 
 pub fn unlink(path: &str) -> Result<(), VfsError> {
     let (parent, name) = resolve_parent(path)?;
-    let parent_ino = parent.inode.lock()
-        .as_ref().map(|i| i.ino).ok_or(VfsError::NotFound)?;
+    let parent_ino = parent
+        .inode
+        .lock()
+        .as_ref()
+        .map(|i| i.ino)
+        .ok_or(VfsError::NotFound)?;
 
     // Reject unlinking directories (use rmdir instead)
     if let Some(child) = parent.children.lock().get(&name) {
@@ -653,8 +683,7 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
         if let Some(child) = old_parent.children.lock().remove(&old_name) {
             *child.name.lock() = new_name.clone();
             *child.parent.lock() = Arc::downgrade(&new_parent);
-            let new_ino = new_parent.inode.lock()
-                .as_ref().map(|i| i.ino).unwrap_or(0);
+            let new_ino = new_parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
             dcache().insert(new_ino, new_name.clone(), Arc::downgrade(&child));
             new_parent.children.lock().insert(new_name.clone(), child);
         }

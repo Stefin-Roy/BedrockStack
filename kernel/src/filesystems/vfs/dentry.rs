@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use alloc::sync::{Arc, Weak};
 use alloc::string::String;
+use alloc::sync::{Arc, Weak};
 
 use hashbrown::HashMap;
 use spin::Once;

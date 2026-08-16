@@ -29,7 +29,13 @@ impl TimerEntry {
         callback: TimerCallback,
         context: *mut u8,
     ) -> Self {
-        TimerEntry { id, deadline, period, callback, context }
+        TimerEntry {
+            id,
+            deadline,
+            period,
+            callback,
+            context,
+        }
     }
 }
 
@@ -63,7 +69,9 @@ pub struct TimerQueue {
 
 impl TimerQueue {
     pub fn new() -> Self {
-        TimerQueue { heap: BinaryHeap::new() }
+        TimerQueue {
+            heap: BinaryHeap::new(),
+        }
     }
 
     pub fn len(&self) -> usize {

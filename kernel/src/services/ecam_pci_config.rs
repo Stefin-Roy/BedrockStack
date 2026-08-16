@@ -3,8 +3,6 @@ use super::pci_config::PciConfigSpace;
 /// ECAM-based PCI config space access, shared across both architectures.
 pub struct EcamPciConfig;
 
-
-
 impl PciConfigSpace for EcamPciConfig {
     fn read8(&self, seg: u16, bus: u8, dev: u8, func: u8, off: u16) -> u8 {
         crate::pci::ecam::read_u8(seg, bus, dev, func, off)

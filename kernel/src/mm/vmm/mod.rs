@@ -7,15 +7,19 @@
 
 #[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::AtomicUsize;
+use core::sync::atomic::{AtomicU64, Ordering};
 #[cfg(target_arch = "x86_64")]
 use spin::Mutex;
 
 use crate::mm::phys_alloc::BitmapAllocator;
 
 // Re-export arch-specific activation helpers so callers can switch tables.
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::activate;
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::translate_user;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::activate;
 #[cfg(target_arch = "x86_64")]
@@ -30,15 +34,11 @@ pub use self::x86_64::make_read_only;
 pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::translate_user;
-#[cfg(target_arch = "riscv64")]
-pub use self::riscv64::activate;
-#[cfg(target_arch = "riscv64")]
-pub use self::riscv64::translate_user;
 
-#[cfg(target_arch = "x86_64")]
-mod x86_64;
 #[cfg(target_arch = "riscv64")]
 mod riscv64;
+#[cfg(target_arch = "x86_64")]
+mod x86_64;
 
 // ── Page flags (architecture-independent) ───────────────────────────
 
@@ -49,11 +49,11 @@ mod riscv64;
 pub struct PageFlags(u8);
 
 impl PageFlags {
-    pub const READ:    Self = Self(1 << 0);
-    pub const WRITE:   Self = Self(1 << 1);
+    pub const READ: Self = Self(1 << 0);
+    pub const WRITE: Self = Self(1 << 1);
     pub const EXECUTE: Self = Self(1 << 2);
     pub const NO_CACHE: Self = Self(1 << 3);
-    pub const USER:    Self = Self(1 << 4); // future user-space
+    pub const USER: Self = Self(1 << 4); // future user-space
     pub const WRITE_COMBINING: Self = Self(1 << 5); // WC (via PAT on x86_64)
 
     pub fn contains(self, other: Self) -> bool {
@@ -68,21 +68,31 @@ impl PageFlags {
 // Allow combining flags with `|`.
 impl core::ops::BitOr for PageFlags {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { Self(self.0 | rhs.0) }
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
 }
 impl core::ops::BitOrAssign for PageFlags {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 impl core::ops::BitAnd for PageFlags {
     type Output = Self;
-    fn bitand(self, rhs: Self) -> Self { Self(self.0 & rhs.0) }
+    fn bitand(self, rhs: Self) -> Self {
+        Self(self.0 & rhs.0)
+    }
 }
 impl core::ops::Not for PageFlags {
     type Output = Self;
-    fn not(self) -> Self { Self(!self.0) }
+    fn not(self) -> Self {
+        Self(!self.0)
+    }
 }
 impl core::ops::BitAndAssign for PageFlags {
-    fn bitand_assign(&mut self, rhs: Self) { self.0 &= rhs.0; }
+    fn bitand_assign(&mut self, rhs: Self) {
+        self.0 &= rhs.0;
+    }
 }
 
 // ── Constants ─────────────────────────────────────────────────────────
@@ -116,7 +126,10 @@ impl Vmm {
         unsafe {
             core::ptr::write_bytes(crate::mm::layout::to_physmap(root) as *mut u8, 0, 4096);
         }
-        Vmm { root, alloc: alloc as *mut BitmapAllocator }
+        Vmm {
+            root,
+            alloc: alloc as *mut BitmapAllocator,
+        }
     }
 
     /// Wrap an existing root frame — no allocation.  The internal allocator
@@ -124,7 +137,10 @@ impl Vmm {
     /// registered, otherwise `null` (callers that map must pass an allocator
     /// to the inherent methods, or call `set_alloc` first).
     pub fn from_root(root: u64) -> Self {
-        Vmm { root, alloc: crate::mm::heap::phys_allocator_raw() }
+        Vmm {
+            root,
+            alloc: crate::mm::heap::phys_allocator_raw(),
+        }
     }
 
     /// Bind an allocator to this VMM so the allocator-independent trait
@@ -138,7 +154,9 @@ impl Vmm {
         self.alloc
     }
 
-    pub fn root(&self) -> u64 { self.root }
+    pub fn root(&self) -> u64 {
+        self.root
+    }
 
     // ── Mapping ─────────────────────────────────────────────────────
 
@@ -326,7 +344,10 @@ impl Vmm {
 pub fn flush_tlb() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!("mov rax, cr3; mov cr3, rax", options(nostack, preserves_flags));
+        core::arch::asm!(
+            "mov rax, cr3; mov cr3, rax",
+            options(nostack, preserves_flags)
+        );
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
@@ -365,6 +386,25 @@ static TLB_SEQ: AtomicU64 = AtomicU64::new(0);
 /// flushed and acknowledged.
 static TLB_ACK: [AtomicU64; crate::smp::MAX_CPUS] =
     [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Publish a shootdown acknowledgement without ever moving it backwards.
+///
+/// Shootdowns may overlap on different CPUs.  A plain `store(seq)` is unsafe:
+/// a CPU can acknowledge a newer generation from an IPI and then resume an
+/// older local shootdown which stores its smaller sequence number.  The CPU
+/// that issued the newer shootdown would then wait forever for an
+/// acknowledgement that had already happened.
+fn acknowledge_tlb(seq: u64) {
+    let cpu = crate::smp::current_cpu_id() as usize;
+    let ack = &TLB_ACK[cpu];
+    let mut current = ack.load(Ordering::Acquire);
+    while current < seq {
+        match ack.compare_exchange_weak(current, seq, Ordering::Release, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => current = observed,
+        }
+    }
+}
 
 /// Number of live cloned roots (from `clone_high_half`).  Clones share the
 /// parent's higher-half PDPT/PD/PT subtrees, so intermediate table frames can
@@ -439,7 +479,10 @@ const PENDING_CAPACITY: usize = 256;
 
 impl PendingFrames {
     pub fn new() -> Self {
-        PendingFrames { frames: [0; PENDING_CAPACITY], len: 0 }
+        PendingFrames {
+            frames: [0; PENDING_CAPACITY],
+            len: 0,
+        }
     }
 
     /// Record a frame to be freed once the shootdown completes.
@@ -463,7 +506,9 @@ impl PendingFrames {
     /// referencing these frames (i.e. after `shootdown_tlb`).
     pub fn flush(&mut self, alloc: &mut BitmapAllocator) {
         for i in 0..self.len {
-            unsafe { alloc.free(self.frames[i]); }
+            unsafe {
+                alloc.free(self.frames[i]);
+            }
         }
         self.len = 0;
     }
@@ -487,7 +532,7 @@ pub fn shootdown_tlb() {
     let my = crate::smp::current_cpu_id() as usize;
     let seq = TLB_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     // The local CPU was flushed by the caller before the seq bump.
-    TLB_ACK[my].store(seq, Ordering::Release);
+    acknowledge_tlb(seq);
 
     let count = crate::smp::cpu_count() as usize;
 
@@ -529,9 +574,8 @@ pub fn shootdown_tlb() {
 /// software-IPI branch on riscv64) on every online CPU.
 pub fn tlb_shootdown_on_this_cpu() {
     flush_tlb();
-    let my = crate::smp::current_cpu_id() as usize;
     let seq = TLB_SEQ.load(Ordering::Acquire);
-    TLB_ACK[my].store(seq, Ordering::Release);
+    acknowledge_tlb(seq);
 }
 
 // ── VirtualMemoryManager provider ─────────────────────────────────────
@@ -541,8 +585,6 @@ pub fn tlb_shootdown_on_this_cpu() {
 // kept for early-boot/explicit callers; the provider methods reuse the
 // stored allocator.
 use crate::services::virt_mem::VirtualMemoryManager;
-
-
 
 impl VirtualMemoryManager for Vmm {
     fn map(&mut self, vaddr: u64, paddr: u64, size: u64, flags: PageFlags) {

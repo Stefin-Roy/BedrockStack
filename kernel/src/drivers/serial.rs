@@ -196,7 +196,11 @@ fn write_hex(mut val: u64) {
     while val > 0 {
         i -= 1;
         let digit = (val & 0xF) as u8;
-        buf[i] = if digit < 10 { b'0' + digit } else { b'a' + digit - 10 };
+        buf[i] = if digit < 10 {
+            b'0' + digit
+        } else {
+            b'a' + digit - 10
+        };
         val >>= 4;
     }
     for &b in &buf[i..] {

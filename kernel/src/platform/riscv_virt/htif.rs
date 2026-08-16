@@ -23,5 +23,9 @@ pub fn shutdown() -> ! {
             }
         }
     }
-    loop { unsafe { core::arch::asm!("wfi"); } }
+    loop {
+        unsafe {
+            core::arch::asm!("wfi");
+        }
+    }
 }

@@ -1,8 +1,8 @@
 use super::pci_config::PciConfigSpace;
 
+pub use crate::pci::PciDevice;
 pub use crate::pci::bar::Bar;
 pub use crate::pci::caps::PciCapability;
-pub use crate::pci::PciDevice;
 
 pub trait PciDeviceManager: Send + Sync {
     fn devices(&self) -> &[PciDevice];
@@ -12,13 +12,7 @@ pub trait PciDeviceManager: Send + Sync {
         self.find_capability(dev, cap_id).is_some()
     }
     fn cfg(&self) -> &dyn PciConfigSpace;
-    fn configure_msi(
-        &self,
-        dev: &PciDevice,
-        cap: &PciCapability,
-        vector: u8,
-        dest_apic_id: u8,
-    );
+    fn configure_msi(&self, dev: &PciDevice, cap: &PciCapability, vector: u8, dest_apic_id: u8);
     fn configure_msix(
         &self,
         dev: &PciDevice,

@@ -37,30 +37,63 @@ use super::super::dir::SimpleDir;
 use super::super::schema::{self, EnumVariant, Field, MethodDesc, Schema, Value};
 use super::super::{Object, ObjectKind, UnispaceError};
 
-use crate::input::keymap::Keymap;
 #[cfg(target_arch = "x86_64")]
 use crate::input::InputType;
+use crate::input::keymap::Keymap;
 
 // ── Schemas ──────────────────────────────────────────────────────────
 
 /// `InputType` discriminants, in wire order (matches `crate::input`).
 static INPUT_TYPE_VARIANTS: [EnumVariant; 6] = [
-    EnumVariant { name: "key", value: 1 },
-    EnumVariant { name: "mouse", value: 2 },
-    EnumVariant { name: "touch", value: 3 },
-    EnumVariant { name: "gamepad", value: 4 },
-    EnumVariant { name: "axis", value: 5 },
-    EnumVariant { name: "custom", value: 6 },
+    EnumVariant {
+        name: "key",
+        value: 1,
+    },
+    EnumVariant {
+        name: "mouse",
+        value: 2,
+    },
+    EnumVariant {
+        name: "touch",
+        value: 3,
+    },
+    EnumVariant {
+        name: "gamepad",
+        value: 4,
+    },
+    EnumVariant {
+        name: "axis",
+        value: 5,
+    },
+    EnumVariant {
+        name: "custom",
+        value: 6,
+    },
 ];
 
 /// One drained [`InputEvent`]: `struct{ timestamp: u64, device: u32,
 /// type: enum, code: u32, value: i32 }`.
 static EVENT_ENTRY: Schema = Schema::Struct(&[
-    Field { name: "timestamp", ty: &schema::SCHEMA_U64 },
-    Field { name: "device", ty: &schema::SCHEMA_U32 },
-    Field { name: "type", ty: &Schema::Enum(&INPUT_TYPE_VARIANTS) },
-    Field { name: "code", ty: &schema::SCHEMA_U32 },
-    Field { name: "value", ty: &schema::SCHEMA_I32 },
+    Field {
+        name: "timestamp",
+        ty: &schema::SCHEMA_U64,
+    },
+    Field {
+        name: "device",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "type",
+        ty: &Schema::Enum(&INPUT_TYPE_VARIANTS),
+    },
+    Field {
+        name: "code",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "value",
+        ty: &schema::SCHEMA_I32,
+    },
 ]);
 
 /// `read(/input/events)`: a (possibly empty) list of events.
@@ -68,9 +101,18 @@ pub static EVENT_LIST: Schema = Schema::List(&EVENT_ENTRY);
 
 /// One registered input device: `struct{ id: u32, name: str, caps: u32 }`.
 static DEVICE_ENTRY: Schema = Schema::Struct(&[
-    Field { name: "id", ty: &schema::SCHEMA_U32 },
-    Field { name: "name", ty: &schema::SCHEMA_STR },
-    Field { name: "caps", ty: &schema::SCHEMA_U32 },
+    Field {
+        name: "id",
+        ty: &schema::SCHEMA_U32,
+    },
+    Field {
+        name: "name",
+        ty: &schema::SCHEMA_STR,
+    },
+    Field {
+        name: "caps",
+        ty: &schema::SCHEMA_U32,
+    },
 ]);
 
 /// `read(/input/devices)`: snapshot of every registered device.
@@ -78,13 +120,34 @@ pub static DEVICE_LIST: Schema = Schema::List(&DEVICE_ENTRY);
 
 /// `read(/input/kbd)`: current keymap/modifier state.
 pub static KBD_STATE: Schema = Schema::Struct(&[
-    Field { name: "shift", ty: &schema::SCHEMA_BOOL },
-    Field { name: "ctrl", ty: &schema::SCHEMA_BOOL },
-    Field { name: "alt", ty: &schema::SCHEMA_BOOL },
-    Field { name: "caps", ty: &schema::SCHEMA_BOOL },
-    Field { name: "num", ty: &schema::SCHEMA_BOOL },
-    Field { name: "scroll", ty: &schema::SCHEMA_BOOL },
-    Field { name: "super_", ty: &schema::SCHEMA_BOOL },
+    Field {
+        name: "shift",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "ctrl",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "alt",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "caps",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "num",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "scroll",
+        ty: &schema::SCHEMA_BOOL,
+    },
+    Field {
+        name: "super_",
+        ty: &schema::SCHEMA_BOOL,
+    },
 ]);
 
 /// `:get` output: the decoded character as a single byte.  `x00`-class
@@ -93,8 +156,16 @@ pub static KBD_STATE: Schema = Schema::Struct(&[
 static SCHEMA_U8: Schema = Schema::U8;
 
 static KBD_METHODS: [MethodDesc; 2] = [
-    MethodDesc { name: "get", input: &schema::SCHEMA_UNIT, output: &SCHEMA_U8 },
-    MethodDesc { name: "flush", input: &schema::SCHEMA_UNIT, output: &schema::SCHEMA_UNIT },
+    MethodDesc {
+        name: "get",
+        input: &schema::SCHEMA_UNIT,
+        output: &SCHEMA_U8,
+    },
+    MethodDesc {
+        name: "flush",
+        input: &schema::SCHEMA_UNIT,
+        output: &schema::SCHEMA_UNIT,
+    },
 ];
 
 // ── Registration ──────────────────────────────────────────────────────

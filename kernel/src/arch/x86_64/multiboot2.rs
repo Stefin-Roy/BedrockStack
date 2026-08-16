@@ -1,8 +1,8 @@
 use core::ptr::read_unaligned;
 
+use crate::Kernel;
 use crate::boot::{FramebufferInfo, MemoryRegion, MemoryRegionKind, PixelFormat};
 use crate::drivers::serial::SerialPort;
-use crate::Kernel;
 
 core::arch::global_asm!(include_str!("multiboot2_header.s"));
 
@@ -72,13 +72,17 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
 
     if magic != MB2_MAGIC {
         SerialPort::puts("[mb2] ERROR: bad multiboot2 magic\n");
-        loop { core::hint::spin_loop() }
+        loop {
+            core::hint::spin_loop()
+        }
     }
 
     let total_size = unsafe { r32(info, 0) };
     if total_size < 16 {
         SerialPort::puts("[mb2] ERROR: multiboot2 info too small\n");
-        loop { core::hint::spin_loop() }
+        loop {
+            core::hint::spin_loop()
+        }
     }
 
     let mut fb_info: FramebufferInfo = FramebufferInfo {
@@ -144,6 +148,28 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
                     2 => PixelFormat::Rgb,
                     _ => PixelFormat::Bgr,
                 };
+                SerialPort::puts("[mb2] fb tag: addr=0x");
+                SerialPort::put_hex(addr);
+                SerialPort::puts(" pitch=");
+                SerialPort::put_u64(pitch as u64);
+                SerialPort::puts(" ");
+                SerialPort::put_u64(width as u64);
+                SerialPort::puts("x");
+                SerialPort::put_u64(height as u64);
+                SerialPort::puts(" depth=");
+                SerialPort::put_u64(bpp_bits as u64);
+                SerialPort::puts(" type=");
+                SerialPort::put_u64(fb_type as u64);
+                SerialPort::puts(" -> bpp=");
+                SerialPort::put_u64(bpp_bytes as u64);
+                SerialPort::puts(" stride=");
+                SerialPort::put_u64((pitch / bpp_bytes as usize) as u64);
+                SerialPort::puts(" fmt=");
+                SerialPort::put_u64(match pixel_format {
+                    PixelFormat::Rgb => 1,
+                    PixelFormat::Bgr => 2,
+                });
+                SerialPort::puts("\n");
                 fb_info = FramebufferInfo {
                     address: addr,
                     width,
@@ -175,18 +201,15 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
         tag = tag_next(tag);
     }
 
-    let memory_map: &'static [MemoryRegion] = unsafe {
-        core::slice::from_raw_parts(&region_buf as *const MemoryRegion, region_count)
-    };
+    let memory_map: &'static [MemoryRegion] =
+        unsafe { core::slice::from_raw_parts(&region_buf as *const MemoryRegion, region_count) };
 
     // The guard page is the physical frame just below the kernel's `.stack`
     // section.  `__stack_start` is a higher-half VMA; `__stack_start_phys`
     // is the LMA (physical) value the allocator and pager compare against.
     let stack_guard = unsafe { &crate::__stack_start_phys as *const u8 as u64 - 4096 };
 
-    let mut kernel = unsafe {
-        Kernel::new(memory_map, &fb_info, stack_guard, 0, rsdp_data)
-    };
+    let mut kernel = unsafe { Kernel::new(memory_map, &fb_info, stack_guard, 0, rsdp_data) };
     kernel.init();
     kernel.run();
 }

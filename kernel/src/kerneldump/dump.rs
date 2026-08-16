@@ -11,22 +11,34 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
 
 use crate::drivers::serial::{dump_put_hex, dump_puts};
-use crate::smp::{current_cpu_id, MAX_CPUS};
+use crate::smp::{MAX_CPUS, current_cpu_id};
 
 // ── x86-64 PTE flag constants ───────────────────────────────────────
 
-const PTE_PRESENT:  u64 = 1 << 0;
+const PTE_PRESENT: u64 = 1 << 0;
 const PTE_WRITABLE: u64 = 1 << 1;
-const PTE_USER:     u64 = 1 << 2;
-const PTE_NO_EXEC:  u64 = 1 << 63;
+const PTE_USER: u64 = 1 << 2;
+const PTE_NO_EXEC: u64 = 1 << 63;
 
 // ── Per-CPU re-entrancy guard ──────────────────────────────────────
 
 static DUMP_IN_PROGRESS: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
-    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
 ];
 
 pub fn is_dump_in_progress() -> bool {
@@ -50,11 +62,26 @@ pub static PF_ERROR_CODE: AtomicU64 = AtomicU64::new(0);
 
 fn exception_name(vector: u8) -> &'static str {
     match vector {
-        0 => "#DE",  1 => "#DB",  2 => "#NMI", 3 => "#BP",
-        4 => "#OF",  5 => "#BR",  6 => "#UD",  7 => "#NM",
-        8 => "#DF",  9 => "#COP",10 => "#TS", 11 => "#NP",
-        12 => "#SS", 13 => "#GP", 14 => "#PF", 16 => "#MF",
-        17 => "#AC", 18 => "#MC", 19 => "#XM", 20 => "#VE",
+        0 => "#DE",
+        1 => "#DB",
+        2 => "#NMI",
+        3 => "#BP",
+        4 => "#OF",
+        5 => "#BR",
+        6 => "#UD",
+        7 => "#NM",
+        8 => "#DF",
+        9 => "#COP",
+        10 => "#TS",
+        11 => "#NP",
+        12 => "#SS",
+        13 => "#GP",
+        14 => "#PF",
+        16 => "#MF",
+        17 => "#AC",
+        18 => "#MC",
+        19 => "#XM",
+        20 => "#VE",
         _ => "??",
     }
 }
@@ -63,7 +90,9 @@ fn exception_name(vector: u8) -> &'static str {
 
 struct NullWrite;
 impl Write for NullWrite {
-    fn write_str(&mut self, _: &str) -> core::fmt::Result { Ok(()) }
+    fn write_str(&mut self, _: &str) -> core::fmt::Result {
+        Ok(())
+    }
 }
 
 // ── Lock-free raw serial writer (bypasses spinlock during dump) ────
@@ -85,7 +114,9 @@ impl Write for DumpWriter {
 // `None` instead of faulting again.
 
 unsafe fn pf_read_volatile(ptr: *const u64) -> Option<u64> {
-    if ptr.is_null() { return None; }
+    if ptr.is_null() {
+        return None;
+    }
 
     // Initialize result so the recovery path has a defined value
     // (the asm output is not written on the PF recovery path).
@@ -149,13 +180,18 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
     unsafe {
-        let pml4_entry = pf_read_volatile(frame_va(pml4_phys + (addr >> 39 & 0x1FF) * 8) as *const u64)?;
-        if pml4_entry & PTE_PRESENT == 0 { return None; }
+        let pml4_entry =
+            pf_read_volatile(frame_va(pml4_phys + (addr >> 39 & 0x1FF) * 8) as *const u64)?;
+        if pml4_entry & PTE_PRESENT == 0 {
+            return None;
+        }
 
         let pdp_phys = pml4_entry & 0x000F_FFFF_FFFF_F000;
         let pdp_entry =
             pf_read_volatile(frame_va(pdp_phys + (addr >> 30 & 0x1FF) * 8) as *const u64)?;
-        if pdp_entry & PTE_PRESENT == 0 { return None; }
+        if pdp_entry & PTE_PRESENT == 0 {
+            return None;
+        }
         if pdp_entry & (1 << 7) != 0 {
             let page = pdp_entry & 0x000F_FFC0_0000_0000;
             return pf_read_volatile(frame_va(page | (addr & 0x3FFF_FFFF)) as *const u64);
@@ -164,7 +200,9 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
         let pd_phys = pdp_entry & 0x000F_FFFF_FFFF_F000;
         let pd_entry =
             pf_read_volatile(frame_va(pd_phys + (addr >> 21 & 0x1FF) * 8) as *const u64)?;
-        if pd_entry & PTE_PRESENT == 0 { return None; }
+        if pd_entry & PTE_PRESENT == 0 {
+            return None;
+        }
         if pd_entry & (1 << 7) != 0 {
             let page = pd_entry & 0x000F_FFFF_FE00_0000;
             return pf_read_volatile(frame_va(page | (addr & 0x1F_FFFF)) as *const u64);
@@ -172,7 +210,9 @@ fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
 
         let pt_phys = pd_entry & 0x000F_FFFF_FFFF_F000;
         let pte = pf_read_volatile(frame_va(pt_phys + (addr >> 12 & 0x1FF) * 8) as *const u64)?;
-        if pte & PTE_PRESENT == 0 { return None; }
+        if pte & PTE_PRESENT == 0 {
+            return None;
+        }
 
         let page = pte & 0x000F_FFFF_FFFF_F000;
         pf_read_volatile(frame_va(page | (addr & 0xFFF)) as *const u64)
@@ -195,11 +235,15 @@ fn dump_fault_stack(w: &mut impl Write, rsp: u64, cr3: u64) {
                     let _ = write!(w, "  {:#018x}", val);
                     any_valid = true;
                 }
-                None => { let _ = write!(w, "  ________________"); }
+                None => {
+                    let _ = write!(w, "  ________________");
+                }
             }
         }
         let _ = writeln!(w);
-        if !any_valid { break; }
+        if !any_valid {
+            break;
+        }
     }
 }
 
@@ -269,7 +313,9 @@ fn dump_code_bytes(w: &mut impl Write, rip: u64, cr3: u64) {
                 let _ = write!(w, " {:02x}", buf[offset + j]);
             }
             let pad_len = (25usize).saturating_sub(len * 3);
-            for _ in 0..pad_len { let _ = write!(w, " "); }
+            for _ in 0..pad_len {
+                let _ = write!(w, " ");
+            }
 
             super::disasm::disasm_one(addr, &buf[offset..], w);
 
@@ -289,32 +335,86 @@ fn dump_code_bytes(w: &mut impl Write, rip: u64, cr3: u64) {
 fn dump_error_code(w: &mut impl Write, vector: u8, code: u64) {
     match vector {
         14 => {
-            let p   = (code >> 0) & 1;
-            let wr  = (code >> 1) & 1;
-            let us  = (code >> 2) & 1;
+            let p = (code >> 0) & 1;
+            let wr = (code >> 1) & 1;
+            let us = (code >> 2) & 1;
             let rsv = (code >> 3) & 1;
-            let id  = (code >> 4) & 1;
-            let pk  = (code >> 5) & 1;
-            let ss  = (code >> 6) & 1;
+            let id = (code >> 4) & 1;
+            let pk = (code >> 5) & 1;
+            let ss = (code >> 6) & 1;
             let _sgx = (code >> 15) & 1;
 
             let _ = writeln!(w, "--- Page Fault Error Code ({:#x}) ---", code);
-            let _ = writeln!(w, "  P    = {}  {}", p,    if p   != 0 { "Protection violation"     } else { "Not present"            });
-            let _ = writeln!(w, "  W/R  = {}  {}", wr,   if wr  != 0 { "Write access"              } else { "Read access"            });
-            let _ = writeln!(w, "  U/S  = {}  {}", us,   if us  != 0 { "User mode"                 } else { "Supervisor mode"        });
+            let _ = writeln!(
+                w,
+                "  P    = {}  {}",
+                p,
+                if p != 0 {
+                    "Protection violation"
+                } else {
+                    "Not present"
+                }
+            );
+            let _ = writeln!(
+                w,
+                "  W/R  = {}  {}",
+                wr,
+                if wr != 0 {
+                    "Write access"
+                } else {
+                    "Read access"
+                }
+            );
+            let _ = writeln!(
+                w,
+                "  U/S  = {}  {}",
+                us,
+                if us != 0 {
+                    "User mode"
+                } else {
+                    "Supervisor mode"
+                }
+            );
             let _ = writeln!(w, "  RSVD = {}", rsv);
-            let _ = writeln!(w, "  I/D  = {}  {}", id,   if id  != 0 { "Instruction fetch"         } else { "Data access"            });
+            let _ = writeln!(
+                w,
+                "  I/D  = {}  {}",
+                id,
+                if id != 0 {
+                    "Instruction fetch"
+                } else {
+                    "Data access"
+                }
+            );
             let _ = writeln!(w, "  PK   = {}", pk);
             let _ = writeln!(w, "  SS   = {}", ss);
         }
         10 | 11 | 12 | 13 => {
             let _ = writeln!(w, "Error code: {:#x}", code);
-            let ext   = (code >> 0) & 1;
+            let ext = (code >> 0) & 1;
             let table = (code >> 1) & 3;
             let index = (code >> 3) & 0x1FFF;
             let table_name = ["GDT", "IDT", "LDT", "IDT"][table as usize];
-            let _ = writeln!(w, "  External : {}", if ext != 0 { "Yes (event sourced externally)" } else { "No" });
-            let _ = writeln!(w, "  Table    : {} ({})", table_name, match table { 0 => "GDT", 1 => "IDT", 2 => "LDT", _ => "IDT" });
+            let _ = writeln!(
+                w,
+                "  External : {}",
+                if ext != 0 {
+                    "Yes (event sourced externally)"
+                } else {
+                    "No"
+                }
+            );
+            let _ = writeln!(
+                w,
+                "  Table    : {} ({})",
+                table_name,
+                match table {
+                    0 => "GDT",
+                    1 => "IDT",
+                    2 => "LDT",
+                    _ => "IDT",
+                }
+            );
             let _ = writeln!(w, "  Selector : {:#05x} (index {})", index << 3, index);
         }
         _ => {
@@ -351,18 +451,33 @@ fn write_cpuid_info(w: &mut impl Write) {
     }
 
     let stepping = eax_1 & 0xF;
-    let model   = ((eax_1 >> 4) & 0xF) | ((eax_1 >> 12) & 0xF0);
-    let family  = ((eax_1 >> 8) & 0xF) + if (eax_1 >> 8) & 0xF == 0xF { (eax_1 >> 20) & 0xFF } else { 0 };
+    let model = ((eax_1 >> 4) & 0xF) | ((eax_1 >> 12) & 0xF0);
+    let family = ((eax_1 >> 8) & 0xF)
+        + if (eax_1 >> 8) & 0xF == 0xF {
+            (eax_1 >> 20) & 0xFF
+        } else {
+            0
+        };
     let v = core::str::from_utf8(&vendor).unwrap_or("unknown");
 
-    let _ = writeln!(w, "CPUID: {}  Family {}  Model {}  Stepping {}", v, family, model, stepping);
+    let _ = writeln!(
+        w,
+        "CPUID: {}  Family {}  Model {}  Stepping {}",
+        v, family, model, stepping
+    );
 
     let _ = write!(w, "Features:");
-    macro_rules! feat { ($cond:expr, $name:expr) => { if $cond { let _ = write!(w, " {}", $name); } }; }
+    macro_rules! feat {
+        ($cond:expr, $name:expr) => {
+            if $cond {
+                let _ = write!(w, " {}", $name);
+            }
+        };
+    }
     feat!((edx_1 >> 25) & 1 != 0, "sse");
     feat!((edx_1 >> 26) & 1 != 0, "sse2");
-    feat!((ecx_1 >> 0)  & 1 != 0, "sse3");
-    feat!((ecx_1 >> 9)  & 1 != 0, "ssse3");
+    feat!((ecx_1 >> 0) & 1 != 0, "sse3");
+    feat!((ecx_1 >> 9) & 1 != 0, "ssse3");
     feat!((ecx_1 >> 19) & 1 != 0, "sse4.1");
     feat!((ecx_1 >> 20) & 1 != 0, "sse4.2");
     feat!((ecx_1 >> 28) & 1 != 0, "avx");
@@ -370,9 +485,9 @@ fn write_cpuid_info(w: &mut impl Write) {
     feat!((edx_8 >> 11) & 1 != 0, "syscall");
     feat!((edx_8 >> 20) & 1 != 0, "nx");
     feat!((edx_8 >> 27) & 1 != 0, "rdtscp");
-    feat!((ebx_7 >> 7)  & 1 != 0, "smep");
+    feat!((ebx_7 >> 7) & 1 != 0, "smep");
     feat!((ebx_7 >> 20) & 1 != 0, "smap");
-    feat!((ebx_7 >> 0)  & 1 != 0, "fsgsbase");
+    feat!((ebx_7 >> 0) & 1 != 0, "fsgsbase");
     let _ = writeln!(w);
 }
 
@@ -382,7 +497,9 @@ unsafe fn read_msr(msr: u32) -> u64 {
     let lo: u32;
     let hi: u32;
     // SAFETY: caller guarantees MSR number is valid.
-    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi); }
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi);
+    }
     ((hi as u64) << 32) | (lo as u64)
 }
 
@@ -406,11 +523,24 @@ fn dump_msrs(w: &mut impl Write) {
         let _ = writeln!(w, "  SVME={}   SVM Enable", (efer >> 12) & 1);
         let _ = writeln!(w, "  LMSLE={}  Long Mode Segment Limit", (efer >> 13) & 1);
         let _ = writeln!(w, "  FFXSR={}  Fast FXSAVE/FXRSTOR", (efer >> 14) & 1);
-        let _ = writeln!(w, "  TCE ={}   Translation Cache Extension", (efer >> 15) & 1);
+        let _ = writeln!(
+            w,
+            "  TCE ={}   Translation Cache Extension",
+            (efer >> 15) & 1
+        );
         let _ = writeln!(w, "STAR        = {:#018x}", star);
         let _ = writeln!(w, "LSTAR       = {:#018x}", lstar);
         let _ = writeln!(w, "CSTAR       = {:#018x}", cstar);
-        let _ = writeln!(w, "FMASK       = {:#018x}  (IF={})", fmask, if fmask & 0x200 != 0 { "masked" } else { "unmasked" });
+        let _ = writeln!(
+            w,
+            "FMASK       = {:#018x}  (IF={})",
+            fmask,
+            if fmask & 0x200 != 0 {
+                "masked"
+            } else {
+                "unmasked"
+            }
+        );
         let _ = writeln!(w, "FS_BASE     = {:#018x}", fs_base);
         let _ = writeln!(w, "GS_BASE     = {:#018x}", gs_base);
         let _ = writeln!(w, "KERNEL_GS_BASE = {:#018x}", kernel_gs_base);
@@ -421,11 +551,11 @@ fn dump_msrs(w: &mut impl Write) {
 
 fn write_cr0_flags(w: &mut impl Write, cr0: u64) {
     let flags = [
-        ("PE    ",  0, "Protected mode"),
-        ("MP    ",  1, "Monitor co-processor"),
-        ("EM    ",  2, "Emulation"),
-        ("TS    ",  3, "Task switched"),
-        ("NE    ",  5, "Numeric error"),
+        ("PE    ", 0, "Protected mode"),
+        ("MP    ", 1, "Monitor co-processor"),
+        ("EM    ", 2, "Emulation"),
+        ("TS    ", 3, "Task switched"),
+        ("NE    ", 5, "Numeric error"),
         ("WP    ", 16, "Write protect"),
         ("AM    ", 18, "Alignment mask"),
         ("NW    ", 29, "Not write-through"),
@@ -434,22 +564,28 @@ fn write_cr0_flags(w: &mut impl Write, cr0: u64) {
     ];
     for &(name, bit, desc) in &flags {
         let v = (cr0 >> bit) & 1;
-        let _ = writeln!(w, "      {} = {}  {}", name, v, if v != 0 { desc } else { "" });
+        let _ = writeln!(
+            w,
+            "      {} = {}  {}",
+            name,
+            v,
+            if v != 0 { desc } else { "" }
+        );
     }
 }
 
 fn write_cr4_flags(w: &mut impl Write, cr4: u64) {
     let flags = [
-        ("VME        ",  0, "VM Extensions"),
-        ("PVI        ",  1, "Protected-mode VM"),
-        ("TSD        ",  2, "Time-stamp disable"),
-        ("DE         ",  3, "Debugging extensions"),
-        ("PSE        ",  4, "Page size extensions"),
-        ("PAE        ",  5, "Physical address extension"),
-        ("MCE        ",  6, "Machine check enable"),
-        ("PGE        ",  7, "Page global enable"),
-        ("PCE        ",  8, "Performance counter enable"),
-        ("OSFXSR     ",  9, "FXSAVE/FXRSTOR"),
+        ("VME        ", 0, "VM Extensions"),
+        ("PVI        ", 1, "Protected-mode VM"),
+        ("TSD        ", 2, "Time-stamp disable"),
+        ("DE         ", 3, "Debugging extensions"),
+        ("PSE        ", 4, "Page size extensions"),
+        ("PAE        ", 5, "Physical address extension"),
+        ("MCE        ", 6, "Machine check enable"),
+        ("PGE        ", 7, "Page global enable"),
+        ("PCE        ", 8, "Performance counter enable"),
+        ("OSFXSR     ", 9, "FXSAVE/FXRSTOR"),
         ("OSXMMEXCPT ", 10, "SSE unmasked exceptions"),
         ("UMIP       ", 11, "UMIP"),
         ("LA57       ", 12, "57-bit VA"),
@@ -466,7 +602,13 @@ fn write_cr4_flags(w: &mut impl Write, cr4: u64) {
     ];
     for &(name, bit, desc) in &flags {
         let v = (cr4 >> bit) & 1;
-        let _ = writeln!(w, "      {} = {}  {}", name, v, if v != 0 { desc } else { "" });
+        let _ = writeln!(
+            w,
+            "      {} = {}  {}",
+            name,
+            v,
+            if v != 0 { desc } else { "" }
+        );
     }
 }
 
@@ -474,13 +616,13 @@ fn write_cr4_flags(w: &mut impl Write, cr4: u64) {
 
 fn write_rflags(w: &mut impl Write, rflags: u64) {
     let flags = [
-        ("CF",  0, "Carry"),
-        ("PF",  2, "Parity"),
-        ("AF",  4, "Adjust"),
-        ("ZF",  6, "Zero"),
-        ("SF",  7, "Sign"),
-        ("TF",  8, "Trap (single-step)"),
-        ("IF",  9, "Interrupt enable"),
+        ("CF", 0, "Carry"),
+        ("PF", 2, "Parity"),
+        ("AF", 4, "Adjust"),
+        ("ZF", 6, "Zero"),
+        ("SF", 7, "Sign"),
+        ("TF", 8, "Trap (single-step)"),
+        ("IF", 9, "Interrupt enable"),
         ("DF", 10, "Direction"),
         ("OF", 11, "Overflow"),
         ("NT", 14, "Nested task"),
@@ -493,9 +635,17 @@ fn write_rflags(w: &mut impl Write, rflags: u64) {
     ];
     let iopl = (rflags >> 12) & 3;
     for &(name, bit, desc) in &flags {
-        if bit == 12 { continue; }
+        if bit == 12 {
+            continue;
+        }
         let v = (rflags >> bit) & 1;
-        let _ = writeln!(w, "      {:4} = {}  {}", name, v, if v != 0 { desc } else { "" });
+        let _ = writeln!(
+            w,
+            "      {:4} = {}  {}",
+            name,
+            v,
+            if v != 0 { desc } else { "" }
+        );
     }
     let _ = writeln!(w, "      IOPL = {}  I/O privilege level {}", iopl, iopl);
 }
@@ -504,14 +654,42 @@ fn write_rflags(w: &mut impl Write, rflags: u64) {
 
 fn write_pte_entry(w: &mut impl Write, label: &str, idx: usize, entry: u64) {
     let _ = write!(w, "  {}[{}] = {:#018x}", label, idx, entry);
-    if entry & PTE_PRESENT  != 0 { let _ = write!(w, " P"); } else { let _ = write!(w, " ."); }
-    if entry & PTE_WRITABLE != 0 { let _ = write!(w, " W"); } else { let _ = write!(w, " ."); }
-    if entry & PTE_USER     != 0 { let _ = write!(w, " U"); } else { let _ = write!(w, " ."); }
-    if entry & (1 << 5)     != 0 { let _ = write!(w, " A"); } else { let _ = write!(w, " ."); }
-    if entry & (1 << 6)     != 0 { let _ = write!(w, " D"); } else { let _ = write!(w, " ."); }
-    if entry & (1 << 8)     != 0 { let _ = write!(w, " G"); }
-    if entry & (1 << 7)     != 0 { let _ = write!(w, " PS"); }
-    if entry & PTE_NO_EXEC  != 0 { let _ = write!(w, " NX"); } else { let _ = write!(w, " X"); }
+    if entry & PTE_PRESENT != 0 {
+        let _ = write!(w, " P");
+    } else {
+        let _ = write!(w, " .");
+    }
+    if entry & PTE_WRITABLE != 0 {
+        let _ = write!(w, " W");
+    } else {
+        let _ = write!(w, " .");
+    }
+    if entry & PTE_USER != 0 {
+        let _ = write!(w, " U");
+    } else {
+        let _ = write!(w, " .");
+    }
+    if entry & (1 << 5) != 0 {
+        let _ = write!(w, " A");
+    } else {
+        let _ = write!(w, " .");
+    }
+    if entry & (1 << 6) != 0 {
+        let _ = write!(w, " D");
+    } else {
+        let _ = write!(w, " .");
+    }
+    if entry & (1 << 8) != 0 {
+        let _ = write!(w, " G");
+    }
+    if entry & (1 << 7) != 0 {
+        let _ = write!(w, " PS");
+    }
+    if entry & PTE_NO_EXEC != 0 {
+        let _ = write!(w, " NX");
+    } else {
+        let _ = write!(w, " X");
+    }
     let phys = entry & 0x000F_FFFF_FFFF_F000;
     let _ = writeln!(w, "   phys={:#x}", phys);
 }
@@ -522,21 +700,33 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let pml4_phys = cr3 & 0x000F_FFFF_FFFF_F000;
 
     let idx4 = ((vaddr >> 39) & 0x1FF) as usize;
-    let e4 = match unsafe { pf_read_volatile(frame_va(pml4_phys + (idx4 as u64) * 8) as *const u64) } {
-        Some(v) => v,
-        None => { let _ = writeln!(w, "  (PML4 unreadable)"); return; }
-    };
+    let e4 =
+        match unsafe { pf_read_volatile(frame_va(pml4_phys + (idx4 as u64) * 8) as *const u64) } {
+            Some(v) => v,
+            None => {
+                let _ = writeln!(w, "  (PML4 unreadable)");
+                return;
+            }
+        };
     write_pte_entry(w, "PML4", idx4, e4);
-    if e4 & PTE_PRESENT == 0 { return; }
+    if e4 & PTE_PRESENT == 0 {
+        return;
+    }
 
     let pdp_phys = e4 & 0x000F_FFFF_FFFF_F000;
     let idx3 = ((vaddr >> 30) & 0x1FF) as usize;
-    let e3 = match unsafe { pf_read_volatile(frame_va(pdp_phys + (idx3 as u64) * 8) as *const u64) } {
+    let e3 = match unsafe { pf_read_volatile(frame_va(pdp_phys + (idx3 as u64) * 8) as *const u64) }
+    {
         Some(v) => v,
-        None => { let _ = writeln!(w, "  (PDP unreadable)"); return; }
+        None => {
+            let _ = writeln!(w, "  (PDP unreadable)");
+            return;
+        }
     };
     write_pte_entry(w, "PDP", idx3, e3);
-    if e3 & PTE_PRESENT == 0 { return; }
+    if e3 & PTE_PRESENT == 0 {
+        return;
+    }
     if e3 & (1 << 7) != 0 {
         let phys = (e3 & 0x000F_FFC0_0000_0000) | (vaddr & 0x3FFF_FFFF);
         let _ = writeln!(w, "  -> 1 GiB huge page  phys={:#x}", phys);
@@ -545,12 +735,18 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 
     let pd_phys = e3 & 0x000F_FFFF_FFFF_F000;
     let idx2 = ((vaddr >> 21) & 0x1FF) as usize;
-    let e2 = match unsafe { pf_read_volatile(frame_va(pd_phys + (idx2 as u64) * 8) as *const u64) } {
+    let e2 = match unsafe { pf_read_volatile(frame_va(pd_phys + (idx2 as u64) * 8) as *const u64) }
+    {
         Some(v) => v,
-        None => { let _ = writeln!(w, "  (PD unreadable)"); return; }
+        None => {
+            let _ = writeln!(w, "  (PD unreadable)");
+            return;
+        }
     };
     write_pte_entry(w, " PD", idx2, e2);
-    if e2 & PTE_PRESENT == 0 { return; }
+    if e2 & PTE_PRESENT == 0 {
+        return;
+    }
     if e2 & (1 << 7) != 0 {
         let phys = (e2 & 0x000F_FFFF_FE00_0000) | (vaddr & 0x1F_FFFF);
         let _ = writeln!(w, "  -> 2 MiB huge page  phys={:#x}", phys);
@@ -559,9 +755,13 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
 
     let pt_phys = e2 & 0x000F_FFFF_FFFF_F000;
     let idx1 = ((vaddr >> 12) & 0x1FF) as usize;
-    let e1 = match unsafe { pf_read_volatile(frame_va(pt_phys + (idx1 as u64) * 8) as *const u64) } {
+    let e1 = match unsafe { pf_read_volatile(frame_va(pt_phys + (idx1 as u64) * 8) as *const u64) }
+    {
         Some(v) => v,
-        None => { let _ = writeln!(w, "  (PT unreadable)"); return; }
+        None => {
+            let _ = writeln!(w, "  (PT unreadable)");
+            return;
+        }
     };
     write_pte_entry(w, " PT", idx1, e1);
     if e1 & PTE_PRESENT == 0 {
@@ -584,16 +784,18 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
         dump_put_hex(vector as u64);
         dump_puts(") while dumping -- halting\n");
         loop {
-            unsafe { asm!("cli", "hlt", options(nomem, nostack)); }
+            unsafe {
+                asm!("cli", "hlt", options(nomem, nostack));
+            }
         }
     }
 
     // ── Extract frame values ──────────────────────────────────────
-    let fault_rip  = frame.instruction_pointer.as_u64();
-    let fault_rsp  = frame.stack_pointer.as_u64();
-    let fault_cs   = frame.code_segment.0 as u64;
-    let fault_rfl  = frame.cpu_flags.bits();
-    let fault_ss   = frame.stack_segment.0 as u64;
+    let fault_rip = frame.instruction_pointer.as_u64();
+    let fault_rsp = frame.stack_pointer.as_u64();
+    let fault_cs = frame.code_segment.0 as u64;
+    let fault_rfl = frame.cpu_flags.bits();
+    let fault_ss = frame.stack_segment.0 as u64;
 
     // ── Read control registers ────────────────────────────────────
     let cr0: u64;
@@ -612,12 +814,30 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     // ── Header ─────────────────────────────────────────────────────
     let _ = writeln!(w);
     match vector {
-        14 => { let _ = writeln!(w, "==== PAGE FAULT (#14) {:=>39}", ""); }
-        13 => { let _ = writeln!(w, "==== GENERAL PROTECTION (#13) {:=>29}", ""); }
-        6  => { let _ = writeln!(w, "==== INVALID OPCODE (#6) {:=>35}", ""); }
-        0  => { let _ = writeln!(w, "==== DIVIDE ERROR (#0) {:=>36}", ""); }
-        8  => { let _ = writeln!(w, "==== DOUBLE FAULT (#8) {:=>36}", ""); }
-        _  => { let _ = writeln!(w, "==== {} (#{}) {:=>50}", exception_name(vector), vector, ""); }
+        14 => {
+            let _ = writeln!(w, "==== PAGE FAULT (#14) {:=>39}", "");
+        }
+        13 => {
+            let _ = writeln!(w, "==== GENERAL PROTECTION (#13) {:=>29}", "");
+        }
+        6 => {
+            let _ = writeln!(w, "==== INVALID OPCODE (#6) {:=>35}", "");
+        }
+        0 => {
+            let _ = writeln!(w, "==== DIVIDE ERROR (#0) {:=>36}", "");
+        }
+        8 => {
+            let _ = writeln!(w, "==== DOUBLE FAULT (#8) {:=>36}", "");
+        }
+        _ => {
+            let _ = writeln!(
+                w,
+                "==== {} (#{}) {:=>50}",
+                exception_name(vector),
+                vector,
+                ""
+            );
+        }
     }
 
     // ── Error code and fault address ──────────────────────────────
@@ -672,7 +892,15 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
 
     // ── RFLAGS summary ────────────────────────────────────────────
     let if_flag = (fault_rfl >> 9) & 1;
-    let _ = writeln!(w, "Interrupts: {}", if if_flag != 0 { "enabled (IF=1)" } else { "disabled (IF=0)" });
+    let _ = writeln!(
+        w,
+        "Interrupts: {}",
+        if if_flag != 0 {
+            "enabled (IF=1)"
+        } else {
+            "disabled (IF=0)"
+        }
+    );
     let _ = writeln!(w);
 
     // ── Page-table walk (page faults only) ────────────────────────
@@ -693,6 +921,8 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
     let _ = writeln!(w, "================================================");
 
     loop {
-        unsafe { asm!("cli", "hlt", options(nomem, nostack)); }
+        unsafe {
+            asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }

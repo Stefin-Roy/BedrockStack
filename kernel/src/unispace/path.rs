@@ -22,12 +22,18 @@ pub struct ParsedPath<'a> {
 pub fn parse(path: &str) -> Result<ParsedPath<'_>, UnispaceError> {
     let trimmed = path.strip_prefix('/').unwrap_or(path);
     if trimmed.is_empty() {
-        return Ok(ParsedPath { components: Vec::new(), method: None });
+        return Ok(ParsedPath {
+            components: Vec::new(),
+            method: None,
+        });
     }
 
     let mut raw: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
     if raw.is_empty() {
-        return Ok(ParsedPath { components: Vec::new(), method: None });
+        return Ok(ParsedPath {
+            components: Vec::new(),
+            method: None,
+        });
     }
 
     let mut method = None;
@@ -54,5 +60,8 @@ pub fn parse(path: &str) -> Result<ParsedPath<'_>, UnispaceError> {
         }
     }
 
-    Ok(ParsedPath { components: raw, method })
+    Ok(ParsedPath {
+        components: raw,
+        method,
+    })
 }

@@ -4,12 +4,16 @@ pub const PIT_CMD: u16 = 0x43;
 pub const PIT_DATA0: u16 = 0x40;
 
 pub fn outb(port: u16, val: u8) {
-    unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags));
+    }
 }
 
 pub fn inb(port: u16) -> u8 {
     let val: u8;
-    unsafe { asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags)); }
+    unsafe {
+        asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
+    }
     val
 }
 

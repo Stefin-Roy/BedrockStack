@@ -2,12 +2,12 @@ pub mod gdt;
 pub mod idt;
 #[cfg(feature = "cpu_slow")]
 pub mod limiter;
+#[cfg(feature = "kernelmb2")]
+mod multiboot2;
 pub mod paging;
 pub mod serial;
 pub mod syscall;
 pub mod trampoline;
-#[cfg(feature = "kernelmb2")]
-mod multiboot2;
 
 use crate::platform::x86_64_pc::apic;
 use crate::services::clockevent::Clockevent;
@@ -16,10 +16,10 @@ use crate::services::universal_timer;
 
 pub struct X86_64;
 
+use crate::KernelLayout;
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::Vmm;
-use crate::KernelLayout;
 
 impl X86_64 {
     pub fn init() {
@@ -34,10 +34,7 @@ impl X86_64 {
 
         // Initialise the universal timer as early as possible — before
         // services, before SMP, before interrupts are enabled.
-        universal_timer::early_init(
-            &X86TscClocksource,
-            &ApicOneShotClockevent,
-        );
+        universal_timer::early_init(&X86TscClocksource, &ApicOneShotClockevent);
     }
 
     pub fn init_ap(_cpu_id: u32) {
@@ -71,15 +68,21 @@ impl X86_64 {
         fb_stride: usize,
         fb_bpp: u8,
     ) -> Vmm {
-        paging::setup(allocator, layout, stack_guard, fb_addr, fb_height, fb_stride, fb_bpp)
+        paging::setup(
+            allocator,
+            layout,
+            stack_guard,
+            fb_addr,
+            fb_height,
+            fb_stride,
+            fb_bpp,
+        )
     }
 }
 
 // ── TSC clocksource ───────────────────────────────────────────────
 
 pub struct X86TscClocksource;
-
-
 
 impl Clocksource for X86TscClocksource {
     fn now_ns(&self) -> u64 {
@@ -93,8 +96,6 @@ impl Clocksource for X86TscClocksource {
 // programs the LAPIC in one-shot mode.
 
 pub struct ApicOneShotClockevent;
-
-
 
 impl Clockevent for ApicOneShotClockevent {
     /// Program the APIC timer to fire at (or slightly after) `deadline_ns`.

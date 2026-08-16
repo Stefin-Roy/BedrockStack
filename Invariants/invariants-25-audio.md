@@ -1,12 +1,13 @@
 # BedrockOS Invariants — Audio Subsystem & Intel HD Audio Driver
 
-**Version:** 0.4.0
-**Date:** 2026-08-13
+**Version:** 0.5.0
+**Date:** 2026-08-15
 **Source paths:**
-- `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, `record_pcm`/`record_pcm_stream`, sine synthesis, `device_name()`/`pub const SAMPLE_RATE, CHANNELS`
-- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream, input stream (capture)
+- `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, `record_pcm`/`record_pcm_stream`, the playback **pump task** (`enqueue_playback`/`spawn_pump`/`audio_pump_entry`), sine synthesis, `device_name()`/`pub const SAMPLE_RATE, CHANNELS`
+- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream, input stream (capture), the streaming ring (`play_stream`) and the continuous cyclic-ring engine (`play_stream_continuous`)
+- `kernel/src/services/universal_timer.rs` — `wait_until_cond_coop` (task-aware cooperative wait)
 - `kernel/src/audio/codec.rs` — generic HDA codec driver: probe, widget graph, output/input path discovery, path bring-up
-- `kernel/src/lib.rs` — `pub mod audio`, `audio::init()` in `Kernel::run()`
+- `kernel/src/lib.rs` — `pub mod audio`, `audio::init()` in `Kernel::run()`, `audio::spawn_pump()` after `task::init()`
 - `kernel/src/unispace/provider/driver.rs` — `/driver/audio` unispace device surface (AUD-026..028)
 - `run.bat`, `fullrun.bat` — `-audiodev dsound` + `ich9-intel-hda` + `hda-output` + `hda-duplex` QEMU wiring
 
@@ -44,14 +45,18 @@ logged and the scan continues; no controller leaves the subsystem idle.
 - Location: `kernel/src/audio/mod.rs:43-84`
 
 **AUD-004** `play_pcm()`/`play_tone()` return `Err("audio device not
-initialised")` before any hardware is live. Playback is synchronous and
-blocking; it is only invoked from the boot context (serialised).
+initialised")` before any hardware is live. Playback is **asynchronous**: both
+synthesise (or copy) their samples and call `enqueue_playback`, which queues
+them for the pump task and returns immediately. Only when the pump is not
+running (no device, boot context, or spawn failure) do they fall back to the
+legacy blocking one-shot `play_pcm`. Nothing on the playback path ever HLTs
+the BSP (see AUD-028).
 
 **AUD-005** `play_tone(freq_hz, ms)` synthesises a sine into a heap `Vec<i16>`
-(stereo, 48 kHz, 0.35 amplitude) and feeds it to `play_pcm`. The sine uses the
-Bhaskara I rational approximation (`+ - * /` only) because the kernel is
-`no_std` and lacks `f64::sin`; max amplitude error ≈ 1.8%.
-- Location: `kernel/src/audio/mod.rs:88-125`
+(stereo, 48 kHz, 0.35 amplitude) and feeds it to `enqueue_playback`. The sine
+uses the Bhaskara I rational approximation (`+ - * /` only) because the kernel
+is `no_std` and lacks `f64::sin`; max amplitude error ≈ 1.8%.
+- Location: `kernel/src/audio/mod.rs` `play_tone()`
 
 ---
 
@@ -66,9 +71,13 @@ register window mirrored at 0x2000).
 
 **AUD-011** DMA allocations come from the shared `KernelDma` pool: one page
 each for CORB (256×4 B) and RIRB (256×8 B), one BDL page (32×16 B capacity),
-and one contiguous 256 KiB PCM staging buffer. All are held for the driver's
-lifetime (leaked with the device).
-- Location: `kernel/src/audio/hda.rs:291-295`
+and one contiguous 256 KiB PCM staging buffer. The streaming path additionally
+allocates its **own** BDL page and 256 KiB PCM ring buffer (`Inner.sbd_*` /
+`Inner.sbuf_*`) so its refill loop can drop the Inner mutex (and yield to the
+scheduler) without colliding with capture or one-shot playback sharing the
+legacy buffer/BDL. All are held for the driver's lifetime (leaked with the
+device).
+- Location: `kernel/src/audio/hda.rs:291-305`
 
 ### Controller reset & rings
 
@@ -273,11 +282,12 @@ single device object (`kernel/src/unispace/provider/driver.rs`). Its value
 schema `AUDIO_STATE` is `struct{ present: bool, name: str, sample_rate: u32,
 channels: u32, can_record: bool }` — a live snapshot (`present` mirrors
 `audio::is_ready()`, `name` is `device_name()`/`""`, format comes from the
-exported `SAMPLE_RATE`/`CHANNELS` consts). Two methods wrap the blocking
-engine: `:play_tone{freq: u32, ms: u64}` and `:play_pcm{pcm: bytes}`, where
-`pcm` is raw little-endian interleaved 16-bit signed stereo (an odd length, an
-empty payload, or bytes over the 256 KiB staging limit is `InvalidArgument`;
-values are converted with `i16::from_le_bytes`).
+exported `SAMPLE_RATE`/`CHANNELS` consts). Two methods queue playback for the
+pump: `:play_tone{freq: u32, ms: u64}` and `:play_pcm{pcm: bytes}`, where
+`pcm` is raw little-endian interleaved 16-bit signed stereo (an odd length or
+an empty payload is `InvalidArgument`; the former 256 KiB staging limit is
+gone — the ring streams any length). Values are converted with
+`i16::from_le_bytes`.
 - Location: `kernel/src/unispace/provider/driver.rs` (`AudioObject`),
   `kernel/src/audio/mod.rs` (`device_name()`, `pub const SAMPLE_RATE/CHANNELS`)
 
@@ -288,12 +298,48 @@ an absent engine. Engine failures (`&'static str`) also surface as
 `ObjectKind::Device` like `/driver/debugserial`, and every read/method path is
 `Result`-only (no panics on device data).
 
-**AUD-028** Playback methods are strictly single-consumer: the engine's
-blocking waits HLT the calling CPU for the tone's whole duration
-(`universal_timer::sleep_ms`), so a ring-3 `:play_tone` parks its CPU rather
-than yielding. Safe for the single user INIT task; not for concurrent audio
-clients. The `selftest` suite probes both method schemas but never invokes
-them from boot context.
+**AUD-028** Playback methods are **non-blocking**: `:play_pcm`/`:play_tone`
+enqueue owned samples into the bounded pump queue (`PUMP_QUEUE_CAP = 8`) and
+return immediately. The pump task (`audio_pump_entry`, spawned by
+`spawn_pump` from `Kernel::run()` right after `task::init()`) pops the queue
+and feeds the continuous ring, chaining back-to-back requests with no
+stop/start seam. When the queue is full an enqueuing task parks cooperatively
+(`sleep_current` slices) until the pump frees a slot — it yields, never
+HLTs. Boot-context callers (no pump yet) fall back to the legacy blocking
+one-shot path. The `selftest` suite probes both method schemas but never
+invokes them from boot context.
+
+## Playback Pump & Continuous Ring
+
+**AUD-029** `play_stream` runs the fixed-total streaming ring on the
+**dedicated** stream DMA (`Inner.sbd_*`/`Inner.sbuf_*`) and releases the Inner
+mutex for its refill loop; completions are awaited with
+`universal_timer::wait_until_cond_coop`, which slice-sleeps as a scheduler
+task (yielding to the rest of the system) and HLTs only in boot context (no
+current task). The loop only touches the dedicated DMA, the output descriptor
+and the atomic completion counters, so a yield — or a concurrent capture on
+the input descriptor — cannot corrupt state. `record`/`record_stream` keep the
+legacy shared buffer/BDL and their HLT waits (capture is still boot-context /
+polled; decoupling it the same way is a follow-up).
+
+**AUD-030** `play_stream_continuous` is the "flow through the ends of time"
+path: a full cyclic ring (all `RING_ENTRIES` slots `eb`-sized and IOC, `LVI =
+n-1`, `CBL = u32::MAX`), fed from a `next` closure that keeps pulling until it
+returns `None`, then stopped the instant the last staged slot completes
+(before the DMA can cycle back to replay older audio). The CBL = u32::MAX
+deviation is documented QEMU tolerance — QEMU treats CBL as the transfer
+budget while the descriptors cycle; a real controller would expect
+`CBL = Σ BDL lengths`. The pump's closure chains the next queued request
+straight into the running ring, so back-to-back `:play_pcm` calls merge into a
+single gapless session.
+- Location: `kernel/src/audio/hda.rs` `play_stream_continuous()`,
+  `kernel/src/audio/mod.rs` `audio_pump_entry()`
+
+**AUD-031** The `AudioDevice` trait gains `play_pcm_stream_continuous(eb,
+next)` with a default that collects the whole feed into one `play_pcm_stream`
+pass (gapless, one stop at the end); `HdaAudio` overrides it with the cyclic
+ring. The dedicated stream BDL/buffer allocation is the enabling factor for
+both the lock-free refill loop and future full-duplex (AUD-025).
  
 ---
  
@@ -319,8 +365,13 @@ the host audio backend feeds silence.
   format structure, value `0x11`/`0x0011` (the old `0x0A11` descriptor value
   was a 32 kHz encoding and is fixed); a future
   rate/channel change must keep the two in agreement.
-- Playback and capture are blocking by design for now; a ring of buffers +
-  interrupt-driven completion (BDL `IOC`, `SDnSTS.BCIS`) is the path to
-  non-blocking both-way audio.  The streaming ring (`play_pcm_stream` /
-  `record_pcm_stream`) already uses IOC completions end-to-end; what remains
-  is decoupling the transfer from the calling thread.
+- Playback is fully decoupled from callers: the pump task + continuous ring
+  give gapless, non-blocking output that chains queued requests with no seam,
+  and cooperative waits keep the rest of the system flowing while the DMA
+  rides.  Capture remains blocking/polled; the same decoupling (its own DMA +
+  a cooperative completion loop) is the natural next phase, and the dedicated
+  per-direction DMA now removes the AUD-025 blocker for true full-duplex.
+  The streaming ring (`play_pcm_stream` / `record_pcm_stream`) already uses
+  IOC completions end-to-end; what remains is capture-side decoupling and HDA
+  MSI (`pci::msi::enable` + `services.msi`), a clean follow-up since the QEMU
+  controller supports it.

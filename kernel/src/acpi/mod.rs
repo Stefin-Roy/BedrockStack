@@ -3,22 +3,22 @@ use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{Vmm, PageFlags, KERNEL_VMA_BASE};
+use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 
-mod tables;
-mod mcfg;
-mod fadt;
-mod gas;
-mod madt;
-#[cfg(target_arch = "x86_64")]
-mod handler;
 #[cfg(target_arch = "x86_64")]
 mod aml_ctx;
+mod fadt;
+mod gas;
+#[cfg(target_arch = "x86_64")]
+mod handler;
+mod madt;
+mod mcfg;
 pub mod platform;
+mod tables;
 
 pub use platform::{
-    AcpiError, Apic, Gas, InterruptModel, IoApic, PciConfigRegions, PciMcfgRegion,
-    Pm1ControlBit, Polarity, PlatformInfo, Processor, ProcessorInfo, ProcessorState, TriggerMode,
+    AcpiError, Apic, Gas, InterruptModel, IoApic, PciConfigRegions, PciMcfgRegion, PlatformInfo,
+    Pm1ControlBit, Polarity, Processor, ProcessorInfo, ProcessorState, TriggerMode,
 };
 
 /// Resolve a legacy ISA IRQ to its GSI plus polarity/trigger via the MADT
@@ -45,7 +45,11 @@ static ACPI_STATE: Mutex<Option<AcpiVmmState>> = Mutex::new(None);
 /// Initialise the ACPI VMM state. Must be called once after higher-half page
 /// tables are activated and before any `AcpiSubsystem::new()` call.
 pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
-    *ACPI_STATE.lock() = Some(AcpiVmmState { root, alloc, next_vaddr: ACPI_VADDR_BASE });
+    *ACPI_STATE.lock() = Some(AcpiVmmState {
+        root,
+        alloc,
+        next_vaddr: ACPI_VADDR_BASE,
+    });
 }
 
 /// ACPI VMM floor — 512 MB of virtual space for ACPI tables (generous).
@@ -54,13 +58,21 @@ const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
 /// Map a physical MMIO region through the ACPI VMM.
 pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
     let mut guard = ACPI_STATE.lock();
-    let state = guard.as_mut().expect("ACPI VMM not initialized — call init_vmm first");
+    let state = guard
+        .as_mut()
+        .expect("ACPI VMM not initialized — call init_vmm first");
     // Page-round the reservation so successive small mappings can never
     // overlap within a shared page.
     let pages = (size + 0xFFF) & !0xFFF;
-    let vaddr = state.next_vaddr.checked_sub(pages).expect("ACPI VMM: address space exhausted (overflow)");
+    let vaddr = state
+        .next_vaddr
+        .checked_sub(pages)
+        .expect("ACPI VMM: address space exhausted (overflow)");
     if vaddr < ACPI_VADDR_FLOOR {
-        panic!("ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)", vaddr);
+        panic!(
+            "ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)",
+            vaddr
+        );
     }
     state.next_vaddr = vaddr;
     let mut vmm = Vmm::from_root(state.root);
@@ -110,8 +122,13 @@ impl AcpiSubsystem {
             .iter()
             .find(|e| e.signature == sig(b"MCFG"))
             .and_then(|e| mcfg::parse_mcfg(e.vaddr, e.length).ok())
-            .unwrap_or(PciConfigRegions { regions: alloc::vec::Vec::new() });
-        log::info!("ACPI: {} PCI config regions", pci_config_regions.regions.len());
+            .unwrap_or(PciConfigRegions {
+                regions: alloc::vec::Vec::new(),
+            });
+        log::info!(
+            "ACPI: {} PCI config regions",
+            pci_config_regions.regions.len()
+        );
 
         let (interrupt_model, processor_info) = entries
             .iter()
@@ -156,12 +173,28 @@ impl AcpiSubsystem {
             slp_typ_s5,
         };
 
-        log::info!("ACPI: platform info parsed (interrupt model: {:?})", interrupt_model);
+        log::info!(
+            "ACPI: platform info parsed (interrupt model: {:?})",
+            interrupt_model
+        );
 
         #[cfg(target_arch = "x86_64")]
-        let subsystem = Self { interrupt_model, processor_info, cpus, pci_config_regions, platform_info, aml };
+        let subsystem = Self {
+            interrupt_model,
+            processor_info,
+            cpus,
+            pci_config_regions,
+            platform_info,
+            aml,
+        };
         #[cfg(not(target_arch = "x86_64"))]
-        let subsystem = Self { interrupt_model, processor_info, cpus, pci_config_regions, platform_info };
+        let subsystem = Self {
+            interrupt_model,
+            processor_info,
+            cpus,
+            pci_config_regions,
+            platform_info,
+        };
         Ok(subsystem)
     }
 
@@ -196,7 +229,10 @@ impl AcpiSubsystem {
                 (Some(spin::Mutex::new(ctx)), slp)
             }
             Err(e) => {
-                log::error!("ACPI: AML interpreter init failed: {:?} -- ACPI PM1 shutdown disabled", e);
+                log::error!(
+                    "ACPI: AML interpreter init failed: {:?} -- ACPI PM1 shutdown disabled",
+                    e
+                );
                 (None, None)
             }
         }
@@ -235,10 +271,16 @@ impl AcpiSubsystem {
             log::info!("ACPI: reset via 8042 keyboard controller");
             for _ in 0..100_000 {
                 let mut status: u8;
-                unsafe { core::arch::asm!("in al, dx", in("dx") 0x64u16, out("al") status, options(nomem, nostack, preserves_flags)); }
-                if status & 0x02 == 0 { break; }
+                unsafe {
+                    core::arch::asm!("in al, dx", in("dx") 0x64u16, out("al") status, options(nomem, nostack, preserves_flags));
+                }
+                if status & 0x02 == 0 {
+                    break;
+                }
             }
-            unsafe { core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0xFEu8, options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("out dx, al", in("dx") 0x64u16, in("al") 0xFEu8, options(nomem, nostack, preserves_flags));
+            }
         }
 
         #[cfg(target_arch = "riscv64")]
@@ -247,7 +289,9 @@ impl AcpiSubsystem {
         #[cfg(target_arch = "x86_64")]
         {
             log::error!("ACPI: reset failed -- halting");
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
     }
 
@@ -287,7 +331,9 @@ impl AcpiSubsystem {
             log::info!("ACPI: shutdown fallback -- QEMU PM IO port");
             let pm1a_port = self.platform_info.pm1_control.pm1a.address as u16;
             let val: u16 = (0x00u16 << 10) | (1u16 << 13);
-            unsafe { core::arch::asm!("out dx, ax", in("dx") pm1a_port, in("ax") val, options(nomem, nostack, preserves_flags)); }
+            unsafe {
+                core::arch::asm!("out dx, ax", in("dx") pm1a_port, in("ax") val, options(nomem, nostack, preserves_flags));
+            }
         }
 
         #[cfg(target_arch = "riscv64")]
@@ -296,7 +342,9 @@ impl AcpiSubsystem {
         #[cfg(target_arch = "x86_64")]
         {
             log::error!("ACPI: shutdown failed -- halting");
-            loop { unsafe { core::arch::asm!("hlt", options(nomem, nostack)) } }
+            loop {
+                unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+            }
         }
     }
 }

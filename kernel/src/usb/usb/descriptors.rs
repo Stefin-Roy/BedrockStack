@@ -169,7 +169,8 @@ impl EndpointDescriptor {
     }
 
     pub fn max_packet_size(&self) -> u16 {
-        u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() }) & 0x07FF
+        u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() })
+            & 0x07FF
     }
 
     pub fn interval(&self) -> u8 {
@@ -180,7 +181,9 @@ impl EndpointDescriptor {
     /// `wMaxPacketSize` bits 12:11, "additional transactions per microframe",
     /// values 0-3.  Zero for full/low-speed devices.
     pub fn hs_burst(&self) -> u8 {
-        ((u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() }) >> 11) & 0x3) as u8
+        ((u16::from_le(unsafe { core::ptr::addr_of!(self.w_max_packet_size).read_unaligned() })
+            >> 11)
+            & 0x3) as u8
     }
 }
 

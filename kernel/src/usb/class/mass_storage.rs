@@ -2,9 +2,9 @@ use alloc::sync::Arc;
 use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
-use crate::filesystems::blockdriver::traits::{BlockDevice, IoRequest, IoBuffer, IoCompletions};
-use crate::usb::xhci::memory::TrbRing;
+use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
 use crate::usb::xhci::device;
+use crate::usb::xhci::memory::TrbRing;
 
 const CBW_SIGNATURE: u32 = 0x43425355;
 const CSW_SIGNATURE: u32 = 0x53425355;
@@ -101,11 +101,7 @@ struct UsbMassStorageInner {
 impl UsbMassStorageInner {
     fn bot_send_cbw(&mut self, cbw_bytes: &[u8; 31]) -> Result<(), &'static str> {
         unsafe {
-            core::ptr::copy_nonoverlapping(
-                cbw_bytes.as_ptr(),
-                self.cbw_va as *mut u8,
-                31,
-            );
+            core::ptr::copy_nonoverlapping(cbw_bytes.as_ptr(), self.cbw_va as *mut u8, 31);
         }
         device::submit_bulk(
             &mut self.bulk_out_ring,
@@ -161,7 +157,13 @@ impl UsbMassStorageInner {
         )
     }
 
-    fn do_scsi_command(&mut self, cdb: &[u8; 16], data_phys: u64, data_len: u32, dir_in: bool) -> Result<(), &'static str> {
+    fn do_scsi_command(
+        &mut self,
+        cdb: &[u8; 16],
+        data_phys: u64,
+        data_len: u32,
+        dir_in: bool,
+    ) -> Result<(), &'static str> {
         let tag = self.tag;
         self.tag = self.tag.wrapping_add(1);
 
@@ -214,7 +216,9 @@ impl UsbMassStorageDevice {
         bulk_in_ring: TrbRing,
         dma: &dyn crate::services::dma::DmaAllocator,
     ) -> Result<Arc<Self>, &'static str> {
-        let data_buf = dma.alloc_contiguous(DATA_BUFFER_PAGES).ok_or("OOM for USB MSD data buffer")?;
+        let data_buf = dma
+            .alloc_contiguous(DATA_BUFFER_PAGES)
+            .ok_or("OOM for USB MSD data buffer")?;
         let cbw_page = dma.alloc_page().ok_or("OOM for USB MSD CBW page")?;
         let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;
 
@@ -351,10 +355,19 @@ impl BlockDevice for UsbMassStorageDevice {
                     let lba = req.lba + i as u64;
                     let src = buf_vaddr + (i as usize * 512) as u64;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(src as *const u8, data_va as *mut u8, chunk_bytes);
+                        core::ptr::copy_nonoverlapping(
+                            src as *const u8,
+                            data_va as *mut u8,
+                            chunk_bytes,
+                        );
                     }
                     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
-                    inner.do_scsi_command(&scsi_write10_cdb(lba as u32, chunk as u16), data_phys, chunk_bytes as u32, false)?;
+                    inner.do_scsi_command(
+                        &scsi_write10_cdb(lba as u32, chunk as u16),
+                        data_phys,
+                        chunk_bytes as u32,
+                        false,
+                    )?;
                     i += chunk;
                 }
             } else {
@@ -363,10 +376,19 @@ impl BlockDevice for UsbMassStorageDevice {
                     let chunk = (count - i).min(max_sectors);
                     let chunk_bytes = (chunk as usize) * 512;
                     let lba = req.lba + i as u64;
-                    inner.do_scsi_command(&scsi_read10_cdb(lba as u32, chunk as u16), data_phys, chunk_bytes as u32, true)?;
+                    inner.do_scsi_command(
+                        &scsi_read10_cdb(lba as u32, chunk as u16),
+                        data_phys,
+                        chunk_bytes as u32,
+                        true,
+                    )?;
                     let dst = buf_vaddr + (i as usize * 512) as u64;
                     unsafe {
-                        core::ptr::copy_nonoverlapping(data_va as *const u8, dst as *mut u8, chunk_bytes);
+                        core::ptr::copy_nonoverlapping(
+                            data_va as *const u8,
+                            dst as *mut u8,
+                            chunk_bytes,
+                        );
                     }
                     i += chunk;
                 }

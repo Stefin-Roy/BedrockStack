@@ -1,4 +1,3 @@
-
 pub trait SerialConsole: Send + Sync {
     fn putc(&self, c: u8);
     fn puts(&self, s: &str);
@@ -11,8 +10,6 @@ pub trait SerialConsole: Send + Sync {
 /// The arch-specific inner I/O (`PortIo` vs `MmioIo`) is hidden inside
 /// `drivers::serial` via the `Inner` type alias.
 pub struct KernelSerial;
-
-
 
 impl SerialConsole for KernelSerial {
     fn putc(&self, c: u8) {

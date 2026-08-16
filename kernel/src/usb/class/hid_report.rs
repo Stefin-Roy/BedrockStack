@@ -94,7 +94,11 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Option<HidReportInfo> {
                         // Collection: a top-level application collection names
                         // the device kind via its local usage on page 1.
                         if usage_page == 1 {
-                            let usage = if local_usage != 0 { local_usage } else { val & 0xFF };
+                            let usage = if local_usage != 0 {
+                                local_usage
+                            } else {
+                                val & 0xFF
+                            };
                             match usage {
                                 0x06 => kind = Some(HidKind::Keyboard),
                                 0x01 | 0x02 => kind = Some(HidKind::Mouse),
@@ -133,11 +137,19 @@ pub fn parse_report_descriptor(desc: &[u8]) -> Option<HidReportInfo> {
         return None;
     }
     let out_bytes = ((output_bits + 7) / 8) as usize;
-    let output_len = if has_report_id { out_bytes + 1 } else { out_bytes };
+    let output_len = if has_report_id {
+        out_bytes + 1
+    } else {
+        out_bytes
+    };
     if output_len > 4096 {
         return None;
     }
-    Some(HidReportInfo { report_len, output_len, kind })
+    Some(HidReportInfo {
+        report_len,
+        output_len,
+        kind,
+    })
 }
 
 fn le_u32(data: &[u8]) -> u32 {

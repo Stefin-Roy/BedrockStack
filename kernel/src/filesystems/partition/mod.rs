@@ -65,7 +65,10 @@ impl BlockDevice for PartitionDevice {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str> {
         let n = reqs.len();
         if n == 0 {
-            return Ok(IoCompletions { completed: 0, errors: 0 });
+            return Ok(IoCompletions {
+                completed: 0,
+                errors: 0,
+            });
         }
 
         let mut adjusted: Vec<IoRequest> = Vec::with_capacity(n);

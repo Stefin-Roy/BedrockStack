@@ -27,7 +27,7 @@ pub const KERNEL_IMAGE_BASE: u64 = KERNEL_VMA_BASE;
 
 /// Heap arena: grows downward from `HEAP_TOP`; each growth chunk is followed
 /// by an unmapped guard page; bounded below by `HEAP_FLOOR`.
-pub const HEAP_TOP: u64   = KERNEL_VMA_BASE + 0x3000_0000; // top  (+768 MiB)
+pub const HEAP_TOP: u64 = KERNEL_VMA_BASE + 0x3000_0000; // top  (+768 MiB)
 pub const HEAP_FLOOR: u64 = KERNEL_VMA_BASE + 0x1000_0000; //      (+256 MiB)
 pub const HEAP_GUARD_PAGES: u64 = 1;
 pub const HEAP_GUARD_BYTES: u64 = HEAP_GUARD_PAGES * 4096;
@@ -47,7 +47,7 @@ pub const KSTACK_WINDOW_SIZE: u64 = (MAX_KSTACKS as u64) * KSTACK_SIZE;
 /// a stack mapped into the kernel root is visible under any task root, and
 /// post-clone mapping is irrelevant because sharing, not snapshotting, is the
 /// mechanism (see `clone_high_half`).
-pub const KSTACK_VADDR_BASE: u64  = KERNEL_VMA_BASE + 0x4000_0000; // (+1 GiB)
+pub const KSTACK_VADDR_BASE: u64 = KERNEL_VMA_BASE + 0x4000_0000; // (+1 GiB)
 pub const KSTACK_VADDR_FLOOR: u64 = KSTACK_VADDR_BASE - KSTACK_WINDOW_SIZE;
 
 /// Private physmap: DIRECT_MAP maps physical `[0, alloc_end)` here.  Grows
@@ -72,16 +72,33 @@ pub const PHYS_MAP_BASE: u64 = 0xFFFFFFC0_00000000;
 // Each arena allocates *downward* from its BASE toward its FLOOR.
 
 /// ACPI table + GAS MMIO arena.
-pub const ACPI_VADDR_BASE: u64  = KERNEL_VMA_BASE - 0x1000_0000;
+pub const ACPI_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x1000_0000;
 pub const ACPI_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x3000_0000;
 
 /// PCI ECAM config window.
-pub const ECAM_VADDR_BASE: u64  = KERNEL_VMA_BASE - 0x3000_0000;
+pub const ECAM_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x3000_0000;
 pub const ECAM_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x5000_0000;
 
 /// DMA (uncached device buffer) arena.
-pub const DMA_VADDR_BASE: u64   = KERNEL_VMA_BASE - 0x5000_0000;
-pub const DMA_VADDR_FLOOR: u64  = KERNEL_VMA_BASE - 0x7000_0000;
+pub const DMA_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x5000_0000;
+pub const DMA_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x7000_0000;
+
+/// Framebuffer device window: the physical scanout framebuffer is mapped here
+/// at a fixed higher-half VA so it is visible under user-task page tables
+/// (cloned higher half) and writable by `/dev/fb`.  Sits directly below the
+/// DMA arena, inside PML4 entry 510 (which `clone_high_half` carries into every
+/// task root).
+pub const FB_VADDR_BASE: u64 = KERNEL_VMA_BASE - 0x7000_0000;
+pub const FB_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x9000_0000;
+
+/// Local APIC device window: the LAPIC MMIO page is mapped here at a fixed
+/// higher-half VA, directly below the framebuffer arena, still inside PML4
+/// entry 510.  The LAPIC cannot stay identity-only: IRQ handlers call
+/// `apic_eoi` while the CPU runs on the *process* CR3 (device IRQs fire during
+/// syscalls, and syscalls run on the task root), and cloned task roots share
+/// only the higher half.
+pub const LAPIC_VADDR_BASE: u64 = FB_VADDR_FLOOR - 0x1000_0000;
+pub const LAPIC_VADDR_FLOOR: u64 = LAPIC_VADDR_BASE - 0x1000_0000;
 
 // ── Runtime region table ───────────────────────────────────────────
 //
@@ -99,14 +116,19 @@ pub struct Region {
 }
 
 const fn region(name: &'static str, base: u64, floor: u64) -> Region {
-    Region { name, base, floor, next: base }
+    Region {
+        name,
+        base,
+        floor,
+        next: base,
+    }
 }
 
 /// The live device windows, keyed by name.
 static REGIONS: Mutex<[Region; 3]> = Mutex::new([
     region("acpi", ACPI_VADDR_BASE, ACPI_VADDR_FLOOR),
     region("ecam", ECAM_VADDR_BASE, ECAM_VADDR_FLOOR),
-    region("dma",  DMA_VADDR_BASE,  DMA_VADDR_FLOOR),
+    region("dma", DMA_VADDR_BASE, DMA_VADDR_FLOOR),
 ]);
 
 /// Allocate `size` bytes downward inside the named window, page-rounding up.
@@ -166,13 +188,7 @@ pub fn physmap_end() -> u64 {
 /// active, otherwise `0` (identity).  Used by the VMM walkers to translate a
 /// page-table frame's physical address into the VA they deref.
 pub fn phys_offset() -> u64 {
-    unsafe {
-        if PHYS_MAP_ON {
-            PHYS_MAP_BASE
-        } else {
-            0
-        }
-    }
+    unsafe { if PHYS_MAP_ON { PHYS_MAP_BASE } else { 0 } }
 }
 
 /// Translate a page-table frame's physical address to the VA a walker must
@@ -184,20 +200,27 @@ pub fn to_physmap(phys: u64) -> u64 {
 
 /// Assert the static regions do not overlap. Called once early in `init`.
 pub fn verify_layout() {
-    let regions: [(&str, Range<u64>); 6] = [
-        ("heap",    HEAP_FLOOR..HEAP_TOP),
-        ("kstack",  KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE),
+    let regions: [(&str, Range<u64>); 8] = [
+        ("heap", HEAP_FLOOR..HEAP_TOP),
+        ("kstack", KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE),
         ("physmap", PHYS_MAP_BASE..PHYS_MAP_BASE + physmap_end()),
-        ("acpi",    ACPI_VADDR_FLOOR..ACPI_VADDR_BASE),
-        ("ecam",    ECAM_VADDR_FLOOR..ECAM_VADDR_BASE),
-        ("dma",     DMA_VADDR_FLOOR..DMA_VADDR_BASE),
+        ("acpi", ACPI_VADDR_FLOOR..ACPI_VADDR_BASE),
+        ("ecam", ECAM_VADDR_FLOOR..ECAM_VADDR_BASE),
+        ("dma", DMA_VADDR_FLOOR..DMA_VADDR_BASE),
+        ("fb", FB_VADDR_FLOOR..FB_VADDR_BASE),
+        ("lapic", LAPIC_VADDR_FLOOR..LAPIC_VADDR_BASE),
     ];
     for (i, (an, ar)) in regions.iter().enumerate() {
         for (bn, br) in &regions[i + 1..] {
             assert!(
                 ar.end <= br.start || br.end <= ar.start,
                 "virtual layout overlap {} [{:#x},{:#x}) vs {} [{:#x},{:#x})",
-                an, ar.start, ar.end, bn, br.start, br.end
+                an,
+                ar.start,
+                ar.end,
+                bn,
+                br.start,
+                br.end
             );
         }
     }

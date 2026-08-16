@@ -1,10 +1,10 @@
 use x86_64::registers::control::{Cr0, Cr0Flags};
 use x86_64::registers::model_specific::{Efer, EferFlags, Msr};
 
-use crate::mm::layout::PHYS_MAP_BASE;
-use crate::mm::phys_alloc::BitmapAllocator;
-use crate::mm::vmm::{PageFlags, Vmm, KERNEL_VMA_BASE, init_pat_wc};
 use crate::KernelLayout;
+use crate::mm::layout::{FB_VADDR_BASE, LAPIC_VADDR_BASE, PHYS_MAP_BASE};
+use crate::mm::phys_alloc::BitmapAllocator;
+use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm, init_pat_wc};
 
 const PAGE_4K: u64 = 4096;
 const PAGE_2M: u64 = 2 * 1024 * 1024;
@@ -94,7 +94,12 @@ pub fn setup(
     let mut vaddr = kernel_start;
     while vaddr < kernel_end {
         let paddr = vaddr - KERNEL_VMA_BASE + KERNEL_LMA_BASE;
-        vmm.map_4k(allocator, vaddr, paddr, leaf_flags(vaddr, layout, fb_start, fb_end));
+        vmm.map_4k(
+            allocator,
+            vaddr,
+            paddr,
+            leaf_flags(vaddr, layout, fb_start, fb_end),
+        );
         vaddr += PAGE_4K;
     }
 
@@ -137,6 +142,20 @@ pub fn setup(
         );
     }
 
+    // (b2) Local APIC MMIO — higher-half device window.  Same page as the
+    // identity window above, re-mapped at `LAPIC_VADDR_BASE` so user task roots
+    // (which clone the higher half) can reach the APIC: `apic_eoi` runs on the
+    // process CR3 when a device IRQ fires during a syscall.  Uncached like the
+    // identity window.
+    if apic_base != 0 {
+        vmm.map_4k(
+            allocator,
+            LAPIC_VADDR_BASE,
+            apic_base,
+            PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
+        );
+    }
+
     // (d) Framebuffer — identity, write-combining.  The graphics driver
     // derefs the framebuffer's physical address as its VA, so the physical
     // range must be mapped at its own address.  May be far above 4 GiB.
@@ -154,6 +173,29 @@ pub fn setup(
             vmm.map_4k(
                 allocator,
                 page,
+                page,
+                PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINING,
+            );
+        }
+        page += PAGE_4K;
+    }
+
+    // (d2) Framebuffer — higher-half device window.  Same physical pages as the
+    // identity window above, re-mapped at `FB_VADDR_BASE` so user task roots
+    // (which clone the higher half) can reach the scanout buffer: `/dev/fb`
+    // write-through happens on the process CR3 during a syscall.  WC like the
+    // identity window; NX is automatic (page_flags_to_x86 sets NO_EXECUTE
+    // whenever EXECUTE is absent).
+    let mut page = fb_map_start;
+    while page < fb_map_end {
+        let already_mapped = page == apic_base
+            || (page >= TRAMPOLINE_PHYS && page < TRAMPOLINE_PHYS + PAGE_4K)
+            || (page >= TRAMPOLINE_STACK_PHYS && page < TRAMPOLINE_STACK_PHYS + PAGE_4K)
+            || (stack_guard != 0 && page == guard_page);
+        if !already_mapped {
+            vmm.map_4k(
+                allocator,
+                FB_VADDR_BASE + (page - fb_map_start),
                 page,
                 PageFlags::READ | PageFlags::WRITE | PageFlags::WRITE_COMBINING,
             );

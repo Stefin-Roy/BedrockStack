@@ -22,7 +22,8 @@ fn priority_addr(irq: u32) -> *mut u32 {
 }
 
 fn enable_addr(context: usize, word: usize) -> *mut u32 {
-    (PLIC_BASE + PLIC_ENABLE + context as u64 * ENABLE_STRIDE + word as u64 * WORD_STRIDE) as *mut u32
+    (PLIC_BASE + PLIC_ENABLE + context as u64 * ENABLE_STRIDE + word as u64 * WORD_STRIDE)
+        as *mut u32
 }
 
 fn context_threshold(context: usize) -> *mut u32 {
@@ -40,18 +41,24 @@ fn context_claim(context: usize) -> *mut u32 {
 pub fn init() {
     // Disable all interrupts by setting priority to 0.
     for irq in 1..=NUM_SOURCES {
-        unsafe { write_volatile(priority_addr(irq as u32), 0); }
+        unsafe {
+            write_volatile(priority_addr(irq as u32), 0);
+        }
     }
 
     // Clear all enable bits for our context.
     // QEMU virt: hart N S-mode context = (N * 2) + 1
     let context = scontext();
     for word in 0..4 {
-        unsafe { write_volatile(enable_addr(context, word), 0); }
+        unsafe {
+            write_volatile(enable_addr(context, word), 0);
+        }
     }
 
     // Set threshold to 0 (accept all).
-    unsafe { write_volatile(context_threshold(context), 0); }
+    unsafe {
+        write_volatile(context_threshold(context), 0);
+    }
 }
 
 /// Enable a specific interrupt source for S-mode.
@@ -80,7 +87,9 @@ pub fn disable_irq(irq: u32) {
 
 /// Set priority for an interrupt source (1-7, where 7 is highest).
 pub fn set_priority(irq: u32, priority: u32) {
-    unsafe { write_volatile(priority_addr(irq), priority & 7); }
+    unsafe {
+        write_volatile(priority_addr(irq), priority & 7);
+    }
 }
 
 /// Claim the highest-priority pending interrupt.
@@ -94,7 +103,9 @@ pub fn claim() -> u32 {
 /// Complete (EOI) an interrupt.
 pub fn complete(irq: u32) {
     let context = scontext();
-    unsafe { write_volatile(context_claim(context), irq); }
+    unsafe {
+        write_volatile(context_claim(context), irq);
+    }
 }
 
 pub static HART_ID: AtomicUsize = AtomicUsize::new(usize::MAX);

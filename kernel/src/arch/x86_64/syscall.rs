@@ -7,11 +7,11 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use x86_64::VirtAddr;
 use x86_64::registers::model_specific::{
     Efer, EferFlags, GsBase, KernelGsBase, LStar, SFMask, Star,
 };
 use x86_64::registers::rflags::RFlags;
-use x86_64::VirtAddr;
 
 use crate::unispace::{self, UnispaceError};
 
@@ -24,7 +24,9 @@ use crate::unispace::{self, UnispaceError};
 ///   SYSRETQ  CS = 0x28 | RPL3 = 0x2B (user code) / SS = 0x20 | RPL3 = 0x23
 /// Note SYSCALL's SS = 0x20 is the *user* data descriptor — Intel performs no
 /// DPL check on the SS loaded by SYSCALL (base is 0 in long mode), so this is
-/// safe while SS effectively carries no privilege.
+/// safe at the instant of entry. It is *not* safe to carry through an IRETQ:
+/// the return validates the popped SS against the current CPL, so the entry
+/// stub reloads SS to the kernel data segment (0x10) before STI.
 const IA32_STAR: u64 = (0x001Bu64 << 48) | (0x0018u64 << 32);
 
 /// Enable SYSCALL/SYSRET (EFER.SCE) and program the syscall MSRs:
@@ -81,24 +83,24 @@ pub fn set_user_gs(user_gs: u64) {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SyscallFrame {
-    pub r15: u64,          // 0x00
-    pub r14: u64,          // 0x08
-    pub r13: u64,          // 0x10
-    pub r12: u64,          // 0x18
-    pub r11: u64,          // 0x20  — SYSCALL destroyed the user value; holds user RFLAGS
-    pub r10: u64,          // 0x28
-    pub r9: u64,           // 0x30
-    pub r8: u64,           // 0x38
-    pub rbp: u64,          // 0x40
-    pub rdi: u64,          // 0x48
-    pub rsi: u64,          // 0x50
-    pub rdx: u64,          // 0x58
-    pub rcx: u64,          // 0x60  — SYSCALL destroyed the user value; holds user RIP
-    pub rbx: u64,          // 0x68
-    pub rax: u64,          // 0x70  — syscall number in, return value out
-    pub user_rsp: u64,     // 0x78
-    pub user_rflags: u64,  // 0x80
-    pub user_rip: u64,     // 0x88
+    pub r15: u64,         // 0x00
+    pub r14: u64,         // 0x08
+    pub r13: u64,         // 0x10
+    pub r12: u64,         // 0x18
+    pub r11: u64,         // 0x20  — SYSCALL destroyed the user value; holds user RFLAGS
+    pub r10: u64,         // 0x28
+    pub r9: u64,          // 0x30
+    pub r8: u64,          // 0x38
+    pub rbp: u64,         // 0x40
+    pub rdi: u64,         // 0x48
+    pub rsi: u64,         // 0x50
+    pub rdx: u64,         // 0x58
+    pub rcx: u64,         // 0x60  — SYSCALL destroyed the user value; holds user RIP
+    pub rbx: u64,         // 0x68
+    pub rax: u64,         // 0x70  — syscall number in, return value out
+    pub user_rsp: u64,    // 0x78
+    pub user_rflags: u64, // 0x80
+    pub user_rip: u64,    // 0x88
 }
 
 const RAX_OFF: u64 = core::mem::offset_of!(SyscallFrame, rax) as u64;
@@ -123,6 +125,11 @@ const FRAME_SIZE: u64 = core::mem::size_of::<SyscallFrame>() as u64;
 // GS state. The stub enables IF for the dispatch body, then `cli`s before
 // `SET_GS_SEL 0x23`, so no interrupt can fire while the user selectors are
 // loaded but kernel code is still running (before sysretq re-enables IF).
+// SS: SYSCALL loads SS = STAR.CS + 8 = 0x20, which is the *user* data
+// descriptor in this GDT — safe to run on (base 0 in long mode), but an ISR
+// frame carrying SS = 0x20 faults on IRETQ (the return validates SS against
+// the current CPL). The stub therefore reloads SS to the kernel data segment
+// (0x10) before STI, so no interrupt ever captures SS = 0x20.
 core::arch::global_asm!(
     r#"
 .macro SET_GS_SEL sel
@@ -168,6 +175,8 @@ syscall_entry:
     lea  rcx, [rsp + {frame}]       # kernel_top
     mov  gs:[{p_off}], rcx          # restore the syscall_rsp0 mirror for the next syscall
     SET_GS_SEL 0x10                 # kernel data selectors + GS.base = PerCpu
+    mov  ax, 0x10
+    mov  ss, ax                     # SYSCALL loaded SS = 0x20 (user data); swap in kernel data
     sti                             # kernel GS/segments live: open the interrupt window
     mov  rdi, rsp                   # &mut SyscallFrame
     call syscall_dispatch
@@ -259,13 +268,40 @@ fn sys_read(frame: &mut SyscallFrame) {
             return;
         }
     };
+    #[cfg(feature = "heap_trace")]
+    let trace_t0_ms = crate::services::universal_timer::now_ns() / 1_000_000;
+    #[cfg(feature = "heap_trace")]
+    {
+        use crate::drivers::serial::SerialPort;
+        let cap = core::cmp::min(frame.rdx, MAX_COPY);
+        SerialPort::puts("[sys-read] path=");
+        SerialPort::puts(&path);
+        SerialPort::puts(" want=");
+        SerialPort::put_u64(cap);
+        SerialPort::puts(" t0=");
+        SerialPort::put_u64(trace_t0_ms);
+        SerialPort::puts("\n");
+    }
     let mut data = Vec::new();
-    match unispace::read_flags(
+    let r = unispace::read_flags(
         &path,
         &mut data,
         core::cmp::min(frame.rdx, MAX_COPY) as usize,
         frame.r10,
-    ) {
+    );
+    #[cfg(feature = "heap_trace")]
+    {
+        use crate::drivers::serial::SerialPort;
+        SerialPort::puts("[sys-read] path=");
+        SerialPort::puts(&path);
+        SerialPort::puts(" -> ");
+        SerialPort::put_u64(data.len() as u64);
+        SerialPort::puts(" bytes dt=");
+        let trace_t1_ms = crate::services::universal_timer::now_ns() / 1_000_000;
+        SerialPort::put_u64(trace_t1_ms.saturating_sub(trace_t0_ms));
+        SerialPort::puts("ms\n");
+    }
+    match r {
         Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &data) {
             Ok(n) => frame.rax = n as u64,
             Err(e) => frame.rax = e as u64,
@@ -285,6 +321,35 @@ fn sys_write(frame: &mut SyscallFrame) {
             return;
         }
     };
+    // Fast-path: whole-buffer write-through to `/dev/fb`.  A full-screen blit
+    // is a few MB; routing it through `copy_user_in` (Vec alloc + to_vec),
+    // schema decode, and the response zero-fill triples the memcpy work and
+    // allocates per call.  Here we validate the user pages and copy straight
+    // from user VA into the scanout — one copy, no allocations.  `r10` keeps
+    // its meaning as the byte offset (`flags`).
+    if path == "/dev/fb" {
+        let src = frame.rsi;
+        let len = frame.rdx;
+        let root = match current_task_root() {
+            Ok(r) => r,
+            Err(e) => {
+                frame.rax = e as u64;
+                return;
+            }
+        };
+        if !user_range_ok(src, len) || validate_user_range(root, src, len, false).is_err() {
+            frame.rax = (-14i64) as u64;
+            return;
+        }
+        let bytes =
+            unsafe { core::slice::from_raw_parts(src as *const u8, len as usize) };
+        if crate::display::write_at(frame.r10, bytes) {
+            frame.rax = len as u64;
+        } else {
+            frame.rax = errno(UnispaceError::InvalidArgument) as u64;
+        }
+        return;
+    }
     let data = match copy_user_in(frame.rsi, frame.rdx) {
         Ok(d) => d,
         Err(e) => {
@@ -453,21 +518,23 @@ pub fn copy_user_out(dst: u64, len: u64, data: &[u8]) -> Result<usize, i64> {
 fn errno(e: UnispaceError) -> i64 {
     use UnispaceError::*;
     match e {
-        NotFound => -2,        // ENOENT
-        IsADirectory => -21,   // EISDIR
-        NotADirectory => -20,  // ENOTDIR
-        Unsupported => -38,      // ENOSYS
+        NotFound => -2,                                    // ENOENT
+        IsADirectory => -21,                               // EISDIR
+        NotADirectory => -20,                              // ENOTDIR
+        Unsupported => -38,                                // ENOSYS
         InvalidPath | DecodeError | SchemaMismatch => -22, // EINVAL
-        OutOfMemory => -12,    // ENOMEM
-        BadAddress => -14,     // EFAULT
-        InvalidArgument => -22, // EINVAL
-        MethodNotFound => -38, // ENOSYS
-        Vfs(_) => -5,          // EIO
+        OutOfMemory => -12,                                // ENOMEM
+        BadAddress => -14,                                 // EFAULT
+        InvalidArgument => -22,                            // EINVAL
+        MethodNotFound => -38,                             // ENOSYS
+        Vfs(_) => -5,                                      // EIO
     }
 }
 
 /// Runtime address of the `syscall_entry` stub, for IA32_LSTAR.
 pub fn syscall_entry_addr() -> u64 {
-    unsafe extern "C" { static syscall_entry: u8; }
+    unsafe extern "C" {
+        static syscall_entry: u8;
+    }
     core::ptr::addr_of!(syscall_entry) as u64
 }
