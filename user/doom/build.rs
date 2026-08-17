@@ -21,6 +21,7 @@ const WSL_GCC_FLAGS: &[&str] = &[
     "-fno-stack-protector",
     "-fno-pic",
     "-fno-pie",
+    "-mcmodel=large",
     "-mno-red-zone",
     "-fno-builtin",
     "-w",
@@ -89,19 +90,62 @@ fn main() {
     let objdir = out.join("obj");
     fs::create_dir_all(&objdir).expect("create obj dir");
 
+    // Headers are real compilation inputs too: an edit to doomfeatures.h or
+    // config.h must rebuild every object that includes it, otherwise the
+    // archive becomes a silent mix of feature flags (e.g. i_sound.c built
+    // with FEATURE_SOUND but m_config.c without).  Track every header in the
+    // include paths, and treat an object as stale if any header is newer
+    // than it.
+    let mut headers: Vec<PathBuf> = Vec::new();
+    for dir in ["third_party/doomgeneric", "user/doom/include"] {
+        let base = ws.join(dir);
+        if !base.exists() {
+            continue;
+        }
+        let mut stack: Vec<PathBuf> = vec![base];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if p.is_dir() {
+                        stack.push(p);
+                    } else if p.extension().map_or(false, |x| x == "h") {
+                        headers.push(p);
+                    }
+                }
+            }
+        }
+    }
+    for h in &headers {
+        println!("cargo:rerun-if-changed={}", h.display());
+    }
+    let header_cutoff = headers
+        .iter()
+        .filter_map(|h| fs::metadata(h).ok().and_then(|m| m.modified().ok()))
+        .max();
+
     let ws_wsl = to_wsl(&ws);
+    let flag_key = WSL_GCC_FLAGS.join("\x1f");
     let mut objs: Vec<String> = Vec::new();
     for f in &files {
         let src = ws.join(f);
         println!("cargo:rerun-if-changed={}", src.display());
-        let obj = objdir.join(format!("{}.o", hash(f)));
-        let stale = match (
-            fs::metadata(&src).and_then(|m| m.modified()).ok(),
-            fs::metadata(&obj).and_then(|m| m.modified()).ok(),
-        ) {
+        // Include the compile flags in the object name.  This prevents an
+        // object built with (for example) GCC's small code model from being
+        // silently reused after the high-half image switches to large-model
+        // relocations.
+        let obj_key = format!("{f}\0{flag_key}");
+        let obj = objdir.join(format!("{}.o", hash(&obj_key)));
+        let src_m = fs::metadata(&src).and_then(|m| m.modified()).ok();
+        let obj_m = fs::metadata(&obj).and_then(|m| m.modified()).ok();
+        let stale = match (src_m, obj_m) {
             (Some(s), Some(o)) => o < s,
             (Some(_), None) => true,
             _ => true,
+        } || match (header_cutoff, obj_m) {
+            (Some(h), Some(o)) => o < h,
+            (Some(_), None) => true,
+            _ => false,
         };
         if stale {
             let cmd = format!(
@@ -124,6 +168,12 @@ fn main() {
     }
 
     let archive = out.join("libdoomgeneric.a");
+    // `ar rcs` updates named members but does not remove members from an
+    // older archive.  The object-name key includes the compiler flags, so
+    // replace the generated archive before collecting the current objects;
+    // otherwise old small-model members would be linked alongside the new
+    // large-model objects.
+    let _ = fs::remove_file(&archive);
     let ar_cmd = format!(
         "cd {} && ar rcs {} {}",
         ws_wsl,

@@ -18,7 +18,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#if defined(FEATURE_SOUND) && !defined(__DJGPP__)
+// SDL_mixer include is intentionally omitted on BedrockOS: sound and music
+// are provided by user/doom/platform/bedrock_{sfx,music}.c instead.
+
+#if defined(FEATURE_SOUND) && !defined(__DJGPP__) && defined(ORIGCODE)
 #include <SDL_mixer.h>
 #endif
 
