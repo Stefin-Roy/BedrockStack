@@ -183,7 +183,7 @@ fn realtek_eapd_verb_control(s: &mut dyn VerbSender, c: &Codec) {
 
 // ── Realtek ALC256 hardcoded output nids (ALC269-family wiring) ─────
 /// Audio output converter (DAC) of the ALC256.
-const RTL_ALC256_DAC: u32 = 0x02;
+pub const RTL_ALC256_DAC: u32 = 0x02;
 /// Internal speaker output pin.
 const RTL_ALC256_SPKR_PIN: u32 = 0x14;
 /// Headphone-jack output pin.

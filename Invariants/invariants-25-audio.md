@@ -1,7 +1,7 @@
 # BedrockOS Invariants — Audio Subsystem & Intel HD Audio Driver
 
-**Version:** 0.5.0
-**Date:** 2026-08-15
+**Version:** 0.6.0
+**Date:** 2026-08-17
 **Source paths:**
 - `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `play_tone`/`play_pcm`, `record_pcm`/`record_pcm_stream`, the playback **pump task** (`enqueue_playback`/`spawn_pump`/`audio_pump_entry`), sine synthesis, `device_name()`/`pub const SAMPLE_RATE, CHANNELS`
 - `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, output stream, input stream (capture), the streaming ring (`play_stream`) and the continuous cyclic-ring engine (`play_stream_continuous`)
@@ -163,11 +163,21 @@ controller-agnostic.
 **AUD-018** `play_pcm` stages samples into the DMA buffer (rejected if larger
 than 256 KiB), builds a single-entry BDL `{ addr, 0, len, IOC }`, resets the
 stream (`SDnCTL.SRST` set then cleared), programs `BDPL/U`, `LVI=0`, `CBL=len`,
-`SDnFMT=0x0011`, then starts DMA with `SDnCTL = tag(1)<<20 | RUN`. The stop
-write clears RUN but **preserves the stream tag**: QEMU derives the stream
-number from `SDnCTL` on every RUN-bit flip, so clearing the tag would notify
-the codec with `stnr=0` and the converter (tag 1) would keep playing the
-wrapping BDL forever.
+`SDnFMT=0x0011`, then starts DMA with `SDnCTL = tag(1)<<20 | RUN | IOCE`.
+The stop/reset sequence clears RUN and **preserves the stream tag**: QEMU
+derives the stream number from `SDnCTL` on every RUN-bit flip, so clearing the
+tag would notify the codec with `stnr=0` and the converter (tag 1) would keep
+playing the wrapping BDL forever.
+
+The stream reset helper (`reset_stream`) clears RUN first and polls the
+descriptor against a time budget (`STREAM_RESET_TIMEOUT_NS`, 10 ms) until the
+controller reports `RUN=0` *before* asserting SRST (HDA 3.3.35); each phase
+(RUN clear, SRST assert, SRST release) that fails to settle is reported as
+`Err` and propagated out of every play/record/stop path instead of proceeding
+with a force.  Input stops (`record`, `record_stream`) route through the same
+helper, preserving the input tag (2) across the transition.  The codec's
+output converter is muted on stop and unmuted on start (best-effort, logged on
+failure), so a stopped DAC cannot hold the last sample as a residual DC level.
 
 `SDnFMT=0x0011` is the Table 53 stream-format structure for 48 kHz/16-bit/
 stereo (TYPE=0 · BASE=0 · MULT=000 · DIV=000 · BITS=001 · CHAN=0001), the
@@ -253,17 +263,23 @@ started with `SD_CTL = (2 << 20) | RUN | IOCE` (tag 2 = the codec's input
 allowed the full duration, then both entries' completions consumed (IRQ count
 delta or two BCIS poll-clears) before a 50 ms FIFO drain, copied into `dest`,
 then stopped **preserving the input tag** (QEMU derives the stream number from
-`SDnCTL` on every RUN flip, exactly as for output).  `record_pcm_stream`
-mirrors `play_stream`: a fixed-geometry BDL ring of `RING_ENTRIES` `eb`-sized
-entries (rejecting non-128-aligned `eb`), CBL = padded total,
-refilled/consumed entry-by-entry as input completions arrive; each completed
-slot is copied into an **owned** `Vec<i16>` (a ring slot is live DMA memory
-being overwritten by the controller) and the final chunk is trimmed to
-`total_bytes - (needed-1)*eb`.  The ring slot for completion `c` is `(c-1) mod n`,
-safe to read until the controller cycles `n` entries later.  QEMU delivers
-silence when no host audio source is configured, so the DMA still advances and
-the completion fires; a genuinely stalled input DMA times out with
-`"capture stalled"` rather than fabricating samples.
+`SDnCTL` on every RUN flip, exactly as for output).  If both descriptors do
+**not** complete within the wait budget the capture fails with
+`"capture stalled"` — success is never reported on unconfirmed DMA data.
+`record_pcm_stream` builds a **linear BDL covering the whole payload**: exactly
+`needed = ceil(total_bytes/eb)` entries are written (bounded by the BDL page
+capacity, 256 entries, and by `BUF_CAP`), so `CBL` equals the descriptor sum
+per 3.3.38 and a controller fetching toward CBL never reads BDL-page garbage
+past the last written entry (a payload larger than the 8-entry ring previously
+under-wrote the BDL).  Rejects non-128-aligned `eb`; each completed slot is
+copied into an **owned** `Vec<i16>` (a slot is live DMA memory being
+overwritten by the controller) and the final chunk is trimmed to
+`total_bytes - (needed-1)*eb`.  Completions are consumed through the exclusive
+ISR-counter / LPIB accounting, handling several descriptors coalescing into
+one BCIS latch during a slow `sink`.  QEMU delivers silence when no host audio
+source is configured, so the DMA still advances and the completion fires; a
+genuinely stalled input DMA times out with `"capture stalled"` rather than
+fabricating samples.
 - Location: `kernel/src/audio/hda.rs` `record()`, `record_stream()`
  
 **AUD-025** Capture is mutually exclusive with playback: both `play_*` and the
@@ -324,22 +340,42 @@ polled; decoupling it the same way is a follow-up).
 
 **AUD-030** `play_stream_continuous` is the "flow through the ends of time"
 path: a full cyclic ring (all `RING_ENTRIES` slots `eb`-sized and IOC, `LVI =
-n-1`, `CBL = u32::MAX`), fed from a `next` closure that keeps pulling until it
-returns `None`, then stopped the instant the last staged slot completes
-(before the DMA can cycle back to replay older audio). The CBL = u32::MAX
-deviation is documented QEMU tolerance — QEMU treats CBL as the transfer
-budget while the descriptors cycle; a real controller would expect
-`CBL = Σ BDL lengths`. The pump's closure chains the next queued request
+n-1`, `CBL = n * eb`), fed from a `next` closure that keeps pulling until it
+returns `None`. Once the producer ends, each completed slot is cleared before
+the controller can revisit it, and the stream is then stopped and reset.
+The driver keeps the ring running for one additional full ring of cleared
+descriptors as a silence guard, allowing the controller/FIFO to settle before
+RUN is cleared.
+When the producer signals the end, the slot the DMA wraps to after the last
+staged chunk (`fed % n`, still holding chunk `fed - n` from the session's
+first lap) is zeroed *immediately* — it is 1..n slots ahead of the cursor (a
+full ring only when the ring is still full).  On QEMU the DMA reads buffer
+bytes only as its position reaches them, so the write cannot race the live
+fetch; a real controller with a deep data-FIFO prefetch could have already
+pulled the stale bytes, making the pre-zero a QEMU-tuned optimisation.  Each
+subsequent guard completion clears its freed slot the same way, so the whole
+guard ring is silence before the controller can re-fetch it.
+Output starts set `IOCE`, so IOC-marked descriptors generate BCIS interrupts
+as required by HDA 3.3.35; the poll fallback remains available. The pump's closure chains the next queued request
 straight into the running ring, so back-to-back `:play_pcm` calls merge into a
-single gapless session.
+single gapless session. The pump's feed closure is **non-blocking**: when the
+queue empties it returns silence-filled slots up to a bounded `PUMP_GRACE_NS`
+(50 ms) window (tracked across calls, reset when a request arrives), so a
+near-back-to-back enqueue still chains with no seam and consumed slots are
+always immediately refilled — the cyclic DMA can never wrap around and replay
+stale audio from a previous lap while the producer stalls.  Completion
+accounting is exclusive per direction: the ISR counter when the interrupt
+route is live, the cumulative SD_LPIB position (which loses nothing to the
+single-bit BCIS latch) when it is polled.
 - Location: `kernel/src/audio/hda.rs` `play_stream_continuous()`,
   `kernel/src/audio/mod.rs` `audio_pump_entry()`
 
-**AUD-031** The `AudioDevice` trait gains `play_pcm_stream_continuous(eb,
-next)` with a default that collects the whole feed into one `play_pcm_stream`
-pass (gapless, one stop at the end); `HdaAudio` overrides it with the cyclic
-ring. The dedicated stream BDL/buffer allocation is the enabling factor for
-both the lock-free refill loop and future full-duplex (AUD-025).
+**AUD-031** The `AudioDevice` trait exposes `play_pcm_stream_continuous(eb,
+next)` as a **required** method — there is deliberately no collecting default,
+because draining a real-time producer's `next` to `None` before starting DMA
+would loop forever and exhaust the heap; `HdaAudio` implements it with the
+cyclic ring. The dedicated stream BDL/buffer allocation is the enabling factor
+for both the lock-free refill loop and future full-duplex (AUD-025).
  
 ---
  
