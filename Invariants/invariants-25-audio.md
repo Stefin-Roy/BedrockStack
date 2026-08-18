@@ -1,10 +1,10 @@
 # BedrockOS Invariants — Audio Subsystem & Intel HD Audio Driver
 
-**Version:** 0.7.0
+**Version:** 0.8.0
 **Date:** 2026-08-18
 **Source paths:**
 - `kernel/src/audio/mod.rs` — subsystem engine, `AudioDevice` trait, `submit_playback`/`read_capture`, `play_tone`/`play_pcm`/`record_pcm`, sine synthesis, `device_name()`/`pub const SAMPLE_RATE, CHANNELS`
-- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, per-direction **feeding rings**, ISR cursor advance + slot zeroing
+- `kernel/src/audio/hda.rs` — Intel HD Audio (ICH6/ICH9) controller driver: reset, CORB/RIRB, serialised verbs, per-direction **feeding rings**, LPIB-reconciled cursor advance + slot zeroing
 - `kernel/src/services/universal_timer.rs` — `wait_until_cond_coop` (task-aware cooperative wait)
 - `kernel/src/audio/codec.rs` — generic HDA codec driver: probe, widget graph, output/input path discovery, path bring-up
 - `kernel/src/lib.rs` — `pub mod audio`, `audio::init()` in `Kernel::run()`
@@ -66,41 +66,63 @@ a caller loop over `submit_playback`/`read_capture`.
 ### Feeding rings (AUD-010…AUD-014 cover discovery)
 
 **AUD-015** Each direction owns one fixed-geometry cyclic BDL ring, programmed
-**once at init** (`Inner::start_ring`): `RING_SLOTS` (= 16) IOC entries of
-`RING_SLOT_BYTES` (= 4096 B, ≈ 21 ms) over a contiguous `RING_BUF_BYTES`
+**once at init** (`Inner::start_ring`): `RING_SLOTS` (= 8) IOC entries of
+`RING_SLOT_BYTES` (= 2048 B, ≈ 10.7 ms) over a contiguous `RING_BUF_BYTES`
 buffer, `LVI = RING_SLOTS-1`, `CBL = RING_SLOTS * RING_SLOT_BYTES`, then DMA
 started with `RUN | IOCE` and left running for the kernel's lifetime.  There is
 no per-call stream reset or descriptor reprogramming.
 
-**AUD-016** Ring ownership is two cursors per direction, both lock-free
-atomics:
-- Playback: `OUT_PRODUCED` (slots staged by callers) and `OUT_COMPLETED`
-  (slots the DMA has finished playing, advanced by the ISR).  A caller may
-  write slot `OUT_PRODUCED % RING_SLOTS` whenever
-  `OUT_PRODUCED % RING_SLOTS != OUT_COMPLETED % RING_SLOTS`.  This single rule
-  keeps the caller safely ahead of the play head (never overwrites the
-  in-progress slot) and safely inside the ring (never runs `RING_SLOTS` ahead,
-  which would alias back onto the in-progress slot) — it subsumes both the
-  "ring full" and "ring empty" parking cases with no wrap arithmetic.
-- Capture: `IN_CAPTURED` (slots the input DMA has filled, ISR advanced) and
-  `IN_CONSUMED` (slots read by callers); a caller reads slot
-  `IN_CONSUMED % RING_SLOTS` whenever
-  `IN_CONSUMED % RING_SLOTS != IN_CAPTURED % RING_SLOTS`.
+**AUD-016** Ring ownership is two **byte** cursors per direction, both lock-free
+atomics (the DMA works in fixed BDL slots, but a partial slot simply carries
+over into the next call — no data is lost, no silence is inserted mid-slot):
+- Playback: `OUT_PRODUCED` (bytes staged by callers) and `OUT_COMPLETED`
+  (bytes the DMA has finished playing).  A caller writes at
+  `OUT_PRODUCED % RING_BUF_BYTES` while the staged-but-unplayed fill level
+  `OUT_PRODUCED - OUT_COMPLETED` stays below `MAX_STAGED_BYTES` =
+  `RING_BUF_BYTES - RING_SLOT_BYTES` (7 slots ≈ 74 ms).  `OUT_COMPLETED`
+  tracks the exact byte the DMA has played, so the write head always stays at
+  or ahead of the play head.  Only a **true underrun** — the DMA caught up to
+  or passed the write head (`OUT_PRODUCED <= OUT_COMPLETED`), a cold start or
+  a stall longer than the staged window — realigns `OUT_PRODUCED` to
+  `c + 2·slot` (the unwritten gap plays as zeroed silence).  A partial fill
+  (`0 < OUT_PRODUCED - OUT_COMPLETED < cap`) is healthy and never touches
+  `OUT_PRODUCED`; the stall indicator is **never** the fill level dropping
+  below two slots.  When the staging cap is reached the caller parks
+  cooperatively until a completion frees space.
+- Capture: `IN_CAPTURED` (bytes the input DMA has filled, reconciled against
+  the input `SDnLPIB`) and `IN_CONSUMED` (bytes read by callers); a caller
+  reads at `IN_CONSUMED % RING_BUF_BYTES` whenever
+  `IN_CAPTURED.wrapping_sub(IN_CONSUMED) > 0`, never reading past
+  `IN_CAPTURED` (so it never touches the slot the input DMA is filling).  If
+  the caller lags a full ring behind the DMA, the overrun is detected and
+  `IN_CONSUMED` is realigned to the newest captured slot, dropping the
+  overwritten tail instead of replaying stale data.
 
 **AUD-017** The completion ISR (`hda_irq_handler`) is the only asynchronous
-actor.  On an output BCIS it advances `OUT_COMPLETED` and **zeroes the
-just-consumed output slot** (before the `Release` store of the cursor), so a
-stalled producer plays silence rather than a stale tail from an earlier lap.
-On an input BCIS it advances `IN_CAPTURED` (no zeroing — the DMA overwrites).
-The producer's `Acquire` load of `OUT_COMPLETED` synchronises with the ISR's
-`Release` store, so the zeroing is always visible before the producer reclaims
-that slot — there is no double-write race.  The producer additionally zeroes
-the whole target slot before copying (belt-and-braces).
+actor.  Cursors are advanced by **reconciling against `SDnLPIB`**, never
+counted per interrupt: the controller latches BCIS **sticky-once** even when
+several slots completed between services, so a blind `+1 slot per BCIS` would
+let `OUT_COMPLETED`/`IN_CAPTURED` lag the DMA permanently (QEMU updates LPIB
+byte-by-byte on every xfer and resets it to 0 at BDL wrap).  The servicer reads
+LPIB and advances the cursor by the **exact byte distance**
+`(lpib + ring - last_lpib) % ring` since the previous observation (tracked in
+`LAST_OUT_LPIB`/`LAST_IN_LPIB`), so a wrap is native and no absolute-offset
+wrap guessing can fabricate a false full-ring lap (which would teleport the
+cursor ~7 slots ahead and wipe the buffer).  Every just-consumed **output
+byte** is zeroed (before the `Release` store of the cursor), so a stalled
+producer plays silence rather than a stale tail from an earlier lap.  Input
+bytes are not zeroed — the DMA overwrites its own ring.  The producer's
+`Acquire` load of `OUT_COMPLETED` synchronises with the servicer's `Release`
+store, so the zeroing is always visible before the producer reclaims that byte —
+there is no double-write race (the producer only ever writes at or ahead of the
+just-consumed position).
 
 **AUD-018** If no interrupt route is established, `INTERRUPT_DRIVEN` stays
 false and the waiting caller services the BCIS latches itself
-(`service_polled_completions`), advancing the cursors exactly as the ISR would.
-Because it runs only when the ISR is not wired, there is no double-count race.
+(`service_polled_completions`), reconciling the cursors against LPIB exactly as
+the ISR would — unconditionally each poll, since one latch may cover several
+slots and LPIB is a no-op when no boundary was crossed.  Because it runs only
+when the ISR is not wired, there is no double-count race.
 
 **AUD-019** Callers park via `ring_wait_until`, which loops
 `wait_until_cond_coop` (task context: cooperative `sleep_current` slices, never
@@ -179,8 +201,15 @@ blocks when `can_record()` and logs the byte count/peak/RMS.
 - The fixed 48 kHz / 16-bit / stereo stream format matches the controller
   `SDnFMT` and the codec format verb (`0x11`/`0x0011`); a future rate/channel
   change must keep the two in agreement.
-- `RING_SLOT_BYTES` (latency granularity, ≈ 21 ms) and `RING_SLOTS` (in-flight
-  headroom, ≈ 341 ms) are tunable constants; both keep the 128-byte BDL buffer
-  alignment of HDA 3.6.3.
+- `RING_SLOT_BYTES` (DMA-quantum granularity, ≈ 10.7 ms), `RING_SLOTS`
+  (in-flight headroom, ≈ 85 ms), and the staging cap `MAX_STAGED_BYTES`
+  (≈ 74 ms of in-flight audio) are tunable constants; they keep the 128-byte
+  BDL buffer alignment of HDA 3.6.3.  The staging cap must stay a multiple of
+  `RING_SLOT_BYTES` and strictly inside `RING_BUF_BYTES`.
 - Full-duplex works: separate output/input rings and cursors, no shared mutex
   at runtime.
+- Playback realigns (a genuine stall: DMA lapped the producer) and capture
+  overruns (consumer lags a full ring) each emit a single serial log line.
+  They indicate a real stall, never normal operation — a healthy producer
+  keeps ahead of the play head and a healthy consumer drains before the DMA
+  wraps, so steady-state playback is completely silent on the serial console.
