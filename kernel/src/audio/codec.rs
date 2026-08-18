@@ -114,18 +114,28 @@ pub const AMP_SET_RIGHT: u32 = 1 << 12;
 pub const AMP_INDEX_MASK: u32 = 0xF << 8;
 pub const AMP_MUTE: u32 = 1 << 7;
 pub const AMP_GAIN_MASK: u32 = 0x7F;
-/// Amp capability: mute supported (bit 31), number of gain steps (bits 14:8).
+/// Amp capability fields per HDA spec 7.3.4.10:
+/// - Bit 31: Mute supported
+/// - Bits [22:16]: Step size
+/// - Bits [14:8]: Number of gain steps (NUM_STEPS)
+/// - Bits [6:0]: Offset (gain value at step 0)
 pub const AMPCAP_MUTE: u32 = 1 << 31;
+pub const AMPCAP_OFFSET: u32 = 0x7F;
+pub const AMPCAP_STEP_SIZE: u32 = 0x7F << 16;
 pub const AMPCAP_NUM_STEPS: u32 = 0x7F << 8;
 
 // ── Pin Widget Control (7.3.3.31) ───────────────────────────────────
 pub const PIN_OUT_EN: u32 = 0x40;
 pub const PIN_IN_EN: u32 = 0x20;
 pub const PIN_HP_EN: u32 = 0x80;
-pub const PIN_VREF_50: u32 = 0x10;
-pub const PIN_VREF_80: u32 = 0x11;
-pub const PIN_VREF_100: u32 = 0x12;
-pub const PIN_VREF_GRD: u32 = 0x13;
+/// VREF 50% — HDA spec bits [2:0] = 001.
+pub const PIN_VREF_50: u32 = 1;
+/// VREF Ground — HDA spec bits [2:0] = 010.
+pub const PIN_VREF_GRD: u32 = 2;
+/// VREF 80% — HDA spec bits [2:0] = 100.
+pub const PIN_VREF_80: u32 = 4;
+/// VREF 100% — HDA spec bits [2:0] = 101.
+pub const PIN_VREF_100: u32 = 5;
 
 // ── Default-config device types (7.3.4.11) ──────────────────────────
 /// Headphone-out jack (default-config device field).
@@ -144,20 +154,24 @@ const ALC_EAPD_COEF: u32 = 0x10;
 const ALC_EAPD_VERB_CONTROL: u32 = 9;
 
 /// Clear `bit` of vendor COEF `idx` on node 0x20 (read-modify-write, with
-/// the index re-selected before each access as Linux does).
-fn alc_coef_clear_bit(s: &mut dyn VerbSender, c: &Codec, idx: u32, bit: u32) {
-    let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx);
-    let old = s
-        .verb(c.cad, RTL_COEF_NID, VERB_GET_PROC_COEF, 0)
-        .unwrap_or(0);
-    let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx);
-    let _ = s.verb(c.cad, RTL_COEF_NID, VERB_SET_PROC_COEF, old & !(1 << bit));
+/// the index re-selected before each access as Linux does).  Returns `Err`
+/// when the read or write verb fails so the caller can decide whether to
+/// abort or continue (a failed read must not be written back — that would
+/// zero the entire coefficient).
+fn alc_coef_clear_bit(s: &mut dyn VerbSender, c: &Codec, idx: u32, bit: u32) -> Result<(), &'static str> {
+    s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx)?;
+    let old = s.verb(c.cad, RTL_COEF_NID, VERB_GET_PROC_COEF, 0)?;
+    s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx)?;
+    s.verb(c.cad, RTL_COEF_NID, VERB_SET_PROC_COEF, old & !(1 << bit))?;
+    Ok(())
 }
 
 /// ALC269-family EAPD quirk: clear COEF 0x10 bit 9 so `VERB_SET_EAPD_BTLENABLE`
 /// actually drives the pin EAPD.  Mirrors the vendor list in Linux
 /// `alc_fill_eapd_coef` (the `0x10, 1<<9, 0` case, incl. ALC256 = 0x10ec0256).
 /// No-op on other codecs (and on QEMU's, which has no coef widget semantics).
+/// Logs a warning if the coefficient read/write fails rather than silently
+/// corrupting the value.
 fn realtek_eapd_verb_control(s: &mut dyn VerbSender, c: &Codec) {
     if matches!(
         c.vendor,
@@ -177,7 +191,11 @@ fn realtek_eapd_verb_control(s: &mut dyn VerbSender, c: &Codec) {
             | 0x10ec0298
             | 0x10ec0300
     ) {
-        alc_coef_clear_bit(s, c, ALC_EAPD_COEF, ALC_EAPD_VERB_CONTROL);
+        if let Err(e) = alc_coef_clear_bit(s, c, ALC_EAPD_COEF, ALC_EAPD_VERB_CONTROL) {
+            crate::drivers::serial::SerialPort::puts("[audio] warn: alc_coef_clear_bit: ");
+            crate::drivers::serial::SerialPort::puts(e);
+            crate::drivers::serial::SerialPort::puts("\n");
+        }
     }
 }
 
@@ -546,7 +564,8 @@ fn find_output_path(widgets: &[Widget]) -> (Option<u32>, Option<u32>, Vec<(u32, 
 /// Walk the connection graph from `start` toward its sources and return the
 /// first widget of type `target` plus the path of widgets from it back to
 /// `start` (inclusive on both ends), each hop tagged with the connection-list
-/// index it uses toward the source.  Bounded depth; no hardcoded NIDs.
+/// index it uses toward the source.  Bounded at MAX_CONNS depth; no hardcoded
+/// NIDs.  Traverses mixers, selectors, and volume-knob widgets.
 fn reach_converter(
     widgets: &[Widget],
     start: u32,
@@ -555,7 +574,7 @@ fn reach_converter(
     // parents[(nid)] = the widget whose connlist contains nid.
     let mut parents: Vec<(u32, u32)> = Vec::new();
     let mut frontier: Vec<u32> = alloc::vec![start];
-    for _ in 0..8 {
+    for _ in 0..MAX_CONNS {
         let mut next: Vec<u32> = Vec::new();
         for &nid in &frontier {
             let Some(w) = widgets.iter().find(|w| w.nid == nid) else {
@@ -591,7 +610,7 @@ fn reach_converter(
                     }
                     return Some((c, path_hops(widgets, &path)));
                 }
-                if cw.wtype() == WIDGET_MIXER || cw.wtype() == WIDGET_SEL {
+                if matches!(cw.wtype(), WIDGET_MIXER | WIDGET_SEL | WIDGET_VOL_KNOB) {
                     parents.push((c, nid));
                     next.push(c);
                 }
@@ -642,14 +661,14 @@ fn find_input_path(widgets: &[Widget]) -> (Option<u32>, Option<u32>, Vec<(u32, u
 }
 
 /// From an ADC, follow its connection list upstream to the first in-capable
-/// pin (possibly through mixers/selectors).  Returns the pin and the source-
-/// first path `pin .. adc` tagged with per-hop connection indices.
+/// pin (possibly through mixers/selectors/volume-knobs).  Returns the pin and
+/// the source-first path `pin .. adc` tagged with per-hop connection indices.
 fn reach_in_pin(widgets: &[Widget], adc: u32) -> Option<(u32, Vec<(u32, usize)>)> {
     let mut visited: Vec<u32> = alloc::vec![adc];
     let mut frontier: Vec<u32> = alloc::vec![adc];
     // parents[(source)] = the downstream node whose connlist contains it.
     let mut parents: Vec<(u32, u32)> = Vec::new();
-    for _ in 0..8 {
+    for _ in 0..MAX_CONNS {
         let mut next: Vec<u32> = Vec::new();
         for &nid in &frontier {
             let Some(w) = widgets.iter().find(|w| w.nid == nid) else {
@@ -684,7 +703,7 @@ fn reach_in_pin(widgets: &[Widget], adc: u32) -> Option<(u32, Vec<(u32, usize)>)
                         }
                         return Some((c, path_hops(widgets, &path)));
                     }
-                } else if cw.wtype() == WIDGET_MIXER || cw.wtype() == WIDGET_SEL {
+                } else if matches!(cw.wtype(), WIDGET_MIXER | WIDGET_SEL | WIDGET_VOL_KNOB) {
                     parents.push((c, nid));
                     next.push(c);
                 }
@@ -724,16 +743,20 @@ fn unmute_amp(
     } else {
         AMP_SET_INPUT
     };
-    // Full, unmuted gain = the number of steps the (effective) amp capability
-    // advertises — never a blind 0x7F.
-    let gain = (cap & AMPCAP_NUM_STEPS) >> 8;
+    // The gain payload is the step index. StepSize describes the dB value
+    // represented by each index; it is not multiplied into the payload.
+    let offset = cap & AMPCAP_OFFSET;
+    let num_steps = (cap & AMPCAP_NUM_STEPS) >> 8;
+    let gain = (offset + num_steps).min(AMP_GAIN_MASK);
     let payload =
         dir | AMP_SET_LEFT | AMP_SET_RIGHT | (((index as u32) << 8) & AMP_INDEX_MASK) | gain;
     let _ = s.verb(c.cad, nid, VERB_SET_AMP_GAIN_MUTE, payload);
 }
 
-/// Highest VREF bias a pin supports, if any: 100% when the 80%/100% pin-cap
-/// bit is set, else 50%, else ground.  `None` for pins without VREF circuitry.
+/// Highest VREF bias a pin supports, if any: 100%, then 80%, then 50%, then
+/// ground.  Pin-capability bits are the VREF[7:0] field, not the PinCntl
+/// encoding used in the returned value.
+/// `None` for pins without VREF circuitry.
 fn pick_vref(pincap: u32) -> Option<u32> {
     if pincap & PINCAP_VREF_MASK == 0 {
         return None;
@@ -741,8 +764,10 @@ fn pick_vref(pincap: u32) -> Option<u32> {
     if pincap & (1 << 13) != 0 {
         Some(PIN_VREF_100)
     } else if pincap & (1 << 12) != 0 {
+        Some(PIN_VREF_80)
+    } else if pincap & (1 << 9) != 0 {
         Some(PIN_VREF_50)
-    } else if pincap & (1 << 8) != 0 {
+    } else if pincap & (1 << 10) != 0 {
         Some(PIN_VREF_GRD)
     } else {
         None
@@ -771,7 +796,7 @@ pub fn setup_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &
             WIDGET_AUD_OUT => unmute_amp(s, c, n, true, w.wcap, w.amp_out, 0),
             WIDGET_SEL => {
                 if w.nconns > 1 {
-                    let _ = s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32);
+                    s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32)?;
                 }
                 unmute_amp(s, c, n, false, w.wcap, w.amp_in, idx);
             }
@@ -779,7 +804,7 @@ pub fn setup_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &
             WIDGET_PIN => {
                 unmute_amp(s, c, n, true, w.wcap, w.amp_out, 0);
                 if w.nconns > 1 {
-                    let _ = s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32);
+                    s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32)?;
                 }
             }
             _ => {}
@@ -795,10 +820,10 @@ pub fn setup_output(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &
                 // ALC269-family codecs gate EAPD on COEF 0x10 bit 9; clear it
                 // first so the pin's EAPD is actually verb-controlled.
                 realtek_eapd_verb_control(s, c);
-                let _ = s.verb(c.cad, pin, VERB_SET_EAPD_BTLENABLE, EAPD_EN);
+                s.verb(c.cad, pin, VERB_SET_EAPD_BTLENABLE, EAPD_EN)?;
             }
         }
-        let _ = s.verb(c.cad, pin, VERB_SET_PIN_WIDGET_CONTROL, pctl);
+        s.verb(c.cad, pin, VERB_SET_PIN_WIDGET_CONTROL, pctl)?;
     }
     s.verb(c.cad, dac, VERB_SET_CONV, (tag << 4) | 0)?;
     s.verb(c.cad, dac, VERB_SET_STREAM_FORMAT, c.fmt as u32)?;
@@ -822,8 +847,20 @@ pub fn setup_alc256_output(
         let _ = s.verb(c.cad, nid, VERB_SET_POWER_STATE, PWR_D0);
     }
     realtek_eapd_verb_control(s, c);
+    // Read the DAC's actual output amplifier capability and compute full
+    // gain (offset + num_steps * step_size) instead of hardcoding 0x7F.
+    let amp_out_cap = s
+        .verb(c.cad, RTL_ALC256_DAC, VERB_GET_PARAM, PARAM_AMP_OUT_CAP)
+        .unwrap_or(0);
+    let offset = amp_out_cap & AMPCAP_OFFSET;
+    let num_steps = (amp_out_cap & AMPCAP_NUM_STEPS) >> 8;
+    let gain = if amp_out_cap != 0 {
+        (offset + num_steps).min(AMP_GAIN_MASK)
+    } else {
+        0x7F
+    };
     // Full-gain, unmuted output amp (index 0) on the converter and both pins.
-    let amp = AMP_SET_OUTPUT | AMP_SET_LEFT | AMP_SET_RIGHT | 0x7F;
+    let amp = AMP_SET_OUTPUT | AMP_SET_LEFT | AMP_SET_RIGHT | gain;
     let _ = s.verb(c.cad, RTL_ALC256_DAC, VERB_SET_AMP_GAIN_MUTE, amp);
     let _ = s.verb(
         c.cad,
@@ -867,7 +904,7 @@ pub fn setup_input(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &'
             WIDGET_AUD_IN => unmute_amp(s, c, n, false, w.wcap, w.amp_in, idx),
             WIDGET_SEL => {
                 if w.nconns > 1 {
-                    let _ = s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32);
+                    s.verb(c.cad, n, VERB_SET_CONNECT_SEL, idx as u32)?;
                 }
                 unmute_amp(s, c, n, false, w.wcap, w.amp_in, idx);
             }
@@ -878,11 +915,17 @@ pub fn setup_input(s: &mut dyn VerbSender, c: &Codec, tag: u32) -> Result<(), &'
     if let Some(pin) = c.in_pin {
         let mut pctl = PIN_IN_EN;
         if let Some(w) = c.widget(pin) {
-            if let Some(vref) = pick_vref(w.pincap) {
-                pctl |= vref;
+            // Only bias microphone-capable pins with VREF; line-in (type 8)
+            // and aux (type 9) are typically line-level inputs that should not
+            // be biased.  mic-in = 10, telephony-mic = 11.
+            let dev_type = (w.pin_cfg >> 20) & 0xF;
+            if matches!(dev_type, 10 | 11) {
+                if let Some(vref) = pick_vref(w.pincap) {
+                    pctl |= vref;
+                }
             }
         }
-        let _ = s.verb(c.cad, pin, VERB_SET_PIN_WIDGET_CONTROL, pctl);
+        s.verb(c.cad, pin, VERB_SET_PIN_WIDGET_CONTROL, pctl)?;
     }
     s.verb(c.cad, adc, VERB_SET_CONV, (tag << 4) | 0)?;
     s.verb(c.cad, adc, VERB_SET_STREAM_FORMAT, c.fmt as u32)?;

@@ -55,11 +55,11 @@ impl Object for DebugSerialObject {
 /// `/driver/audio` — the audio subsystem's device surface.
 ///
 /// The value is a snapshot of the live playback/capture state.  The two
-/// methods queue playback for the kernel pump task: `:play_tone{freq, ms}`
-/// and `:play_pcm{pcm}` (little-endian interleaved 16-bit signed stereo,
-/// 48 kHz).  Both return immediately — the pump plays the queued samples
-/// gaplessly through the HDA streaming ring, chaining back-to-back requests
-/// with no seam — so no caller ever parks the CPU (old blocking behaviour).
+/// methods feed the running HDA DMA ring: `:play_tone{freq, ms}` and
+/// `:play_pcm{pcm}` (little-endian interleaved 16-bit signed stereo, 48 kHz).
+/// Each call stages the samples into the next free ring slot and returns once
+/// staged, parking the caller cooperatively only when the ring is momentarily
+/// full — the DMA ring never stops, so back-to-back requests chain gaplessly.
 /// x86_64-only: the `audio` crate module is not compiled on riscv64.
 #[cfg(target_arch = "x86_64")]
 struct AudioObject;
@@ -191,7 +191,7 @@ impl Object for AudioObject {
                 for pair in pcm.chunks_exact(2) {
                     samples.push(i16::from_le_bytes([pair[0], pair[1]]));
                 }
-                crate::audio::enqueue_playback(samples).map_err(unsupported)?;
+                crate::audio::play_pcm(&samples).map_err(unsupported)?;
                 Ok(())
             }
             _ => Err(UnispaceError::MethodNotFound),
