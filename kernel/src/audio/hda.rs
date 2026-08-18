@@ -1,16 +1,52 @@
 //! Intel HD Audio (ICH6/ICH9) controller driver.
 //!
-//! Polled driver for QEMU's `intel-hda` / `ich9-intel-hda` emulation.  The
+//! Polled/IRQ driver for QEMU's `intel-hda` / `ich9-intel-hda` emulation.  The
 //! controller moves verbs to the codec over the CORB/RIRB rings and plays
 //! 16-bit signed stereo PCM at 48 kHz through the codec's output converter
 //! (discovered generically by `super::codec`).  When the chosen codec also
-//! exposes an input path (e.g. QEMU's `hda-duplex`), the same stream
-//! machinery drives the input converter the other way for capture, so the
-//! carriage rides in both directions.
+//! exposes an input path (e.g. QEMU's `hda-duplex`), the same ring machinery
+//! drives the input converter the other way for capture.
 //!
-//! Playback runs as a single descriptor in a BDL (Buffer Descriptor List)
-//! that the controller DMA's into the codec; capture is the mirror image —
-//! the controller DMA's codec samples out of a BDL into the staging buffer.
+//! ## Feeding ring model
+//!
+//! Each direction owns one fixed-geometry cyclic BDL ring that is programmed
+//! **once at init** and left running for the kernel's lifetime.  The DMA never
+//! stops, so back-to-back calls chain gaplessly and there is no per-call stream
+//! reset or descriptor reprogramming.
+//!
+//! Ownership is tracked with two **byte** cursors per direction (the DMA works
+//! in 4096-byte BDL slots, but callers may stage or read any byte count, so a
+//! partial slot simply carries over into the next call — no data is lost and no
+//! silence is inserted at slot boundaries):
+//!
+//! - **Playback**: `OUT_PRODUCED` (bytes staged by callers) and
+//!   `OUT_COMPLETED` (bytes the DMA has finished playing, advanced by a full
+//!   slot in the completion ISR).  A caller stages bytes at
+//!   `OUT_PRODUCED % ring_bytes` whenever the linear distance
+//!   `OUT_PRODUCED - OUT_COMPLETED` is less than the ring size — i.e. whenever
+//!   it is not running a full ring ahead of the play head (which would alias
+//!   the write back onto the DMA's in-progress slot).  When the ring is full
+//!   the caller parks cooperatively until a completion frees space.  Each
+//!   consumed output slot is zeroed by the ISR, so a stalled producer plays
+//!   **silence**, never a stale tail from an earlier lap.
+//!
+//! - **Capture**: `IN_CAPTURED` (bytes filled by the input DMA, advanced by a
+//!   full slot in the ISR) and `IN_CONSUMED` (bytes read out by callers).  A
+//!   caller reads `IN_CONSUMED % ring_bytes` whenever capture is ahead of
+//!   consumption, parking until new capture arrives.  Partial reads carry over
+//!   into the next call, so unread bytes are never discarded.
+//!
+//! The cursors are lock-free atomics and the DMA buffers are only touched by
+//! their owning side, so playback, capture and full-duplex coexist with no
+//! `Inner` mutex at runtime (the mutex is held only during init/bring-up).  A
+//! single producer/consumer lock guards each direction against concurrent
+//! callers (e.g. two user tasks staging playback at once); the ISR shares the
+//! cursors lock-free.
+//!
+//! The completion ISR advances the cursors and zeroes consumed output slots.
+//! If no interrupt route could be established the driver falls back to
+//! servicing the BCIS latches from the waiting caller (polled), so playback
+//! still progresses.
 //!
 //! QEMU-specific facts this driver relies on (see hw/audio/intel-hda.c,
 //! hw/audio/hda-codec.c):
@@ -46,14 +82,21 @@ use crate::services::dma::DmaAllocator;
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const CHANNELS: usize = 2;
 
-/// DMA staging buffer capacity in bytes (one contiguous allocation).
-const BUF_CAP: usize = 256 * 1024;
-
 /// Output converter stream tag (matches SDnCTL bits 20..23).
 const STREAM_TAG: u32 = 1;
-/// Input converter stream tag, configured on the codec side only (capture is
-/// not exposed yet, so no input stream descriptor is run).
+/// Input converter stream tag.
 const INPUT_TAG: u32 = 2;
+
+// ── Feeding-ring geometry ───────────────────────────────────────────
+/// Per-slot size in bytes.  4096 B = 1024 stereo frames ≈ 21 ms at 48 kHz.
+/// Slots must keep the 128-byte buffer alignment of HDA 3.6.3 (both 128 and
+/// 4096 satisfy it).
+const RING_SLOT_BYTES: usize = 4096;
+/// Ring depth: slots per direction.  16 slots ≈ 341 ms of total in-flight
+/// DMA headroom at 48 kHz.
+const RING_SLOTS: usize = 16;
+/// One contiguous DMA buffer per direction: `RING_SLOT_BYTES * RING_SLOTS`.
+const RING_BUF_BYTES: usize = RING_SLOT_BYTES * RING_SLOTS;
 
 // ── Controller register offsets ────────────────────────────────────
 mod regs {
@@ -80,7 +123,6 @@ mod regs {
     // regtab: .shift=24); byte 0x04 of that byte is BCIS, "descriptor
     // complete", latched whenever an IOC-flagged BDL entry is consumed.
     pub const SD_STS: u32 = 0x03;
-    pub const SD_LPIB: u32 = 0x04;
     pub const SD_CBL: u32 = 0x08;
     pub const SD_LVI: u32 = 0x0C;
     pub const SD_FMT: u32 = 0x12; // SDnFMT is at 0x12 (0x10 is SDnFIFOS, R/O)
@@ -123,9 +165,7 @@ const VERB_TIMEOUT_NS: u64 = 100_000_000;
 const SD_CTL_SRST: u32 = 1 << 0;
 const SD_CTL_RUN: u32 = 1 << 1;
 /// Interrupt On Completion Enable — spec 3.3.35 bit 2: BCIS raises a
-/// controller interrupt only while set (output's omission is a tolerated QEMU
-/// deviation; the poll fallback covers it).  Input sets it so real hardware
-/// gets completion interrupts too.
+/// controller interrupt only while set.
 const SD_CTL_IOCE: u32 = 1 << 2;
 const SD_CTL_STREAM_TAG: u32 = 1 << 20; // stream tag 1
 /// Input stream tag — matches the codec's ADC `SET_CONV` binding (tag 2).
@@ -136,104 +176,103 @@ const SD_CTL_INPUT_STREAM_TAG: u32 = 2 << 20;
 /// Stream-format structure (spec 3.7.1, Table 53), shared by SDnFMT and the
 /// codec `SET_STREAM_FORMAT` verb: TYPE=0 (PCM) · BASE=0 (48 kHz) ·
 /// MULT=000 (÷1) · DIV=000 (÷1) · BITS=001 (16-bit) · CHAN=0001 (2 ch)
-/// ⇒ 0x0011.  This MUST agree with the codec-side verb (`codec::STREAM_FMT_48K_STEREO_16`
-/// is also 0x11); the previous 0x0A11 encoded 32 kHz (MULT=001, DIV=010) and
-/// silently disagreed with the 48 kHz verb.
+/// ⇒ 0x0011.  This MUST agree with the codec-side verb
+/// (`codec::STREAM_FMT_48K_STEREO_16` is also 0x11).
 const SD_FMT_48K_STEREO_16: u16 = 0x0011;
 
 const BDL_IOC: u32 = 0x01; // interrupt-on-complete flag
 
 /// Stream-completion status bit (BCIS) within the SD_STS byte.
 const SD_STS_BCIS: u8 = 0x04;
+/// All Write-1-to-Clear bits of SD_STS (spec 3.3.36): BCIS (bit 2), FIFOE
+/// (bit 3) and DESE (bit 5).  Clearing all of them on stream reset prevents a
+/// stale error latch from raising spurious interrupts later.
+const SD_STS_CLEAR_MASK: u8 = 0x04 | 0x08 | 0x20;
 
-/// Number of BDL ring entries.  The 256 KiB DMA staging buffer is split into
-/// equal slots of `BUF_CAP / RING_ENTRIES` bytes (32 KiB), giving ~1.3 s of
-/// DMA headroom — far more than a disk read takes, so refills never starve.
-const RING_ENTRIES: usize = 8;
+/// Timeout for stream SRST spin-loops (10 ms).  Real HDA controllers clear
+/// SRST within a few hundred microseconds; QEMU transitions instantly.
+const STREAM_RESET_TIMEOUT_NS: u64 = 10_000_000;
 
-// ── Streaming-path helpers (lock-free) ────────────────────────────
+// ── Feeding-ring cursors and geometry (lock-free, shared with the ISR) ──
 //
-// The pump's ring runs on a *dedicated* BDL page and 256 KiB buffer
-// (`Inner.sbd_*` / `Inner.sbuf_*`), so its refill loop can release the Inner
-// mutex and yield to the cooperative scheduler without colliding with a
-// capture or a one-shot playback that shares the legacy buffer/BDL.
-
-/// Zero-pad and copy `chunk` into its ring slot in the stream buffer.
-/// Returns the real bytes staged (a short final chunk is zero-padded so the
-/// fixed-geometry BDL stays consistent across ring wraps).
-fn stage_chunk(
-    buf_virt: *mut u8,
-    n: usize,
-    eb: usize,
-    chunk_idx: usize,
-    chunk: &[i16],
-) -> Result<u64, &'static str> {
-    let bytes = chunk.len() * 2;
-    if bytes == 0 || bytes > eb {
-        return Err("bad chunk size");
-    }
-    unsafe {
-        let dst = buf_virt.add((chunk_idx % n) * eb);
-        core::ptr::write_bytes(dst, 0, eb);
-        core::ptr::copy_nonoverlapping(chunk.as_ptr() as *const u8, dst, bytes);
-    }
-    Ok(bytes as u64)
-}
-
-/// Whether the output stream's BCIS (descriptor complete) bit is latched.
-fn stream_bcis(mmio: u64, ob: u32) -> bool {
-    unsafe {
-        read_volatile((mmio + ob as u64 + regs::SD_STS as u64) as *const u8) & SD_STS_BCIS != 0
-    }
-}
-
-/// Clear the output stream's BCIS bit (write-1-to-clear), deasserting the
-/// shared INTx/MSI line exactly as the ISR does.
-fn stream_bcis_clear(mmio: u64, ob: u32) {
-    unsafe {
-        write_volatile(
-            (mmio + ob as u64 + regs::SD_STS as u64) as *mut u8,
-            SD_STS_BCIS,
-        );
-    }
-}
-
-/// Consume one output-stream completion: the ISR already cleared BCIS (the
-/// counter moved) or we clear it here (poll fallback).  Returns the updated
-/// seen counter.
-fn consume_completion(seen: u64, mmio: u64, ob: u32) -> u64 {
-    use core::sync::atomic::Ordering;
-    if HDA_IRQ_COUNT.load(Ordering::Relaxed) != seen {
-        HDA_IRQ_COUNT.load(Ordering::Relaxed)
-    } else {
-        stream_bcis_clear(mmio, ob);
-        seen
-    }
-}
-
-// ── Interrupt state (lock-free, owned by the ISR) ──────────────────
-//
-// QEMU's intel-hda latches BCIS and raises the INTx/MSI line when an
-// IOC-flagged BDL entry completes.  The ISR clears BCIS to deassert the
-// line and counts the event; the playback/capture loops wait on the counter
-// and refill the freed ring slot.  If the interrupt route is broken, the
-// loops fall back to polling BCIS (QEMU latches it regardless of enablement).
-// The output and input streams have separate descriptors and therefore
-// separate BCIS bits; each is counted independently so a completion on one
-// stream can never be mistaken for a completion on the other.
+// The DMA buffers are owned by the ring; the ISR (or, in the polled fallback,
+// the waiting caller) advances the completion cursors.  Geometry is published
+// once at init so the ISR and callers agree on slot sizes.
 
 static HDA_MMIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Output stream descriptor base.
 static HDA_OUT_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-/// Input stream descriptor base.  0 = sentinel for "capture not armed" (the
-/// ISR must not touch a non-existent descriptor).
+/// Input stream descriptor base.  0 = sentinel for "capture not armed".
 static HDA_IN_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static HDA_IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static HDA_IN_IRQ_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// True once a working MSI/INTx route exists (the ISR advances the cursors);
+/// false → callers service the BCIS latches themselves.
+static INTERRUPT_DRIVEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Output ring: bytes staged by callers (the DMA plays a whole slot per
+/// completion, but a submission may stage any byte count).
+static OUT_PRODUCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Output ring: bytes the DMA has finished playing (ISR/poll advanced by a
+/// full slot).
+static OUT_COMPLETED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OUT_BUF_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OUT_SLOT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static OUT_RING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Serialises concurrent playback callers (the cursors alone would let two
+/// tasks double-stage the same bytes).
+static OUT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+/// Input ring: bytes the input DMA has filled (ISR/poll advanced by a full
+/// slot).
+static IN_CAPTURED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Input ring: bytes read out by callers.
+static IN_CONSUMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IN_BUF_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IN_SLOT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static IN_RING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Serialises concurrent capture callers.
+static IN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// Serialises the polled BCIS read-clear-advance, so two waiting callers
+/// (e.g. a playback task and a capture task) can never both observe one
+/// completion latch and double-advance a cursor.  Only ever taken in polled
+/// mode (the ISR path is the sole servicer when interrupt-driven), and always
+/// innermost, so it cannot deadlock.
+static POLL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
+use core::sync::atomic::Ordering;
+
+/// Advance the output cursor by one slot and zero the just-consumed slot, so a
+/// stalled producer plays silence (the DMA, on its wrap, reads a zeroed slot)
+/// rather than a stale tail from an earlier lap.  Must be called exactly once
+/// per output completion, either by the ISR or by a polled caller.  Uses
+/// `fetch_add` so concurrent completions never lose an increment.
+fn out_completed_advance() {
+    let buf = OUT_BUF_VIRT.load(Ordering::Relaxed);
+    let slot = OUT_SLOT_BYTES.load(Ordering::Relaxed) as usize;
+    let slots = OUT_RING_SLOTS.load(Ordering::Relaxed) as usize;
+    if buf == 0 || slot == 0 || slots == 0 {
+        return;
+    }
+    let ring = slot * slots;
+    let c = OUT_COMPLETED.fetch_add(slot as u64, Ordering::AcqRel);
+    let pos = (c as usize) % ring;
+    let dst = unsafe { (buf as *mut u8).add(pos) };
+    unsafe {
+        core::ptr::write_bytes(dst, 0, slot);
+    }
+}
+
+/// Advance the input cursor by one slot (the DMA has filled a slot).
+fn in_captured_advance() {
+    let slot = IN_SLOT_BYTES.load(Ordering::Relaxed);
+    if slot != 0 {
+        let _ = IN_CAPTURED.fetch_add(slot, Ordering::Relaxed);
+    }
+}
 
 /// Called from the device vector with interrupts disabled.  Acknowledges
-/// every pending stream completion and counts each stream independently.
+/// every pending stream completion and advances that direction's cursor.
 fn hda_irq_handler() {
-    use core::sync::atomic::Ordering;
     let mmio = HDA_MMIO.load(Ordering::Relaxed);
     if mmio == 0 {
         return;
@@ -241,14 +280,115 @@ fn hda_irq_handler() {
     let ob = HDA_OUT_BASE.load(Ordering::Relaxed) as u64;
     let ib = HDA_IN_BASE.load(Ordering::Relaxed) as u64;
     unsafe {
-        // Write-1-to-clear each BCIS: deasserts the INTx/MSI level.
-        core::ptr::write_volatile((mmio + ob + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
-        let _ = HDA_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+        if read_volatile((mmio + ob + regs::SD_STS as u64) as *const u8) & SD_STS_BCIS != 0 {
+            write_volatile((mmio + ob + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+            out_completed_advance();
+        }
         if ib != 0 {
-            core::ptr::write_volatile((mmio + ib + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
-            let _ = HDA_IN_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
+            if read_volatile((mmio + ib + regs::SD_STS as u64) as *const u8) & SD_STS_BCIS != 0 {
+                write_volatile((mmio + ib + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+                in_captured_advance();
+            }
         }
     }
+}
+
+/// Polled fallback: when no interrupt route was established, a waiting caller
+/// services the BCIS latches directly (mirroring the ISR) so the cursors
+/// still advance and playback/capture progress.  No-op when interrupt-driven.
+/// Serialised by `POLL_LOCK` so concurrent callers cannot both consume one
+/// latch.
+fn service_polled_completions() {
+    if INTERRUPT_DRIVEN.load(Ordering::Relaxed) {
+        return;
+    }
+    let _guard = POLL_LOCK.lock();
+    let mmio = HDA_MMIO.load(Ordering::Relaxed);
+    if mmio == 0 {
+        return;
+    }
+    let ob = HDA_OUT_BASE.load(Ordering::Relaxed) as u64;
+    let ib = HDA_IN_BASE.load(Ordering::Relaxed) as u64;
+    unsafe {
+        if read_volatile((mmio + ob + regs::SD_STS as u64) as *const u8) & SD_STS_BCIS != 0 {
+            write_volatile((mmio + ob + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+            out_completed_advance();
+        }
+        if ib != 0 {
+            if read_volatile((mmio + ib + regs::SD_STS as u64) as *const u8) & SD_STS_BCIS != 0 {
+                write_volatile((mmio + ib + regs::SD_STS as u64) as *mut u8, SD_STS_BCIS);
+                in_captured_advance();
+            }
+        }
+    }
+}
+
+/// Park the caller (cooperatively in task context, HLT in boot context) until
+/// `done()` becomes true.  The condition is re-checked every ~1 ms slice, and
+/// — in the polled BCIS fallback — the completion latches are serviced inside
+/// the wait itself, so a completion is observed within one slice instead of
+/// only when the 10 ms outer deadline expires.  (`service_polled_completions`
+/// is a no-op in interrupt-driven mode, so wrapping the condition is free.)
+fn ring_wait_until(done: &dyn Fn() -> bool) {
+    while !done() {
+        service_polled_completions();
+        let check = || {
+            service_polled_completions();
+            done()
+        };
+        let _ = crate::services::universal_timer::wait_until_cond_coop(
+            crate::services::universal_timer::now_ns() + 10_000_000,
+            1_000_000,
+            &check,
+        );
+    }
+}
+
+// ── Init-time stream helpers ────────────────────────────────────────
+
+/// Reset a stream descriptor: clear RUN, assert SRST, deassert SRST, and
+/// verify each phase completes before programming descriptors.  Returns
+/// `Err("stream reset timeout")` if the controller does not settle.
+fn reset_stream(mmio: u64, base: u32, tag: u32) -> Result<(), &'static str> {
+    let r32 = |off: u32| unsafe { read_volatile((mmio + base as u64 + off as u64) as *const u32) };
+    let w32 = |off: u32, v: u32| unsafe {
+        write_volatile((mmio + base as u64 + off as u64) as *mut u32, v)
+    };
+    let w8 = |off: u32, v: u8| unsafe { write_volatile((mmio + base as u64 + off as u64) as *mut u8, v) };
+
+    // Phase 1: Clear RUN and wait for the controller to report RUN=0 (3.3.35).
+    // Asserting SRST while RUN is still set is an invalid state that can wedge
+    // the stream DMA engine, so fail loudly rather than proceeding blind.
+    w32(regs::SD_CTL, tag); // clear RUN, preserve tag
+    let deadline1 = crate::services::universal_timer::now_ns() + STREAM_RESET_TIMEOUT_NS;
+    if !crate::services::universal_timer::wait_until_cond(deadline1, &|| {
+        r32(regs::SD_CTL) & SD_CTL_RUN == 0
+    }) {
+        return Err("stream reset timeout (RUN clear)");
+    }
+
+    // Phase 2: Assert SRST and verify that the controller entered reset.
+    w32(regs::SD_CTL, tag | SD_CTL_SRST);
+    let deadline2 = crate::services::universal_timer::now_ns() + STREAM_RESET_TIMEOUT_NS;
+    if !crate::services::universal_timer::wait_until_cond(deadline2, &|| {
+        r32(regs::SD_CTL) & SD_CTL_SRST != 0
+    }) {
+        return Err("stream reset timeout (SRST assert)");
+    }
+
+    // Phase 3: Deassert SRST explicitly.  QEMU does not self-clear this bit.
+    w32(regs::SD_CTL, tag);
+    let deadline3 = crate::services::universal_timer::now_ns() + STREAM_RESET_TIMEOUT_NS;
+    if !crate::services::universal_timer::wait_until_cond(deadline3, &|| {
+        r32(regs::SD_CTL) & SD_CTL_SRST == 0
+    }) {
+        return Err("stream reset timeout (SRST release)");
+    }
+
+    // Clear every Write-1-to-Clear status bit (BCIS, FIFOE, DESE) so a stale
+    // error latch cannot fire spurious interrupts on the next stream run.
+    w8(regs::SD_STS, SD_STS_CLEAR_MASK);
+    Ok(())
 }
 
 struct Inner {
@@ -257,35 +397,28 @@ struct Inner {
     corb_virt: u64,
     rirb_phys: u64,
     rirb_virt: u64,
-    bdl_phys: u64,
-    bdl_virt: u64,
-    buf_phys: u64,
-    buf_virt: u64,
-    /// Dedicated streaming-path DMA: its own BDL page and 256 KiB PCM buffer,
-    /// so the pump's refill loop can release the Inner mutex (and yield to
-    /// the scheduler) while a capture or one-shot playback keeps using the
-    /// legacy `bdl_*`/`buf_*` allocation above without colliding.
-    sbd_phys: u64,
-    sbd_virt: u64,
-    sbuf_phys: u64,
-    sbuf_virt: u64,
+    /// Output ring: BDL page + contiguous PCM buffer.
+    out_bdl_phys: u64,
+    out_bdl_virt: u64,
+    out_buf_phys: u64,
+    out_buf_virt: u64,
+    /// Input ring: BDL page + contiguous PCM buffer.
+    in_bdl_phys: u64,
+    in_bdl_virt: u64,
+    in_buf_phys: u64,
+    in_buf_virt: u64,
     /// Register offset of the first output stream.
     out_base: u32,
-    /// Register offset of the first input stream (0x80; input descriptors
-    /// 0..BSS live under the output block).  0 when capture is not armed.
+    /// Register offset of the first input stream (0x80).  0 when capture is
+    /// not armed.
     in_base: u32,
     /// RIRB write pointer seen so far (response ring consumption).
     last_wp: u16,
-    /// BDL ring depth used by the streaming path.
-    ring_entries: usize,
 }
 
 impl Inner {
     fn w8(&self, off: u32, v: u8) {
         unsafe { write_volatile((self.mmio + off as u64) as *mut u8, v) }
-    }
-    fn r8(&self, off: u32) -> u8 {
-        unsafe { read_volatile((self.mmio + off as u64) as *const u8) }
     }
     fn r16(&self, off: u32) -> u16 {
         unsafe { read_volatile((self.mmio + off as u64) as *const u16) }
@@ -303,25 +436,9 @@ impl Inner {
     /// Send one command verb over CORB and wait for its solicited RIRB
     /// response.  Commands are strictly serialised (one in flight at a time).
     fn codec_verb(&mut self, cmd: u32) -> Result<u32, &'static str> {
-        // Clear the RIRB status bits (write-1-to-clear).  Clearing RINTFL is
-        // what resets QEMU's `rirb_count` gate — QEMU stops processing CORB
-        // once `rirb_count == RINTCNT`, and the count only resets when the
-        // guest clears this bit.  One command is in flight per call, so this
-        // keeps the count from ever reaching RINTCNT and stalling the ring.
         self.w8(regs::RIRBSTS, RIRB_INT_MASK);
-
-        // Real codecs inject unsolicited responses (jack/HDMI events) that no
-        // verb solicited, and a timed-out verb can leave a response behind.
-        // Drain anything already in the ring so the solicited-response wait
-        // below starts from a known write pointer.
         self.drain_rirb(true);
 
-        // Wait for the CORB ring to drain.  The ring is empty when the read
-        // and write pointers agree.  The waits here are time-based rather than
-        // spin-count based: real codecs gate verb processing on their power
-        // state, so a still-powering-up codec holds the ring busy far longer
-        // than a spin budget tuned to QEMU's instant responses allows.  QEMU
-        // answers immediately, so it is unaffected.
         let mmio = self.mmio;
         let drain_deadline = crate::services::universal_timer::now_ns() + VERB_TIMEOUT_NS;
         if !crate::services::universal_timer::wait_until_cond(drain_deadline, &|| {
@@ -332,14 +449,11 @@ impl Inner {
             return Err("CORB ring not empty");
         }
 
-        // The controller consumes the command at index `CORBRP + 1`, so the
-        // command goes into the slot *after* CORBWP (Linux convention).
         let wp = self.r16(regs::CORBWP) & 0xff;
         let nxt = (wp + 1) & 0xff;
         unsafe { write_volatile((self.corb_virt + nxt as u64 * 4) as *mut u32, cmd) };
         self.w16(regs::CORBWP, nxt);
 
-        // Wait for the controller to consume the command.
         let consumed_deadline = crate::services::universal_timer::now_ns() + VERB_TIMEOUT_NS;
         if !crate::services::universal_timer::wait_until_cond(consumed_deadline, &|| {
             let rp = (unsafe { read_volatile((mmio + regs::CORBRP as u64) as *const u16) }) & 0xff;
@@ -348,14 +462,6 @@ impl Inner {
             return Err("CORB command not consumed");
         }
 
-        // Wait for the solicited response.  The RIRB is a FIFO: the
-        // controller appends every response (solicited and unsolicited, for
-        // any codec) and only advances RIRBWP.  Consume the batch from
-        // `last_wp + 1 ..= RIRBWP`, skipping unsolicited entries (res_ex bit
-        // 4) and responses addressed to another codec (res_ex low nibble), and
-        // take the newest entry matching this command's codec address.  If a
-        // batch turns out to contain no match, keep waiting within the same
-        // deadline for the next batch.
         let rirb_virt = self.rirb_virt;
         let cad = (cmd >> 28) & 0xF;
         let mut last_wp = self.last_wp;
@@ -371,8 +477,6 @@ impl Inner {
                         w != last_wp
                     });
                 if !got {
-                    // Diagnostic: dump the ring state so a persistent failure
-                    // is visible in the serial log instead of just an error.
                     let wp_now =
                         (unsafe { read_volatile((mmio + regs::RIRBWP as u64) as *const u16) })
                             & 0xff;
@@ -394,7 +498,6 @@ impl Inner {
                 }
                 continue;
             }
-            // FIFO-consume `last_wp + 1 ..= wp`.
             let mut idx = (last_wp + 1) & 0xff;
             let mut found: Option<u32> = None;
             while idx != ((wp + 1) & 0xff) {
@@ -415,13 +518,7 @@ impl Inner {
     }
 
     /// Consume every RIRB entry the controller has written so far, advancing
-    /// `last_wp` to the current RIRBWP.  Real codecs inject unsolicited
-    /// responses (jack/HDMI events) and a timed-out verb may leave an entry
-    /// behind; draining keeps the ring in sync so the next verb's solicited
-    /// response is found at a known index.  When `log_first`, prints one
-    /// diagnostic line describing the first drained entry (proves stale
-    /// entries were the cause of a truncated probe).  Returns the count
-    /// drained.
+    /// `last_wp` to the current RIRBWP.
     fn drain_rirb(&mut self, log_first: bool) -> u32 {
         let rirb_virt = self.rirb_virt;
         let wp = self.r16(regs::RIRBWP) & 0xff;
@@ -453,6 +550,36 @@ impl Inner {
         self.last_wp = wp;
         n
     }
+
+    /// Program `slots` cyclic IOC BDL entries over the ring buffer, reset the
+    /// stream, and start DMA.  Called once per direction at init; the ring
+    /// then runs for the kernel's lifetime.
+    fn start_ring(
+        &self,
+        base: u32,
+        tag: u32,
+        bdl_phys: u64,
+        bdl_virt: u64,
+        buf_phys: u64,
+        slot: usize,
+        slots: usize,
+    ) -> Result<(), &'static str> {
+        let bdl = bdl_virt as *mut u64;
+        for k in 0..slots {
+            unsafe {
+                write_volatile(bdl.add(k * 2), buf_phys + (k as u64) * slot as u64);
+                write_volatile(bdl.add(k * 2 + 1), ((BDL_IOC as u64) << 32) | (slot as u64));
+            }
+        }
+        reset_stream(self.mmio, base, tag)?;
+        self.w32(base + regs::SD_BDPL, bdl_phys as u32);
+        self.w32(base + regs::SD_BDPU, (bdl_phys >> 32) as u32);
+        self.w16(base + regs::SD_LVI, (slots - 1) as u16);
+        self.w32(base + regs::SD_CBL, (slots * slot) as u32);
+        self.w16(base + regs::SD_FMT, SD_FMT_48K_STEREO_16);
+        self.w32(base + regs::SD_CTL, tag | SD_CTL_RUN | SD_CTL_IOCE);
+        Ok(())
+    }
 }
 
 impl VerbSender for Inner {
@@ -476,642 +603,114 @@ impl AudioDevice for HdaAudio {
         "intel-hda"
     }
 
-    fn play_pcm(&self, samples: &[i16]) -> Result<(), &'static str> {
-        self.play(samples)
-    }
-
-    fn play_pcm_stream(
-        &self,
-        total_bytes: u32,
-        entry_bytes: usize,
-        next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
-    ) -> Result<u64, &'static str> {
-        self.play_stream(total_bytes, entry_bytes, next)
-    }
-
-    fn play_pcm_stream_continuous(
-        &self,
-        entry_bytes: usize,
-        next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
-    ) -> Result<u64, &'static str> {
-        self.play_stream_continuous(entry_bytes, next)
+    fn submit_playback(&self, samples: &[i16]) -> Result<(), &'static str> {
+        if samples.is_empty() {
+            // A zero-length flush is a benign no-op, not an error.
+            return Ok(());
+        }
+        if samples.len() % 2 != 0 {
+            return Err("odd sample count (stereo requires even)");
+        }
+        let _guard = OUT_LOCK.lock();
+        let nbytes = samples.len() * 2;
+        let slot = OUT_SLOT_BYTES.load(Ordering::Relaxed) as usize;
+        let slots = OUT_RING_SLOTS.load(Ordering::Relaxed) as usize;
+        let ring = slot * slots;
+        let buf_virt = OUT_BUF_VIRT.load(Ordering::Relaxed) as *mut u8;
+        if slot == 0 || slots == 0 || buf_virt.is_null() {
+            return Err("audio ring not initialised");
+        }
+        let mut off = 0usize;
+        while off < nbytes {
+            // Wait until the producer is less than a full ring ahead of the
+            // play head: a full ring would alias the write back onto the DMA's
+            // in-progress slot.  Signed distance, so a producer that is behind
+            // the play head (e.g. the first call after the DMA has already
+            // been running) proceeds immediately instead of wrapping forever.
+            let ring_i = ring as i128;
+            ring_wait_until(&|| {
+                let p = OUT_PRODUCED.load(Ordering::Relaxed) as i128;
+                let c = OUT_COMPLETED.load(Ordering::Acquire) as i128;
+                p - c < ring_i
+            });
+            let p = OUT_PRODUCED.load(Ordering::Relaxed) as usize;
+            let pos = p % ring;
+            // Never cross a ring boundary in one write (a partial slot simply
+            // carries over into the next call).
+            let take = (nbytes - off).min(ring - pos);
+            let dst = unsafe { buf_virt.add(pos) };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    samples.as_ptr().add(off / 2) as *const u8,
+                    dst,
+                    take,
+                );
+            }
+            OUT_PRODUCED.store((p + take) as u64, Ordering::Release);
+            off += take;
+        }
+        Ok(())
     }
 
     fn can_record(&self) -> bool {
-        use core::sync::atomic::Ordering;
         self.cap_ready.load(Ordering::Acquire)
     }
 
-    fn record_pcm(&self, dest: &mut [i16]) -> Result<(), &'static str> {
-        self.record(dest)
-    }
-
-    fn record_pcm_stream(
-        &self,
-        total_bytes: u32,
-        entry_bytes: usize,
-        sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
-    ) -> Result<u64, &'static str> {
-        self.record_stream(total_bytes, entry_bytes, sink)
-    }
-}
-
-impl HdaAudio {
-    fn play(&self, samples: &[i16]) -> Result<(), &'static str> {
-        let i = self.inner.lock();
-        let nbytes = samples.len() * 2;
-        if nbytes == 0 {
-            return Err("empty PCM");
-        }
-        if nbytes > BUF_CAP {
-            return Err("PCM larger than DMA buffer");
-        }
-
-        // Stage the samples into the DMA staging buffer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                samples.as_ptr() as *const u8,
-                i.buf_virt as *mut u8,
-                nbytes,
-            );
-        }
-
-        // Build a single-entry BDL: { phys addr, 0, length, IOC }.
-        let bdl = i.bdl_virt as *mut u64;
-        unsafe {
-            write_volatile(bdl, i.buf_phys);
-            write_volatile(bdl.add(1), ((BDL_IOC as u64) << 32) | (nbytes as u64));
-        }
-
-        let ob = i.out_base;
-
-        // Reset the stream (assert SRST, then deassert) while it is stopped.
-        i.w32(ob + regs::SD_CTL, SD_CTL_SRST);
-        core::hint::spin_loop();
-        i.w32(ob + regs::SD_CTL, 0);
-
-        // Program the stream descriptor.
-        i.w32(ob + regs::SD_BDPL, i.bdl_phys as u32);
-        i.w32(ob + regs::SD_BDPU, (i.bdl_phys >> 32) as u32);
-        i.w16(ob + regs::SD_LVI, 0);
-        i.w32(ob + regs::SD_CBL, nbytes as u32);
-        i.w16(ob + regs::SD_FMT, SD_FMT_48K_STEREO_16);
-
-        // Start DMA.
-        i.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG | SD_CTL_RUN);
-
-        // Let the buffer play for its full duration, then wait for the ring
-        // to drain before stopping.  LPIB (Link Position in Buffer) stays in
-        // [0, nbytes) and wraps back to 0 once the whole cyclic buffer has
-        // been consumed, so a wrap — LPIB moving backwards — is the drain
-        // signal; `LPIB >= nbytes` can never be observed.
-        let frames = samples.len() / CHANNELS;
-        let ms = (frames as u64) * 1000 / SAMPLE_RATE as u64;
-        crate::services::universal_timer::sleep_ms(ms);
-        let started = i.r32(ob + regs::SD_LPIB);
-        let deadline = crate::services::universal_timer::now_ns() + 500_000_000;
-        crate::services::universal_timer::wait_until_cond(deadline, &|| {
-            started == 0 || i.r32(ob + regs::SD_LPIB) < started
-        });
-        crate::services::universal_timer::sleep_ms(50);
-
-        let lpib = i.r32(ob + regs::SD_LPIB);
-        SerialPort::puts("[audio] hda: played ");
-        SerialPort::put_u64(nbytes as u64);
-        SerialPort::puts(" B (lpib=");
-        SerialPort::put_u64(lpib as u64);
-        SerialPort::puts(")\n");
-
-        // Stop DMA but keep the stream tag.  QEMU derives the stream number
-        // from SDnCTL on every RUN-bit flip (`intel_hda_set_st_ctl`), so
-        // clearing the tag along with RUN would notify the codec with
-        // stnr=0 and the converter (tag 1) would never stop — the codec's
-        // output timer keeps pulling the wrapping BDL forever.
-        i.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-        Ok(())
-    }
-
-    /// Stream PCM through a continuously-running BDL ring.  The BDL geometry
-    /// is programmed once (QEMU caches it in `st->bpl[]` at RUN start), so
-    /// refills write PCM data into the ring slots, not the descriptors.
-    ///
-    /// The ring runs on the dedicated stream DMA, so the Inner mutex is
-    /// released for the refill loop; completions are awaited cooperatively
-    /// (slice-sleeping as a scheduler task) rather than HLTing the CPU, so
-    /// the rest of the system keeps flowing while the carriage rides.
-    fn play_stream(
-        &self,
-        total_bytes: u32,
-        entry_bytes: usize,
-        next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
-    ) -> Result<u64, &'static str> {
-        let mut guard = self.inner.lock();
-        let i = &mut *guard;
-        let ob = i.out_base;
-        let n = i.ring_entries;
-        let eb = entry_bytes;
-        let ring_cap = BUF_CAP / n;
-        if eb == 0 || eb > ring_cap || total_bytes == 0 {
-            return Err("bad stream params");
-        }
-
-        // Number of `eb`-sized entries the payload occupies.  Every ring slot
-        // is `eb` bytes long; a short final chunk is zero-padded so the
-        // fixed-geometry BDL stays consistent across ring wraps.
-        let needed = (total_bytes as u64).div_ceil(eb as u64) as usize;
-        // QEMU stops transferring when LPIB reaches CBL, so CBL must cover
-        // the padded total or the last entry never completes.
-        let cbl = (needed as u64).saturating_mul(eb as u64) as u32;
-
-        let bdl = i.sbd_virt as *mut u64;
-        let buf_virt = i.sbuf_virt as *mut u8;
-        let buf_phys = i.sbuf_phys;
-
-        // Program the ring descriptors: used slots are all `eb`-sized and
-        // carry IOC; unused slots (payload shorter than the ring) are
-        // zero-length with no IOC and are skipped without a completion.
-        for k in 0..n {
-            let used = k < needed;
-            let len = if used { eb } else { 0 };
-            let flags = if used { BDL_IOC } else { 0 };
-            unsafe {
-                write_volatile(bdl.add(k * 2), buf_phys + (k as u64) * eb as u64);
-                write_volatile(bdl.add(k * 2 + 1), ((flags as u64) << 32) | (len as u64));
-            }
-        }
-
-        // Pre-fill the ring with the first `min(needed, n)` chunks.
-        let prefilled = needed.min(n);
-        for k in 0..prefilled {
-            let chunk = next().ok_or("stream ended early")?;
-            stage_chunk(buf_virt, n, eb, k, &chunk)?;
-        }
-
-        // Clear any stale completion left by a previous run, then reset the
-        // stream descriptor and program the ring.
-        i.w8(ob + regs::SD_STS, SD_STS_BCIS);
-        i.w32(ob + regs::SD_CTL, SD_CTL_SRST);
-        core::hint::spin_loop();
-        i.w32(ob + regs::SD_CTL, 0);
-        i.w32(ob + regs::SD_BDPL, i.sbd_phys as u32);
-        i.w32(ob + regs::SD_BDPU, (i.sbd_phys >> 32) as u32);
-        i.w16(ob + regs::SD_LVI, (n - 1) as u16);
-        i.w32(ob + regs::SD_CBL, cbl);
-        i.w16(ob + regs::SD_FMT, SD_FMT_48K_STEREO_16);
-
-        // Start DMA.
-        i.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG | SD_CTL_RUN);
-
-        // Release the Inner mutex for the refill loop: the loop only touches
-        // the dedicated stream DMA, the output descriptor and the atomic
-        // completion counter, so cooperative yields (and a concurrent capture
-        // on the input descriptor) cannot corrupt state.
-        let mmio = i.mmio;
-        drop(guard);
-
-        // Refill the ring as entries complete.  The engine keeps cycling the
-        // descriptors, so each completion frees one slot (`completed - 1` mod
-        // n); that slot is next played as chunk `completed - 1 + n`.
-        let mut irq_seen = HDA_IRQ_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-        let mut completed: u64 = 0;
-        while completed < needed as u64 {
-            let seen = irq_seen;
-            let deadline = crate::services::universal_timer::now_ns() + 1_000_000_000;
-            let got = crate::services::universal_timer::wait_until_cond_coop(
-                deadline,
-                1_000_000,
-                &|| {
-                    HDA_IRQ_COUNT.load(core::sync::atomic::Ordering::Relaxed) != seen
-                        || stream_bcis(mmio, ob)
-                },
-            );
-            if !got {
-                // Entries complete every ~170 ms; a full second without one
-                // means the DMA stalled — don't fabricate a completion.
-                let guard = self.inner.lock();
-                guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-                return Err("playback stalled");
-            }
-            irq_seen = consume_completion(irq_seen, mmio, ob);
-            completed += 1;
-
-            let next_chunk = (completed - 1) + n as u64;
-            if next_chunk < needed as u64 {
-                let chunk = match next() {
-                    Some(c) => c,
-                    None => {
-                        let guard = self.inner.lock();
-                        guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-                        return Err("stream ended early");
-                    }
-                };
-                if let Err(e) =
-                    stage_chunk(buf_virt, n, eb, (next_chunk % n as u64) as usize, &chunk)
-                {
-                    let guard = self.inner.lock();
-                    guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-                    return Err(e);
-                }
-            }
-        }
-
-        // Let the codec's FIFO drain the final bytes, then stop the stream
-        // (keeping the tag, as in `play`).
-        crate::services::universal_timer::sleep_ms(20);
-        let guard = self.inner.lock();
-        guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-        Ok(total_bytes as u64)
-    }
-
-    /// Stream PCM through the continuously-running BDL ring, feeding it from
-    /// `next` until the closure returns `None`, then stopping as soon as the
-    /// last staged slot has been consumed.  Unlike `play_stream` the ring's
-    /// CBL is u32::MAX (QEMU's transfer budget is effectively unbounded while
-    /// the descriptors cycle), so back-to-back data chains with **no
-    /// stop/start seam**: the pump passes a closure that pulls straight from
-    /// the next queued request when the current one runs out.  This is the
-    /// "flow through the ends of time" path.
-    fn play_stream_continuous(
-        &self,
-        entry_bytes: usize,
-        next: &mut dyn FnMut() -> Option<alloc::vec::Vec<i16>>,
-    ) -> Result<u64, &'static str> {
-        let mut guard = self.inner.lock();
-        let i = &mut *guard;
-        let ob = i.out_base;
-        let n = i.ring_entries;
-        let eb = entry_bytes;
-        let ring_cap = BUF_CAP / n;
-        if eb == 0 || eb > ring_cap {
-            return Err("bad stream params");
-        }
-
-        let bdl = i.sbd_virt as *mut u64;
-        let buf_virt = i.sbuf_virt as *mut u8;
-        let buf_phys = i.sbuf_phys;
-
-        // Zero the whole ring once so slots never staged play silence rather
-        // than stale DMA garbage.
-        unsafe { core::ptr::write_bytes(i.sbuf_virt as *mut u8, 0, BUF_CAP) }
-
-        // Program a full cyclic ring: every slot `eb`-sized and IOC-flagged,
-        // LVI = n-1, CBL = u32::MAX.  On QEMU CBL is the total transfer
-        // budget (LPIB advances toward it while the 8 descriptors cycle); a
-        // huge budget keeps the ring cycling for the whole session.  This is
-        // a documented QEMU-tolerant deviation from a real controller's
-        // "CBL = sum of BDL lengths" expectation.
-        for k in 0..n {
-            unsafe {
-                write_volatile(bdl.add(k * 2), buf_phys + (k as u64) * eb as u64);
-                write_volatile(bdl.add(k * 2 + 1), ((BDL_IOC as u64) << 32) | (eb as u64));
-            }
-        }
-
-        // Pre-fill the ring from `next`.  The closure is expected to chain
-        // queued data; a None here means the caller has nothing and we drain
-        // immediately (all-zero ring plays silence).
-        let mut fed: u64 = 0;
-        let mut fed_bytes: u64 = 0;
-        for k in 0..n {
-            match next() {
-                Some(chunk) => {
-                    fed_bytes += stage_chunk(buf_virt, n, eb, k, &chunk)?;
-                    fed += 1;
-                }
-                None => break,
-            }
-        }
-        if fed == 0 {
-            return Err("stream ended early");
-        }
-        crate::drivers::serial::SerialPort::puts("[audio] stream: prefill fed=");
-        crate::drivers::serial::SerialPort::put_u64(fed);
-        crate::drivers::serial::SerialPort::puts("\n");
-
-        // Clear any stale completion, reset the stream, program the ring.
-        i.w8(ob + regs::SD_STS, SD_STS_BCIS);
-        i.w32(ob + regs::SD_CTL, SD_CTL_SRST);
-        core::hint::spin_loop();
-        i.w32(ob + regs::SD_CTL, 0);
-        i.w32(ob + regs::SD_BDPL, i.sbd_phys as u32);
-        i.w32(ob + regs::SD_BDPU, (i.sbd_phys >> 32) as u32);
-        i.w16(ob + regs::SD_LVI, (n - 1) as u16);
-        i.w32(ob + regs::SD_CBL, u32::MAX);
-        i.w16(ob + regs::SD_FMT, SD_FMT_48K_STEREO_16);
-
-        // Start DMA.
-        i.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG | SD_CTL_RUN);
-        crate::drivers::serial::SerialPort::puts("[audio] stream: dma run, waiting completions\n");
-
-        // Release the Inner mutex for the refill loop (same reasoning as
-        // `play_stream`).
-        let mmio = i.mmio;
-        drop(guard);
-
-        // Refill freed slots until `next()` signals the end of the session,
-        // then stop as soon as the last staged slot has been consumed —
-        // before the DMA can cycle back to replay an earlier slot.  The
-        // invariant: chunk `k` lives in slot `k % n`, so completion `c`
-        // consumes slot `(c-1) % n`, and staging chunk `fed` (the next
-        // unstaged index) keeps the refill a full ring — or the remainder of
-        // one, when the ring started under-filled — ahead of the play
-        // pointer, so the DMA plays chunks strictly in index order.
-        let mut irq_seen = HDA_IRQ_COUNT.load(core::sync::atomic::Ordering::Relaxed);
-        let mut completed: u64 = 0;
-        while completed < fed {
-            let seen = irq_seen;
-            let deadline = crate::services::universal_timer::now_ns() + 1_000_000_000;
-            let got = crate::services::universal_timer::wait_until_cond_coop(
-                deadline,
-                1_000_000,
-                &|| {
-                    HDA_IRQ_COUNT.load(core::sync::atomic::Ordering::Relaxed) != seen
-                        || stream_bcis(mmio, ob)
-                },
-            );
-            if !got {
-                let guard = self.inner.lock();
-                guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-                return Err("playback stalled");
-            }
-            irq_seen = consume_completion(irq_seen, mmio, ob);
-            completed += 1;
-
-            // The freed slot hosts the next chunk; a None from `next` means
-            // the session is over — the loop's `completed < fed` bound then
-            // stops us once the last real slot has been consumed.
-            //
-            // Chunk `fed` always goes into slot `fed % n`: staged at
-            // completion `c` where `c < fed`, it is written a full ring
-            // (or the remainder of one, when the ring started under-filled)
-            // before the DMA reaches it, and the DMA then plays chunks
-            // strictly in index order with no replay and no seam.
-            if completed < fed {
-                let k = fed;
-                match next() {
-                    Some(chunk) => {
-                        match stage_chunk(buf_virt, n, eb, (k % n as u64) as usize, &chunk) {
-                            Ok(b) => {
-                                fed_bytes += b;
-                                fed += 1;
-                            }
-                            Err(e) => {
-                                let guard = self.inner.lock();
-                                guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-                                return Err(e);
-                            }
-                        }
-                    }
-                    None => {}
-                }
-            }
-        }
-
-        // Stop immediately: with CBL = u32::MAX the DMA would otherwise
-        // cycle back and replay slot `fed % n` (old audio) during a long
-        // drain.  The final slot is zero-padded, so its padding already
-        // flushed the codec FIFO.
-        let guard = self.inner.lock();
-        guard.w32(ob + regs::SD_CTL, SD_CTL_STREAM_TAG);
-        Ok(fed_bytes)
-    }
-
-    /// Record a whole buffer: `dest.len()` i16 samples of interleaved stereo
-    /// 48 kHz audio, captured through a two-entry BDL into the staging buffer
-    /// and copied out once the DMA has delivered the full length.  Blocking;
-    /// the mirror image of `play`.
-    fn record(&self, dest: &mut [i16]) -> Result<(), &'static str> {
-        use core::sync::atomic::Ordering;
+    fn read_capture(&self, dest: &mut [i16]) -> Result<(), &'static str> {
         if !self.cap_ready.load(Ordering::Acquire) {
             return Err("capture not supported");
         }
-        let i = self.inner.lock();
+        if dest.is_empty() {
+            // A zero-length read is a benign no-op, not an error.
+            return Ok(());
+        }
+        if dest.len() % 2 != 0 {
+            return Err("odd sample count (stereo requires even)");
+        }
+        let _guard = IN_LOCK.lock();
         let nbytes = dest.len() * 2;
-        if nbytes == 0 {
-            return Err("empty PCM");
+        let slot = IN_SLOT_BYTES.load(Ordering::Relaxed) as usize;
+        let slots = IN_RING_SLOTS.load(Ordering::Relaxed) as usize;
+        let ring = slot * slots;
+        let buf_virt = IN_BUF_VIRT.load(Ordering::Relaxed) as *const u8;
+        if slot == 0 || slots == 0 || buf_virt.is_null() {
+            return Err("audio ring not initialised");
         }
-        if nbytes > BUF_CAP {
-            return Err("PCM larger than DMA buffer");
-        }
-        // BDL lengths must be an integer number of 32-bit words (3.6.3).
-        if nbytes % 4 != 0 {
-            return Err("PCM length not word-aligned");
-        }
-        let ib = i.in_base;
-
-        // Two-entry BDL: the whole buffer split at a 128-byte boundary, both
-        // IOC.  The spec requires LVI >= 1 — at least two valid descriptors
-        // before DMA can begin (3.3.39) — and every buffer start 128-byte
-        // aligned (3.6.3); splitting at `buf_phys + split` keeps both aligned.
-        let split = if nbytes >= 256 {
-            (nbytes / 2) / 128 * 128
-        } else {
-            nbytes.min(128)
-        };
-        let e0 = split;
-        let e1 = nbytes - split;
-        let bdl = i.bdl_virt as *mut u64;
-        unsafe {
-            write_volatile(bdl, i.buf_phys);
-            write_volatile(bdl.add(1), ((BDL_IOC as u64) << 32) | (e0 as u64));
-            write_volatile(bdl.add(2), i.buf_phys + split as u64);
-            write_volatile(bdl.add(3), ((BDL_IOC as u64) << 32) | (e1 as u64));
-        }
-
-        // Reset the input stream (assert SRST, then deassert) while stopped.
-        // RUN must be clear before SRST is asserted (3.3.35, bit 0), which it
-        // is: every prior stop leaves RUN=0 and the tag in SDnCTL.
-        i.w32(ib + regs::SD_CTL, SD_CTL_SRST);
-        core::hint::spin_loop();
-        i.w32(ib + regs::SD_CTL, 0);
-
-        // Program the stream descriptor (CBL/LVI may only be written after a
-        // reset and with RUN=0, per 3.3.38/3.3.39).
-        i.w32(ib + regs::SD_BDPL, i.bdl_phys as u32);
-        i.w32(ib + regs::SD_BDPU, (i.bdl_phys >> 32) as u32);
-        i.w16(ib + regs::SD_LVI, 1);
-        i.w32(ib + regs::SD_CBL, nbytes as u32);
-        i.w16(ib + regs::SD_FMT, SD_FMT_48K_STEREO_16);
-
-        // Start DMA.  The input tag (2) matches the codec's ADC `SET_CONV`;
-        // as with output, a stop must preserve it in SDnCTL.
-        let mut irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
-        i.w8(ib + regs::SD_STS, SD_STS_BCIS);
-        i.w32(
-            ib + regs::SD_CTL,
-            SD_CTL_INPUT_STREAM_TAG | SD_CTL_RUN | SD_CTL_IOCE,
-        );
-
-        // Let the capture run for the full duration, then wait for both BDL
-        // entries to complete (IRQ count delta = 2, or two BCIS poll-clear
-        // cycles when no IRQ is wired) before draining the FIFO.  If no audio
-        // source is connected QEMU still delivers silence, so the DMA
-        // advances and the buffer fills; a still-missing completion is
-        // tolerated, mirroring `play`'s tolerance of a missing wrap.
-        let frames = dest.len() / CHANNELS;
-        let ms = (frames as u64) * 1000 / SAMPLE_RATE as u64;
-        crate::services::universal_timer::sleep_ms(ms);
-        let mut remaining = 2u64;
-        let deadline = crate::services::universal_timer::now_ns() + 500_000_000;
-        while remaining > 0 {
-            if !crate::services::universal_timer::wait_until_cond(deadline, &|| {
-                HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != irq_seen
-                    || i.r8(ib + regs::SD_STS) & SD_STS_BCIS != 0
-            }) {
-                break;
-            }
-            if HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != irq_seen {
-                let cur = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
-                let delta = cur - irq_seen;
-                irq_seen = cur;
-                remaining = remaining.saturating_sub(delta);
-            } else {
-                i.w8(ib + regs::SD_STS, SD_STS_BCIS);
-                remaining -= 1;
-            }
-        }
-        crate::services::universal_timer::sleep_ms(50);
-
-        // Copy the captured samples out of the live DMA buffer.
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                i.buf_virt as *const u8,
-                dest.as_mut_ptr() as *mut u8,
-                nbytes,
-            );
-        }
-
-        let lpib = i.r32(ib + regs::SD_LPIB);
-        SerialPort::puts("[audio] hda: captured ");
-        SerialPort::put_u64(nbytes as u64);
-        SerialPort::puts(" B (lpib=");
-        SerialPort::put_u64(lpib as u64);
-        SerialPort::puts(")\n");
-
-        // Stop DMA but keep the input stream tag in SDnCTL.
-        i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
-        Ok(())
-    }
-
-    /// Record PCM through a continuously-running BDL ring, mirroring
-    /// `play_stream`.  The ring geometry is programmed once; each completion
-    /// frees one slot, which is copied out into an owned chunk (the ring is
-    /// live DMA memory being overwritten by the controller) and handed to
-    /// `sink`.  The final chunk is trimmed to the exact requested size.
-    fn record_stream(
-        &self,
-        total_bytes: u32,
-        entry_bytes: usize,
-        sink: &mut dyn FnMut(alloc::vec::Vec<i16>),
-    ) -> Result<u64, &'static str> {
-        use core::sync::atomic::Ordering;
-        if !self.cap_ready.load(Ordering::Acquire) {
-            return Err("capture not supported");
-        }
-        let i = self.inner.lock();
-        let ib = i.in_base;
-        let n = i.ring_entries;
-        let eb = entry_bytes;
-        let ring_cap = BUF_CAP / n;
-        if eb == 0 || eb > ring_cap || total_bytes == 0 {
-            return Err("bad stream params");
-        }
-        // Every ring slot must keep the 128-byte buffer alignment of 3.6.3.
-        if eb % 128 != 0 {
-            return Err("entry size not 128-byte aligned");
-        }
-
-        // Number of `eb`-sized entries the payload occupies.  Ring slots are
-        // all `eb` bytes long and CBL is the padded total, so the fixed
-        // geometry holds across ring wraps; the final slot's trailing capture
-        // is discarded by the trim below.
-        let needed = (total_bytes as u64).div_ceil(eb as u64) as usize;
-        let cbl = (needed as u64).saturating_mul(eb as u64) as u32;
-
-        let bdl = i.bdl_virt as *mut u64;
-        for k in 0..n {
-            let used = k < needed;
-            let len = if used { eb } else { 0 };
-            let flags = if used { BDL_IOC } else { 0 };
-            unsafe {
-                write_volatile(bdl.add(k * 2), i.buf_phys + (k as u64) * eb as u64);
-                write_volatile(bdl.add(k * 2 + 1), ((flags as u64) << 32) | (len as u64));
-            }
-        }
-
-        // Clear any stale completion, reset the stream, program the ring.
-        i.w8(ib + regs::SD_STS, SD_STS_BCIS);
-        i.w32(ib + regs::SD_CTL, SD_CTL_SRST);
-        core::hint::spin_loop();
-        i.w32(ib + regs::SD_CTL, 0);
-        i.w32(ib + regs::SD_BDPL, i.bdl_phys as u32);
-        i.w32(ib + regs::SD_BDPU, (i.bdl_phys >> 32) as u32);
-        i.w16(ib + regs::SD_LVI, (n - 1) as u16);
-        i.w32(ib + regs::SD_CBL, cbl);
-        i.w16(ib + regs::SD_FMT, SD_FMT_48K_STEREO_16);
-
-        // Start DMA.
-        let mut irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
-        i.w32(
-            ib + regs::SD_CTL,
-            SD_CTL_INPUT_STREAM_TAG | SD_CTL_RUN | SD_CTL_IOCE,
-        );
-
-        // Drain completions; completion `completed - 1` filled slot
-        // `(completed - 1) mod n`, which the controller will not revisit
-        // until the ring has cycled n entries later.
-        let mut completed: u64 = 0;
-        let mut recorded: u64 = 0;
-        while completed < needed as u64 {
-            let seen = irq_seen;
-            let deadline = crate::services::universal_timer::now_ns() + 1_000_000_000;
-            let got = crate::services::universal_timer::wait_until_cond(deadline, &|| {
-                HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != seen
-                    || i.r8(ib + regs::SD_STS) & SD_STS_BCIS != 0
+        let mut off = 0usize;
+        while off < nbytes {
+            // Wait until at least one captured byte is unconsumed.  Byte
+            // distance, so a fully-wrapped ring (all slots captured) still
+            // drains instead of deadlocking on the old modulo test.
+            ring_wait_until(&|| {
+                let cap = IN_CAPTURED.load(Ordering::Acquire);
+                let con = IN_CONSUMED.load(Ordering::Relaxed);
+                cap.wrapping_sub(con) > 0
             });
-            if !got {
-                i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
-                return Err("capture stalled");
-            }
-            if HDA_IN_IRQ_COUNT.load(Ordering::Relaxed) != seen {
-                irq_seen = HDA_IN_IRQ_COUNT.load(Ordering::Relaxed);
-            } else {
-                i.w8(ib + regs::SD_STS, SD_STS_BCIS);
-            }
-            completed += 1;
-
-            let slot = ((completed - 1) % n as u64) as usize;
-            let bytes = if (completed as usize) == needed {
-                total_bytes as usize - (needed - 1) * eb
-            } else {
-                eb
-            };
-            let n_i16 = bytes / 2;
-            let mut chunk = alloc::vec![0i16; n_i16];
+            let cap = IN_CAPTURED.load(Ordering::Acquire) as usize;
+            let con = IN_CONSUMED.load(Ordering::Relaxed) as usize;
+            let avail = cap.wrapping_sub(con);
+            let pos = con % ring;
+            // Never cross a ring boundary, and never read past what the input
+            // DMA has actually filled (partial reads carry over into the next
+            // call instead of discarding the rest of the slot).
+            let take = (nbytes - off).min(avail).min(ring - pos);
+            let src = unsafe { buf_virt.add(pos) };
             unsafe {
                 core::ptr::copy_nonoverlapping(
-                    (i.buf_virt + slot as u64 * eb as u64) as *const u8,
-                    chunk.as_mut_ptr() as *mut u8,
-                    bytes,
+                    src,
+                    dest.as_mut_ptr().add(off / 2) as *mut u8,
+                    take,
                 );
             }
-            sink(chunk);
-            recorded += bytes as u64;
+            IN_CONSUMED.store((con + take) as u64, Ordering::Release);
+            off += take;
         }
-
-        // Allow the codec FIFO to settle, then stop keeping the input tag.
-        crate::services::universal_timer::sleep_ms(20);
-        i.w32(ib + regs::SD_CTL, SD_CTL_INPUT_STREAM_TAG);
-        Ok(recorded)
+        Ok(())
     }
 }
 
 /// Bring up the controller at `dev` and return it as a leakable device.
 pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'static str> {
-    // Real hardware can hand the HDA function over with memory decode and
-    // bus master disabled in the PCI Command register; BAR0 then reads as
-    // all-ones and no codec is ever seen.  Enable them up front (QEMU is a
-    // no-op — OVMF already did it).  Mirrors Linux pci_enable_device().
     crate::pci::enable_device(dev);
 
     let base = match crate::pci::bar::bar(dev, 0) {
@@ -1121,21 +720,40 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
 
     let dma: &dyn DmaAllocator = crate::services::kernel_services().dma;
 
-    // BAR0 covers 0x4000 on QEMU (a 0x2000 register window mirrored above).
     let mmio = dma.map_mmio(base, 0x4000)?;
+
+    // Read the controller capabilities once, up front: input/output stream
+    // counts and the 64-bit DMA support bit (GCAP bit 0, spec 3.3.1).  GCAP
+    // is read-only, so this is valid before the controller reset.
+    let gcap = unsafe { read_volatile((mmio + regs::GCAP as u64) as *const u16) };
+    let gcap_64ok = gcap & 1 != 0;
+    let iss = (gcap >> 8) & 0x0f;
+    let oss = (gcap >> 12) & 0x0f;
+    // Input descriptors occupy the first `iss` slots starting at 0x80; the
+    // first output descriptor follows them.
+    let out_base = 0x80 + (iss as u32) * 0x20;
+    let in_base = 0x80u32;
+
     let corb = dma.alloc_page().ok_or("OOM CORB")?;
     let rirb = dma.alloc_page().ok_or("OOM RIRB")?;
-    let bdl = dma.alloc_page().ok_or("OOM BDL")?;
-    let buf = dma
-        .alloc_contiguous(BUF_CAP / 4096)
-        .ok_or("OOM PCM buffer")?;
-    // Dedicated streaming path: its own BDL page and 256 KiB PCM buffer, so
-    // the pump's refill loop can drop the Inner mutex (and yield to the
-    // scheduler) without colliding with capture or one-shot playback.
-    let sbd = dma.alloc_page().ok_or("OOM stream BDL")?;
-    let sbuf = dma
-        .alloc_contiguous(BUF_CAP / 4096)
-        .ok_or("OOM stream buffer")?;
+    // Output ring: a BDL page (16 entries fit trivially) and a contiguous PCM
+    // buffer of `RING_BUF_BYTES`.
+    let out_bdl = dma.alloc_page().ok_or("OOM output BDL")?;
+    let out_buf = dma
+        .alloc_contiguous(RING_BUF_BYTES / 4096)
+        .ok_or("OOM output ring buffer")?;
+
+    // On a 32-bit-only controller (64OK == 0) the upper-base registers are
+    // ignored, so a DMA address above 4 GiB would silently corrupt low
+    // memory.  Fail bring-up rather than risk it.
+    if !gcap_64ok
+        && (corb.phys >= 0x1_0000_0000
+            || rirb.phys >= 0x1_0000_0000
+            || out_bdl.phys >= 0x1_0000_0000
+            || out_buf.phys >= 0x1_0000_0000)
+    {
+        return Err("HDA controller is 32-bit only and a DMA buffer sits above 4 GiB");
+    }
 
     let audio = Box::new(HdaAudio {
         inner: Mutex::new(Inner {
@@ -1144,18 +762,17 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
             corb_virt: corb.virt,
             rirb_phys: rirb.phys,
             rirb_virt: rirb.virt,
-            bdl_phys: bdl.phys,
-            bdl_virt: bdl.virt,
-            buf_phys: buf.phys,
-            buf_virt: buf.virt,
-            sbd_phys: sbd.phys,
-            sbd_virt: sbd.virt,
-            sbuf_phys: sbuf.phys,
-            sbuf_virt: sbuf.virt,
+            out_bdl_phys: out_bdl.phys,
+            out_bdl_virt: out_bdl.virt,
+            out_buf_phys: out_buf.phys,
+            out_buf_virt: out_buf.virt,
+            in_bdl_phys: 0,
+            in_bdl_virt: 0,
+            in_buf_phys: 0,
+            in_buf_virt: 0,
             out_base: 0,
             in_base: 0,
             last_wp: 0,
-            ring_entries: RING_ENTRIES,
         }),
         cap_ready: core::sync::atomic::AtomicBool::new(false),
     });
@@ -1164,95 +781,87 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
     {
         let mut i = audio.inner.lock();
 
-        // Controller reset: CRST (GCTL bit 0) is active-high for operational
-        // mode — 0 = held in reset, 1 = operational (Intel spec 3.3.7).
-        // Assert reset (QEMU cold-resets on a write that leaves CRST=0), wait
-        // for the controller to report CRST=0, then take it out of reset and
-        // wait until CRST reads back 1.  The poll is required on real
-        // hardware; QEMU transitions instantly so the loops exit immediately.
+        // Controller reset.  Per the HDA spec (§3.3.7) the exit-reset phase
+        // needs at least 521 µs of CRST-asserted time; a bare spin loop turns
+        // over in microseconds on modern CPUs, so wait on the timer and fail
+        // loudly if the controller never settles.
         SerialPort::puts("[audio] hda: controller reset\n");
         i.w32(regs::GCTL, 0);
-        for _ in 0..1000 {
-            if i.r32(regs::GCTL) & GCTL_RSTCRST == 0 {
-                break;
-            }
-            core::hint::spin_loop();
+        let reset_clear_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
+        if !crate::services::universal_timer::wait_until_cond(reset_clear_deadline, &|| {
+            i.r32(regs::GCTL) & GCTL_RSTCRST == 0
+        }) {
+            return Err("HDA controller reset timeout (CRST clear)");
         }
         i.w32(regs::GCTL, GCTL_RSTCRST);
-        for _ in 0..1000 {
-            if i.r32(regs::GCTL) & GCTL_RSTCRST != 0 {
-                break;
-            }
-            core::hint::spin_loop();
+        let reset_set_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
+        if !crate::services::universal_timer::wait_until_cond(reset_set_deadline, &|| {
+            i.r32(regs::GCTL) & GCTL_RSTCRST != 0
+        }) {
+            return Err("HDA controller reset timeout (CRST set)");
         }
 
-        // Codecs reset asynchronously after the controller comes out of CRST;
-        // a real codec can take a few ms to report present on the link.  Poll
-        // STATESTS for a codec to appear (bounded ~100 ms) instead of reading
-        // it once immediately after reset.  QEMU sets the bits instantly, so
-        // this returns immediately there.
         let c_mmio = i.mmio;
         let present_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
         crate::services::universal_timer::wait_until_cond(present_deadline, &|| {
             (unsafe { read_volatile((c_mmio + regs::STATESTS as u64) as *const u16) }) != 0
         });
         let sts = i.r16(regs::STATESTS);
+        // STATESTS carries write-1-to-clear SDI wake bits (spec §3.3.9);
+        // write the latched value back so stale wake flags are acknowledged
+        // instead of hanging around.
+        i.w16(regs::STATESTS, sts);
 
-        // Read capabilities and compute the first output stream base.
-        // GCAP bits: [15:12] OSS, [11:8] ISS, [7:4] BSS, [3:0] NSDO.  Input
-        // streams occupy descriptors 0..ISS-1, so the first output stream is
-        // at offset 0x80 + ISS*0x20.  QEMU's ich9/intel-hda reports
-        // GCAP = 0x4401 → ISS=4 → out_base = 0x100.
-        let gcap = i.r16(regs::GCAP);
-        let iss = (gcap >> 8) & 0x0f;
-        let oss = (gcap >> 12) & 0x0f;
-        let out_base = 0x80 + (iss as u32) * 0x20;
         i.out_base = out_base;
-        // Input streams live at descriptor 0 (register index < 4 is an input
-        // stream; QEMU decides direction by the register index, not a
-        // descriptor bit).  Armed only when a codec with an ADC is selected.
-        let in_base = 0x80u32;
         SerialPort::puts("[audio] hda: iss=");
         SerialPort::put_u64(iss as u64);
         SerialPort::puts(" oss=");
         SerialPort::put_u64(oss as u64);
+        SerialPort::puts(" 64ok=");
+        SerialPort::put_u64(gcap_64ok as u64);
         SerialPort::puts(" out_base=0x");
         SerialPort::put_hex(out_base as u64);
         SerialPort::puts("\n");
 
-        // CORB: base pointers, program the ring size (0x02 = 256 entries, the
-        // encoding Linux uses and the size our `& 0xff` pointer masking and
-        // QEMU's internal ring assume), reset pointers, then run.
+        // CORB: base pointers, ring size (256 entries), reset pointers, run.
+        // The read-pointer reset bit (bit 15, CORBRPRST, spec §3.3.20) must
+        // read back asserted before it is cleared, or the controller has not
+        // actually reset the pointer.  Some QEMU models never latch the bit,
+        // so a timeout is logged and tolerated rather than aborting init.
         i.w32(regs::CORBLBASE, i.corb_phys as u32);
         i.w32(regs::CORBUBASE, (i.corb_phys >> 32) as u32);
         i.w8(regs::CORBSIZE, 0x02);
         i.w16(regs::CORBRP, 0x8000);
+        let corb_rst_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
+        if !crate::services::universal_timer::wait_until_cond(corb_rst_deadline, &|| {
+            i.r16(regs::CORBRP) & 0x8000 != 0
+        }) {
+            SerialPort::puts("[audio] hda: CORBRP reset bit never asserted\n");
+        }
         i.w16(regs::CORBRP, 0);
         i.w16(regs::CORBWP, 0);
         i.w8(regs::CORBSTS, 0);
         i.w8(regs::CORBCTL, CORB_RUN);
 
         // RIRB: base pointers, ring size (256 entries), reset pointers, then
-        // enable DMA.  RINTCNT must be non-zero or the controller never drains
-        // the CORB; RIRBCTL must set DMA_EN or responses are dropped (and
-        // IRQ_EN so the response-count gate can be cleared — see
-        // `codec_verb`).
+        // enable DMA.  RINTCNT must be non-zero and RIRBCTL must set DMA_EN.
         i.w32(regs::RIRBLBASE, i.rirb_phys as u32);
         i.w32(regs::RIRBUBASE, (i.rirb_phys >> 32) as u32);
         i.w8(regs::RIRBSIZE, 0x02);
         i.w16(regs::RIRBWP, 0x8000);
+        let rirb_rst_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
+        if !crate::services::universal_timer::wait_until_cond(rirb_rst_deadline, &|| {
+            i.r16(regs::RIRBWP) & 0x8000 != 0
+        }) {
+            SerialPort::puts("[audio] hda: RIRBWP reset bit never asserted\n");
+        }
         i.w16(regs::RIRBWP, 0);
         i.w8(regs::RIRBSTS, 0);
         i.w16(regs::RINTCNT, RINTCNT_QUIET);
         i.w8(regs::RIRBCTL, RIRB_CTL);
         i.last_wp = 0;
 
-        // Real codecs finish powering up a few ms after the link reset and may
-        // answer their first verbs with the error-default (0) or stall the
-        // ring while still waking.  Ping each present codec until its vendor
-        // ID reads back stable and non-zero, bounded at ~200 ms, before the
-        // full probe.  QEMU answers the first read instantly, so this is a
-        // no-op there.
+        // Ping each present codec until its vendor ID reads back stable.
         for cad in 0..16u32 {
             if sts & (1 << cad) == 0 {
                 continue;
@@ -1274,20 +883,11 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
             }
         }
 
-        // Discover attached codecs via STATESTS (bit i = codec i present),
-        // probe each, and keep a usable one.  Prefer a codec with an analog
-        // output (line-out/speaker/headphone) over a digital-only one such as
-        // the Intel HDMI/DP function, which has no path to the speakers;
-        // digital is only a fallback.  Among analog-output codecs, one that
-        // *also* has an ADC wins: with both `hda-output` (cad 0, no ADC) and
-        // `hda-duplex` (cad 1, DAC+ADC) attached, the first probed analog
-        // codec is output-only, so picking it would silently lose capture.
         SerialPort::puts("[audio] hda: states=0x");
         SerialPort::put_hex(sts as u64);
         SerialPort::puts("\n");
 
         let mut codec: Option<codec::Codec> = None;
-        // An analog-output codec that can also capture (two-way preference).
         let mut duplex: Option<codec::Codec> = None;
         let mut digital: Option<codec::Codec> = None;
         for cad in 0..16u32 {
@@ -1312,10 +912,6 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
                     SerialPort::put_u64(c.widgets.len() as u64);
                     SerialPort::puts("\n");
                     if codec::is_realtek_alc256(c.vendor) {
-                        // ALC256 is the analog codec that reaches the speakers.
-                        // Prefer it over any digital (HDMI) function even when
-                        // the generic walk failed to enumerate it; it is
-                        // brought up via the hardcoded path below.
                         if codec.is_none() {
                             codec = Some(c);
                         }
@@ -1357,18 +953,16 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         }
         let codec = duplex.or(codec).or(digital).ok_or("no usable codec")?;
 
-        // Bring up the output path (power, amps, pin, stream binding), then
-        // the input path when the codec has an ADC.  An ALC256 whose widget
-        // walk was truncated gets its hardcoded analog path instead of the
-        // generic one (and, lacking a hardcoded input binding, stays
-        // playback-only).  Capture is armed only when setup succeeds.
         if codec::is_realtek_alc256(codec.vendor) {
             SerialPort::puts("[audio] hda: alc256 hardcoded analog path\n");
             codec::setup_alc256_output(&mut *i, &codec, STREAM_TAG)?;
         } else {
             codec::setup_output(&mut *i, &codec, STREAM_TAG)?;
         }
-        let mut cap_ok = codec.adc.is_some();
+        // Capture needs both a codec ADC *and* an input stream descriptor on
+        // the controller (ISS > 0).  On a playback-only controller the input
+        // descriptor at 0x80 would alias the output stream, so never arm it.
+        let mut cap_ok = iss > 0 && codec.adc.is_some();
         if cap_ok {
             match codec::setup_input(&mut *i, &codec, INPUT_TAG) {
                 Ok(()) => SerialPort::puts("[audio] hda: input path ready\n"),
@@ -1383,17 +977,65 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         audio
             .cap_ready
             .store(cap_ok, core::sync::atomic::Ordering::Release);
+
+        // Start the permanent output ring (silence until data is submitted).
+        unsafe { core::ptr::write_bytes(i.out_buf_virt as *mut u8, 0, RING_BUF_BYTES) }
+        i.start_ring(
+            out_base,
+            SD_CTL_STREAM_TAG,
+            i.out_bdl_phys,
+            i.out_bdl_virt,
+            i.out_buf_phys,
+            RING_SLOT_BYTES,
+            RING_SLOTS,
+        )?;
+        OUT_PRODUCED.store(0, Ordering::Release);
+        OUT_COMPLETED.store(0, Ordering::Release);
+        OUT_BUF_VIRT.store(i.out_buf_virt, Ordering::Release);
+        OUT_SLOT_BYTES.store(RING_SLOT_BYTES as u64, Ordering::Release);
+        OUT_RING_SLOTS.store(RING_SLOTS as u64, Ordering::Release);
+        SerialPort::puts("[audio] hda: output ring running\n");
+
+        // When the codec captures, start the permanent input ring.
         if cap_ok {
+            let in_bdl = dma.alloc_page().ok_or("OOM input BDL")?;
+            let in_buf = dma
+                .alloc_contiguous(RING_BUF_BYTES / 4096)
+                .ok_or("OOM input ring buffer")?;
+            if !gcap_64ok
+                && (in_bdl.phys >= 0x1_0000_0000 || in_buf.phys >= 0x1_0000_0000)
+            {
+                return Err("HDA controller is 32-bit only and a DMA buffer sits above 4 GiB");
+            }
             i.in_base = in_base;
+            i.in_bdl_phys = in_bdl.phys;
+            i.in_bdl_virt = in_bdl.virt;
+            i.in_buf_phys = in_buf.phys;
+            i.in_buf_virt = in_buf.virt;
+            unsafe { core::ptr::write_bytes(i.in_buf_virt as *mut u8, 0, RING_BUF_BYTES) }
+            i.start_ring(
+                in_base,
+                SD_CTL_INPUT_STREAM_TAG,
+                i.in_bdl_phys,
+                i.in_bdl_virt,
+                i.in_buf_phys,
+                RING_SLOT_BYTES,
+                RING_SLOTS,
+            )?;
+            IN_CAPTURED.store(0, Ordering::Release);
+            IN_CONSUMED.store(0, Ordering::Release);
+            IN_BUF_VIRT.store(i.in_buf_virt, Ordering::Release);
+            IN_SLOT_BYTES.store(RING_SLOT_BYTES as u64, Ordering::Release);
+            IN_RING_SLOTS.store(RING_SLOTS as u64, Ordering::Release);
+            SerialPort::puts("[audio] hda: input ring running\n");
         }
 
         // Publish the registers the completion ISR needs (lock-free), then
-        // enable stream-completion interrupts.  Best-effort: playback falls
-        // back to polling BCIS if the route can't be established.
-        HDA_MMIO.store(mmio, core::sync::atomic::Ordering::Release);
-        HDA_OUT_BASE.store(out_base, core::sync::atomic::Ordering::Release);
+        // enable stream-completion interrupts.
+        HDA_MMIO.store(mmio, Ordering::Release);
+        HDA_OUT_BASE.store(out_base, Ordering::Release);
         if cap_ok {
-            HDA_IN_BASE.store(in_base, core::sync::atomic::Ordering::Release);
+            HDA_IN_BASE.store(in_base, Ordering::Release);
         }
         #[cfg(target_arch = "x86_64")]
         setup_stream_interrupt(dev, out_base, in_base, cap_ok);
@@ -1404,48 +1046,54 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
 
 /// Enable stream-completion interrupts for the output (and, when capture is
 /// armed, input) streams: MSI when the controller exposes a capability,
-/// legacy INTx otherwise.  QEMU's intel-hda advertises MSI by default, so the
-/// MSI path is the normal one.
+/// legacy INTx otherwise.  Sets `INTERRUPT_DRIVEN` when a route succeeds; if
+/// none can be established the driver falls back to polling BCIS from the
+/// callers.
 #[cfg(target_arch = "x86_64")]
 fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32, in_base: u32, cap_ok: bool) {
     use crate::arch::x86_64::idt;
     use crate::drivers::serial::SerialPort;
     use crate::pci::caps;
 
-    let Some(vector) = idt::register_device_handler(hda_irq_handler) else {
-        SerialPort::puts("[audio] hda: no device vector free, polling BCIS\n");
-        return;
-    };
-
-    // Stream index of the output descriptor, for INTCTL bit selection.
     let stream_index = (out_base - 0x80) / 0x20;
 
     let caps_list = caps::all(dev);
+    let mut route_ok = false;
     if let Some(msi) = caps_list.iter().find(|c| c.id == caps::CAP_MSI) {
+        // MSI: the driver owns the vector, so grab a free device vector and
+        // program MSI to deliver on it.
+        let Some(vector) = idt::register_device_handler(hda_irq_handler) else {
+            SerialPort::puts("[audio] hda: no device vector free, polling BCIS\n");
+            INTERRUPT_DRIVEN.store(false, Ordering::Release);
+            return;
+        };
         let bsp_apic_id = unsafe {
             let lapic = crate::platform::x86_64_pc::apic::lapic_base();
             core::ptr::read_volatile((lapic as *const u32).add(0x20 / 4)) >> 24
         } as u8;
         crate::pci::msi::enable(dev, msi, vector, bsp_apic_id);
         SerialPort::puts("[audio] hda: MSI enabled\n");
+        route_ok = true;
     } else if dev.interrupt_line != 0 {
-        if crate::platform::x86_64_pc::ioapic::enable_irq(
+        // INTx: the I/O APIC assigns the vector, so register the handler at
+        // that vector rather than a separately-allocated one (the two pools
+        // are independent and must not be assumed to coincide).
+        if let Some(vector) = crate::platform::x86_64_pc::ioapic::enable_irq(
             dev.interrupt_line as u32,
             crate::acpi::Polarity::ActiveLow,
             crate::acpi::TriggerMode::Level,
-        )
-        .is_none()
-        {
-            idt::unregister_device_handler(vector);
-            SerialPort::puts("[audio] hda: INTx route failed, polling BCIS\n");
-            return;
+        ) {
+            idt::register_device_handler_at(vector, hda_irq_handler);
+            SerialPort::puts("[audio] hda: INTx enabled\n");
+            route_ok = true;
         }
-        SerialPort::puts("[audio] hda: INTx enabled\n");
-    } else {
-        idt::unregister_device_handler(vector);
+    }
+    if !route_ok {
         SerialPort::puts("[audio] hda: no interrupt source, polling BCIS\n");
+        INTERRUPT_DRIVEN.store(false, Ordering::Release);
         return;
     }
+    INTERRUPT_DRIVEN.store(true, Ordering::Release);
 
     // Gate completion interrupts for the output and (when armed) input
     // streams, plus the global enable.
@@ -1455,7 +1103,7 @@ fn setup_stream_interrupt(dev: &crate::pci::PciDevice, out_base: u32, in_base: u
         intctl |= 1 << in_stream_index;
     }
     unsafe {
-        let mmio = HDA_MMIO.load(core::sync::atomic::Ordering::Relaxed);
+        let mmio = HDA_MMIO.load(Ordering::Relaxed);
         core::ptr::write_volatile((mmio + global_regs::INTCTL as u64) as *mut u32, intctl);
     }
 }

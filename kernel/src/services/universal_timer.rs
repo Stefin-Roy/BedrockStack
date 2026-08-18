@@ -452,6 +452,11 @@ pub fn sleep_ms(ms: u64) {
     wait_until(universal_timer().now_ns() + ms * 1_000_000);
 }
 
+/// Block for `ns` nanoseconds, yielding the CPU.
+pub fn sleep_ns(ns: u64) {
+    wait_until(universal_timer().now_ns() + ns);
+}
+
 /// Current monotonic time in nanoseconds.
 pub fn now_ns() -> u64 {
     universal_timer().now_ns()

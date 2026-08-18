@@ -437,8 +437,8 @@ impl Kernel {
         #[cfg(target_arch = "x86_64")]
         crate::audio::init();
 
-        // Capture self-test: with a duplex codec, record ~250 ms over the
-        // streaming ring path and report what came back.  All-zero audio (no
+        // Capture self-test: with a duplex codec, record ~250 ms through the
+        // feeding input ring and report what came back.  All-zero audio (no
         // host mic configured for the QEMU backend) still proves the input
         // DMA moved — BCIS fired and the ring advanced.  Gated behind
         // `selftest` so routine boots are untouched.
@@ -448,23 +448,27 @@ impl Kernel {
             use crate::drivers::serial::SerialPort as SP;
             if crate::audio::can_record() {
                 let total_bytes = 48_000u32; // 250 ms of stereo 16-bit @ 48 kHz
-                let mut total: u64 = 0;
+                let mut recorded: u64 = 0;
                 let mut peak: u32 = 0;
                 let mut rms_acc: u64 = 0;
                 let mut n_sum: u64 = 0;
-                let r = crate::audio::record_pcm_stream(
-                    total_bytes,
-                    8192,
-                    &mut |chunk: alloc::vec::Vec<i16>| {
-                        total += (chunk.len() * 2) as u64;
-                        for s in chunk {
-                            let a = s.unsigned_abs() as u64;
-                            rms_acc += (a * a) >> 8;
-                            n_sum += 1;
-                            peak = peak.max(a as u32);
-                        }
-                    },
-                );
+                let mut chunk: alloc::vec::Vec<i16> = alloc::vec![0i16; 4096];
+                let r = loop {
+                    match crate::audio::record_pcm(&mut chunk) {
+                        Ok(()) => {}
+                        Err(e) => break Err(e),
+                    }
+                    recorded += (chunk.len() * 2) as u64;
+                    for s in &chunk {
+                        let a = s.unsigned_abs() as u64;
+                        rms_acc += (a * a) >> 8;
+                        n_sum += 1;
+                        peak = peak.max(a as u32);
+                    }
+                    if recorded >= total_bytes as u64 {
+                        break Ok(recorded);
+                    }
+                };
                 SP::puts("[audio] selftest capture: ");
                 match r {
                     Ok(b) => {
@@ -477,7 +481,7 @@ impl Kernel {
                     }
                 }
                 SP::puts(" total=");
-                SP::put_u64(total);
+                SP::put_u64(recorded);
                 SP::puts(" peak=");
                 SP::put_hex(peak as u64);
                 if n_sum > 0 {
@@ -531,10 +535,6 @@ impl Kernel {
             crate::task::init(self.page_table_root);
             #[cfg(feature = "selftest")]
             crate::task::smoke_test(&mut self.allocator);
-            // Playback pump: a kernel task that drains the audio request queue
-            // through the streaming DMA ring (gapless, non-blocking callers).
-            // No-op when no audio device came up.
-            crate::audio::spawn_pump(&mut self.allocator);
         }
 
         // Phase 6: load \EFI\BEDROCK\INIT from the ESP (via the unispace /B
