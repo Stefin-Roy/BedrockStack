@@ -22,6 +22,7 @@ set OVMF_PATH=%~dp0target\ovmf_code.fd
 set OVMF_VARS=%~dp0target\ovmf_vars.fd
 set IMAGE_PATH=%~dp0target\os.img
 set NVME_IMAGE=%~dp0target\nvme.img
+set NTFS_IMAGE=%~dp0target\ntfs.img
 
 if not exist "%IMAGE_PATH%" (
     echo ERROR: Disk image not found at %IMAGE_PATH%
@@ -34,6 +35,10 @@ if not exist "%NVME_IMAGE%" (
     echo Creating demo FAT32 USB disk image...
     python "%~dp0make_demo_drive.py" --output "%NVME_IMAGE%"
 )
+if not exist "%NTFS_IMAGE%" (
+    echo Creating demo NTFS disk image...
+    python "%~dp0make_ntfs_demo.py" --output "%NTFS_IMAGE%"
+)
 echo Running QEMU with BedrockOS (x86_64^)...
 "%QEMU_PATH%" ^
     -machine q35 ^
@@ -43,6 +48,8 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
+    -drive file="%NTFS_IMAGE%",format=raw,if=none,id=ntfs_disk ^
+    -device ide-hd,drive=ntfs_disk,bus=ahci.1 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
     -device qemu-xhci,msi=on,msix=on ^
     -device usb-storage,drive=usb_disk ^

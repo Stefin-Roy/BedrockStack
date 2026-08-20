@@ -1,5 +1,5 @@
 [workspace]
-members = ["boot", "kernel", "common", "graphics/Framebuffer", "user", "user/libc", "user/doom"]
+members = ["boot", "kernel", "common", "graphics/Framebuffer", "user", "user/libc", "user/doom", "user/posixcheck"]
 resolver = "2"
 
 [profile.dev]

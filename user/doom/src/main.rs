@@ -183,6 +183,14 @@ pub extern "C" fn bedrock_exit(code: i32) -> ! {
 /// spawn args and hands control to the engine's `main` (which runs forever).
 #[unsafe(no_mangle)]
 pub extern "C" fn entry_main() -> usize {
+    // The engine writes savegames and its config via relative paths (e.g.
+    // `.savegame/doomsav0.dsg`) against the process CWD, which defaults to
+    // `/` — the read-only unispace registry root.  Repoint the CWD at the
+    // writable tmpfs (`A>`) so saves land in `/A/.savegame/`.
+    unsafe {
+        libc::vfs::chdir(b"/A\0".as_ptr() as *const core::ffi::c_char);
+    }
+
     let argv0 = DOOM_ARGV0.as_ptr() as *const c_char;
 
     let mut argc = 1usize;

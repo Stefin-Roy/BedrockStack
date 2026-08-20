@@ -671,12 +671,8 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
         i.w32(regs::RIRBUBASE, (i.rirb_phys >> 32) as u32);
         i.w8(regs::RIRBSIZE, 0x02);
         i.w16(regs::RIRBWP, 0x8000);
-        let rirb_rst_deadline = crate::services::universal_timer::now_ns() + 100_000_000;
-        if !crate::services::universal_timer::wait_until_cond(rirb_rst_deadline, &|| {
-            i.r16(regs::RIRBWP) & 0x8000 != 0
-        }) {
-            SerialPort::puts("[audio] hda: RIRBWP reset bit never asserted\n");
-        }
+        // RIRBWPRST is write-only (spec 3.3.27: "always read as 0"), so the reset
+        // cannot be verified by read-back; just clear the reset bit again.
         i.w16(regs::RIRBWP, 0);
         i.w8(regs::RIRBSTS, 0);
         i.w16(regs::RINTCNT, RINTCNT_QUIET);

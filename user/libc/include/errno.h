@@ -1,11 +1,15 @@
 /*
- * Minimal freestanding <errno.h> for the vendored doomgeneric engine.
+ * BedrockOS permissive libc — <errno.h>
  *
- * errno lives in `user/libc` (via __errno_location), mirroring Linux errno
- * numbers.  EISDIR is referenced by m_misc.c.
+ * errno lives in the Rust libc (errno.rs) via __errno_location, mirroring
+ * Linux errno numbers.
  */
-#ifndef BEDROCK_ERRNO_H
-#define BEDROCK_ERRNO_H
+#ifndef BEDROCK_LIBC_ERRNO_H
+#define BEDROCK_LIBC_ERRNO_H
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #define EPERM   1
 #define ENOENT  2
@@ -21,7 +25,6 @@
 #define ENOMEM  12
 #define EACCES  13
 #define EFAULT  14
-#define ENOTBLK 15
 #define EBUSY   16
 #define EEXIST  17
 #define EXDEV   18
@@ -32,7 +35,6 @@
 #define ENFILE  23
 #define EMFILE  24
 #define ENOTTY  25
-#define ETXTBSY 26
 #define EFBIG   27
 #define ENOSPC  28
 #define ESPIPE  29
@@ -41,14 +43,15 @@
 #define EPIPE   32
 #define EDOM    33
 #define ERANGE  34
-#define EDEADLK 35
 #define ENAMETOOLONG 36
-#define ENOLCK  37
 #define ENOSYS  38
 #define ENOTEMPTY 39
-#define ELOOP   40
 
 extern int *__errno_location(void);
 #define errno (*__errno_location())
 
-#endif /* BEDROCK_ERRNO_H */
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* BEDROCK_LIBC_ERRNO_H */

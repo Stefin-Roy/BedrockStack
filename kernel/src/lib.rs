@@ -8,6 +8,8 @@ pub mod arch;
 #[cfg(target_arch = "x86_64")]
 pub mod audio;
 pub mod boot;
+#[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+pub mod bootanim;
 pub mod display;
 pub mod drivers;
 #[cfg(target_arch = "riscv64")]
@@ -390,6 +392,11 @@ impl Kernel {
             self.layout.idt_end,
         );
 
+        // Boot animation: start the indeterminate spinner, which ticks on the
+        // universal timer for the whole of the boot tail below.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::start(&mut self.framebuffer);
+
         // Initialise PCI subsystem (ECAM mapping + bus enumeration).
         if let Some(ref acpi) = self.acpi {
             crate::pci::init(
@@ -519,6 +526,19 @@ impl Kernel {
             }
         }
 
+        // Read-only NTFS demo drive (second block device) as C>, exercised
+        // only under `selftest` so routine boots are untouched.
+        #[cfg(all(target_arch = "x86_64", feature = "selftest"))]
+        if let Some(dev) = block_devices.get(1) {
+            match crate::filesystems::partition::mount_first_partition(dev.clone(), "ntfs", 'C') {
+                Ok(()) => {
+                    log::info!("Mounted NTFS demo as C> (read-only)");
+                    crate::filesystems::fstypes::ntfs::selftest::run();
+                }
+                Err(e) => log::warn!("Could not mount NTFS demo on C>: {:?}", e),
+            }
+        }
+
         // Unispace: build the / registry, attach the providers (VFS mounts,
         // /sys), then run the boot self-test (gated behind `selftest`).
         crate::unispace::init();
@@ -536,6 +556,10 @@ impl Kernel {
             #[cfg(feature = "selftest")]
             crate::task::smoke_test(&mut self.allocator);
         }
+
+        // Stop the spinner: INIT's desktop paint takes over the screen now.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::stop();
 
         // Phase 6: load \EFI\BEDROCK\INIT from the ESP (via the unispace /B
         // mount) into its own address space and drop to ring 3. No-ops with a

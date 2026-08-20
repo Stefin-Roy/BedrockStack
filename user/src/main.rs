@@ -174,9 +174,7 @@ fn drain_child_stdout(pid: isize) {
         if sr <= 0 {
             break;
         }
-        unsafe {
-            libc::stdio::write(1, sbuf.as_ptr() as *const core::ffi::c_void, sr as usize);
-        }
+        serial_write(&sbuf[..sr as usize]);
     }
 }
 
@@ -271,6 +269,51 @@ fn serial_puts(s: &[u8]) {
     unsafe {
         let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
     }
+}
+
+/// Relay an arbitrary-length buffer to live serial in small chunks.
+fn serial_write(s: &[u8]) {
+    let mut buf = [0u8; 128];
+    let mut off = 0usize;
+    while off < s.len() {
+        let n = (s.len() - off).min(buf.len());
+        buf[..n].copy_from_slice(&s[off..off + n]);
+        unsafe {
+            let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
+        }
+        off += n;
+    }
+}
+
+/// Serial-print a `prefix <decimal> suffix` line (e.g. an exit code report).
+fn serial_puts_dec(prefix: &[u8], v: u64, suffix: &[u8]) {
+    let mut buf = [0u8; 128];
+    let mut n = 0usize;
+    let plen = prefix.len().min(buf.len());
+    buf[..plen].copy_from_slice(&prefix[..plen]);
+    n = plen;
+    let mut digits = [0u8; 20];
+    let mut d = 20usize;
+    if v == 0 {
+        digits[19] = b'0';
+        d = 19;
+    }
+    let mut vv = v;
+    while vv > 0 {
+        d -= 1;
+        digits[d] = b'0' + (vv % 10) as u8;
+        vv /= 10;
+    }
+    for i in d..20 {
+        if n < buf.len() {
+            buf[n] = digits[i];
+            n += 1;
+        }
+    }
+    let m = suffix.len().min(buf.len() - n);
+    buf[n..n + m].copy_from_slice(&suffix[..m]);
+    n += m;
+    serial_puts(&buf[..n]);
 }
 
 /// Append a 64-bit value as lowercase hex to a `&[u8]` diagnostic string.
@@ -406,6 +449,16 @@ pub extern "C" fn entry_main() -> usize {
     //    repaint the gradient, and on any keypress launch DOOM with the
     //    Freedoom IWAD, wait for it, and dump its stdout. INIT is the parent
     //    task, so it must not exit while the OS keeps running.
+    // 5a. First run the POSIX conformance harness and report its outcome.
+    serial_puts(b"[INIT] running POSIXCHECK\n");
+    let pcheck = libc::process::spawn("/B/EFI/BEDROCK/POSIXCHECK", "");
+    if pcheck < 0 {
+        serial_puts_dec(b"[INIT] POSIXCHECK spawn failed rc=", pcheck as u64, b"\n");
+    } else {
+        let code = libc::process::wait(pcheck as u64);
+        drain_child_stdout(pcheck);
+        serial_puts_dec(b"[INIT] POSIXCHECK exit code=", code as u64, b"\n");
+    }
     serial_puts(b"[INIT] PLAYING SOUND FUNCTION\n");
     play_startup_wav();
     loop {

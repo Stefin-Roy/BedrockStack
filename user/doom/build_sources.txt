@@ -80,7 +80,6 @@ third_party/doomgeneric/i_video.c
 third_party/doomgeneric/doomgeneric.c
 third_party/doomgeneric/mus2mid.c
 user/doom/platform/doomgeneric_bedrock.c
-user/doom/platform/shim.c
 user/doom/platform/w_mem.c
 user/doom/platform/bedrock_audio.c
 user/doom/platform/bedrock_sfx.c

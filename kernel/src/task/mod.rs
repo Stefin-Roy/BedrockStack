@@ -626,6 +626,11 @@ fn task_parent(pid: u64) -> Option<u64> {
     None
 }
 
+/// Public accessor for `task_parent`: the recorded parent pid of `pid`, if any.
+pub fn task_parent_pid(pid: u64) -> Option<u64> {
+    task_parent(pid)
+}
+
 /// True if `pid` is parked in `ZOMBIES` (dead but not yet reaped).
 fn zombie_present(pid: u64) -> bool {
     ZOMBIES.lock().iter().any(|t| t.id == pid)
