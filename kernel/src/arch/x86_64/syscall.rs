@@ -115,16 +115,24 @@ const FRAME_SIZE: u64 = core::mem::size_of::<SyscallFrame>() as u64;
 // rax = syscall number, rdi/rsi/rdx/r10 = args. All other GP registers are
 // untouched by the hardware.
 //
-// GS management: the swapgs invariant is preserved here. Loading a flat data
-// selector into GS forces GS.base = 0, so every `mov gs, sel` is immediately
-// followed by re-writing IA32_GS_BASE = PerCpu (captured from gs:[0] first).
-// This keeps KERNEL_GS_BASE = user GS and GS.base = PerCpu at every swapgs.
-// Interrupts are masked (SFMASK) on entry and stay masked until `SET_GS_SEL
-// 0x10` has re-established the kernel data segments and GS.base; an ISR taken
-// in that window (CPL0 frame, so no user-mode swapgs) has the correct kernel
-// GS state. The stub enables IF for the dispatch body, then `cli`s before
-// `SET_GS_SEL 0x23`, so no interrupt can fire while the user selectors are
-// loaded but kernel code is still running (before sysretq re-enables IF).
+// GS management: the swapgs invariant is preserved here without any GS selector
+// load or WRMSR.  The entry `swapgs` already leaves GS.base = PerCpu, and the
+// kernel never touches GS again, so GS.base stays PerCpu for the whole syscall
+// (no interrupt can observe a stale user GS: every ISR checks `from_user` and
+// only swaps for a ring-3 frame).  Only DS/ES/FS need explicit selector loads —
+// SYSCALL leaves them as the user's data selectors, and long-mode addressing
+// ignores their bases (FS.base/GS.base come from MSRs, not selector loads).
+// The exit therefore only reloads DS/ES/FS to the user data selector before
+// the final `swapgs`/`sysretq`, which restores GS.base = user GS.  This removes
+// the two serializing WRMSRs (IA32_GS_BASE) and the `mov gs` that used to sit
+// on every syscall.
+//
+// Interrupts are masked (SFMASK) on entry and stay masked until the kernel DS/
+// ES/FS/SS selectors are loaded; an ISR taken in that window (CPL0 frame, so no
+// user-mode swapgs) has the correct kernel GS state (GS.base = PerCpu from the
+// entry swapgs). The stub enables IF for the dispatch body, then `cli`s before
+// loading the user selectors, so no interrupt can fire while the user selectors
+// are loaded but kernel code is still running (before sysretq re-enables IF).
 // SS: SYSCALL loads SS = STAR.CS + 8 = 0x20, which is the *user* data
 // descriptor in this GDT — safe to run on (base 0 in long mode), but an ISR
 // frame carrying SS = 0x20 faults on IRETQ (the return validates SS against
@@ -132,18 +140,11 @@ const FRAME_SIZE: u64 = core::mem::size_of::<SyscallFrame>() as u64;
 // (0x10) before STI, so no interrupt ever captures SS = 0x20.
 core::arch::global_asm!(
     r#"
-.macro SET_GS_SEL sel
-    mov  r11, gs:[0]                # r11 = PerCpu (self_ptr) — GS.base still PerCpu here
+.macro SET_DATA_SEL sel
     mov  ax, \sel
     mov  ds, ax
     mov  es, ax
     mov  fs, ax
-    mov  gs, ax                     # GS.base := 0 (flat descriptor base)
-    mov  ecx, 0xC0000101            # IA32_GS_BASE
-    mov  eax, r11d                  # low 32 of PerCpu
-    shr  r11, 32
-    mov  edx, r11d                  # high 32 of PerCpu
-    wrmsr                           # GS.base = PerCpu (kernel state restored)
 .endm
 
 .globl syscall_entry
@@ -174,14 +175,14 @@ syscall_entry:
     push r15                        # 0x00; rsp = frame_base
     lea  rcx, [rsp + {frame}]       # kernel_top
     mov  gs:[{p_off}], rcx          # restore the syscall_rsp0 mirror for the next syscall
-    SET_GS_SEL 0x10                 # kernel data selectors + GS.base = PerCpu
+    SET_DATA_SEL 0x10               # kernel DS/ES/FS (GS.base already PerCpu)
     mov  ax, 0x10
     mov  ss, ax                     # SYSCALL loaded SS = 0x20 (user data); swap in kernel data
     sti                             # kernel GS/segments live: open the interrupt window
     mov  rdi, rsp                   # &mut SyscallFrame
     call syscall_dispatch
     cli                             # close the window before the user selectors load
-    SET_GS_SEL 0x23                 # user data selectors + GS.base = PerCpu (pre-swapgs)
+    SET_DATA_SEL 0x23               # user DS/ES/FS (GS.base stays PerCpu for swapgs)
     pop  r15
     pop  r14
     pop  r13
@@ -322,11 +323,11 @@ fn sys_write(frame: &mut SyscallFrame) {
         }
     };
     // Fast-path: whole-buffer write-through to `/dev/fb`.  A full-screen blit
-    // is a few MB; routing it through `copy_user_in` (Vec alloc + to_vec),
-    // schema decode, and the response zero-fill triples the memcpy work and
-    // allocates per call.  Here we validate the user pages and copy straight
-    // from user VA into the scanout — one copy, no allocations.  `r10` keeps
-    // its meaning as the byte offset (`flags`).
+    // is a few MB; routing it through the general path (schema decode + the
+    // response zero-fill) would waste a full page-walk and copy.  Here we
+    // validate the user pages and copy straight from user VA into the scanout
+    // — one copy, no allocations.  `r10` keeps its meaning as the byte offset
+    // (`flags`).
     if path == "/dev/fb" {
         let src = frame.rsi;
         let len = frame.rdx;
@@ -341,8 +342,7 @@ fn sys_write(frame: &mut SyscallFrame) {
             frame.rax = (-14i64) as u64;
             return;
         }
-        let bytes =
-            unsafe { core::slice::from_raw_parts(src as *const u8, len as usize) };
+        let bytes = unsafe { core::slice::from_raw_parts(src as *const u8, len as usize) };
         if crate::display::write_at(frame.r10, bytes) {
             frame.rax = len as u64;
         } else {
@@ -350,22 +350,35 @@ fn sys_write(frame: &mut SyscallFrame) {
         }
         return;
     }
-    let data = match copy_user_in(frame.rsi, frame.rdx) {
-        Ok(d) => d,
+    let mut resp = Vec::new();
+    // The buffer is read in and rewritten in place, so validate the whole
+    // range once (present, user-accessible, writable — writable subsumes
+    // readable) and copy straight from user VA into the provider, no `Vec`
+    // input copy.  `write_flags` decodes `data` synchronously and never
+    // retains it, so handing it the validated user slice is safe; the
+    // response is copied back raw after.
+    let root = match current_task_root() {
+        Ok(r) => r,
         Err(e) => {
             frame.rax = e as u64;
             return;
         }
     };
-    let mut resp = Vec::new();
-    match unispace::write_flags(&path, &data, &mut resp, frame.r10) {
-        Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &resp) {
-            Ok(_) => frame.rax = resp.len() as u64,
-            Err(e) => frame.rax = e as u64,
-        },
+    if !user_range_ok(frame.rsi, frame.rdx)
+        || validate_user_range(root, frame.rsi, frame.rdx, true).is_err()
+    {
+        frame.rax = (-14i64) as u64;
+        return;
+    }
+    let data = unsafe { core::slice::from_raw_parts(frame.rsi as *const u8, frame.rdx as usize) };
+    match unispace::write_flags(&path, data, &mut resp, frame.r10) {
+        Ok(()) => {
+            let n = copy_validated_out(frame.rsi, frame.rdx, &resp);
+            frame.rax = n as u64;
+        }
         Err(e) => {
             // Best-effort copy of any error-detail bytes; the errno wins.
-            let _ = copy_user_out(frame.rsi, frame.rdx, &resp);
+            let _ = copy_validated_out(frame.rsi, frame.rdx, &resp);
             frame.rax = errno(e) as u64;
         }
     }
@@ -476,18 +489,24 @@ pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
     String::from_utf8(out).map_err(|_| -22) // EINVAL
 }
 
-/// Copy `len` raw bytes from user memory into a kernel buffer.
-pub fn copy_user_in(ptr: u64, len: u64) -> Result<Vec<u8>, i64> {
-    let root = current_task_root()?;
-    if !user_range_ok(ptr, len) {
-        return Err(-14);
+/// Copy `data` into a user buffer of size `len` whose pages were already
+/// validated writable (see `validate_user_range`). The full `len` range is
+/// written: `min(len, data.len())` bytes are copied and any remainder is
+/// zero-filled, so the caller's buffer is always defined. Returns the number
+/// of bytes copied.
+fn copy_validated_out(dst: u64, len: u64, data: &[u8]) -> usize {
+    let n = core::cmp::min(len, data.len() as u64) as usize;
+    if n > 0 {
+        unsafe {
+            core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, n);
+        }
     }
-    validate_user_range(root, ptr, len, false)?;
-    if len == 0 {
-        return Ok(Vec::new());
+    if len as usize > n {
+        unsafe {
+            core::ptr::write_bytes((dst + n as u64) as *mut u8, 0, len as usize - n);
+        }
     }
-    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    Ok(slice.to_vec())
+    n
 }
 
 /// Copy `data` into a user buffer of size `len`. The full `len` range is
@@ -500,18 +519,7 @@ pub fn copy_user_out(dst: u64, len: u64, data: &[u8]) -> Result<usize, i64> {
         return Err(-14);
     }
     validate_user_range(root, dst, len, true)?;
-    let n = core::cmp::min(len, data.len() as u64) as usize;
-    if n > 0 {
-        unsafe {
-            core::ptr::copy_nonoverlapping(data.as_ptr(), dst as *mut u8, n);
-        }
-    }
-    if len as usize > n {
-        unsafe {
-            core::ptr::write_bytes((dst + n as u64) as *mut u8, 0, len as usize - n);
-        }
-    }
-    Ok(n)
+    Ok(copy_validated_out(dst, len, data))
 }
 
 /// Map a unispace error to a negative errno for the caller's `rax`.

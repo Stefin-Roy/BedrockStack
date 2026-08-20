@@ -49,11 +49,7 @@ pub extern "C" fn getgroups(_size: c_int, _list: *mut c_int) -> c_int {
 /// `isatty(fd)` — the std streams are the task console; file fds are not.
 #[unsafe(no_mangle)]
 pub extern "C" fn isatty(fd: c_int) -> c_int {
-    if fd <= 2 {
-        1
-    } else {
-        0
-    }
+    if fd <= 2 { 1 } else { 0 }
 }
 
 /// `access(path, mode)` — F_OK checks existence; R/W/X are always granted.

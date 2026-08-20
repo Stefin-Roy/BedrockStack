@@ -6,7 +6,10 @@
 //! Floats are parsed with `str::parse::<f64>()` (dec2flt), available on this
 //! target.
 
-use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong, c_short, c_uchar, c_uint, c_ulong, c_ulonglong, c_ushort, c_void, VaList};
+use core::ffi::{
+    VaList, c_char, c_double, c_float, c_int, c_long, c_longlong, c_short, c_uchar, c_uint,
+    c_ulong, c_ulonglong, c_ushort, c_void,
+};
 
 use crate::stdio::FILE;
 
@@ -85,11 +88,7 @@ impl ScanSrc for SrcFile {
             return Some(b);
         }
         let c = crate::stdio::fgetc(self.f);
-        if c < 0 {
-            None
-        } else {
-            Some((c & 0xFF) as u8)
-        }
+        if c < 0 { None } else { Some((c & 0xFF) as u8) }
     }
     fn ungetc(&mut self, b: u8) {
         self.back = Some(b);
@@ -113,11 +112,7 @@ impl ScanSrc for SrcStdin {
             return Some(b);
         }
         let c = crate::stdio::getchar();
-        if c < 0 {
-            None
-        } else {
-            Some((c & 0xFF) as u8)
-        }
+        if c < 0 { None } else { Some((c & 0xFF) as u8) }
     }
     fn ungetc(&mut self, b: u8) {
         self.back = Some(b);
@@ -222,7 +217,9 @@ fn scan_int(src: &mut dyn ScanSrc, base: i32, width: usize) -> Option<(u64, bool
         };
         match d {
             Some(d) if d < effective_base as u64 => {
-                value = value.saturating_mul(effective_base as u64).saturating_add(d);
+                value = value
+                    .saturating_mul(effective_base as u64)
+                    .saturating_add(d);
                 tok[n] = b;
                 n += 1;
                 any = true;
@@ -551,11 +548,7 @@ fn scan_engine(src: &mut dyn ScanSrc, fmt: &[u8], ap: &mut VaList) -> c_int {
 
 /// Assign a signed integer per length modifier.
 fn assign_int(ap: &mut VaList, len: u8, neg: bool, mag: u64) {
-    let val: i64 = if neg {
-        -(mag as i64)
-    } else {
-        mag as i64
-    };
+    let val: i64 = if neg { -(mag as i64) } else { mag as i64 };
     match len {
         1 => {
             let p = unsafe { ap.next_arg::<*mut c_char>() };

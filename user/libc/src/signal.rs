@@ -68,10 +68,6 @@ pub extern "C" fn sigfillset(set: *mut SigSet) -> c_int {
 
 /// `sigaction()` — record nothing; always succeeds.
 #[unsafe(no_mangle)]
-pub extern "C" fn sigaction(
-    _sig: c_int,
-    _act: *const c_void,
-    _oldact: *mut c_void,
-) -> c_int {
+pub extern "C" fn sigaction(_sig: c_int, _act: *const c_void, _oldact: *mut c_void) -> c_int {
     0
 }

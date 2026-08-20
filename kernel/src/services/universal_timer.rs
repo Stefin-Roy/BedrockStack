@@ -369,11 +369,15 @@ fn wake_callback(context: *mut u8) {
 
 /// Wait until `done()` returns true, or `deadline_ns` (absolute) passes.
 ///
-/// Yields the CPU via HLT, waking on device IRQs or a 1 ms periodic wake
-/// timer, and re-evaluates `done()` after each wake.  This means pure
-/// register-poll waits (port reset, controller start) progress even when no
-/// interrupt is generated.  Returns `true` if `done()` became true before
-/// the deadline.
+/// Arms a one-shot timer at the deadline (or a coarse re-check cadence,
+/// whichever is sooner), then HLTs.  Any interrupt (device IRQ, IPI, or the
+/// timer itself) wakes the CPU and `done()` is re-evaluated, so an
+/// interrupt-driven completion is serviced at interrupt latency — not on a
+/// fixed 1 kHz poll.  The one-shot bounds the sleep even when no interrupt is
+/// ever raised; the coarse re-check (re-armed only when the timer fires,
+/// ~10 ms) keeps pure register-poll waits (port reset, controller start)
+/// progressing when the hardware generates no interrupt.  Returns `true` if
+/// `done()` became true before the deadline.
 ///
 /// Falls back to a spin loop if IRQs are disabled (the timer ISR could
 /// never run, so HLT would sleep forever).
@@ -390,31 +394,54 @@ pub fn wait_until_cond(deadline_ns: u64, done: &dyn Fn() -> bool) -> bool {
         }
     }
 
-    // Periodic 1 ms wake: guarantees done() is re-checked at a bounded
-    // cadence even if the hardware never raises an interrupt.  Pinned to
-    // this CPU's own base, so this CPU's own ISR processes and wakes us.
+    // One-shot wake, re-armed only when it fires (not on every device IRQ),
+    // so a wait burns at most one interrupt per fallback interval.  Pinned to
+    // this CPU's own base, so this CPU's own ISR processes it and re-arms the
+    // clockevent.
     let wake = AtomicBool::new(false);
-    let id = universal_timer().set_periodic(
-        1_000_000,
-        wake_callback,
-        &wake as *const AtomicBool as *mut u8,
-    );
     loop {
         if done() {
-            universal_timer().cancel(id);
             return true;
         }
-        if universal_timer().now_ns() >= deadline_ns {
-            universal_timer().cancel(id);
+        let now = universal_timer().now_ns();
+        if now >= deadline_ns {
             // One last chance — the condition may have just become true.
             return done();
         }
+        let id = universal_timer().set(
+            now.saturating_add(POLL_FALLBACK_NS).min(deadline_ns),
+            wake_callback,
+            &wake as *const AtomicBool as *mut u8,
+        );
         wake.store(false, Ordering::SeqCst);
-        while !wake.load(Ordering::SeqCst) {
+        loop {
+            // HLT returns on ANY interrupt — device IRQ, IPI, or the timer.
+            // Re-evaluate `done()` immediately so an interrupt-driven
+            // completion is serviced at interrupt latency, not on the timer
+            // cadence.  The timer interrupt additionally breaks us out to
+            // re-arm for the next fallback window.
             crate::arch::CurrentArch::halt();
+            if done() {
+                universal_timer().cancel(id);
+                return true;
+            }
+            if universal_timer().now_ns() >= deadline_ns {
+                universal_timer().cancel(id);
+                return done();
+            }
+            if wake.load(Ordering::SeqCst) {
+                break;
+            }
         }
+        universal_timer().cancel(id);
     }
 }
+
+/// Coarse re-check cadence for [`wait_until_cond`] when the hardware never
+/// raises an interrupt for the condition being polled.  Old code woke every
+/// 1 ms; this is 10 ms — a 10× cut in idle timer interrupts while still
+/// bounding pure register-poll waits to ~10 ms detection latency.
+const POLL_FALLBACK_NS: u64 = 10_000_000;
 
 /// Cooperative sibling of [`wait_until_cond`]: when a task context exists
 /// (the audio pump parks as a scheduler task), park the current task in
@@ -443,8 +470,31 @@ pub fn wait_until_cond_coop(deadline_ns: u64, slice_ns: u64, done: &dyn Fn() -> 
 }
 
 /// Block until `now_ns() >= deadline_ns` (absolute), yielding the CPU.
+///
+/// A pure sleep — unlike [`wait_until_cond`] there is no condition to poll, so
+/// this arms a single one-shot at the deadline and HLTs until it fires.  The
+/// idle loop relies on this to park between sleeper deadlines while burning
+/// exactly one timer interrupt per wait (not one per millisecond).
 pub fn wait_until(deadline_ns: u64) {
-    wait_until_cond(deadline_ns, &|| false);
+    if !crate::arch::CurrentArch::are_interrupts_enabled() {
+        loop {
+            if universal_timer().now_ns() >= deadline_ns {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    let wake = AtomicBool::new(false);
+    let id = universal_timer().set(
+        deadline_ns,
+        wake_callback,
+        &wake as *const AtomicBool as *mut u8,
+    );
+    while !wake.load(Ordering::SeqCst) {
+        crate::arch::CurrentArch::halt();
+    }
+    universal_timer().cancel(id);
 }
 
 /// Block for `ms` milliseconds, yielding the CPU.

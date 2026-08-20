@@ -126,9 +126,7 @@ pub fn run() {
                 SerialPort::puts("[ntfs] FAIL big.bin head\n");
             }
             let _ = vfs::seek(fd, SeekFrom::Start(st.size - 16));
-            if vfs::read(fd, &mut probe).is_ok()
-                && probe[0] == ((st.size - 16) % 251) as u8
-            {
+            if vfs::read(fd, &mut probe).is_ok() && probe[0] == ((st.size - 16) % 251) as u8 {
                 SerialPort::puts("[ntfs] OK   big.bin tail\n");
             } else {
                 SerialPort::puts("[ntfs] FAIL big.bin tail\n");

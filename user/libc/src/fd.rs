@@ -86,11 +86,7 @@ fn alloc_fd(path: &[u8], readable: bool, writable: bool, append: bool) -> c_int 
 
 /// POSIX `open(path, flags, ...)`.  `mode` is ignored (no permission model).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn open(
-    path: *const c_char,
-    flags: c_int,
-    mode: c_uint,
-) -> c_int {
+pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     let _ = mode;
     let mut buf = [0u8; PATH_CAP];
     let Some(plen) = crate::vfs::resolve_c(path, &mut buf) else {
@@ -297,11 +293,7 @@ pub fn write_fd(fd: c_int, buf: *const c_void, len: usize) -> isize {
             }
             let base = f.offset;
             let path = &f.path[..f.plen + 1];
-            let flags = if f.append {
-                0x1
-            } else {
-                base << 8
-            };
+            let flags = if f.append { 0x1 } else { base << 8 };
             let data = data_slice(buf, len);
             let r = chunked_write(path, data, flags);
             if r >= 0 && !f.append {

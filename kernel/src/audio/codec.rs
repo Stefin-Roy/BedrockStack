@@ -158,7 +158,12 @@ const ALC_EAPD_VERB_CONTROL: u32 = 9;
 /// when the read or write verb fails so the caller can decide whether to
 /// abort or continue (a failed read must not be written back — that would
 /// zero the entire coefficient).
-fn alc_coef_clear_bit(s: &mut dyn VerbSender, c: &Codec, idx: u32, bit: u32) -> Result<(), &'static str> {
+fn alc_coef_clear_bit(
+    s: &mut dyn VerbSender,
+    c: &Codec,
+    idx: u32,
+    bit: u32,
+) -> Result<(), &'static str> {
     s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx)?;
     let old = s.verb(c.cad, RTL_COEF_NID, VERB_GET_PROC_COEF, 0)?;
     s.verb(c.cad, RTL_COEF_NID, VERB_SET_COEF_INDEX, idx)?;

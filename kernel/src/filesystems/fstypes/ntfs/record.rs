@@ -95,5 +95,11 @@ pub(crate) fn read_mft_record(sb: &NtfsSuperBlock, mft_no: u64) -> Result<Vec<u8
     let offset = mft_no
         .checked_mul(sb.boot.record_size)
         .ok_or(VfsError::IOError)?;
-    read_record_at(&*sb.device, &sb.boot, &sb.mft_runs, offset, sb.boot.record_size)
+    read_record_at(
+        &*sb.device,
+        &sb.boot,
+        &sb.mft_runs,
+        offset,
+        sb.boot.record_size,
+    )
 }

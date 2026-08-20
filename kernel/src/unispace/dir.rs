@@ -50,14 +50,14 @@ impl Object for SimpleDir {
 
     fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
         let children = self.children.lock();
-        let mut names: Vec<String> = children.keys().cloned().collect();
-        names.sort();
-        for n in names {
-            let kind = children
-                .get(&n)
-                .map(|o| o.kind())
-                .unwrap_or(ObjectKind::Service);
-            out.push(ListingEntry { name: n, kind });
+        let mut keys: Vec<&String> = children.keys().collect();
+        keys.sort();
+        for k in keys {
+            // Index once, no re-probe fallback needed — `k` came from the map.
+            out.push(ListingEntry {
+                name: k.clone(),
+                kind: children[k].kind(),
+            });
         }
         Ok(())
     }

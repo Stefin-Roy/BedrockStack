@@ -4,6 +4,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use crate::filesystems::vfs::DRIVE_MAP;
+use crate::filesystems::vfs::dentry::Dentry;
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::types::FileType;
@@ -122,25 +123,29 @@ fn stat_output(ops: &dyn InodeOps, out: &mut Vec<u8>) -> Result<(), UnispaceErro
 /// Attach the VFS mounts at `/A` (tmpfs) and, if mounted, `/B` (ESP).
 pub fn register() -> Result<(), UnispaceError> {
     for letter in ['A', 'B'] {
-        if let Ok(ops) = mount_root_ops(letter) {
-            let obj: Arc<dyn Object> = Arc::new(VfsDir { ops });
+        if let Ok(root) = DRIVE_MAP.lookup(letter).map(|m| m.root.clone()) {
+            let obj = wrap(root).ok_or(UnispaceError::NotFound)?;
             super::super::register(&String::from(letter), obj)?;
         }
     }
     Ok(())
 }
 
-fn mount_root_ops(letter: char) -> Result<Arc<dyn InodeOps>, UnispaceError> {
-    let mount = DRIVE_MAP.lookup(letter)?;
-    let lock = mount.root.inode.lock();
-    let inode = lock.as_ref().ok_or(UnispaceError::NotFound)?;
-    Ok(inode.ops.clone())
-}
-
-fn wrap(ops: Arc<dyn InodeOps>) -> Arc<dyn Object> {
-    match ops.file_type() {
-        FileType::Directory => Arc::new(VfsDir { ops }),
-        FileType::Regular => Arc::new(VfsFile { ops }),
+/// Build a unispace object wrapping `dentry`.  The object keeps the `Dentry`
+/// (not just its ops) so `resolve` can walk through the VFS dentry cache
+/// (`path::walk_from`) instead of re-running the filesystem's raw `lookup` on
+/// every read/write — a cached path costs a hash-map hit, not a FAT scan.
+fn wrap(dentry: Arc<Dentry>) -> Option<Arc<dyn Object>> {
+    let inode = dentry.inode.lock();
+    let inode = inode.as_ref()?;
+    match inode.file_type {
+        FileType::Directory => Some(Arc::new(VfsDir {
+            dentry: dentry.clone(),
+            ops: inode.ops.clone(),
+        })),
+        FileType::Regular => Some(Arc::new(VfsFile {
+            ops: inode.ops.clone(),
+        })),
     }
 }
 
@@ -157,6 +162,7 @@ fn arg_str(v: &Value, idx: usize) -> Result<&str, UnispaceError> {
 // ── Directory object ───────────────────────────────────────────────────
 
 pub struct VfsDir {
+    dentry: Arc<Dentry>,
     ops: Arc<dyn InodeOps>,
 }
 
@@ -174,8 +180,12 @@ impl Object for VfsDir {
     }
 
     fn resolve(&self, name: &str) -> Option<Arc<dyn Object>> {
-        let child = self.ops.lookup(name).ok()?;
-        Some(wrap(child))
+        // Walk through the VFS dentry cache (`walk_from` consults the parent's
+        // children map, then the global dcache, and only falls back to the
+        // filesystem's raw `lookup` on a miss — a cached path is a hash-map
+        // hit instead of a FAT directory scan per read/write).
+        let child = crate::filesystems::vfs::path::walk_from(self.dentry.clone(), &[name]).ok()?;
+        wrap(child)
     }
 
     fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
@@ -344,12 +354,13 @@ impl VfsFile {
             if want == 0 {
                 break;
             }
-            let mut chunk = vec![0u8; want];
-            let n = self.ops.read_at(pos, &mut chunk)?;
+            let base = out.len();
+            out.resize(base + want, 0);
+            let n = self.ops.read_at(pos, &mut out[base..])?;
+            out.truncate(base + n);
             if n == 0 {
                 break;
             }
-            out.extend_from_slice(&chunk[..n]);
             pos += n as u64;
         }
         Ok(())

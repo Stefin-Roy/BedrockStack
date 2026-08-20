@@ -110,6 +110,22 @@ fn emit(c: u8) {
     Inner::putc(c);
 }
 
+/// Record a batch into the capture log, then transmit it in one FIFO burst.
+///
+/// The capture push and the hardware write are both done once for the whole
+/// slice (instead of per byte), so a multi-byte line no longer drains the TX
+/// FIFO 14 times per byte.  `Inner::write_bytes` waits once per FIFO-full
+/// burst, cutting both the LSR polling and the line latency.
+fn emit_bytes(bytes: &[u8]) {
+    {
+        let mut log = CAPTURE.lock();
+        for &c in bytes {
+            log.push(c);
+        }
+    }
+    Inner::write_bytes(bytes);
+}
+
 /// Serial port with per-CPU re-entrancy guard and `[CPU(N)]` prefix.
 ///
 /// Only `puts()` adds the prefix (at the start of each line).  `putc`,
@@ -153,15 +169,32 @@ impl SerialPort {
         let has_nl = bytes.last() == Some(&b'\n');
         LAST_WAS_NL.store(has_nl, Ordering::Relaxed);
 
+        // Accumulate the line (prefixes + content) into a stack buffer and
+        // transmit it in one FIFO burst instead of one UART poll per byte.
+        // The longest possible `[CPU(N)] ` prefix is 13 bytes.
+        let mut buf = [0u8; 128];
+        let mut len = 0usize;
         for &b in bytes {
             if need_prefix {
-                write_prefix(cpu_id.unwrap());
+                if len + 13 > buf.len() {
+                    emit_bytes(&buf[..len]);
+                    len = 0;
+                }
+                write_prefix_into(&mut buf, &mut len, cpu_id.unwrap());
                 need_prefix = false;
             }
-            emit(b);
+            if len == buf.len() {
+                emit_bytes(&buf);
+                len = 0;
+            }
+            buf[len] = b;
+            len += 1;
             if b == b'\n' {
                 need_prefix = cpu_id.is_some();
             }
+        }
+        if len > 0 {
+            emit_bytes(&buf[..len]);
         }
 
         release_locks(cpu);
@@ -203,9 +236,7 @@ fn write_hex(mut val: u64) {
         };
         val >>= 4;
     }
-    for &b in &buf[i..] {
-        emit(b);
-    }
+    emit_bytes(&buf[i..]);
 }
 
 fn write_u64(mut val: u64) {
@@ -220,9 +251,7 @@ fn write_u64(mut val: u64) {
         buf[i] = b'0' + (val % 10) as u8;
         val /= 10;
     }
-    for &b in &buf[i..] {
-        emit(b);
-    }
+    emit_bytes(&buf[i..]);
 }
 
 impl core::fmt::Write for SerialPort {
@@ -243,9 +272,7 @@ pub fn dump_putc(c: u8) {
 
 /// Write a string to serial without acquiring any locks.
 pub fn dump_puts(s: &str) {
-    for &b in s.as_bytes() {
-        Inner::putc(b);
-    }
+    Inner::write_bytes(s.as_bytes());
 }
 
 /// Write a u64 as hex to serial without acquiring any locks.
@@ -258,15 +285,41 @@ pub fn dump_put_u64(val: u64) {
     Inner::put_u64(val);
 }
 
-fn write_prefix(cpu_id: u32) {
-    emit(b'[');
-    emit(b'C');
-    emit(b'P');
-    emit(b'U');
-    write_u64(cpu_id as u64);
-    emit(b']');
-    emit(b' ');
-    // These primitives don't affect LAST_WAS_NL — only the caller's content does.
+/// Append `[CPU(N)] ` to a line buffer.  Caller must guarantee room for the
+/// prefix (≤13 bytes: `[CPU(`, up to 3 digits, `)] `).
+fn write_prefix_into(buf: &mut [u8; 128], len: &mut usize, cpu_id: u32) {
+    buf[*len] = b'[';
+    *len += 1;
+    buf[*len] = b'C';
+    *len += 1;
+    buf[*len] = b'P';
+    *len += 1;
+    buf[*len] = b'U';
+    *len += 1;
+    buf[*len] = b'(';
+    *len += 1;
+    // Decimal digits.
+    let mut digits = [0u8; 4];
+    let mut d = 0;
+    let mut v = cpu_id as u64;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in (0..d).rev() {
+        buf[*len] = digits[i];
+        *len += 1;
+    }
+    buf[*len] = b')';
+    *len += 1;
+    buf[*len] = b']';
+    *len += 1;
+    buf[*len] = b' ';
+    *len += 1;
 }
 
 #[cfg(feature = "forceslowlogging")]

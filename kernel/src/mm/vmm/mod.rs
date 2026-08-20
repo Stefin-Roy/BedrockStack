@@ -5,7 +5,6 @@
 //! live.  Arch-specific page-table walks live in the sibling modules
 //! `x86_64` and `riscv64`.
 
-#[cfg(target_arch = "x86_64")]
 use alloc::vec::Vec;
 #[cfg(target_arch = "x86_64")]
 use core::sync::atomic::AtomicUsize;
@@ -258,6 +257,30 @@ impl Vmm {
         return riscv64::unmap_4k(self.root, vaddr, pending);
     }
 
+    /// Clear the leaf PTE at `vaddr` *without* reclaiming intermediate tables.
+    ///
+    /// Range unmap uses this so it can reclaim each touched page table once
+    /// (via [`Self::reclaim_tables`]) instead of once per 4 KiB page.
+    fn unmap_page_collect_noreclaim(&mut self, pending: &mut PendingFrames, vaddr: u64) -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return x86_64::unmap_4k_no_reclaim(self.root, vaddr, pending);
+        #[cfg(target_arch = "riscv64")]
+        return riscv64::unmap_4k(self.root, vaddr, pending);
+    }
+
+    /// Reclaim intermediate page tables for a 2 MiB PT-group whose leaves are
+    /// all already cleared.  Must be followed by a TLB flush + shootdown
+    /// before the collected frames are released to the allocator.
+    #[cfg(target_arch = "x86_64")]
+    fn reclaim_tables(&self, pending: &mut PendingFrames, first_cleared: u64) {
+        x86_64::reclaim_empty_tables(self.root, pending, first_cleared);
+    }
+
+    /// No intermediate tables are reclaimed on riscv64; the collector is a
+    /// no-op there (the PendingFrames buffer stays empty on that path).
+    #[cfg(target_arch = "riscv64")]
+    fn reclaim_tables(&self, _pending: &mut PendingFrames, _first_cleared: u64) {}
+
     /// Unmap the 4 KiB page at `vaddr`.
     ///
     /// Returns `false` if the page was not mapped.
@@ -289,16 +312,29 @@ impl Vmm {
         let mut v = vaddr;
         let end = vaddr + size;
         let mut removed_any = false;
+        // `group_first` is the first cleared page of the current 2 MiB PT-group.
+        // Reclaim runs once per touched table (all its leaves clear in address
+        // order) rather than once per 4 KiB page.
+        let mut group_first: u64 = u64::MAX;
         while v < end {
-            if self.unmap_page_collect(&mut pending, v) {
+            if self.unmap_page_collect_noreclaim(&mut pending, v) {
                 removed_any = true;
+                let group = v >> 21;
+                if group != group_first >> 21 {
+                    if group_first != u64::MAX {
+                        self.reclaim_tables(&mut pending, group_first);
+                        if pending.is_full() {
+                            flush_tlb();
+                            shootdown_tlb();
+                            pending.flush(alloc);
+                            removed_any = false;
+                        }
+                    }
+                    group_first = v;
+                }
             }
             v += 4096;
             if pending.is_full() {
-                // Drain the collector to keep the buffer bounded.  Draining
-                // mid-range is still correct: every PTE cleared so far is
-                // flushed before its orphaned frames are freed; the remaining
-                // pages get their own shootdown when the loop finishes.
                 if removed_any {
                     flush_tlb();
                     shootdown_tlb();
@@ -307,7 +343,84 @@ impl Vmm {
                 removed_any = false;
             }
         }
-        if removed_any {
+        if group_first != u64::MAX {
+            self.reclaim_tables(&mut pending, group_first);
+        }
+        if removed_any || !pending.is_empty() {
+            flush_tlb();
+            shootdown_tlb();
+            pending.flush(alloc);
+        }
+    }
+
+    /// Unmap a range of pages (4 KiB granularity), collecting the backing
+    /// physical frames into `frames` so the caller can free them.
+    ///
+    /// This is the batched sibling of the per-page `translate`+`unmap_4k`
+    /// dance: every PTE in the range is cleared first, then a *single* TLB
+    /// shootdown (or one per `PENDING_CAPACITY` orphaned table frames) is
+    /// broadcast before any leaf frame lands in `frames` or any orphaned
+    /// intermediate table frame is released.  Releasing leaves one-at-a-time
+    /// through `unmap_4k` broadcasts a full cross-CPU shootdown per page, which
+    /// turns a 100-page `brk` shrink into 100 IPI storms; this collapses the
+    /// whole range into one (plus one per `PENDING_CAPACITY` orphaned table
+    /// frames).  Intermediate tables are reclaimed once per touched 2 MiB
+    /// group rather than once per 4 KiB page, skipping the redundant
+    /// 512-entry emptiness scans.
+    ///
+    /// `frames` is appended to, never cleared.  Its contents are valid to free
+    /// once this returns (all affected PTEs are flushed system-wide by then).
+    pub fn unmap_range_collect(
+        &mut self,
+        alloc: &mut BitmapAllocator,
+        vaddr: u64,
+        size: u64,
+        frames: &mut Vec<u64>,
+    ) {
+        assert_eq!(vaddr & 0xFFF, 0);
+        assert_eq!(size & 0xFFF, 0);
+        let mut pending = PendingFrames::new();
+        let mut v = vaddr;
+        let end = vaddr + size;
+        let mut removed_any = false;
+        // `group_first` is the first cleared page of the current 2 MiB PT-group.
+        // Reclaim runs once per touched table (all its leaves clear in address
+        // order) rather than once per 4 KiB page.
+        let mut group_first: u64 = u64::MAX;
+        while v < end {
+            if let Some(phys) = self.translate(v) {
+                if self.unmap_page_collect_noreclaim(&mut pending, v) {
+                    frames.push(phys);
+                    removed_any = true;
+                    let group = v >> 21;
+                    if group != group_first >> 21 {
+                        if group_first != u64::MAX {
+                            self.reclaim_tables(&mut pending, group_first);
+                            if pending.is_full() {
+                                flush_tlb();
+                                shootdown_tlb();
+                                pending.flush(alloc);
+                                removed_any = false;
+                            }
+                        }
+                        group_first = v;
+                    }
+                }
+            }
+            v += 4096;
+            if pending.is_full() {
+                if removed_any {
+                    flush_tlb();
+                    shootdown_tlb();
+                }
+                pending.flush(alloc);
+                removed_any = false;
+            }
+        }
+        if group_first != u64::MAX {
+            self.reclaim_tables(&mut pending, group_first);
+        }
+        if removed_any || !pending.is_empty() {
             flush_tlb();
             shootdown_tlb();
             pending.flush(alloc);
@@ -497,6 +610,10 @@ impl PendingFrames {
 
     pub fn is_full(&self) -> bool {
         self.len >= PENDING_CAPACITY
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
     }
 
     /// Return the deferred frames to the physical allocator.

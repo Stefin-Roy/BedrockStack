@@ -94,7 +94,8 @@ impl NtfsInode {
 
         let list_attr = attrs.iter().find(|a| a.attr_type == ATTR_ATTRIBUTE_LIST);
         if let Some(list) = list_attr {
-            let list_bytes = super::attr::read_attr_value(&*sb.device, &sb.boot, &record, list, 1 << 20)?;
+            let list_bytes =
+                super::attr::read_attr_value(&*sb.device, &sb.boot, &record, list, 1 << 20)?;
             let entries = parse_attr_list(&list_bytes)?;
             for e in entries {
                 if e.attr_type != ATTR_DATA || e.name.is_some() {
@@ -110,17 +111,31 @@ impl NtfsInode {
                 };
                 let rec_attrs = super::attr::iter_attrs(&rec)?;
                 if let Some(a) = rec_attrs.iter().find(|a| {
-                    a.attr_type == ATTR_DATA
-                        && a.name.is_none()
-                        && a.lowest_vcn == e.lowest_vcn
+                    a.attr_type == ATTR_DATA && a.name.is_none() && a.lowest_vcn == e.lowest_vcn
                 }) {
-                    add_data_attr(a, &rec, &mut resident, &mut runs, &mut size, &mut init, &mut unsupported)?;
+                    add_data_attr(
+                        a,
+                        &rec,
+                        &mut resident,
+                        &mut runs,
+                        &mut size,
+                        &mut init,
+                        &mut unsupported,
+                    )?;
                 }
             }
         } else {
             for a in attrs.iter() {
                 if a.attr_type == ATTR_DATA && a.name.is_none() {
-                    add_data_attr(a, &record, &mut resident, &mut runs, &mut size, &mut init, &mut unsupported)?;
+                    add_data_attr(
+                        a,
+                        &record,
+                        &mut resident,
+                        &mut runs,
+                        &mut size,
+                        &mut init,
+                        &mut unsupported,
+                    )?;
                 }
             }
         }
@@ -180,7 +195,13 @@ impl InodeOps for NtfsInode {
                         buf[done..done + want].fill(0);
                     } else {
                         let inited = core::cmp::min(want, (*init - pos) as usize);
-                        let n = read_file_at(&*self.sb.device, &self.sb.boot, runs, pos, &mut buf[done..done + inited])?;
+                        let n = read_file_at(
+                            &*self.sb.device,
+                            &self.sb.boot,
+                            runs,
+                            pos,
+                            &mut buf[done..done + inited],
+                        )?;
                         buf[done + n..done + want].fill(0);
                     }
                     done += want;

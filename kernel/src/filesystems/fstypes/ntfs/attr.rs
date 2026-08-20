@@ -44,7 +44,9 @@ pub(crate) fn u32_at(d: &[u8], o: usize) -> Option<u32> {
 #[inline]
 pub(crate) fn u64_at(d: &[u8], o: usize) -> Option<u64> {
     let s = d.get(o..o + 8)?;
-    Some(u64::from_le_bytes([s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7]]))
+    Some(u64::from_le_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
 }
 
 pub(crate) fn decode_utf16le(units: &[u8]) -> String {
@@ -112,7 +114,9 @@ pub(crate) fn iter_attrs(record: &[u8]) -> Result<Vec<Attr<'_>>, VfsError> {
             if name_off + name_len * 2 > len {
                 return Err(VfsError::IOError);
             }
-            Some(decode_utf16le(&record[pos + name_off..pos + name_off + name_len * 2]))
+            Some(decode_utf16le(
+                &record[pos + name_off..pos + name_off + name_len * 2],
+            ))
         };
 
         if nonresident {
@@ -239,7 +243,9 @@ pub(crate) fn parse_attr_list(value: &[u8]) -> Result<Vec<AttrListEntry>, VfsErr
             if name_off + name_len * 2 > len {
                 return Err(VfsError::IOError);
             }
-            Some(decode_utf16le(&value[pos + name_off..pos + name_off + name_len * 2]))
+            Some(decode_utf16le(
+                &value[pos + name_off..pos + name_off + name_len * 2],
+            ))
         };
         out.push(AttrListEntry {
             attr_type: t,
@@ -264,7 +270,9 @@ pub(crate) fn read_attr_value<'a>(
     if attr.resident {
         return Ok(attr.value.to_vec());
     }
-    let pairs = record.get(attr.map_off..attr.map_end).ok_or(VfsError::IOError)?;
+    let pairs = record
+        .get(attr.map_off..attr.map_end)
+        .ok_or(VfsError::IOError)?;
     let runs = super::runs::decode_mapping_pairs(pairs, attr.lowest_vcn)?;
     let want = core::cmp::min(attr.real_size, cap);
     let mut buf = alloc::vec![0u8; want as usize];

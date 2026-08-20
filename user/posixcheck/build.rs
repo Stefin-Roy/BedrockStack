@@ -69,7 +69,12 @@ fn main() {
     }
 
     let _ = fs::remove_file(&archive);
-    let ar = format!("cd {} && ar rcs {} {} 2>&1", ws_wsl, to_wsl(&archive), to_wsl(&obj));
+    let ar = format!(
+        "cd {} && ar rcs {} {} 2>&1",
+        ws_wsl,
+        to_wsl(&archive),
+        to_wsl(&obj)
+    );
     if let Err(e) = wsl_ok(&ar) {
         panic!("ar failed: {e}");
     }

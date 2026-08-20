@@ -94,7 +94,8 @@ const STREAM_RESET_TIMEOUT_NS: u64 = 10_000_000;
 static HDA_MMIO: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HDA_OUT_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 static HDA_IN_BASE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-static INTERRUPT_DRIVEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static INTERRUPT_DRIVEN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 static OUT_PRODUCED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static OUT_COMPLETED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -125,9 +126,8 @@ fn out_completed_reconcile() {
         return;
     }
     let ring = slot * slots;
-    let lpib = unsafe {
-        read_volatile((mmio + ob + regs::SD_LPIB as u64) as *const u32) as usize % ring
-    };
+    let lpib =
+        unsafe { read_volatile((mmio + ob + regs::SD_LPIB as u64) as *const u32) as usize % ring };
 
     let prev_lpib = LAST_OUT_LPIB.swap(lpib as u32, Ordering::AcqRel) as usize;
     let delta = (lpib + ring - prev_lpib) % ring;
@@ -159,9 +159,8 @@ fn in_captured_reconcile() {
         return;
     }
     let ring = slot * slots;
-    let lpib = unsafe {
-        read_volatile((mmio + ib + regs::SD_LPIB as u64) as *const u32) as usize % ring
-    };
+    let lpib =
+        unsafe { read_volatile((mmio + ib + regs::SD_LPIB as u64) as *const u32) as usize % ring };
 
     let prev_lpib = LAST_IN_LPIB.swap(lpib as u32, Ordering::AcqRel) as usize;
     let delta = (lpib + ring - prev_lpib) % ring;
@@ -238,7 +237,9 @@ fn reset_stream(mmio: u64, base: u32, tag: u32) -> Result<(), &'static str> {
     let w32 = |off: u32, v: u32| unsafe {
         write_volatile((mmio + base as u64 + off as u64) as *mut u32, v)
     };
-    let w8 = |off: u32, v: u8| unsafe { write_volatile((mmio + base as u64 + off as u64) as *mut u8, v) };
+    let w8 = |off: u32, v: u8| unsafe {
+        write_volatile((mmio + base as u64 + off as u64) as *mut u8, v)
+    };
 
     w32(regs::SD_CTL, tag);
     let deadline1 = crate::services::universal_timer::now_ns() + STREAM_RESET_TIMEOUT_NS;
@@ -706,11 +707,15 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
             }
             if let Ok(c) = codec::probe(&mut *i, cad) {
                 if codec::is_realtek_alc256(c.vendor) {
-                    if codec.is_none() { codec = Some(c); }
+                    if codec.is_none() {
+                        codec = Some(c);
+                    }
                 } else if c.dac.is_some() {
                     if c.out_is_analog() {
                         if c.adc.is_some() {
-                            if duplex.is_none() { duplex = Some(c); }
+                            if duplex.is_none() {
+                                duplex = Some(c);
+                            }
                         } else if codec.is_none() {
                             codec = Some(c);
                         }
@@ -758,9 +763,7 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
             let in_buf = dma
                 .alloc_contiguous(RING_BUF_BYTES / 4096)
                 .ok_or("OOM input ring buffer")?;
-            if !gcap_64ok
-                && (in_bdl.phys >= 0x1_0000_0000 || in_buf.phys >= 0x1_0000_0000)
-            {
+            if !gcap_64ok && (in_bdl.phys >= 0x1_0000_0000 || in_buf.phys >= 0x1_0000_0000) {
                 return Err("HDA controller is 32-bit only and a DMA buffer sits above 4 GiB");
             }
             i.in_base = in_base;

@@ -84,7 +84,11 @@ pub extern "C" fn gettimeofday(tv: *mut Timeval, tz: *mut c_void) -> c_int {
         return -1;
     }
     let ns = now_ns();
-    let usec = if ns >= 0 { (ns as u64 % 1_000_000_000) / 1000 } else { 0 };
+    let usec = if ns >= 0 {
+        (ns as u64 % 1_000_000_000) / 1000
+    } else {
+        0
+    };
     unsafe {
         (*tv).tv_sec = s as i64;
         (*tv).tv_usec = usec as i64;
@@ -106,7 +110,11 @@ pub extern "C" fn clock_gettime(clockid: c_int, ts: *mut Timespec) -> c_int {
                 return -1;
             }
             let ns = now_ns();
-            let nsec = if ns >= 0 { (ns as u64 % 1_000_000_000) as i64 } else { 0 };
+            let nsec = if ns >= 0 {
+                (ns as u64 % 1_000_000_000) as i64
+            } else {
+                0
+            };
             unsafe {
                 (*ts).tv_sec = s as i64;
                 (*ts).tv_nsec = nsec;
@@ -146,35 +154,25 @@ pub extern "C" fn nanosleep(req: *const Timespec, rem: *mut Timespec) -> c_int {
         errno::set(errno::EINVAL);
         return -1;
     }
-    let total = (sec as u64).saturating_mul(1_000_000_000).saturating_add(nsec as u64);
+    let total = (sec as u64)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(nsec as u64);
     let r = crate::process::sleep_ns(total);
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// POSIX `sleep(secs)`: returns the unslept seconds (0 on success).
 #[unsafe(no_mangle)]
 pub extern "C" fn sleep(secs: c_uint) -> c_uint {
     let r = crate::process::sleep(secs as u64);
-    if r < 0 {
-        secs
-    } else {
-        0
-    }
+    if r < 0 { secs } else { 0 }
 }
 
 /// POSIX `usleep(usecs)`: returns 0 on success, -1 on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn usleep(usecs: c_uint) -> c_int {
     let r = crate::process::usleep(usecs as u64);
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// `clock()`: approximate CPU time as CLOCKS_PER_SEC ticks (µs since boot).

@@ -25,10 +25,7 @@ pub struct NtfsSuperBlock {
 
 /// Extract the unnamed non-resident $DATA run list of MFT record 0 (the
 /// $MFT).  Only used during bootstrap, before the superblock exists.
-fn boot_mft_runs(
-    device: &dyn BlockDevice,
-    boot: &BootSector,
-) -> Result<RunList, VfsError> {
+fn boot_mft_runs(device: &dyn BlockDevice, boot: &BootSector) -> Result<RunList, VfsError> {
     let lba = boot.cluster_to_lba(boot.mft_lcn);
     let secs = boot.record_size / boot.bytes_per_sector;
     let mut buf = vec![0u8; boot.record_size as usize];

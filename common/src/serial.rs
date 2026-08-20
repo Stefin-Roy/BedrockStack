@@ -41,31 +41,55 @@ impl<B: IoBackend> SerialPort<B> {
     }
 
     pub fn putc(c: u8) {
-        // Spin with a timeout: if the transmitter stays busy for ~100K
-        // iterations, write anyway (best-effort) to avoid hanging the kernel.
-        for _ in 0..100_000 {
-            if B::read_reg(5) & 0x20 != 0 {
-                B::write_reg(0, c);
-                return;
+        Self::write_bytes(&[c]);
+    }
+
+    /// Write a batch of bytes, filling the TX FIFO in bursts.
+    ///
+    /// THRE (LSR bit 5) only asserts when the holding register *and* the FIFO
+    /// are empty, so writing one byte per `putc` pays a full 14-byte drain wait
+    /// per character.  Batching waits once per FIFO-full burst instead of once
+    /// per byte, cutting the number of LSR polls and the per-line latency on a
+    /// multi-byte line by ~14×.
+    pub fn write_bytes(data: &[u8]) {
+        // 16550-class FIFOs are 16 bytes; the FCR threshold is 14.
+        const FIFO_DEPTH: usize = 16;
+        let mut i = 0;
+        while i < data.len() {
+            // Wait for the transmitter + FIFO to drain before a burst. Spin
+            // with a timeout: if the transmitter stays busy for ~100K
+            // iterations, write anyway (best-effort) to avoid hanging.
+            let mut spun = 0usize;
+            loop {
+                if B::read_reg(5) & 0x20 != 0 {
+                    break;
+                }
+                spun += 1;
+                if spun >= 100_000 {
+                    break;
+                }
+                core::hint::spin_loop();
             }
-            core::hint::spin_loop();
+            let end = core::cmp::min(i + FIFO_DEPTH, data.len());
+            for &c in &data[i..end] {
+                B::write_reg(0, c);
+            }
+            i = end;
         }
-        // Timeout — write anyway; data may be lost but the kernel continues.
-        B::write_reg(0, c);
     }
 
     pub fn puts(s: &str) {
         for b in s.bytes() {
             if b == b'\n' {
-                Self::putc(b'\r');
+                Self::write_bytes(b"\r");
             }
-            Self::putc(b);
+            Self::write_bytes(&[b]);
         }
     }
 
     pub fn put_hex(mut val: u64) {
         if val == 0 {
-            Self::puts("0");
+            Self::write_bytes(b"0");
             return;
         }
         let mut buf = [0u8; 16];
@@ -80,12 +104,12 @@ impl<B: IoBackend> SerialPort<B> {
             };
             val >>= 4;
         }
-        Self::puts(core::str::from_utf8(&buf[i..]).unwrap_or("???"));
+        Self::write_bytes(&buf[i..]);
     }
 
     pub fn put_u64(mut val: u64) {
         if val == 0 {
-            Self::puts("0");
+            Self::write_bytes(b"0");
             return;
         }
         let mut buf = [0u8; 20];
@@ -95,7 +119,7 @@ impl<B: IoBackend> SerialPort<B> {
             buf[i] = b'0' + (val % 10) as u8;
             val /= 10;
         }
-        Self::puts(core::str::from_utf8(&buf[i..]).unwrap_or("???"));
+        Self::write_bytes(&buf[i..]);
     }
 }
 

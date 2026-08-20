@@ -280,15 +280,16 @@ pub(crate) fn encode_listing(
     entries: Vec<ListingEntry>,
     out: &mut Vec<u8>,
 ) -> Result<(), UnispaceError> {
-    let mut items = Vec::with_capacity(entries.len());
+    // Direct wire encoding of `DIR_SCHEMA` (`struct{ entries: list<{name: str,
+    // kind: enum}> }`) — no intermediate `Value` tree, so a listing costs one
+    // string copy per entry instead of a per-entry `Value::Struct`/`Value::Str`
+    // allocation plus a second recursive traversal.
+    out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
     for e in entries {
-        items.push(Value::Struct(vec![
-            Value::Str(e.name),
-            Value::Enum(e.kind.tag() as u32),
-        ]));
+        crate::unispace::schema::write_len_string(out, &e.name);
+        out.extend_from_slice(&(e.kind.tag() as u32).to_le_bytes());
     }
-    let root = Value::Struct(vec![Value::List(items)]);
-    schema::encode_value(&root, &DIR_SCHEMA, out)
+    Ok(())
 }
 
 // ── Root registry ──────────────────────────────────────────────────────

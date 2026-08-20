@@ -85,7 +85,11 @@ pub(crate) fn decode_mapping_pairs(data: &[u8], base_vcn: u64) -> Result<RunList
             // Sparse run: advances the VCN, not the LCN.
             vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
             let abs = base_vcn.checked_add(vcn as u64).ok_or(VfsError::IOError)?;
-            runs.push(Run { vcn: abs, lcn: -1, len: length });
+            runs.push(Run {
+                vcn: abs,
+                lcn: -1,
+                len: length,
+            });
         } else {
             let mut raw: u64 = 0;
             for i in 0..off_len {
@@ -97,7 +101,11 @@ pub(crate) fn decode_mapping_pairs(data: &[u8], base_vcn: u64) -> Result<RunList
             lcn = lcn.checked_add(delta).ok_or(VfsError::IOError)?;
             vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
             let abs = base_vcn.checked_add(vcn as u64).ok_or(VfsError::IOError)?;
-            runs.push(Run { vcn: abs, lcn, len: length });
+            runs.push(Run {
+                vcn: abs,
+                lcn,
+                len: length,
+            });
         }
 
         pos += len_len + off_len;
@@ -133,7 +141,8 @@ pub(crate) fn read_file_at(
             .checked_mul(cluster_size)
             .ok_or(VfsError::IOError)?
             .saturating_sub(in_run);
-        let want = core::cmp::min(avail, (buf.len() - done) as u64).min(MAX_READ_BYTES as u64) as usize;
+        let want =
+            core::cmp::min(avail, (buf.len() - done) as u64).min(MAX_READ_BYTES as u64) as usize;
 
         if run.lcn < 0 {
             buf[done..done + want].fill(0);

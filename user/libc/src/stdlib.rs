@@ -26,7 +26,10 @@ pub extern "C" fn abort() -> ! {
 /// bytes consumed, validity, and whether a `-` sign was seen.
 unsafe fn parse_int(s: *const c_char, base: c_int) -> (u64, usize, bool, bool) {
     let mut i = 0usize;
-    while matches!(*s.add(i) as u8, b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c') {
+    while matches!(
+        *s.add(i) as u8,
+        b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'
+    ) {
         i += 1;
     }
     let mut neg = false;
@@ -55,8 +58,7 @@ unsafe fn parse_int(s: *const c_char, base: c_int) -> (u64, usize, bool, bool) {
         } else {
             base = 10;
         }
-    } else if base == 16 && *s.add(i) as u8 == b'0' && matches!(*s.add(i + 1) as u8, b'x' | b'X')
-    {
+    } else if base == 16 && *s.add(i) as u8 == b'0' && matches!(*s.add(i + 1) as u8, b'x' | b'X') {
         i += 2;
     }
     if base < 2 || base > 36 {
@@ -111,11 +113,7 @@ pub extern "C" fn atoll(s: *const c_char) -> c_longlong {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strtol(
-    s: *const c_char,
-    endptr: *mut *mut c_char,
-    base: c_int,
-) -> c_long {
+pub extern "C" fn strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long {
     let (mag, consumed, _ok, neg) = unsafe { parse_int(s, base) };
     unsafe {
         if !endptr.is_null() {
@@ -126,11 +124,7 @@ pub extern "C" fn strtol(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strtoll(
-    s: *const c_char,
-    endptr: *mut *mut c_char,
-    base: c_int,
-) -> c_longlong {
+pub extern "C" fn strtoll(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_longlong {
     let (mag, consumed, _ok, neg) = unsafe { parse_int(s, base) };
     unsafe {
         if !endptr.is_null() {
@@ -141,30 +135,18 @@ pub extern "C" fn strtoll(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strtoul(
-    s: *const c_char,
-    endptr: *mut *mut c_char,
-    base: c_int,
-) -> c_ulong {
+pub extern "C" fn strtoul(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulong {
     let (mag, consumed, _ok, neg) = unsafe { parse_int(s, base) };
     unsafe {
         if !endptr.is_null() {
             *endptr = s.add(consumed) as *mut c_char;
         }
     }
-    if neg {
-        mag.wrapping_neg()
-    } else {
-        mag
-    }
+    if neg { mag.wrapping_neg() } else { mag }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strtoull(
-    s: *const c_char,
-    endptr: *mut *mut c_char,
-    base: c_int,
-) -> c_ulonglong {
+pub extern "C" fn strtoull(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_ulonglong {
     strtoul(s, endptr, base)
 }
 
@@ -291,12 +273,7 @@ type Cmp = unsafe extern "C" fn(*const c_void, *const c_void) -> c_int;
 /// In-place quick sort over `nmemb` elements of `size` bytes at `base`,
 /// ordering via the C comparator. Plain quicksort with insertion fallback.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn qsort(
-    base: *mut c_void,
-    nmemb: usize,
-    size: usize,
-    cmp: Cmp,
-) {
+pub unsafe extern "C" fn qsort(base: *mut c_void, nmemb: usize, size: usize, cmp: Cmp) {
     unsafe {
         if base.is_null() || nmemb < 2 || size == 0 || (cmp as usize) == 0 {
             return;
