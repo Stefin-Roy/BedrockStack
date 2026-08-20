@@ -69,7 +69,7 @@ static PROC_STATE_VARIANTS: [EnumVariant; 4] = [
     },
 ];
 
-/// `read(/proc/<pid>/status)`: `struct{ pid: u64, state: enum, exit_code: u64 }`.
+/// `read(/proc/<pid>/status)`: `struct{ pid: u64, state: enum, exit_code: u64, ppid: u64 }`.
 /// `exit_code` is the retained code of a zombie (0 for a live task).
 static STATUS: Schema = Schema::Struct(&[
     schema::Field {
@@ -82,6 +82,10 @@ static STATUS: Schema = Schema::Struct(&[
     },
     schema::Field {
         name: "exit_code",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "ppid",
         ty: &schema::SCHEMA_U64,
     },
 ]);
@@ -524,10 +528,12 @@ impl Object for StatusObject {
             crate::task::TaskState::Dead => 3,
         };
         let exit_code = crate::task::task_exit_code(self.pid).unwrap_or(0);
+        let ppid = crate::task::task_parent_pid(self.pid).unwrap_or(0);
         let v = Value::Struct(vec![
             Value::U64(self.pid),
             Value::Enum(disc),
             Value::U64(exit_code),
+            Value::U64(ppid),
         ]);
         schema::encode_value(&v, &STATUS, out)
     }
@@ -677,6 +683,20 @@ impl Object for StdStream {
         Ok(())
     }
 
+    // The std streams are append-only ring buffers: a pipe has no offsets, so
+    // the syscall flags word (positioned-read / append / write-at) carries no
+    // meaning here. Accept any flags and keep drain/append semantics — the
+    // libc `fwrite` layer always marks the standard streams APPEND (bit 0),
+    // and rejecting that would silently drop every printf-family write.
+    fn read_value_flags(
+        &self,
+        out: &mut Vec<u8>,
+        max: usize,
+        _flags: u64,
+    ) -> Result<(), UnispaceError> {
+        self.read_value(out, max)
+    }
+
     fn write_value(&self, v: Value) -> Result<(), UnispaceError> {
         let bytes = match v {
             Value::Bytes(b) => b,
@@ -684,6 +704,10 @@ impl Object for StdStream {
         };
         self.append(&bytes);
         Ok(())
+    }
+
+    fn write_value_flags(&self, v: Value, _flags: u64) -> Result<(), UnispaceError> {
+        self.write_value(v)
     }
 
     fn invoke(&self, method: usize, _v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {

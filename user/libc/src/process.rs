@@ -1,4 +1,17 @@
+use crate::errno;
 use crate::syscall::{read_path, write_path};
+
+static mut LAST_SPAWNED: u64 = 0;
+
+/// Read the full `/proc/self/status` snapshot into `buf` (28 bytes).
+fn read_status() -> [u8; 32] {
+    let mut buf = [0u8; 32];
+    let r = unsafe { read_path(b"/proc/self/status\0", &mut buf, 0) };
+    if r < 28 {
+        return [0; 32];
+    }
+    buf
+}
 
 pub fn exit(code: usize) -> ! {
     let mut buf = [0u8; 8];
@@ -13,25 +26,26 @@ pub fn abort() -> ! {
     exit(134)
 }
 
-pub fn getpid() -> isize {
-    let mut buf = [0u8; 20];
-    let r = unsafe { read_path(b"/proc/self/status\0", &mut buf, 0) };
-    if r < 0 {
-        return r;
-    }
-    if r < 8 {
-        return -1;
-    }
-    let pid = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-    ]);
-    crate::errno::ret(pid as isize)
+/// POSIX `getpid()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn getpid() -> crate::ffi::c_int {
+    let buf = read_status();
+    let pid = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+    pid as crate::ffi::c_int
+}
+
+/// POSIX `getppid()` — ppid sits at offset 20 in the extended status wire.
+#[unsafe(no_mangle)]
+pub extern "C" fn getppid() -> crate::ffi::c_int {
+    let buf = read_status();
+    let ppid = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+    ppid as crate::ffi::c_int
 }
 
 pub fn sched_yield() -> isize {
     let mut buf = [0u8; 0];
     let r = unsafe { write_path(b"/proc/self:yield\0", &mut buf, 0, 0) };
-    crate::errno::ret(r)
+    errno::ret(r)
 }
 
 pub fn spawn(path: &str, args: &str) -> isize {
@@ -48,7 +62,7 @@ pub fn spawn(path: &str, args: &str) -> isize {
     buf[8 + plen..total].copy_from_slice(args.as_bytes());
     let r = unsafe { write_path(b"/proc/self:spawn\0", &mut buf, total, 0) };
     if r < 0 {
-        return crate::errno::ret(r);
+        return errno::ret(r);
     }
     if r < 8 {
         return -1;
@@ -56,15 +70,18 @@ pub fn spawn(path: &str, args: &str) -> isize {
     let pid = u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
-    crate::errno::ret(pid as isize)
+    unsafe {
+        LAST_SPAWNED = pid;
+    }
+    errno::ret(pid as isize)
 }
 
-pub fn wait(pid: u64) -> isize {
+pub fn wait_rs(pid: u64) -> isize {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&pid.to_le_bytes());
     let r = unsafe { write_path(b"/proc/self:wait\0", &mut buf, 8, 0) };
     if r < 0 {
-        return crate::errno::ret(r);
+        return errno::ret(r);
     }
     if r < 8 {
         return -1;
@@ -72,21 +89,84 @@ pub fn wait(pid: u64) -> isize {
     let code = u64::from_le_bytes([
         buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
     ]);
-    crate::errno::ret(code as isize)
+    errno::ret(code as isize)
+}
+
+pub fn wait(pid: u64) -> isize {
+    wait_rs(pid)
+}
+
+/// POSIX `wait(&status)` — wait for the most recently spawned child.
+#[unsafe(export_name = "wait")]
+pub extern "C" fn c_wait(status: *mut crate::ffi::c_int) -> crate::ffi::c_int {
+    waitpid(-1, status, 0)
+}
+
+/// POSIX `waitpid(pid, &status, options)`.  `pid` < 0 or 0 selects the last
+/// spawned child (approximation of "any child"); options are ignored.
+#[unsafe(no_mangle)]
+pub extern "C" fn waitpid(
+    pid: crate::ffi::c_int,
+    status: *mut crate::ffi::c_int,
+    _options: crate::ffi::c_int,
+) -> crate::ffi::c_int {
+    let target: u64 = if pid < 0 || pid == 0 {
+        unsafe { LAST_SPAWNED }
+    } else {
+        pid as u64
+    };
+    if target == 0 {
+        errno::set(errno::ECHILD);
+        return -1;
+    }
+    let r = wait_rs(target);
+    if r < 0 {
+        return -1;
+    }
+    // Encode POSIX status: exited normally, low 8 bits = code.
+    if !status.is_null() {
+        unsafe {
+            *status = (r & 0xFF) as crate::ffi::c_int;
+        }
+    }
+    target as crate::ffi::c_int
+}
+
+/// POSIX `kill(pid, sig)` — the kernel parks the target; signal numbers are
+/// ignored (the task is simply ended).
+#[unsafe(no_mangle)]
+pub extern "C" fn kill(pid: crate::ffi::c_int, _sig: crate::ffi::c_int) -> crate::ffi::c_int {
+    if pid <= 0 {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    let r = kill_rs(pid as u64);
+    if r < 0 {
+        -1
+    } else {
+        0
+    }
+}
+
+fn kill_rs(pid: u64) -> isize {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&pid.to_le_bytes());
+    let r = unsafe { write_path(b"/proc/self:kill\0", &mut buf, 8, 0) };
+    errno::ret(r)
 }
 
 pub fn sleep_ns(ns: u64) -> isize {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&ns.to_le_bytes());
     let r = unsafe { write_path(b"/kernel/timer:sleep\0", &mut buf, 8, 0) };
-    crate::errno::ret(r)
+    errno::ret(r)
 }
 
 pub fn sleep_ms(ms: u64) -> isize {
     let mut buf = [0u8; 8];
     buf.copy_from_slice(&ms.to_le_bytes());
     let r = unsafe { write_path(b"/kernel/timer:sleep_ms\0", &mut buf, 8, 0) };
-    crate::errno::ret(r)
+    errno::ret(r)
 }
 
 pub fn sleep(secs: u64) -> isize {
@@ -95,13 +175,6 @@ pub fn sleep(secs: u64) -> isize {
 
 pub fn usleep(usecs: u64) -> isize {
     sleep_ns(usecs.saturating_mul(1000))
-}
-
-pub fn kill(pid: u64) -> isize {
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&pid.to_le_bytes());
-    let r = unsafe { write_path(b"/proc/self:kill\0", &mut buf, 8, 0) };
-    crate::errno::ret(r)
 }
 
 /// Read `/proc/self/args` (a `str` wire: u32 LE length + payload), skip the

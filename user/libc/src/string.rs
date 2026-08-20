@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_int, c_long, c_void};
+use core::ffi::{c_char, c_int, c_void};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn strlen(s: *const c_char) -> usize {
@@ -237,43 +237,6 @@ pub extern "C" fn atoi(s: *const c_char) -> c_int {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strtol(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> c_long {
-    unsafe {
-        let mut i = 0usize;
-        while *s.add(i) as u8 == b' ' || *s.add(i) as u8 == b'\t' {
-            i += 1;
-        }
-        let mut sign = 1i64;
-        if *s.add(i) as u8 == b'-' {
-            sign = -1;
-            i += 1;
-        } else if *s.add(i) as u8 == b'+' {
-            i += 1;
-        }
-        let base = base as u64;
-        let mut out = 0i64;
-        loop {
-            let b = *s.add(i) as u8;
-            let d = match b {
-                b'0'..=b'9' => (b - b'0') as u64,
-                b'a'..=b'z' => (b - b'a' + 10) as u64,
-                b'A'..=b'Z' => (b - b'A' + 10) as u64,
-                _ => break,
-            };
-            if base < 2 || d >= base {
-                break;
-            }
-            out = out.wrapping_mul(base as i64).wrapping_add(d as i64);
-            i += 1;
-        }
-        if !endptr.is_null() {
-            *endptr = s.add(i) as *mut c_char;
-        }
-        out * sign
-    }
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn strdup(s: *const c_char) -> *mut c_char {
     if s.is_null() {
         return core::ptr::null_mut();
@@ -287,4 +250,183 @@ pub extern "C" fn strdup(s: *const c_char) -> *mut c_char {
         core::ptr::copy_nonoverlapping(s as *const u8, p as *mut u8, n + 1);
         p as *mut c_char
     }
+}
+
+/// Length of the initial segment of `s` made of bytes in `accept`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strspn(s: *const c_char, accept: *const c_char) -> usize {
+    if s.is_null() || accept.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut set = [false; 256];
+        let mut i = 0usize;
+        while *accept.add(i) != 0 {
+            set[*accept.add(i) as u8 as usize] = true;
+            i += 1;
+        }
+        let mut n = 0usize;
+        while *s.add(n) != 0 && set[*s.add(n) as u8 as usize] {
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Length of the initial segment of `s` made of bytes NOT in `reject`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strcspn(s: *const c_char, reject: *const c_char) -> usize {
+    if s.is_null() || reject.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut set = [false; 256];
+        let mut i = 0usize;
+        while *reject.add(i) != 0 {
+            set[*reject.add(i) as u8 as usize] = true;
+            i += 1;
+        }
+        let mut n = 0usize;
+        while *s.add(n) != 0 && !set[*s.add(n) as u8 as usize] {
+            n += 1;
+        }
+        n
+    }
+}
+
+/// Locate the first byte of `s` that is in `accept`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strpbrk(s: *const c_char, accept: *const c_char) -> *mut c_char {
+    if s.is_null() || accept.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let mut set = [false; 256];
+        let mut i = 0usize;
+        while *accept.add(i) != 0 {
+            set[*accept.add(i) as u8 as usize] = true;
+            i += 1;
+        }
+        let mut n = 0usize;
+        while *s.add(n) != 0 {
+            if set[*s.add(n) as u8 as usize] {
+                return s.add(n) as *mut c_char;
+            }
+            n += 1;
+        }
+        core::ptr::null_mut()
+    }
+}
+
+/// Case-insensitive comparison (ASCII only), like glibc's `strcasecmp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strcasecmp(a: *const c_char, b: *const c_char) -> c_int {
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let ca = (*a.add(i) as u8).to_ascii_lowercase();
+            let cb = (*b.add(i) as u8).to_ascii_lowercase();
+            if ca != cb {
+                return (ca as c_int) - (cb as c_int);
+            }
+            if ca == 0 {
+                return 0;
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Case-insensitive comparison, at most `n` bytes (ASCII only).
+#[unsafe(no_mangle)]
+pub extern "C" fn strncasecmp(a: *const c_char, b: *const c_char, n: usize) -> c_int {
+    unsafe {
+        for i in 0..n {
+            let ca = (*a.add(i) as u8).to_ascii_lowercase();
+            let cb = (*b.add(i) as u8).to_ascii_lowercase();
+            if ca != cb {
+                return (ca as c_int) - (cb as c_int);
+            }
+            if ca == 0 {
+                return 0;
+            }
+        }
+        0
+    }
+}
+
+/// POSIX `strcoll` — bytewise collation order; equivalent to `strcmp`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strcoll(a: *const c_char, b: *const c_char) -> c_int {
+    strcmp(a, b)
+}
+
+/// POSIX `strxfrm` — copies `n` bytes (no locale transform); returns the
+/// (untransformed) source length.
+#[unsafe(no_mangle)]
+pub extern "C" fn strxfrm(dst: *mut c_char, src: *const c_char, n: usize) -> usize {
+    let len = strnlen(src, usize::MAX);
+    if n == 0 {
+        return len;
+    }
+    unsafe {
+        let m = core::cmp::min(len, n - 1);
+        core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, m);
+        *dst.add(m) = 0;
+    }
+    len
+}
+
+/// Reentrant tokeniser. Splits `s` (mutated in place) on the bytes in `delim`.
+/// With a null `s`, resumes from the static pointer saved in `saveptr`.
+#[unsafe(no_mangle)]
+pub extern "C" fn strtok_r(
+    s: *mut c_char,
+    delim: *const c_char,
+    saveptr: *mut *mut c_char,
+) -> *mut c_char {
+    // `s == NULL` is the resume-from-saveptr continuation, NOT an error; only
+    // a missing delimiter set or save pointer is. Returning early on a null
+    // `s` would make every second token NULL.
+    if delim.is_null() || saveptr.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let mut set = [false; 256];
+        let mut i = 0usize;
+        while *delim.add(i) != 0 {
+            set[*delim.add(i) as u8 as usize] = true;
+            i += 1;
+        }
+        let mut p = if s.is_null() { *saveptr } else { s };
+        if p.is_null() {
+            return core::ptr::null_mut();
+        }
+        // Skip leading delimiters.
+        while *p != 0 && set[*p as u8 as usize] {
+            p = p.add(1);
+        }
+        if *p == 0 {
+            *saveptr = p;
+            return core::ptr::null_mut();
+        }
+        let tok = p;
+        while *p != 0 && !set[*p as u8 as usize] {
+            p = p.add(1);
+        }
+        if *p != 0 {
+            *p = 0;
+            *saveptr = p.add(1);
+        } else {
+            *saveptr = p;
+        }
+        tok
+    }
+}
+
+/// Non-reentrant tokeniser over a static save pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_char {
+    static mut SAVE: *mut c_char = core::ptr::null_mut();
+    unsafe { strtok_r(s, delim, core::ptr::addr_of_mut!(SAVE)) }
 }

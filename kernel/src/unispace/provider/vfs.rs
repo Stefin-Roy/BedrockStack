@@ -53,7 +53,17 @@ pub static STAT_OUTPUT: Schema = Schema::Struct(&[
     },
 ]);
 
-static DIR_METHODS: [MethodDesc; 5] = [
+// Shared `:stat` method — identical schema on directories and files so
+// `stat(2)`/`chdir` work uniformly.  Input is SCHEMA_BLOB (not UNIT) so a
+// caller can pass a nonzero-length write buffer and still receive the
+// encoded stat bytes back.
+const STAT_METHOD: MethodDesc = MethodDesc {
+    name: "stat",
+    input: &schema::SCHEMA_BLOB,
+    output: &STAT_OUTPUT,
+};
+
+static DIR_METHODS: [MethodDesc; 6] = [
     MethodDesc {
         name: "create",
         input: &CREATE_INPUT,
@@ -79,22 +89,33 @@ static DIR_METHODS: [MethodDesc; 5] = [
         input: &RENAME_INPUT,
         output: &schema::SCHEMA_UNIT,
     },
+    STAT_METHOD,
 ];
 
 static FILE_METHODS: [MethodDesc; 2] = [
-    // Input is SCHEMA_BLOB (not UNIT) so a caller can pass a nonzero-length
-    // write buffer and still receive the encoded stat bytes back.
-    MethodDesc {
-        name: "stat",
-        input: &schema::SCHEMA_BLOB,
-        output: &STAT_OUTPUT,
-    },
+    STAT_METHOD,
     MethodDesc {
         name: "truncate",
         input: &TRUNCATE_INPUT,
         output: &schema::SCHEMA_UNIT,
     },
 ];
+
+/// Emit the packed `{ino, size, kind, mtime}` stat record for `ops`.
+fn stat_output(ops: &dyn InodeOps, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    let st = ops.getattr()?;
+    let kind = match st.file_type {
+        FileType::Regular => 0u32,
+        FileType::Directory => 1u32,
+    };
+    let value = Value::Struct(vec![
+        Value::U64(st.ino),
+        Value::U64(st.size),
+        Value::Enum(kind),
+        Value::U64(st.mtime),
+    ]);
+    schema::encode_value(&value, &STAT_OUTPUT, out)
+}
 
 // ── Provider registration ──────────────────────────────────────────────
 
@@ -182,7 +203,7 @@ impl Object for VfsDir {
         Err(UnispaceError::IsADirectory)
     }
 
-    fn invoke(&self, method: usize, v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         match method {
             0 => {
                 let name = arg_str(&v, 0)?;
@@ -210,6 +231,7 @@ impl Object for VfsDir {
                 self.ops.rename(old, new)?;
                 Ok(())
             }
+            5 => stat_output(self.ops.as_ref(), out),
             _ => Err(UnispaceError::MethodNotFound),
         }
     }
@@ -292,20 +314,7 @@ impl Object for VfsFile {
 
     fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         match method {
-            0 => {
-                let st = self.ops.getattr()?;
-                let kind = match st.file_type {
-                    FileType::Regular => 0u32,
-                    FileType::Directory => 1u32,
-                };
-                let value = Value::Struct(vec![
-                    Value::U64(st.ino),
-                    Value::U64(st.size),
-                    Value::Enum(kind),
-                    Value::U64(st.mtime),
-                ]);
-                schema::encode_value(&value, &STAT_OUTPUT, out)
-            }
+            0 => stat_output(self.ops.as_ref(), out),
             1 => {
                 let len = match v {
                     Value::Struct(fields) => match fields.get(0) {

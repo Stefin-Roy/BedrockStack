@@ -68,6 +68,18 @@ def find_doom(profile):
     return None
 
 
+def find_posixcheck(profile):
+    """Locate the built POSIXCHECK binary for the given profile."""
+    candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", profile_dir(profile), "posixcheck")
+    if os.path.exists(candidate):
+        return candidate
+    for alt in ("debug", "release"):
+        candidate = os.path.join(TARGET_DIR, "x86_64-bedrock-user", alt, "posixcheck")
+        if os.path.exists(candidate):
+            return candidate
+    return None
+
+
 def find_wad():
     """Locate the Freedoom IWAD (optional; the image still builds without it)."""
     wad = os.path.join(WORKSPACE, "data", "freedoom1.wad")
@@ -154,6 +166,12 @@ def create_fat32_with_mtools(efi_binary_path, profile):
         print(f"  DOOM game copied: {doom_path}")
     else:
         print("  WARNING: DOOM binary not found")
+    posix_path = find_posixcheck(profile)
+    if posix_path:
+        run(["mcopy", "-i", OUTPUT_IMG, posix_path, "::/EFI/BEDROCK/POSIXCHECK"])
+        print(f"  posixcheck copied: {posix_path}")
+    else:
+        print("  WARNING: posixcheck binary not found")
     wad_path = find_wad()
     if wad_path:
         run(["mcopy", "-i", OUTPUT_IMG, wad_path, "::/EFI/BEDROCK/FREEDOOM.WAD"])
@@ -202,6 +220,13 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
     else:
         print("  WARNING: DOOM binary not found")
 
+    posix_path = find_posixcheck(profile)
+    if posix_path:
+        shutil.copy2(posix_path, os.path.join(efi_bedrock_dir, "POSIXCHECK"))
+        print(f"  posixcheck copied: {posix_path}")
+    else:
+        print("  WARNING: posixcheck binary not found")
+
     wad_path = find_wad()
     if wad_path:
         shutil.copy2(wad_path, os.path.join(efi_bedrock_dir, "FREEDOOM.WAD"))
@@ -235,8 +260,8 @@ def create_fat32_with_mkfs(efi_binary_path, profile):
 SECTOR = 512
 ESP_GUID = bytes([0xC1, 0x2A, 0x73, 0x28, 0xF8, 0x1F, 0x11, 0xD2, 0xBA, 0x4B, 0x00, 0xA0, 0xC9, 0x3E, 0xC9, 0x3B])
 WSL_DISTRO = "Ubuntu"
-DISK_MB = 64
-ESP_MB = 60
+DISK_MB = 128
+ESP_MB = 124
 ESP_FIRST_SECTOR = 2048
 
 
@@ -358,6 +383,13 @@ def create_gpt_image(boot_path, kernel_path):
         print("  WARNING: DOOM binary not found - skipping /EFI/BEDROCK/DOOM")
         doom_copy = ""
 
+    posix_path = find_posixcheck("dev")
+    if posix_path:
+        posix_copy = f"mcopy -i '{esp_img_wsl}' '{to_wsl(posix_path)}' ::/EFI/BEDROCK/POSIXCHECK; "
+    else:
+        print("  WARNING: posixcheck binary not found - skipping /EFI/BEDROCK/POSIXCHECK")
+        posix_copy = ""
+
     wad_path = find_wad()
     if wad_path:
         wad_copy = f"mcopy -i '{esp_img_wsl}' '{to_wsl(wad_path)}' ::/EFI/BEDROCK/FREEDOOM.WAD; "
@@ -384,6 +416,7 @@ def create_gpt_image(boot_path, kernel_path):
         f"mcopy -i '{esp_img_wsl}' '{kernel_wsl}' ::/EFI/BEDROCK/KERNEL; "
         + user_init_copy
         + doom_copy
+        + posix_copy
         + wad_copy
         + wav_copy
         + f"mdir -i '{esp_img_wsl}' ::/EFI/BOOT; "

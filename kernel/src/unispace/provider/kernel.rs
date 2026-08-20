@@ -36,7 +36,7 @@ pub static UNTIL_INPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-static TIMER_METHODS: [MethodDesc; 3] = [
+static TIMER_METHODS: [MethodDesc; 4] = [
     MethodDesc {
         name: "sleep",
         input: &SLEEP_INPUT,
@@ -51,6 +51,15 @@ static TIMER_METHODS: [MethodDesc; 3] = [
         name: "until",
         input: &UNTIL_INPUT,
         output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "epoch_secs",
+        // BLOB (not UNIT) input so a caller can pass a nonzero-length write
+        // buffer and still receive the encoded u64 back — the write syscall's
+        // output copy is bounded by the caller's buffer length, so a UNIT
+        // (empty) write could never carry the 8-byte result home.
+        input: &schema::SCHEMA_BLOB,
+        output: &schema::SCHEMA_U64,
     },
 ];
 
@@ -83,7 +92,16 @@ impl Object for TimerObject {
         schema::encode_value(&v, &schema::SCHEMA_U64, out)
     }
 
-    fn invoke(&self, method: usize, v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+        match method {
+            3 => {
+                // epoch_secs — wall-clock seconds (falls back to boot seconds).
+                let s = crate::services::wallclock::now_secs();
+                let v = Value::U64(s);
+                return schema::encode_value(&v, &schema::SCHEMA_U64, out);
+            }
+            _ => {}
+        }
         let arg = arg_u64(&v, 0)?;
         let now = crate::services::universal_timer::now_ns();
         match method {

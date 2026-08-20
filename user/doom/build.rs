@@ -28,7 +28,7 @@ const WSL_GCC_FLAGS: &[&str] = &[
     "-I",
     "third_party/doomgeneric",
     "-I",
-    "user/doom/include",
+    "user/libc/include",
 ];
 
 /// FNV-1a hash of a path, used for stable object filenames.
@@ -97,7 +97,7 @@ fn main() {
     // include paths, and treat an object as stale if any header is newer
     // than it.
     let mut headers: Vec<PathBuf> = Vec::new();
-    for dir in ["third_party/doomgeneric", "user/doom/include"] {
+    for dir in ["third_party/doomgeneric", "user/libc/include"] {
         let base = ws.join(dir);
         if !base.exists() {
             continue;

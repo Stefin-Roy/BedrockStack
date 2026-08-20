@@ -43,6 +43,7 @@ set OVMF_PATH=%TARGET_DIR%\ovmf_code.fd
 set OVMF_VARS=%TARGET_DIR%\ovmf_vars.fd
 set IMAGE_PATH=%TARGET_DIR%\os.img
 set NVME_IMAGE=%TARGET_DIR%\nvme.img
+set NTFS_IMAGE=%TARGET_DIR%\ntfs.img
 
 if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 
@@ -50,6 +51,12 @@ REM Create a demo FAT32 USB disk image if missing
 if not exist "%NVME_IMAGE%" (
     echo [fullrun] Creating demo FAT32 USB disk image...
     python "%SCRIPT_DIR%make_demo_drive.py" --output "%NVME_IMAGE%"
+)
+
+REM Create a demo NTFS disk image if missing
+if not exist "%NTFS_IMAGE%" (
+    echo [fullrun] Creating demo NTFS disk image...
+    python "%SCRIPT_DIR%make_ntfs_demo.py" --output "%NTFS_IMAGE%"
 )
 
 echo ============================================> "%LOG_FILE%"
@@ -102,6 +109,7 @@ echo.
 
 call :build_user
 call :build_doom
+call :build_posixcheck
 
 echo [3/4] Creating FAT32 disk image...
 echo --- image creation --- >> "%LOG_FILE%"
@@ -142,6 +150,8 @@ if not exist "%QEMU_PATH%" (
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
+    -drive file="%NTFS_IMAGE%",format=raw,if=none,id=ntfs_disk ^
+    -device ide-hd,drive=ntfs_disk,bus=ahci.1 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
     -device qemu-xhci,msi=on,msix=on ^
     -device usb-storage,drive=usb_disk ^
@@ -246,6 +256,7 @@ set OVMF_PATH=%TARGET_DIR%\ovmf_code.fd
 set OVMF_VARS=%TARGET_DIR%\ovmf_vars.fd
 set IMAGE_PATH=%TARGET_DIR%\os.img
 set NVME_IMAGE=%TARGET_DIR%\nvme.img
+set NTFS_IMAGE=%TARGET_DIR%\ntfs.img
 set GRUB_CFG=%TARGET_DIR%\grub.cfg
 set GRUB_EFI=%TARGET_DIR%\grub_bootx64.efi
 
@@ -254,6 +265,11 @@ if not exist "%TARGET_DIR%" mkdir "%TARGET_DIR%"
 if not exist "%NVME_IMAGE%" (
     echo [fullrun] Creating demo FAT32 USB disk image...
     python "%SCRIPT_DIR%make_demo_drive.py" --output "%NVME_IMAGE%"
+)
+
+if not exist "%NTFS_IMAGE%" (
+    echo [fullrun] Creating demo NTFS disk image...
+    python "%SCRIPT_DIR%make_ntfs_demo.py" --output "%NTFS_IMAGE%"
 )
 
 echo ============================================> "%LOG_FILE%"
@@ -368,6 +384,7 @@ echo.
 
 call :build_user
 call :build_doom
+call :build_posixcheck
 
 echo [3/3] Creating disk image...
 echo --- image creation --- >> "%LOG_FILE%"
@@ -413,6 +430,8 @@ if not exist "%QEMU_PATH%" (
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
+    -drive file="%NTFS_IMAGE%",format=raw,if=none,id=ntfs_disk ^
+    -device ide-hd,drive=ntfs_disk,bus=ahci.1 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
     -device qemu-xhci,msix=on ^
     -device usb-storage,drive=usb_disk ^
@@ -434,7 +453,7 @@ goto :done
 echo [user] Building user init (x86_64-bedrock-user, debug)...
 echo --- user build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user 2>&1
 set USERERR=%errorlevel%
 if %USERERR% neq 0 (
     echo [fullrun] ERROR: user build failed with exit code %USERERR%
@@ -450,7 +469,7 @@ exit /b 0
 echo [user] Building DOOM game (x86_64-bedrock-user, debug)...
 echo --- doom build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom 2>&1
 set DOOMERR=%errorlevel%
 if %DOOMERR% neq 0 (
     echo [fullrun] ERROR: doom build failed with exit code %DOOMERR%
@@ -459,6 +478,22 @@ if %DOOMERR% neq 0 (
 )
 echo doom build OK >> "%LOG_FILE%"
 echo [fullrun] DOOM game built successfully.
+echo.
+exit /b 0
+
+:build_posixcheck
+echo [user] Building POSIXCHECK (x86_64-bedrock-user, debug)...
+echo --- posixcheck build --- >> "%LOG_FILE%"
+echo %date% %time% >> "%LOG_FILE%"
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p posixcheck 2>&1
+set PCHECKERR=%errorlevel%
+if %PCHECKERR% neq 0 (
+    echo [fullrun] ERROR: posixcheck build failed with exit code %PCHECKERR%
+    echo posixcheck build FAILED: exit %PCHECKERR% >> "%LOG_FILE%"
+    exit /b 1
+)
+echo posixcheck build OK >> "%LOG_FILE%"
+echo [fullrun] POSIXCHECK built successfully.
 echo.
 exit /b 0
 

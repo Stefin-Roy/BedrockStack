@@ -1,4 +1,5 @@
 use crate::syscall::write_path;
+use core::alloc::{GlobalAlloc, Layout};
 
 const HEADER: usize = 16;
 const MIN_ALIGN: usize = 16;
@@ -146,3 +147,68 @@ pub extern "C" fn free(ptr: *mut core::ffi::c_void) {
         FREE = h;
     }
 }
+
+/// POSIX `brk(addr)`: set the program break; returns 0 or -1 (errno set).
+#[unsafe(no_mangle)]
+pub extern "C" fn brk(addr: *mut core::ffi::c_void) -> core::ffi::c_int {
+    let r = sys_brk(addr as usize);
+    if r < 0 {
+        crate::errno::set((-r) as core::ffi::c_int);
+        -1
+    } else {
+        0
+    }
+}
+
+/// POSIX `sbrk(increment)`: move the break by `increment`; returns the old
+/// break or `(void*)-1` on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn sbrk(increment: isize) -> *mut core::ffi::c_void {
+    let cur = sys_brk(0);
+    if cur < 0 {
+        crate::errno::set((-cur) as core::ffi::c_int);
+        return (-1isize) as *mut core::ffi::c_void;
+    }
+    let new = (cur as isize).saturating_add(increment);
+    if new < cur {
+        crate::errno::set(crate::errno::ENOMEM);
+        return (-1isize) as *mut core::ffi::c_void;
+    }
+    let r = sys_brk(new as usize);
+    if r < 0 {
+        crate::errno::set((-r) as core::ffi::c_int);
+        return (-1isize) as *mut core::ffi::c_void;
+    }
+    cur as *mut core::ffi::c_void
+}
+
+/// `#[global_allocator]` bridging the Rust `alloc` crate onto the same heap.
+///
+/// The underlying allocator returns 16-aligned payloads, so any `Layout` with
+/// alignment >16 would be unsafe.  Our uses (`Vec`/`String`/`Box`) never
+/// exceed 8-byte alignment; larger alignments hit `realloc`'s copy path but
+/// still land on a 16-aligned block, which is a superset of what the layout
+/// asked for — alignment is only violated if the requested align exceeds 16,
+/// which no caller here does.
+pub struct OsAlloc;
+
+unsafe impl GlobalAlloc for OsAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let raw = alloc_bytes(layout.size());
+        if raw.is_null() {
+            return core::ptr::null_mut();
+        }
+        raw
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
+        free(ptr as *mut core::ffi::c_void);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, _layout: Layout, new_size: usize) -> *mut u8 {
+        realloc(ptr as *mut core::ffi::c_void, new_size) as *mut u8
+    }
+}
+
+#[global_allocator]
+pub static ALLOC: OsAlloc = OsAlloc;

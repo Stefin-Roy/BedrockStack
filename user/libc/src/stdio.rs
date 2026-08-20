@@ -1,10 +1,13 @@
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
-use core::intrinsics::va_arg;
 use core::ptr;
 
 use crate::errno;
 use crate::syscall;
 use crate::syscall::{read_path, write_path};
+
+// printf-family lives in `format`; re-export for the pre-existing Rust call
+// path (`libc::stdio::printf`).
+pub use crate::format::{fprintf, printf, snprintf, sprintf, vfprintf, vprintf, vsnprintf, vsprintf};
 
 // These buffers live in `.bss`, not on the fixed 32 KiB user stack.  The libc
 // surface is single-threaded today, so one read and one write scratch buffer
@@ -14,49 +17,20 @@ static mut FWRITE_SCRATCH: [u8; crate::IO_CHUNK_BYTES] = [0; crate::IO_CHUNK_BYT
 
 // ── fd-based streams ──────────────────────────────────────────────────
 
-/// POSIX `write(1|2, ...)`: `/proc/self/std/out|err`. The kernel consumes the
-/// syscall buffer in place (zero-filling it), so `syscall::write_data` chunk-
-/// copies through static scratch storage and the caller's buffer stays intact.
+/// POSIX `write(fd, ...)`: fds 1/2 route to `/proc/self/std/out|err`, fds 3+
+/// to an opened path fd. The kernel consumes the syscall buffer in place, so
+/// `fd::write_fd` chunk-copies through static scratch and the caller's buffer
+/// stays intact.
 #[unsafe(no_mangle)]
 pub extern "C" fn write(fd: c_int, buf: *const c_void, len: usize) -> isize {
-    let path: &[u8] = match fd {
-        1 => b"/proc/self/std/out\0",
-        2 => b"/proc/self/std/err\0",
-        _ => {
-            errno::set(9); // EBADF
-            return -1;
-        }
-    };
-    if len > 0 && buf.is_null() {
-        errno::set(14); // EFAULT
-        return -1;
-    }
-    let data: &[u8] = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(buf as *const u8, len) }
-    };
-    let r = syscall::write_data(path, data, 0);
-    errno::ret(r)
+    crate::fd::write_fd(fd, buf, len)
 }
 
-/// POSIX `read(0, ...)`: `/proc/self/std/in` (drains whatever is buffered).
+/// POSIX `read(fd, ...)`: fd 0 drains `/proc/self/std/in`, fds 3+ read an
+/// opened path fd.
 #[unsafe(no_mangle)]
 pub extern "C" fn read(fd: c_int, buf: *mut c_void, len: usize) -> isize {
-    if fd != 0 {
-        errno::set(9); // EBADF
-        return -1;
-    }
-    if len == 0 {
-        return 0;
-    }
-    if buf.is_null() {
-        errno::set(14); // EFAULT
-        return -1;
-    }
-    let b = unsafe { core::slice::from_raw_parts_mut(buf as *mut u8, len) };
-    let r = unsafe { read_path(b"/proc/self/std/in\0", b, 0) };
-    errno::ret(r)
+    crate::fd::read_fd(fd, buf, len)
 }
 
 #[unsafe(no_mangle)]
@@ -95,214 +69,62 @@ pub extern "C" fn puts(s: *const c_char) -> c_int {
     }
 }
 
-// ── printf ────────────────────────────────────────────────────────────
+// ── standard streams ──────────────────────────────────────────────────
 
-/// Bounded byte sink for formatting; a full buffer silently truncates.
-struct Fmt {
-    buf: [u8; 512],
-    pos: usize,
-}
+/// The three standard streams are real FILE objects backed by
+/// `/proc/self/std/{in,out,err}`. The exported `stdin`/`stdout`/`stderr`
+/// globals are pointers to them, matching the C `extern FILE *stdin;` ABI.
+/// They are wired up by `stdio_init()`, which `crt` calls before `entry_main`.
+static mut STDIN_OBJ: FILE = FILE_INIT;
+static mut STDOUT_OBJ: FILE = FILE_INIT;
+static mut STDERR_OBJ: FILE = FILE_INIT;
 
-impl Fmt {
-    fn new() -> Self {
-        Fmt {
-            buf: [0; 512],
-            pos: 0,
-        }
-    }
-    fn push(&mut self, b: u8) {
-        if self.pos < self.buf.len() {
-            self.buf[self.pos] = b;
-            self.pos += 1;
-        }
-    }
-    fn push_slice(&mut self, s: &[u8]) {
-        for &b in s {
-            self.push(b);
-        }
-    }
-    fn pad(&mut self, ch: u8, n: usize) {
-        for _ in 0..n {
-            self.push(ch);
-        }
-    }
-}
-
-/// Emit `v` in `base` (10 or 16) into `f`.
-fn push_uint(f: &mut Fmt, mut v: u64, base: u8, upper: bool) {
-    let mut digits = [0u8; 64];
-    let mut n = 0usize;
-    if v == 0 {
-        digits[0] = b'0';
-        n = 1;
-    }
-    while v > 0 {
-        let d = (v % base as u64) as u8;
-        digits[n] = if d < 10 {
-            b'0' + d
-        } else {
-            (if upper { b'A' } else { b'a' }) + (d - 10)
-        };
-        n += 1;
-        v /= base as u64;
-    }
-    while n > 0 {
-        n -= 1;
-        f.push(digits[n]);
-    }
-}
-
-/// Number of decimal digits in `v` (>= 1).
-fn digits_10(mut v: u64) -> usize {
-    let mut n = 1usize;
-    while v >= 10 {
-        v /= 10;
-        n += 1;
-    }
-    n
-}
-
-/// Number of hex digits in `v` (>= 1).
-fn digits_16(mut v: u64) -> usize {
-    let mut n = 1usize;
-    while v >= 16 {
-        v /= 16;
-        n += 1;
-    }
-    n
-}
-
-/// Minimal `printf`: `%c %s %d %i %u %x %X %p %%`, with `0`/`-` flags and a
-/// decimal minimum width. Output goes to fd 1 (`/proc/self/std/out`).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn printf(fmt: *const c_char, args: ...) -> c_int {
+pub static mut stdin: *mut FILE = core::ptr::null_mut();
+#[unsafe(no_mangle)]
+pub static mut stdout: *mut FILE = core::ptr::null_mut();
+#[unsafe(no_mangle)]
+pub static mut stderr: *mut FILE = core::ptr::null_mut();
+
+/// One-time wiring of the standard stream handles.
+pub fn stdio_init() {
     unsafe {
-        let mut ap = args;
-        let mut f = Fmt::new();
-        let mut i = 0usize;
-        loop {
-            let c = *fmt.add(i);
-            if c == 0 {
-                break;
-            }
-            if c != b'%' as c_char {
-                f.push(c as u8);
-                i += 1;
-                continue;
-            }
-            i += 1;
-            let mut left = false;
-            let mut zero = false;
-            let mut width = 0usize;
-            loop {
-                let d = *fmt.add(i) as u8;
-                if d == b'-' {
-                    left = true;
-                    i += 1;
-                } else if d == b'0' {
-                    zero = true;
-                    i += 1;
-                } else if d.is_ascii_digit() {
-                    width = width.saturating_mul(10).saturating_add((d - b'0') as usize);
-                    i += 1;
-                } else {
-                    break;
-                }
-            }
-            let spec = *fmt.add(i) as u8;
-            i += 1;
-            match spec {
-                b'%' => f.push(b'%'),
-                b'c' => {
-                    let v: c_int = va_arg(&mut ap);
-                    f.push((v & 0xFF) as u8);
-                }
-                b's' => {
-                    let p: *const c_char = va_arg(&mut ap);
-                    let mut len = 0usize;
-                    if !p.is_null() {
-                        while *p.add(len) != 0 {
-                            len += 1;
-                        }
-                    }
-                    if !left && width > len {
-                        f.pad(b' ', width - len);
-                    }
-                    for j in 0..len {
-                        f.push(*p.add(j) as u8);
-                    }
-                    if left && width > len {
-                        f.pad(b' ', width - len);
-                    }
-                }
-                b'd' | b'i' => {
-                    let v: c_int = va_arg(&mut ap);
-                    let neg = v < 0;
-                    let mag = (v as i64).unsigned_abs();
-                    let nd = digits_10(mag);
-                    let tot = nd + neg as usize;
-                    if !zero && !left && width > tot {
-                        f.pad(b' ', width - tot);
-                    }
-                    if neg {
-                        f.push(b'-');
-                    }
-                    if zero && !left && width > tot {
-                        f.pad(b'0', width - tot);
-                    }
-                    push_uint(&mut f, mag, 10, false);
-                    if left && width > tot {
-                        f.pad(b' ', width - tot);
-                    }
-                }
-                b'u' => {
-                    let v: c_uint = va_arg(&mut ap);
-                    let mag = v as u64;
-                    let nd = digits_10(mag);
-                    if !zero && !left && width > nd {
-                        f.pad(b' ', width - nd);
-                    }
-                    if zero && !left && width > nd {
-                        f.pad(b'0', width - nd);
-                    }
-                    push_uint(&mut f, mag, 10, false);
-                    if left && width > nd {
-                        f.pad(b' ', width - nd);
-                    }
-                }
-                b'x' | b'X' => {
-                    let v: c_uint = va_arg(&mut ap);
-                    let mag = v as u64;
-                    let nd = digits_16(mag);
-                    if !zero && !left && width > nd {
-                        f.pad(b' ', width - nd);
-                    }
-                    if zero && !left && width > nd {
-                        f.pad(b'0', width - nd);
-                    }
-                    push_uint(&mut f, mag, 16, spec == b'X');
-                    if left && width > nd {
-                        f.pad(b' ', width - nd);
-                    }
-                }
-                b'p' => {
-                    let p: *const c_char = va_arg(&mut ap);
-                    f.push_slice(b"0x");
-                    push_uint(&mut f, p as usize as u64, 16, false);
-                }
-                _ => {
-                    f.push(b'%');
-                    if spec != 0 {
-                        f.push(spec);
-                    }
-                }
-            }
-        }
-        let n = f.pos;
-        if n > 0 {
-            syscall::write_data(b"/proc/self/std/out\0", &f.buf[..n], 0);
-        }
-        n as c_int
+        let init_std = |obj: *mut FILE, path: &[u8], readable: bool, writable: bool| {
+            let f = &mut *obj;
+            *f = FILE_INIT;
+            f.path[..path.len()].copy_from_slice(path);
+            f.plen = path.len() - 1;
+            f.readable = readable;
+            f.writable = writable;
+            f.slot = 0xFFFF;
+        };
+        init_std(
+            core::ptr::addr_of_mut!(STDOUT_OBJ),
+            b"/proc/self/std/out\0",
+            false,
+            true,
+        );
+        init_std(
+            core::ptr::addr_of_mut!(STDERR_OBJ),
+            b"/proc/self/std/err\0",
+            false,
+            true,
+        );
+        init_std(
+            core::ptr::addr_of_mut!(STDIN_OBJ),
+            b"/proc/self/std/in\0",
+            true,
+            false,
+        );
+        // Standard streams are append-only ring buffers with no offsets, so
+        // `fwrite` must use the append flag (bit 0), never positioned writes.
+        // Without this, the first byte of a `printf` succeeds and every
+        // subsequent chunk (offset in bits 8..63) fails, truncating output.
+        STDOUT_OBJ.append = true;
+        STDERR_OBJ.append = true;
+        stdout = core::ptr::addr_of_mut!(STDOUT_OBJ);
+        stderr = core::ptr::addr_of_mut!(STDERR_OBJ);
+        stdin = core::ptr::addr_of_mut!(STDIN_OBJ);
     }
 }
 
@@ -321,6 +143,8 @@ pub struct FILE {
     writable: bool,
     append: bool,
     slot: usize,
+    eof: bool,
+    error: bool,
 }
 
 const FILE_POOL: usize = 16;
@@ -333,6 +157,8 @@ const FILE_INIT: FILE = FILE {
     writable: false,
     append: false,
     slot: 0,
+    eof: false,
+    error: false,
 };
 
 static mut FILES: [FILE; FILE_POOL] = [FILE_INIT; FILE_POOL];
@@ -373,11 +199,6 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut FILE {
             errno::set(22); // EINVAL
             return ptr::null_mut();
         };
-        let plen = crate::string::strlen(path);
-        if plen == 0 || plen >= 128 {
-            errno::set(22);
-            return ptr::null_mut();
-        }
         let mut slot = None;
         for i in 0..FILE_POOL {
             if !FILE_USED[i] {
@@ -391,14 +212,35 @@ pub extern "C" fn fopen(path: *const c_char, mode: *const c_char) -> *mut FILE {
         };
         FILE_USED[i] = true;
         let f = &mut FILES[i];
-        ptr::copy_nonoverlapping(path as *const u8, f.path.as_mut_ptr(), plen);
-        f.path[plen] = 0;
+        // Resolve the path against the CWD into the FILE's own buffer.
+        let Some(plen) = crate::vfs::resolve_c(path, &mut f.path) else {
+            FILE_USED[i] = false;
+            errno::set(36); // ENAMETOOLONG
+            return ptr::null_mut();
+        };
         f.plen = plen;
         f.offset = 0;
         f.readable = readable;
         f.writable = writable;
         f.append = append;
         f.slot = i;
+        f.eof = false;
+        f.error = false;
+        // C stdio open semantics: 'w'/'w+'/'a'/'a+' create a missing file;
+        // 'r'/'r+' require it to exist (ENOENT otherwise).
+        let exists = crate::vfs::stat_rs(&f.path[..plen]).is_ok();
+        if !exists {
+            if writable && (truncate || append) {
+                if crate::vfs::create_rs(&f.path[..plen]) < 0 {
+                    FILE_USED[i] = false;
+                    return ptr::null_mut();
+                }
+            } else {
+                FILE_USED[i] = false;
+                errno::set(2); // ENOENT
+                return ptr::null_mut();
+            }
+        }
         if truncate {
             // `/path:truncate {len:0}` — build the method path and issue the call.
             let mut tp = [0u8; 140];
@@ -452,16 +294,19 @@ pub extern "C" fn fread(buf: *mut c_void, size: usize, count: usize, f: *mut FIL
             let r = read_path(&path[..plen + 1], &mut data[..chunk], fref.offset);
             if r < 0 {
                 errno::set((-r) as c_int);
+                fref.error = true;
                 break;
             }
             let n = r as usize;
             if n == 0 {
+                fref.eof = true;
                 break;
             }
             ptr::copy_nonoverlapping(data.as_ptr(), (buf as *mut u8).add(got), n);
             got += n;
             fref.offset += n as u64;
             if n < chunk {
+                fref.eof = true;
                 break;
             }
         }
@@ -504,6 +349,7 @@ pub extern "C" fn fwrite(buf: *const c_void, size: usize, count: usize, f: *mut 
             let r = write_path(&path[..plen + 1], scratch, n, flags);
             if r < 0 {
                 errno::set((-r) as c_int);
+                fref.error = true;
                 break;
             }
             done += n;
@@ -577,4 +423,146 @@ pub extern "C" fn ftell(f: *mut FILE) -> c_long {
 #[unsafe(no_mangle)]
 pub extern "C" fn fflush(_f: *mut FILE) -> c_int {
     0
+}
+
+// ── Status flags ──────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn feof(f: *mut FILE) -> c_int {
+    if f.is_null() {
+        return 0;
+    }
+    unsafe { (&*f).eof as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ferror(f: *mut FILE) -> c_int {
+    if f.is_null() {
+        return 0;
+    }
+    unsafe { (&*f).error as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn clearerr(f: *mut FILE) {
+    if f.is_null() {
+        return;
+    }
+    unsafe {
+        (&mut *f).eof = false;
+        (&mut *f).error = false;
+    }
+}
+
+// ── Character / line I/O ──────────────────────────────────────────────
+
+/// Read one byte from the stream; returns the byte or `EOF` (-1).
+#[unsafe(no_mangle)]
+pub extern "C" fn fgetc(f: *mut FILE) -> c_int {
+    let mut b = [0u8; 1];
+    let n = fread(b.as_mut_ptr() as *mut c_void, 1, 1, f);
+    if n == 1 {
+        b[0] as c_int
+    } else {
+        -1
+    }
+}
+
+/// Write one byte to the stream; returns the byte or `EOF`.
+#[unsafe(no_mangle)]
+pub extern "C" fn fputc(c: c_int, f: *mut FILE) -> c_int {
+    let b = [(c & 0xFF) as u8; 1];
+    if fwrite(b.as_ptr() as *const c_void, 1, 1, f) == 1 {
+        c
+    } else {
+        -1
+    }
+}
+
+/// `getc` — function form of `fgetc`.
+#[unsafe(no_mangle)]
+pub extern "C" fn getc(f: *mut FILE) -> c_int {
+    fgetc(f)
+}
+
+/// `putc` — function form of `fputc`.
+#[unsafe(no_mangle)]
+pub extern "C" fn putc(c: c_int, f: *mut FILE) -> c_int {
+    fputc(c, f)
+}
+
+/// `getchar` — read one byte from stdin (`/proc/self/std/in`).
+#[unsafe(no_mangle)]
+pub extern "C" fn getchar() -> c_int {
+    let mut b = [0u8; 1];
+    let r = unsafe { read_path(b"/proc/self/std/in\0", &mut b, 0) };
+    if r > 0 {
+        b[0] as c_int
+    } else {
+        errno::set((-(r)) as c_int);
+        -1
+    }
+}
+
+/// Read a line into `s` (at most `n-1` bytes, up to and including `\n`),
+/// NUL-terminated. Returns `s` or `NULL` at EOF with nothing read.
+#[unsafe(no_mangle)]
+pub extern "C" fn fgets(s: *mut c_char, n: c_int, f: *mut FILE) -> *mut c_char {
+    if s.is_null() || f.is_null() || n <= 0 {
+        errno::set(errno::EINVAL);
+        return core::ptr::null_mut();
+    }
+    let cap = n as usize;
+    let mut i = 0usize;
+    while i + 1 < cap {
+        let c = fgetc(f);
+        if c == -1 {
+            if feof(f) != 0 && i > 0 {
+                break;
+            }
+            if i == 0 {
+                return core::ptr::null_mut();
+            }
+            break;
+        }
+        unsafe {
+            *s.add(i) = (c & 0xFF) as c_char;
+        }
+        i += 1;
+        if c == b'\n' as c_int {
+            break;
+        }
+    }
+    unsafe {
+        *s.add(i) = 0;
+    }
+    s
+}
+
+/// Write a NUL-terminated string (no trailing newline) to the stream.
+#[unsafe(no_mangle)]
+pub extern "C" fn fputs(s: *const c_char, f: *mut FILE) -> c_int {
+    if s.is_null() || f.is_null() {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    let len = crate::string::strlen(s);
+    if fwrite(s as *const c_void, 1, len, f) == len {
+        0
+    } else {
+        -1
+    }
+}
+
+/// `rewind(f)` — seek to the start and clear the EOF flag.
+#[unsafe(no_mangle)]
+pub extern "C" fn rewind(f: *mut FILE) {
+    if f.is_null() {
+        return;
+    }
+    unsafe {
+        (&mut *f).offset = 0;
+        (&mut *f).eof = false;
+        (&mut *f).error = false;
+    }
 }
