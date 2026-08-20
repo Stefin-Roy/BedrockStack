@@ -26,7 +26,9 @@ pub(crate) struct BootSector {
 /// clusters, a negative value means the unit is 1 << -value bytes.
 fn unit_size(value: i8, cluster_size: u64) -> Result<u64, VfsError> {
     if value > 0 {
-        let bytes = cluster_size.checked_mul(value as u64).ok_or(VfsError::InvalidInput)?;
+        let bytes = cluster_size
+            .checked_mul(value as u64)
+            .ok_or(VfsError::InvalidInput)?;
         Ok(bytes)
     } else if value < 0 {
         let shift = (-(value as i64)) as u32;
@@ -61,14 +63,23 @@ impl BootSector {
             return Err(VfsError::InvalidInput);
         }
 
-        let total_sectors =
-            u64::from_le_bytes(sector[0x28..0x30].try_into().map_err(|_| VfsError::IOError)?);
+        let total_sectors = u64::from_le_bytes(
+            sector[0x28..0x30]
+                .try_into()
+                .map_err(|_| VfsError::IOError)?,
+        );
         if total_sectors == 0 || total_sectors > device.sector_count() {
             return Err(VfsError::InvalidInput);
         }
 
-        let mft_lcn = u64::from_le_bytes(sector[0x30..0x38].try_into().map_err(|_| VfsError::IOError)?);
-        if mft_lcn.checked_mul(sectors_per_cluster as u64).map_or(true, |lba| lba >= total_sectors)
+        let mft_lcn = u64::from_le_bytes(
+            sector[0x30..0x38]
+                .try_into()
+                .map_err(|_| VfsError::IOError)?,
+        );
+        if mft_lcn
+            .checked_mul(sectors_per_cluster as u64)
+            .map_or(true, |lba| lba >= total_sectors)
         {
             return Err(VfsError::InvalidInput);
         }

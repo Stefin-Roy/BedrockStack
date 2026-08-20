@@ -7,7 +7,9 @@ use crate::syscall::{read_path, write_path};
 
 // printf-family lives in `format`; re-export for the pre-existing Rust call
 // path (`libc::stdio::printf`).
-pub use crate::format::{fprintf, printf, snprintf, sprintf, vfprintf, vprintf, vsnprintf, vsprintf};
+pub use crate::format::{
+    fprintf, printf, snprintf, sprintf, vfprintf, vprintf, vsnprintf, vsprintf,
+};
 
 // These buffers live in `.bss`, not on the fixed 32 KiB user stack.  The libc
 // surface is single-threaded today, so one read and one write scratch buffer
@@ -461,11 +463,7 @@ pub extern "C" fn clearerr(f: *mut FILE) {
 pub extern "C" fn fgetc(f: *mut FILE) -> c_int {
     let mut b = [0u8; 1];
     let n = fread(b.as_mut_ptr() as *mut c_void, 1, 1, f);
-    if n == 1 {
-        b[0] as c_int
-    } else {
-        -1
-    }
+    if n == 1 { b[0] as c_int } else { -1 }
 }
 
 /// Write one byte to the stream; returns the byte or `EOF`.

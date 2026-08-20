@@ -141,11 +141,7 @@ pub extern "C" fn kill(pid: crate::ffi::c_int, _sig: crate::ffi::c_int) -> crate
         return -1;
     }
     let r = kill_rs(pid as u64);
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 fn kill_rs(pid: u64) -> isize {

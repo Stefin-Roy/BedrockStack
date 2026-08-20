@@ -60,10 +60,6 @@ impl BlockHeader {
     fn end(&self) -> usize {
         (self as *const Self as usize) + self.size
     }
-
-    fn touches(&self, other: &BlockHeader) -> bool {
-        self.end() == other as *const BlockHeader as usize
-    }
 }
 
 /// One mapped heap growth region (a contiguous physical block).
@@ -159,27 +155,50 @@ impl HeapInner {
 
     fn push_free(&mut self, block: *mut BlockHeader) {
         let block_ref = unsafe { &mut *block };
+        block_ref.next = core::ptr::null_mut();
 
-        // Try coalescing with head.
-        if !self.free_list.is_null() {
-            let head_ref = unsafe { &*self.free_list };
-            if block_ref.touches(head_ref) {
-                block_ref.size += head_ref.size;
-                block_ref.next = head_ref.next;
-                self.free_list = block;
-                return;
+        // Insert in address order so the list stays sorted at all times.
+        // Keeps first-fit effective (it walks from the lowest address) and
+        // lets every free coalesce with both neighbours, so the list never
+        // fragments into the scattered order that used to need an O(n log n)
+        // rebuild on the reclaim path.
+        let mut prev: *mut BlockHeader = core::ptr::null_mut();
+        let mut cur = self.free_list;
+        let mut steps = 0usize;
+        while !cur.is_null() && (cur as usize) < (block as usize) {
+            steps += 1;
+            if steps > FREE_LIST_WALK_BOUND {
+                self.free_list_fault("push_free");
             }
-            // Check if head absorbs block.
-            let block_end = block_ref.end();
-            if self.free_list as usize == block_end {
-                let head_ref = unsafe { &mut *self.free_list };
-                head_ref.size += block_ref.size;
-                return;
+            prev = cur;
+            cur = unsafe { (*cur).next };
+        }
+
+        // Coalesce with the following neighbour (`block` immediately precedes
+        // `cur`).
+        if !cur.is_null() {
+            let cur_ref = unsafe { &*cur };
+            if block_ref.end() == cur as usize {
+                block_ref.size += cur_ref.size;
+                block_ref.next = cur_ref.next;
+            } else {
+                block_ref.next = cur;
             }
         }
 
-        block_ref.next = self.free_list;
-        self.free_list = block;
+        // Coalesce with the preceding neighbour (`prev` immediately precedes
+        // `block`); `prev` absorbs `block`.
+        if !prev.is_null() {
+            let prev_ref = unsafe { &mut *prev };
+            if prev_ref.end() == block as usize {
+                prev_ref.size += block_ref.size;
+                prev_ref.next = block_ref.next;
+                return;
+            }
+            prev_ref.next = block;
+        } else {
+            self.free_list = block;
+        }
     }
 
     fn remove_next(&mut self, prev: *mut BlockHeader) {
@@ -620,13 +639,13 @@ impl HeapInner {
     }
 
     /// One fully-idle chunk scheduled for unmapping.
-///
-/// Reclaim records are collected while the heap lock is held, then the caller
-/// drops the lock before running `reclaim_unmapped` on each.  The unmap must
-/// NOT happen under the heap lock: `vmm.unmap` performs a cross-CPU TLB
-/// shootdown that waits for every online CPU to acknowledge, and another CPU
-/// blocked on the heap lock with interrupts disabled (e.g. inside an `IrqMutex`
-/// VFS critical section) could never service that IPI — a deadlock.
+    ///
+    /// Reclaim records are collected while the heap lock is held, then the caller
+    /// drops the lock before running `reclaim_unmapped` on each.  The unmap must
+    /// NOT happen under the heap lock: `vmm.unmap` performs a cross-CPU TLB
+    /// shootdown that waits for every online CPU to acknowledge, and another CPU
+    /// blocked on the heap lock with interrupts disabled (e.g. inside an `IrqMutex`
+    /// VFS critical section) could never service that IPI — a deadlock.
     /// Best-effort reclaim of fully-idle growth regions.
     ///
     /// A chunk is reclaimed only when all its allocations are freed (`live ==
@@ -762,18 +781,16 @@ impl HeapInner {
 
             // Unmap the body plus the trailing guard page.  The guard is
             // normally already unmapped; VMM::unmap safely ignores it.
-            vmm.unmap(
-                &mut *pa,
-                record.vaddr,
-                record.size + HEAP_GUARD_BYTES,
-            );
+            vmm.unmap(&mut *pa, record.vaddr, record.size + HEAP_GUARD_BYTES);
 
             // Return the contiguous data frames after the TLB shootdown has
             // completed and no CPU can retain a stale heap mapping.
             let end = record.phys.saturating_add(record.size);
             let mut f = record.phys;
             while f < end {
-                unsafe { pa.free(f); }
+                unsafe {
+                    pa.free(f);
+                }
                 f += 4096;
             }
 
@@ -1112,7 +1129,12 @@ unsafe impl GlobalAlloc for HeapAllocator {
         // Fast path: reuse a block parked in this CPU's cache.
         let cached = per_cpu_alloc_cached(layout);
         if !cached.is_null() {
-            HEAP.lock().mark_live(cached as u64);
+            // Live accounting only drives chunk reclamation, which is compiled
+            // out when disabled.  Keeping this off the cache hit path means the
+            // per-CPU cache truly never touches the global HEAP lock.
+            if ENABLE_HEAP_CHUNK_RECLAIM {
+                HEAP.lock().mark_live(cached as u64);
+            }
             return cached;
         }
 
@@ -1132,7 +1154,9 @@ unsafe impl GlobalAlloc for HeapAllocator {
             ptr
         };
         if !ptr.is_null() {
-            heap.mark_live(ptr as u64);
+            if ENABLE_HEAP_CHUNK_RECLAIM {
+                heap.mark_live(ptr as u64);
+            }
         }
         ptr
     }
@@ -1141,24 +1165,26 @@ unsafe impl GlobalAlloc for HeapAllocator {
         if ptr.is_null() {
             return;
         }
-        // Park the block in the current CPU's cache when there is room.  The
-        // live-accounting for chunk reclamation is updated immediately (the
-        // block is idle even though it lingers in a cache).  When this free
-        // empties the chunk (`live == 0`), reclaim runs right away: its cached
-        // blocks are drained back onto the free list, so the chunk body can
-        // collapse to one block.  This makes reclamation deterministic — one
-        // shot per transition — instead of waiting for the next cache-overflow
-        // free (the old O(n²) hot path).
+        // Park the block in the current CPU's cache when there is room.  When
+        // chunk reclamation is compiled out this is the entire cost of a free —
+        // no global lock, no chunk scan.  When reclamation is enabled the
+        // live-accounting is updated immediately (the block is idle even
+        // though it lingers in a cache); freeing a chunk's last block (`live
+        // == 0`) runs reclaim right away: its cached blocks are drained back
+        // onto the free list, so the chunk body can collapse to one block.
+        // This makes reclamation deterministic — one shot per transition —
+        // instead of waiting for the next cache-overflow free (the old O(n²)
+        // hot path).
         if per_cpu_free_cached(ptr) {
+            if !ENABLE_HEAP_CHUNK_RECLAIM {
+                return;
+            }
             let mut records = [ReclaimRecord::ZERO; MAX_RECLAIMS_PER_CALL];
             let (count, root) = {
                 let mut heap = HEAP.lock();
                 let mut count = 0;
                 if let Some((idx, live)) = heap.unmark_live(ptr as u64) {
-                    if ENABLE_HEAP_CHUNK_RECLAIM
-                        && live == 0
-                        && heap.chunk_is_reclaimable(idx)
-                    {
+                    if live == 0 && heap.chunk_is_reclaimable(idx) {
                         count = heap.try_reclaim(idx, &mut records);
                     }
                 }
@@ -1174,12 +1200,11 @@ unsafe impl GlobalAlloc for HeapAllocator {
             unsafe { (*block).next = core::ptr::null_mut() }
             heap.push_free(block);
             let mut count = 0;
-            if let Some((idx, live)) = heap.unmark_live(ptr as u64) {
-                if ENABLE_HEAP_CHUNK_RECLAIM
-                    && live == 0
-                    && heap.chunk_is_reclaimable(idx)
-                {
-                    count = heap.try_reclaim(idx, &mut records);
+            if ENABLE_HEAP_CHUNK_RECLAIM {
+                if let Some((idx, live)) = heap.unmark_live(ptr as u64) {
+                    if live == 0 && heap.chunk_is_reclaimable(idx) {
+                        count = heap.try_reclaim(idx, &mut records);
+                    }
                 }
             }
             (count, heap.root)

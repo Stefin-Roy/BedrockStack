@@ -58,11 +58,14 @@ pub fn resolve_path(path: &str) -> Result<(char, Arc<Dentry>), VfsError> {
         let dentry = path::walk_from(mount.root.clone(), &components)?;
         Ok((letter, dentry))
     } else {
-        let cwd = CWD.lock();
-        let cwd = cwd.as_ref().ok_or(VfsError::NotFound)?;
+        let (drive, start) = {
+            let cwd = CWD.lock();
+            let cwd = cwd.as_ref().ok_or(VfsError::NotFound)?;
+            (cwd.drive, cwd.dentry.clone())
+        };
         let components = path::split_components(path);
-        let dentry = path::walk_from(cwd.dentry.clone(), &components)?;
-        Ok((cwd.drive, dentry))
+        let dentry = path::walk_from(start, &components)?;
+        Ok((drive, dentry))
     }
 }
 
@@ -72,9 +75,11 @@ fn resolve_parent(path: &str) -> Result<(Arc<Dentry>, String), VfsError> {
         let mount = DRIVE_MAP.lookup(letter)?;
         (mount.root.clone(), inner)
     } else {
-        let cwd = CWD.lock();
-        let cwd = cwd.as_ref().ok_or(VfsError::NotFound)?;
-        (cwd.dentry.clone(), path)
+        let start = {
+            let cwd = CWD.lock();
+            cwd.as_ref().ok_or(VfsError::NotFound)?.dentry.clone()
+        };
+        (start, path)
     };
 
     let components = path::split_components(inner);

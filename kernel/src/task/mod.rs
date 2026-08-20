@@ -122,8 +122,8 @@ pub fn alloc_kernel_stack(alloc: &mut BitmapAllocator) -> Option<(u64, usize)> {
 /// Unmap and free the four frames backed by window `slot`, releasing the slot.
 ///
 /// Runs on the idle stack under the kernel root (from `reap_dead`), so the
-/// stack is long dead and no CPU parks on it.  `Vmm::unmap_4k` flushes and
-/// broadcasts a TLB shootdown before any frame is freed.
+/// stack is long dead and no CPU parks on it.  The whole window is unmapped in
+/// one batched TLB shootdown rather than one full broadcast per page.
 fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
     if slot >= MAX_KSTACKS {
         return;
@@ -135,13 +135,11 @@ fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
     in_use[slot] = false;
     let base = KSTACK_VADDR_BASE - (slot as u64) * KSTACK_SIZE;
     let mut vmm = Vmm::from_root(kernel_root());
-    for i in 0..KSTACK_PAGES {
-        let va = base + (i as u64) * 4096;
-        if let Some(phys) = vmm.translate(va) {
-            vmm.unmap_4k(alloc, va);
-            unsafe {
-                alloc.free(phys);
-            }
+    let mut frames: Vec<u64> = Vec::new();
+    vmm.unmap_range_collect(alloc, base, KSTACK_PAGES as u64 * 4096, &mut frames);
+    for phys in frames {
+        unsafe {
+            alloc.free(phys);
         }
     }
 }
@@ -195,6 +193,12 @@ static WAITERS: Mutex<Vec<(&'static mut Task, u64)>> = Mutex::new(Vec::new());
 /// until `wake_sleepers` (idle loop) moves it back to `QUEUE` as `Ready`.
 /// Never held together with `QUEUE`: `wake_sleepers` drops the sleep list
 /// before locking the queue, and `schedule`/`yield` never touch it.
+///
+/// Kept sorted ascending by deadline: `earliest_sleep_deadline` is an O(1)
+/// front peek, and `wake_sleepers` drains a contiguous prefix with a single
+/// `drain`, so a burst wakeup costs O(k) (one shift) instead of O(n·k)
+/// per-element `remove` shifts.  Insertion (`sleep_until`) stays O(n), but a
+/// task sleeps far less often than the idle loop scans.
 static SLEEPING: Mutex<Vec<(u64, &'static mut Task)>> = Mutex::new(Vec::new());
 
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
@@ -270,7 +274,17 @@ pub fn sleep_until(deadline_ns: u64) {
             let raw = &mut **t as *mut Task;
             t.state = TaskState::ZzZ;
             drop(cur);
-            SLEEPING.lock().push((deadline_ns, unsafe { &mut *raw }));
+            // Binary-insert so the list stays deadline-sorted (front = earliest).
+            {
+                let mut sleeping = SLEEPING.lock();
+                let pos = sleeping
+                    .binary_search_by(|(d, _)| d.cmp(&deadline_ns))
+                    .unwrap_or_else(|e| e);
+                sleeping.insert(pos, (deadline_ns, unsafe { &mut *raw }));
+            }
+            // The sleep lock must be dropped before `schedule`: the idle loop
+            // takes `SLEEPING` again in `wake_sleepers`, so holding it across a
+            // task switch would deadlock the whole scheduler.
             schedule();
         }
         None => {
@@ -285,10 +299,10 @@ pub fn sleep_current(ns: u64) {
 }
 
 /// Earliest absolute deadline among sleeping tasks, if any.  Used by the idle
-/// loop to arm the timer so a sleeper wakes on time.
+/// loop to arm the timer so a sleeper wakes on time.  The list is
+/// deadline-sorted, so this is a front peek (O(1)).
 pub fn earliest_sleep_deadline() -> Option<u64> {
-    let sleeping = SLEEPING.lock();
-    sleeping.iter().map(|(d, _)| *d).min()
+    SLEEPING.lock().first().map(|(d, _)| *d)
 }
 
 /// Requeue every sleeping task whose deadline has passed.  Called from the
@@ -297,18 +311,16 @@ pub fn earliest_sleep_deadline() -> Option<u64> {
 /// dropped before `QUEUE` is taken, so the two are never held together.
 pub fn wake_sleepers() {
     let now = crate::services::universal_timer::now_ns();
-    let mut due = Vec::new();
-    {
+    let due = {
         let mut sleeping = SLEEPING.lock();
-        let mut i = 0;
-        while i < sleeping.len() {
-            if sleeping[i].0 <= now {
-                due.push(sleeping.remove(i).1);
-            } else {
-                i += 1;
-            }
+        // The list is deadline-sorted, so the expired tasks are a contiguous
+        // front prefix; drain them in one shift instead of per-element removes.
+        let mut n = 0;
+        while n < sleeping.len() && sleeping[n].0 <= now {
+            n += 1;
         }
-    }
+        sleeping.drain(..n).map(|(_, t)| t).collect::<Vec<_>>()
+    };
     if due.is_empty() {
         return;
     }

@@ -422,19 +422,18 @@ fn commit_pages(
 
 /// Unmap and free every frame backing `[vaddr, vaddr + npages*PAGE)`.
 ///
-/// `Vmm::unmap_4k` flushes the local TLB and broadcasts a cross-CPU shootdown
-/// before any frame (leaf or intermediate table) is released — required here
-/// because the process root is the *active* CR3 during a syscall.
+/// All PTEs in the range are cleared first, then a single batched TLB
+/// shootdown is broadcast before any frame (leaf or intermediate table) is
+/// released — required here because the process root is the *active* CR3
+/// during a syscall.  The range-unmap avoids firing one full cross-CPU
+/// shootdown per page (the `unmap_4k` loop this replaces).
 fn release_pages(vmm: &mut Vmm, alloc: &mut BitmapAllocator, vaddr: u64, npages: u64) {
-    let mut va = vaddr;
-    for _ in 0..npages {
-        if let Some(phys) = vmm.translate(va) {
-            vmm.unmap_4k(alloc, va);
-            unsafe {
-                alloc.free(phys);
-            }
+    let mut frames: Vec<u64> = Vec::new();
+    vmm.unmap_range_collect(alloc, vaddr, npages * PAGE, &mut frames);
+    for phys in frames {
+        unsafe {
+            alloc.free(phys);
         }
-        va += PAGE;
     }
 }
 

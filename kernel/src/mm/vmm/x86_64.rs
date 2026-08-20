@@ -158,6 +158,23 @@ pub fn map_2m(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, fl
 }
 
 pub fn unmap_4k(root: u64, vaddr: u64, pending: &mut super::PendingFrames) -> bool {
+    if !unmap_4k_impl(root, vaddr) {
+        return false;
+    }
+    reclaim_empty_tables(root, pending, vaddr);
+    true
+}
+
+/// Clear the leaf PTE at `vaddr` without reclaiming intermediate tables.
+///
+/// Used by range-unmap paths that batch reclamation once per touched page
+/// table instead of per page (the range loop must then run
+/// [`reclaim_empty_tables`] per distinct group before the shootdown).
+pub fn unmap_4k_no_reclaim(root: u64, vaddr: u64, _pending: &mut super::PendingFrames) -> bool {
+    unmap_4k_impl(root, vaddr)
+}
+
+fn unmap_4k_impl(root: u64, vaddr: u64) -> bool {
     let _guard = super::lock();
     let mut mapper = mapper_at(root);
 
@@ -176,11 +193,7 @@ pub fn unmap_4k(root: u64, vaddr: u64, pending: &mut super::PendingFrames) -> bo
         }
         Err(_) => false,
     };
-    if !removed {
-        return false;
-    }
-    reclaim_empty_tables(root, pending, vaddr);
-    true
+    removed
 }
 
 /// The low 12 flag bits of an x86_64 PTE; bit 0 is PRESENT.
@@ -283,7 +296,7 @@ unsafe fn new_higher_half_slot(root: u64, vaddr: u64) -> bool {
 /// allocated (their parent entries are still cleared, releasing the VA space)
 /// rather than freed — freeing a shared table would let the clone's next walk
 /// dereference a reallocated frame.
-fn reclaim_empty_tables(root: u64, pending: &mut super::PendingFrames, vaddr: u64) {
+pub(super) fn reclaim_empty_tables(root: u64, pending: &mut super::PendingFrames, vaddr: u64) {
     // Level-0 (leaf) table index, Level-1 (PD), Level-2 (PDPT), Level-3 (PML4).
     #[rustfmt::skip]
     let (i_pt, i_pd, i_pdpt, i_pml4) = (

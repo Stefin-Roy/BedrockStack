@@ -70,8 +70,7 @@ pub fn resolve_into<'a>(path: &[u8], buf: &'a mut [u8]) -> Option<&'a [u8]> {
 /// Resolve a NUL-terminated C path into `buf`; returns the length (excluding
 /// NUL) or `None`.
 pub fn resolve_c(path: *const c_char, buf: &mut [u8]) -> Option<usize> {
-    let p =
-        unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
     let r = resolve_into(p, buf)?;
     Some(r.len() - 1)
 }
@@ -243,21 +242,13 @@ pub extern "C" fn mkdir(path: *const core::ffi::c_char, _mode: core::ffi::c_uint
 /// Rust-friendly `mkdir` over a byte slice.
 pub fn mkdir_rs(path: &[u8]) -> c_int {
     let r = dir_method(path, b"mkdir");
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// Create a regular file via the parent directory's `:create` method.
 pub fn create_rs(path: &[u8]) -> c_int {
     let r = dir_method(path, b"create");
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// POSIX `rmdir(path)`.
@@ -267,11 +258,7 @@ pub extern "C" fn rmdir(path: *const core::ffi::c_char) -> c_int {
         unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) },
         b"rmdir",
     );
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// POSIX `unlink(path)`.
@@ -281,11 +268,7 @@ pub extern "C" fn unlink(path: *const core::ffi::c_char) -> c_int {
         unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) },
         b"unlink",
     );
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// POSIX `remove(path)` — unlink a file or remove an empty directory.
@@ -298,21 +281,14 @@ pub extern "C" fn remove(path: *const c_char) -> c_int {
     }
     // A directory must be removed with rmdir; retry.
     let r2 = dir_method(p, b"rmdir");
-    if r2 >= 0 {
-        0
-    } else {
-        -1
-    }
+    if r2 >= 0 { 0 } else { -1 }
 }
 
 /// POSIX `rename(old, new)`.  Both names must live in the same directory
 /// (the kernel's `:rename` is a single-directory method); a cross-directory
 /// move returns ENOSYS.
 #[unsafe(no_mangle)]
-pub extern "C" fn rename(
-    old: *const core::ffi::c_char,
-    new: *const core::ffi::c_char,
-) -> c_int {
+pub extern "C" fn rename(old: *const core::ffi::c_char, new: *const core::ffi::c_char) -> c_int {
     let o = unsafe { core::slice::from_raw_parts(old as *const u8, crate::string::strlen(old)) };
     let n = unsafe { core::slice::from_raw_parts(new as *const u8, crate::string::strlen(new)) };
     let mut ro = [0u8; 512];
@@ -358,19 +334,12 @@ pub extern "C" fn rename(
     };
     let total = alen + blen;
     let r = errno::ret(unsafe { write_path(mp, &mut pay, total, 0) });
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// POSIX `truncate(path, length)`.
 #[unsafe(no_mangle)]
-pub extern "C" fn truncate(
-    path: *const core::ffi::c_char,
-    length: core::ffi::c_longlong,
-) -> c_int {
+pub extern "C" fn truncate(path: *const core::ffi::c_char, length: core::ffi::c_longlong) -> c_int {
     truncate_rs(
         unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) },
         length.max(0) as u64,
@@ -392,11 +361,7 @@ pub fn truncate_rs(path: &[u8], len: u64) -> c_int {
     let mut pay = [0u8; 8];
     pay[..8].copy_from_slice(&len.to_le_bytes());
     let r = errno::ret(unsafe { write_path(mp, &mut pay, 8, 0) });
-    if r < 0 {
-        -1
-    } else {
-        0
-    }
+    if r < 0 { -1 } else { 0 }
 }
 
 /// Query a path's stat snapshot.  Returns `Ok(stat)` or the errno.
@@ -428,10 +393,7 @@ pub fn stat_rs(path: &[u8]) -> Result<Stat, c_int> {
 /// The VFS `kind` tag (0 = file, 1 = directory) is translated into
 /// `S_IFREG` / `S_IFDIR` mode bits.
 #[unsafe(no_mangle)]
-pub extern "C" fn stat(
-    path: *const core::ffi::c_char,
-    buf: *mut u8,
-) -> c_int {
+pub extern "C" fn stat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
     let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
     match stat_rs(p) {
         Ok(s) => {
@@ -453,10 +415,7 @@ pub extern "C" fn stat(
 
 /// POSIX `lstat` — same as `stat` (no symlink support in the VFS).
 #[unsafe(no_mangle)]
-pub extern "C" fn lstat(
-    path: *const core::ffi::c_char,
-    buf: *mut u8,
-) -> c_int {
+pub extern "C" fn lstat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
     stat(path, buf)
 }
 

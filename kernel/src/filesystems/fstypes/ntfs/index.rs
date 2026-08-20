@@ -142,7 +142,11 @@ fn read_index_block(
         return Ok(None);
     }
     let (start, end) = index_header_region(&buf, 0x18)?;
-    Ok(Some(IndexBlock { data: buf, start, end }))
+    Ok(Some(IndexBlock {
+        data: buf,
+        start,
+        end,
+    }))
 }
 
 /// List the entries of the directory whose MFT record is `record`.
@@ -159,9 +163,9 @@ pub(crate) fn read_dir_entries(
         .find(|a| a.attr_type == ATTR_INDEX_ROOT && a.name.as_deref() == Some("$I30"))
         .ok_or(VfsError::IOError)?;
 
-    let alloc = attrs.iter().find(|a| {
-        a.attr_type == ATTR_INDEX_ALLOCATION && a.name.as_deref() == Some("$I30")
-    });
+    let alloc = attrs
+        .iter()
+        .find(|a| a.attr_type == ATTR_INDEX_ALLOCATION && a.name.as_deref() == Some("$I30"));
     let bitmap = attrs
         .iter()
         .find(|a| a.attr_type == ATTR_BITMAP && a.name.as_deref() == Some("$I30"));
@@ -237,10 +241,8 @@ pub(crate) fn read_dir_entries(
     // Drop DOS 8.3 aliases that duplicate a Win32/POSIX name.
     let mut kept: Vec<IndexEntry> = Vec::with_capacity(out.len());
     for e in out {
-        let is_dup_dos = e.namespace == 2
-            && kept
-                .iter()
-                .any(|o| o.name == e.name && o.namespace != 2);
+        let is_dup_dos =
+            e.namespace == 2 && kept.iter().any(|o| o.name == e.name && o.namespace != 2);
         if !is_dup_dos {
             kept.push(e);
         }

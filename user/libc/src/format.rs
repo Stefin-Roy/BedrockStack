@@ -7,7 +7,10 @@
 //! `no_fp_fmt_parse` feature).  `%g` approximates C's shortest-significant
 //! form via `{}`; exponent fields are normalized to the C `e+00` style.
 
-use core::ffi::{c_char, c_double, c_int, c_long, c_longlong, c_short, c_uint, c_ulong, c_ulonglong, c_ushort, c_void, VaList};
+use core::ffi::{
+    VaList, c_char, c_double, c_int, c_long, c_longlong, c_short, c_uint, c_ulong, c_ulonglong,
+    c_ushort, c_void,
+};
 use core::fmt::Write as _;
 
 use crate::stdio::FILE;
@@ -543,7 +546,11 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                     } else if need > nd {
                         let zeros = need - nd;
                         unsafe {
-                            core::ptr::copy(digits.as_mut_ptr(), digits.as_mut_ptr().add(zeros), nd);
+                            core::ptr::copy(
+                                digits.as_mut_ptr(),
+                                digits.as_mut_ptr().add(zeros),
+                                nd,
+                            );
                         }
                         for k in 0..zeros {
                             digits[k] = b'0';
@@ -551,7 +558,17 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                         nd = need;
                     }
                 }
-                emit_field(sink, sign, &[], &digits, nd, width, left, zero, !prec_applied);
+                emit_field(
+                    sink,
+                    sign,
+                    &[],
+                    &digits,
+                    nd,
+                    width,
+                    left,
+                    zero,
+                    !prec_applied,
+                );
                 count += nd + (sign != 0) as usize;
             }
             b'u' => {
@@ -565,7 +582,11 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                     } else if need > nd {
                         let zeros = need - nd;
                         unsafe {
-                            core::ptr::copy(digits.as_mut_ptr(), digits.as_mut_ptr().add(zeros), nd);
+                            core::ptr::copy(
+                                digits.as_mut_ptr(),
+                                digits.as_mut_ptr().add(zeros),
+                                nd,
+                            );
                         }
                         for k in 0..zeros {
                             digits[k] = b'0';
@@ -587,7 +608,11 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                     } else if need > nd {
                         let zeros = need - nd;
                         unsafe {
-                            core::ptr::copy(digits.as_mut_ptr(), digits.as_mut_ptr().add(zeros), nd);
+                            core::ptr::copy(
+                                digits.as_mut_ptr(),
+                                digits.as_mut_ptr().add(zeros),
+                                nd,
+                            );
                         }
                         for k in 0..zeros {
                             digits[k] = b'0';
@@ -602,7 +627,17 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                 } else {
                     &[]
                 };
-                emit_field(sink, 0, prefix, &digits, nd, width, left, zero, !prec_applied);
+                emit_field(
+                    sink,
+                    0,
+                    prefix,
+                    &digits,
+                    nd,
+                    width,
+                    left,
+                    zero,
+                    !prec_applied,
+                );
                 count += nd + prefix.len();
             }
             b'x' | b'X' => {
@@ -617,7 +652,11 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                     } else if need > nd {
                         let zeros = need - nd;
                         unsafe {
-                            core::ptr::copy(digits.as_mut_ptr(), digits.as_mut_ptr().add(zeros), nd);
+                            core::ptr::copy(
+                                digits.as_mut_ptr(),
+                                digits.as_mut_ptr().add(zeros),
+                                nd,
+                            );
                         }
                         for k in 0..zeros {
                             digits[k] = b'0';
@@ -626,36 +665,69 @@ fn render(sink: &mut dyn Sink, fmt: &[u8], ap: &mut VaList) -> c_int {
                     }
                 }
                 let prefix: &[u8] = if alt && mag != 0 {
-                    if upper {
-                        b"0X"
-                    } else {
-                        b"0x"
-                    }
+                    if upper { b"0X" } else { b"0x" }
                 } else {
                     &[]
                 };
-                emit_field(sink, 0, prefix, &digits, nd, width, left, zero, !prec_applied);
+                emit_field(
+                    sink,
+                    0,
+                    prefix,
+                    &digits,
+                    nd,
+                    width,
+                    left,
+                    zero,
+                    !prec_applied,
+                );
                 count += nd + prefix.len();
             }
             b'f' | b'F' => {
                 let v = unsafe { ap.next_arg::<c_double>() };
                 let p = if prec >= 0 { prec as usize } else { 6 };
                 emit_float(
-                    sink, v, p, width, left, zero, plus, space, spec == b'F', b'f',
+                    sink,
+                    v,
+                    p,
+                    width,
+                    left,
+                    zero,
+                    plus,
+                    space,
+                    spec == b'F',
+                    b'f',
                 );
             }
             b'e' | b'E' => {
                 let v = unsafe { ap.next_arg::<c_double>() };
                 let p = if prec >= 0 { prec as usize } else { 6 };
                 emit_float(
-                    sink, v, p, width, left, zero, plus, space, spec == b'E', b'e',
+                    sink,
+                    v,
+                    p,
+                    width,
+                    left,
+                    zero,
+                    plus,
+                    space,
+                    spec == b'E',
+                    b'e',
                 );
             }
             b'g' | b'G' => {
                 let v = unsafe { ap.next_arg::<c_double>() };
                 let p = if prec >= 0 { (prec as usize).max(1) } else { 6 };
                 emit_float(
-                    sink, v, p, width, left, zero, plus, space, spec == b'G', b'g',
+                    sink,
+                    v,
+                    p,
+                    width,
+                    left,
+                    zero,
+                    plus,
+                    space,
+                    spec == b'G',
+                    b'g',
                 );
             }
             b'p' => {
@@ -791,7 +863,7 @@ pub unsafe extern "C" fn snprintf(
     s: *mut c_char,
     n: usize,
     fmt: *const c_char,
-    args: ...,
+    args: ...
 ) -> c_int {
     unsafe {
         let mut ap = args;
@@ -800,11 +872,7 @@ pub unsafe extern "C" fn snprintf(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn vsprintf(
-    s: *mut c_char,
-    fmt: *const c_char,
-    ap: VaList,
-) -> c_int {
+pub unsafe extern "C" fn vsprintf(s: *mut c_char, fmt: *const c_char, ap: VaList) -> c_int {
     let mut ap2 = ap;
     let mut sink = BufSink {
         ptr: s as *mut u8,
@@ -821,11 +889,7 @@ pub unsafe extern "C" fn vsprintf(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn sprintf(
-    s: *mut c_char,
-    fmt: *const c_char,
-    args: ...,
-) -> c_int {
+pub unsafe extern "C" fn sprintf(s: *mut c_char, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
         let mut ap = args;
         vsprintf(s, fmt, ap)

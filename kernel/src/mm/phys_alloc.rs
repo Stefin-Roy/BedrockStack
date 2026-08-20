@@ -282,42 +282,110 @@ impl BitmapAllocator {
             return None;
         }
         let next_free = inner.next_free;
-        // Scan from next_free to end-of-bitmap, then wrap around from 0.
-        for offset in [next_free, 0] {
-            let end = if offset == 0 {
-                next_free
-            } else {
-                self.total_frames
-            };
-            let mut run_start = offset;
-            let mut run_len = 0;
-            for i in offset..end {
-                if self.is_free(i) {
-                    if run_len == 0 {
-                        run_start = i;
-                    }
-                    run_len += 1;
-                    if run_len >= count {
-                        for j in run_start..run_start + count {
-                            self.set_used(j);
-                        }
-                        inner.next_free = run_start + count;
-                        let addr = (run_start as u64) * 4096;
-                        let end_addr = addr + (count as u64) * 4096;
-                        debug_assert!(
-                            end_addr <= self.kernel_start || addr >= self.kernel_end,
-                            "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
-                            addr,
-                            end_addr,
-                            self.kernel_start,
-                            self.kernel_end
-                        );
-                        return Some(addr);
-                    }
+        let total_words = (self.total_frames + 63) / 64;
+        let bitmap_u64 = self.bitmap_ptr() as *const u64;
+        let last_bits = if self.total_frames % 64 == 0 {
+            64
+        } else {
+            self.total_frames % 64
+        };
+
+        // Find a run of `count` consecutive free frames within [lo, hi).
+        // Scans 64 frames per word, skipping fully-free words in one shot
+        // instead of probing one frame at a time.
+        let find_run = |lo: usize, hi: usize| -> Option<usize> {
+            if lo >= hi {
+                return None;
+            }
+            let start_word = lo / 64;
+            let end_word = hi / 64 + if hi % 64 == 0 { 0 } else { 1 };
+            let mut run_start = 0usize;
+            let mut run_len = 0usize;
+            for wi in start_word..end_word {
+                let nbits = if wi == total_words - 1 { last_bits } else { 64 };
+                let word_mask = if nbits == 64 {
+                    u64::MAX
                 } else {
+                    (1u64 << nbits) - 1
+                };
+                let mut w = unsafe { *bitmap_u64.add(wi) } & word_mask;
+                // Enforce the [lo, hi) window: treat out-of-window bits as used.
+                if wi == start_word {
+                    let skip = lo % 64;
+                    if skip != 0 {
+                        w |= (1u64 << skip) - 1;
+                    }
+                }
+                if wi == end_word - 1 {
+                    let keep = hi % 64;
+                    if keep != 0 {
+                        w |= !((1u64 << keep) - 1) & word_mask;
+                    }
+                }
+
+                if w == 0 {
+                    // Whole word free: extend the run across all nbits.
+                    if run_len == 0 {
+                        run_start = wi * 64;
+                    }
+                    run_len += nbits;
+                    if run_len >= count {
+                        return Some(run_start);
+                    }
+                    continue;
+                }
+
+                // A used bit exists in this word.  Extend any carryover run
+                // across the leading free bits, then look for fresh runs after
+                // the break (never re-scan the already-consumed prefix).
+                let mut i = 0usize;
+                if run_len > 0 {
+                    let lead = (!w).trailing_zeros() as usize;
+                    run_len += lead;
+                    if run_len >= count {
+                        return Some(run_start);
+                    }
                     run_len = 0;
+                    i = lead + 1;
+                }
+                while i < nbits {
+                    if w & (1 << i) == 0 {
+                        let s = i;
+                        while i < nbits && w & (1 << i) == 0 {
+                            i += 1;
+                        }
+                        let len = i - s;
+                        if len >= count {
+                            return Some(wi * 64 + s);
+                        }
+                        run_len = len;
+                        run_start = wi * 64 + s;
+                    } else {
+                        i += 1;
+                    }
                 }
             }
+            None
+        };
+
+        // Scan from next_free to end-of-bitmap, then wrap around from 0.
+        let run = find_run(next_free, self.total_frames).or_else(|| find_run(0, next_free));
+        if let Some(run_start) = run {
+            for j in run_start..run_start + count {
+                self.set_used(j);
+            }
+            inner.next_free = run_start + count;
+            let addr = (run_start as u64) * 4096;
+            let end_addr = addr + (count as u64) * 4096;
+            debug_assert!(
+                end_addr <= self.kernel_start || addr >= self.kernel_end,
+                "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
+                addr,
+                end_addr,
+                self.kernel_start,
+                self.kernel_end
+            );
+            return Some(addr);
         }
         None
     }
@@ -364,10 +432,6 @@ impl BitmapAllocator {
         if idx < inner.next_free {
             inner.next_free = idx;
         }
-    }
-
-    fn is_free(&self, idx: usize) -> bool {
-        unsafe { *self.bitmap_ptr().add(idx / 8) & (1 << (idx % 8)) == 0 }
     }
 
     fn set_used(&self, idx: usize) {

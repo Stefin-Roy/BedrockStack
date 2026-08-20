@@ -1,9 +1,9 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use spin::Mutex;
 
 use super::error::VfsError;
 use super::file::FileDescription;
-use super::irq::IrqMutex;
 
 struct FdTableInner {
     fds: Vec<Option<Arc<FileDescription>>>,
@@ -11,13 +11,13 @@ struct FdTableInner {
 }
 
 pub struct FdTable {
-    inner: IrqMutex<FdTableInner>,
+    inner: Mutex<FdTableInner>,
 }
 
 impl FdTable {
     pub const fn new() -> Self {
         FdTable {
-            inner: IrqMutex::new(FdTableInner {
+            inner: Mutex::new(FdTableInner {
                 fds: Vec::new(),
                 free_list: Vec::new(),
             }),
@@ -58,16 +58,13 @@ impl FdTable {
     }
 
     pub fn dup(&self, old_fd: u32) -> Result<u32, VfsError> {
-        let entry = {
-            let inner = self.inner.lock();
-            inner
-                .fds
-                .get(old_fd as usize)
-                .and_then(|s| s.as_ref())
-                .cloned()
-                .ok_or(VfsError::BadFileDescriptor)?
-        };
         let mut inner = self.inner.lock();
+        let entry = inner
+            .fds
+            .get(old_fd as usize)
+            .and_then(|s| s.as_ref())
+            .cloned()
+            .ok_or(VfsError::BadFileDescriptor)?;
         if let Some(idx) = inner.free_list.pop() {
             inner.fds[idx as usize] = Some(entry);
             return Ok(idx);
@@ -78,16 +75,13 @@ impl FdTable {
     }
 
     pub fn dup2(&self, old_fd: u32, new_fd: u32) -> Result<(), VfsError> {
-        let entry = {
-            let inner = self.inner.lock();
-            inner
-                .fds
-                .get(old_fd as usize)
-                .and_then(|s| s.as_ref())
-                .cloned()
-                .ok_or(VfsError::BadFileDescriptor)?
-        };
         let mut inner = self.inner.lock();
+        let entry = inner
+            .fds
+            .get(old_fd as usize)
+            .and_then(|s| s.as_ref())
+            .cloned()
+            .ok_or(VfsError::BadFileDescriptor)?;
         if new_fd as usize >= inner.fds.len() {
             inner.fds.resize(new_fd as usize + 1, None);
         }
