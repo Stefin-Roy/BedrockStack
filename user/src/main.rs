@@ -13,67 +13,311 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+use core::alloc::Layout;
+
 /// Paint a vertical RGB gradient across the whole framebuffer.
 /// Paint a 2D RGB gradient (red spans x, green spans y) over the visible
 /// framebuffer region, leaving stride padding untouched.
 ///
-/// Safe for any `bpp`: only the channels that exist are written, each chunk is
-/// zero-filled first so bytes for `bpp > 4` cannot carry stale data into the
-/// next pixel, and `write_at` either performs the whole write or returns an
-/// error (it never does a partial write).
+/// Optimised without losing correctness: LUTs remove per-pixel divisions
+/// (w*h*2 -> w+h), branches hoisted, 8 KiB stack row buffer (one syscall/
+/// row for 1920x4) with direct write_path fast-path, and a heap bulk attempt
+/// (one syscall/frame) for stride==width that falls back to the stack path
+/// on OOM/short-write so the screen never stays black.
 fn paint_gradient(mode: &libc::fb::FbMode) {
     let width = mode.width as usize;
     let height = mode.height as usize;
     let stride = mode.stride as usize;
     let bpp = mode.bpp as usize;
-    let rowbytes = stride.saturating_mul(bpp);
-    if width == 0 || height == 0 || stride == 0 || bpp == 0 || rowbytes == 0 {
+    let rowbytes = match stride.checked_mul(bpp) {
+        Some(v) if v != 0 => v,
+        _ => return,
+    };
+    if width == 0 || height == 0 || stride == 0 || bpp == 0 || width > stride {
         return;
     }
-    // Fixed stack row buffer, chunked so each write fits.  If the buffer can't
-    // even hold one pixel (bpp > ROW_BUF_BYTES) there is nothing we can paint.
-    const ROW_BUF_BYTES: usize = 2560;
+    let r_den = width.saturating_sub(1).max(1);
+    let g_den = height.saturating_sub(1).max(1);
+    let is_rgb = mode.pixel_format == 1;
+
+    // Stack LUTs: 4096 covers every QEMU GOP mode; fallback to division if larger.
+    const LUT_CAP: usize = 4096;
+    let mut r_lut = [0u8; LUT_CAP];
+    let mut g_lut = [0u8; LUT_CAP];
+    let use_r_lut = width <= LUT_CAP;
+    let use_g_lut = height <= LUT_CAP;
+    if use_r_lut {
+        for x in 0..width {
+            r_lut[x] = ((x * 255) / r_den) as u8;
+        }
+    }
+    if use_g_lut {
+        for y in 0..height {
+            g_lut[y] = ((y * 255) / g_den) as u8;
+        }
+    }
+
+    // Heap bulk fast-path: padded total <=16 MiB, LUT-covered.
+    // One heap buffer (rowbytes*height, includes stride padding) + one
+    // write_path, falls through on any failure so screen never stays black.
+    const MAX_COPY: usize = 16 * 1024 * 1024;
+    if use_r_lut && use_g_lut {
+        if let Some(total) = rowbytes.checked_mul(height) {
+            if total != 0 && total <= MAX_COPY {
+                let align = if bpp == 4 { 4 } else { 1 };
+                if let Ok(layout) = Layout::from_size_align(total, align) {
+                    let ptr = unsafe { alloc::alloc::alloc(layout) };
+                    if !ptr.is_null() {
+                        unsafe { core::ptr::write_bytes(ptr, 0, total) };
+                        if bpp == 4 {
+                            if is_rgb {
+                                for y in 0..height {
+                                    let g = g_lut[y] as u32;
+                                    let row_base = y * rowbytes;
+                                    for x in 0..width {
+                                        let r = r_lut[x] as u32;
+                                        let px: u32 = (0xFF << 24) | (64 << 16) | (g << 8) | r;
+                                        unsafe { *(ptr.add(row_base + x * 4) as *mut u32) = px; }
+                                    }
+                                }
+                            } else {
+                                for y in 0..height {
+                                    let g = g_lut[y] as u32;
+                                    let row_base = y * rowbytes;
+                                    for x in 0..width {
+                                        let r = r_lut[x] as u32;
+                                        let px: u32 = (0xFF << 24) | (r << 16) | (g << 8) | 64;
+                                        unsafe { *(ptr.add(row_base + x * 4) as *mut u32) = px; }
+                                    }
+                                }
+                            }
+                        } else if is_rgb {
+                            for y in 0..height {
+                                let g = g_lut[y];
+                                let row_base = y * rowbytes;
+                                for x in 0..width {
+                                    let r = r_lut[x];
+                                    let off = row_base + x * bpp;
+                                    unsafe {
+                                        *ptr.add(off) = r;
+                                        if bpp >= 2 { *ptr.add(off + 1) = g; }
+                                        if bpp >= 3 { *ptr.add(off + 2) = 64; }
+                                        if bpp >= 4 { *ptr.add(off + 3) = 255; }
+                                    }
+                                }
+                            }
+                        } else {
+                            for y in 0..height {
+                                let g = g_lut[y];
+                                let row_base = y * rowbytes;
+                                for x in 0..width {
+                                    let r = r_lut[x];
+                                    let off = row_base + x * bpp;
+                                    unsafe {
+                                        *ptr.add(off) = 64;
+                                        if bpp >= 2 { *ptr.add(off + 1) = g; }
+                                        if bpp >= 3 { *ptr.add(off + 2) = r; }
+                                        if bpp >= 4 { *ptr.add(off + 3) = 255; }
+                                    }
+                                }
+                            }
+                        }
+                        let buf = unsafe { core::slice::from_raw_parts_mut(ptr, total) };
+                        let r = unsafe { libc::syscall::write_path(b"/dev/fb\0", buf, total, 0) };
+                        unsafe { alloc::alloc::dealloc(ptr, layout) };
+                        if r >= 0 && (r as usize) == total {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Stack per-row fallback: 8 KiB row, one fast-path write per chunk.
+    const ROW_BUF_BYTES: usize = 8192;
+    if bpp > ROW_BUF_BYTES {
+        return;
+    }
     let pixels_per_chunk = ROW_BUF_BYTES / bpp;
     if pixels_per_chunk == 0 {
         return;
     }
-    // Gradient spans exactly 0..=255 across each axis (denominator = max index).
-    let r_den = width.saturating_sub(1).max(1);
-    let g_den = height.saturating_sub(1).max(1);
     let mut row = [0u8; ROW_BUF_BYTES];
     for y in 0..height {
+        let g = if use_g_lut { g_lut[y] } else { ((y * 255) / g_den) as u8 };
         let mut x = 0usize;
         while x < width {
             let count = (width - x).min(pixels_per_chunk);
             let bytes = count * bpp;
             row[..bytes].fill(0);
-            for i in 0..count {
-                let px = x + i;
-                let r = ((px * 255) / r_den) as u8;
-                let g = ((y * 255) / g_den) as u8;
-                let b = 64u8;
-                let a = 255u8;
-                let off = i * bpp;
-                row[off] = match mode.pixel_format {
-                    1 => r,
-                    _ => b,
-                };
-                if bpp >= 2 {
-                    row[off + 1] = g;
+            if is_rgb {
+                match bpp {
+                    4 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i] as u32;
+                                let gg = g as u32;
+                                let px: u32 = (0xFF << 24) | (64 << 16) | (gg << 8) | r;
+                                unsafe { *(row.as_mut_ptr().add(i * 4) as *mut u32) = px; }
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u32;
+                                let gg = g as u32;
+                                let px: u32 = (0xFF << 24) | (64 << 16) | (gg << 8) | r;
+                                unsafe { *(row.as_mut_ptr().add(i * 4) as *mut u32) = px; }
+                            }
+                        }
+                    }
+                    3 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i];
+                                let off = i * 3;
+                                row[off] = r;
+                                row[off + 1] = g;
+                                row[off + 2] = 64;
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u8;
+                                let off = i * 3;
+                                row[off] = r;
+                                row[off + 1] = g;
+                                row[off + 2] = 64;
+                            }
+                        }
+                    }
+                    2 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i];
+                                let off = i * 2;
+                                row[off] = r;
+                                row[off + 1] = g;
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u8;
+                                let off = i * 2;
+                                row[off] = r;
+                                row[off + 1] = g;
+                            }
+                        }
+                    }
+                    1 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                row[i] = r_lut[x + i];
+                            }
+                        } else {
+                            for i in 0..count {
+                                row[i] = ((x + i) * 255 / r_den) as u8;
+                            }
+                        }
+                    }
+                    _ => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i];
+                                let off = i * bpp;
+                                row[off] = r;
+                                if bpp >= 2 { row[off + 1] = g; }
+                                if bpp >= 3 { row[off + 2] = 64; }
+                                if bpp >= 4 { row[off + 3] = 255; }
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u8;
+                                let off = i * bpp;
+                                row[off] = r;
+                                if bpp >= 2 { row[off + 1] = g; }
+                                if bpp >= 3 { row[off + 2] = 64; }
+                                if bpp >= 4 { row[off + 3] = 255; }
+                            }
+                        }
+                    }
                 }
-                if bpp >= 3 {
-                    row[off + 2] = match mode.pixel_format {
-                        1 => b,
-                        _ => r,
-                    };
-                }
-                if bpp >= 4 {
-                    row[off + 3] = a;
+            } else {
+                match bpp {
+                    4 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i] as u32;
+                                let gg = g as u32;
+                                let px: u32 = (0xFF << 24) | (r << 16) | (gg << 8) | 64;
+                                unsafe { *(row.as_mut_ptr().add(i * 4) as *mut u32) = px; }
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u32;
+                                let gg = g as u32;
+                                let px: u32 = (0xFF << 24) | (r << 16) | (gg << 8) | 64;
+                                unsafe { *(row.as_mut_ptr().add(i * 4) as *mut u32) = px; }
+                            }
+                        }
+                    }
+                    3 => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i];
+                                let off = i * 3;
+                                row[off] = 64;
+                                row[off + 1] = g;
+                                row[off + 2] = r;
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u8;
+                                let off = i * 3;
+                                row[off] = 64;
+                                row[off + 1] = g;
+                                row[off + 2] = r;
+                            }
+                        }
+                    }
+                    2 => {
+                        for i in 0..count {
+                            let off = i * 2;
+                            row[off] = 64;
+                            row[off + 1] = g;
+                        }
+                    }
+                    1 => {
+                        for i in 0..count {
+                            row[i] = 64;
+                        }
+                    }
+                    _ => {
+                        if use_r_lut {
+                            for i in 0..count {
+                                let r = r_lut[x + i];
+                                let off = i * bpp;
+                                row[off] = 64;
+                                if bpp >= 2 { row[off + 1] = g; }
+                                if bpp >= 3 { row[off + 2] = r; }
+                                if bpp >= 4 { row[off + 3] = 255; }
+                            }
+                        } else {
+                            for i in 0..count {
+                                let r = ((x + i) * 255 / r_den) as u8;
+                                let off = i * bpp;
+                                row[off] = 64;
+                                if bpp >= 2 { row[off + 1] = g; }
+                                if bpp >= 3 { row[off + 2] = r; }
+                                if bpp >= 4 { row[off + 3] = 255; }
+                            }
+                        }
+                    }
                 }
             }
             let byte_off = (y * rowbytes + x * bpp) as u64;
-            let rw = libc::fb::write_at(byte_off, &row[..bytes]);
-            if rw < 0 {
+            let buf = &mut row[..bytes];
+            let r = unsafe { libc::syscall::write_path(b"/dev/fb\0", buf, bytes, byte_off) };
+            if r < 0 {
                 return;
             }
             x += count;

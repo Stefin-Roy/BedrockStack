@@ -296,8 +296,6 @@ fn write_prefix_into(buf: &mut [u8; 128], len: &mut usize, cpu_id: u32) {
     *len += 1;
     buf[*len] = b'U';
     *len += 1;
-    buf[*len] = b'(';
-    *len += 1;
     // Decimal digits.
     let mut digits = [0u8; 4];
     let mut d = 0;
@@ -314,8 +312,6 @@ fn write_prefix_into(buf: &mut [u8; 128], len: &mut usize, cpu_id: u32) {
         buf[*len] = digits[i];
         *len += 1;
     }
-    buf[*len] = b')';
-    *len += 1;
     buf[*len] = b']';
     *len += 1;
     buf[*len] = b' ';

@@ -561,6 +561,12 @@ impl Kernel {
             crate::task::init(self.page_table_root);
             #[cfg(feature = "selftest")]
             crate::task::smoke_test(&mut self.allocator);
+            // Audio pump: fire-forget queue so play_pcm/play_tone return
+            // immediately and never block INIT/DOOM; ISR zeroes consumed slots
+            // so drained audio becomes silence — no stale repetition after
+            // provider finished (old CBL=u32::MAX pump). 16×1024 ring
+            // (≈85 ms, staged cap ≈80 ms) + queue 4 for latency/robustness.
+            crate::audio::spawn_pump(&mut self.allocator);
         }
 
         // Stop the spinner: INIT's desktop paint takes over the screen now.
