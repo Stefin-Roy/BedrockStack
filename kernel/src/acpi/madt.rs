@@ -86,11 +86,17 @@ pub fn parse_madt(
         let offset = phys_addr & 0xFFF;
         let aligned = phys_addr - offset;
         let pages = ((length as u64) + offset + 0xFFF) & !0xFFF;
-        let new_vaddr = crate::acpi::map_device_mmio(
+        let new_vaddr = crate::acpi::try_map_device_mmio(
             aligned,
             pages,
             crate::mm::vmm::PageFlags::READ | crate::mm::vmm::PageFlags::WRITE,
-        ) + offset;
+        )
+        .map(|v| v + offset)
+        .unwrap_or_else(|e| {
+            log::error!("MADT re-map failed: {} (phys={:#x})", e, phys_addr);
+            // Return original vaddr to allow graceful error below, not panic.
+            vaddr
+        });
 
         SerialPort::puts("[madt] re-mapped to vaddr=");
         SerialPort::put_hex(new_vaddr);

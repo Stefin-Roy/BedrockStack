@@ -334,7 +334,7 @@ impl InodeOps for TmpfsInode {
                 let mut children = children.lock();
                 if !children.contains_key(old_name) { return Err(VfsError::NotFound); }
                 if children.contains_key(new_name) { return Err(VfsError::AlreadyExists); }
-                let inode = children.get(old_name).unwrap().clone();
+                let inode = children.get(old_name).ok_or(VfsError::NotFound)?.clone();
                 // Hard link: share inode (increase nlink conceptually, but we just clone Arc).
                 children.insert(String::from(new_name), inode);
                 Ok(())

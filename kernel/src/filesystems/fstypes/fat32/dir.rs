@@ -58,7 +58,11 @@ pub(super) fn read_dir_slots(
         ));
         for i in 0..entries_per_clus {
             let off = i * DIR_ENTRY_SIZE;
-            let entry: &[u8; DIR_ENTRY_SIZE] = &buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
+            let entry: &[u8; DIR_ENTRY_SIZE] = buf
+                .get(off..off + DIR_ENTRY_SIZE)
+                .ok_or(VfsError::IOError)?
+                .try_into()
+                .map_err(|_| VfsError::IOError)?;
             if entry[0] == DIR_END {
                 vfat_chain.clear();
                 end_of_dir = true;
@@ -263,9 +267,11 @@ where
 
             let mut vfat_buf: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
             for j in chain_start..i {
-                let e: &[u8; DIR_ENTRY_SIZE] = &buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE]
+                let e: &[u8; DIR_ENTRY_SIZE] = buf
+                    .get(j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE)
+                    .ok_or(VfsError::IOError)?
                     .try_into()
-                    .unwrap();
+                    .map_err(|_| VfsError::IOError)?;
                 vfat_buf.push(*e);
             }
             let entry_name = if !vfat_buf.is_empty() {
@@ -278,8 +284,11 @@ where
             };
 
             if entry_name.eq_ignore_ascii_case(name) {
-                let mut sfn_entry: [u8; DIR_ENTRY_SIZE] =
-                    buf[off..off + DIR_ENTRY_SIZE].try_into().unwrap();
+                let mut sfn_entry: [u8; DIR_ENTRY_SIZE] = buf
+                    .get(off..off + DIR_ENTRY_SIZE)
+                    .ok_or(VfsError::IOError)?
+                    .try_into()
+                    .map_err(|_| VfsError::IOError)?;
                 f(&mut sfn_entry);
                 buf[off..off + DIR_ENTRY_SIZE].copy_from_slice(&sfn_entry);
                 write_cluster(sb, cluster, &buf)?;
@@ -362,9 +371,11 @@ pub(super) fn remove_dir_entries(
 
             let mut vfat_buf: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
             for j in chain_start..i {
-                let e = &buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE]
+                let e: &[u8; DIR_ENTRY_SIZE] = buf
+                    .get(j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE)
+                    .ok_or(VfsError::IOError)?
                     .try_into()
-                    .unwrap();
+                    .map_err(|_| VfsError::IOError)?;
                 vfat_buf.push(*e);
             }
             let entry_name = if !vfat_buf.is_empty() {

@@ -10,16 +10,29 @@ fn checksum(buf: &[u8]) -> bool {
 }
 
 fn map_region(paddr: u64, size: u64) -> u64 {
+    // Fallible ACPI VMM path: malformed size must not `panic=abort`.
+    // Tables parsing is fallible (`Result`) so try_map failure is propagated
+    // via a sentinel that callers validate; where `?` is needed we use
+    // `try_map_region` instead.
+    try_map_region(paddr, size).unwrap_or_else(|e| {
+        log::error!("ACPI tables: map_region failed: {} (paddr={:#x} size={:#x})", e, paddr, size);
+        // Sentinel — callers that deref this will fault or bounds-check,
+        // but we avoid `panic=abort` on the VMM reservation itself.
+        0
+    })
+}
+
+fn try_map_region(paddr: u64, size: u64) -> Result<u64, &'static str> {
     let offset = paddr & 0xFFF;
     let aligned = paddr - offset;
     let total = size + offset;
     let pages = (total + 0xFFF) & !0xFFF;
-    let vaddr = crate::acpi::map_device_mmio(
+    let vaddr = crate::acpi::try_map_device_mmio(
         aligned,
         pages,
         crate::mm::vmm::PageFlags::READ | crate::mm::vmm::PageFlags::WRITE,
-    );
-    vaddr + offset
+    )?;
+    Ok(vaddr + offset)
 }
 
 pub struct SdtEntry {
@@ -99,7 +112,7 @@ pub fn parse_tables_from_data(rsdp_data: &[u8]) -> Result<Vec<SdtEntry>, AcpiErr
 /// Maps a minimum of 36 bytes, then re-maps with the full length reported
 /// in the RSDP for ACPI 2.0+ before delegating to `parse_tables_from_data`.
 pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
-    let rsdp_vaddr = map_region(rsdp_addr, 36);
+    let rsdp_vaddr = try_map_region(rsdp_addr, 36).map_err(|_| AcpiError::InvalidData)?;
 
     let raw = unsafe { core::slice::from_raw_parts(rsdp_vaddr as *const u8, 36) };
     if &raw[..8] != b"RSD PTR " {
@@ -125,7 +138,7 @@ pub fn parse_tables(rsdp_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     // Re-map with the full RSDP length for ACPI 2.0+ (needed for the extended
     // checksum and in case the initial 36 bytes were insufficient).
     let rsdp_data = if length as u64 > 36 {
-        let vaddr = map_region(rsdp_addr, length as u64);
+        let vaddr = try_map_region(rsdp_addr, length as u64).map_err(|_| AcpiError::InvalidData)?;
         unsafe { core::slice::from_raw_parts(vaddr as *const u8, length as usize) }
     } else {
         raw
@@ -138,7 +151,7 @@ fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if xsdt_addr == 0 {
         return Err(AcpiError::TableNotFound);
     }
-    let vaddr = map_region(xsdt_addr, 8);
+    let vaddr = try_map_region(xsdt_addr, 8).map_err(|_| AcpiError::InvalidData)?;
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
@@ -146,7 +159,7 @@ fn walk_xsdt(xsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if hdr_len < 36 || hdr_len > 0x0100_0000 {
         return Err(AcpiError::InvalidData);
     }
-    let vaddr = map_region(xsdt_addr, hdr_len as u64);
+    let vaddr = try_map_region(xsdt_addr, hdr_len as u64).map_err(|_| AcpiError::InvalidData)?;
 
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
     if !checksum(raw) {
@@ -184,7 +197,7 @@ fn walk_rsdt(rsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if rsdt_addr == 0 {
         return Err(AcpiError::TableNotFound);
     }
-    let vaddr = map_region(rsdt_addr, 8);
+    let vaddr = try_map_region(rsdt_addr, 8).map_err(|_| AcpiError::InvalidData)?;
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
@@ -192,7 +205,7 @@ fn walk_rsdt(rsdt_addr: u64) -> Result<Vec<SdtEntry>, AcpiError> {
     if hdr_len < 36 || hdr_len > 0x0100_0000 {
         return Err(AcpiError::InvalidData);
     }
-    let vaddr = map_region(rsdt_addr, hdr_len as u64);
+    let vaddr = try_map_region(rsdt_addr, hdr_len as u64).map_err(|_| AcpiError::InvalidData)?;
 
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
     if !checksum(raw) {
@@ -220,7 +233,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
     if phys_addr == 0 {
         return Ok(None);
     }
-    let vaddr = map_region(phys_addr, 8);
+    let vaddr = try_map_region(phys_addr, 8).map_err(|_| AcpiError::InvalidData)?;
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
@@ -235,7 +248,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
         return Ok(None);
     }
 
-    let vaddr = map_region(phys_addr, hdr_len as u64);
+    let vaddr = try_map_region(phys_addr, hdr_len as u64).map_err(|_| AcpiError::InvalidData)?;
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
 
     if !checksum(raw) {
@@ -278,7 +291,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
 /// other tables rather than walked from the RSDT/XSDT (e.g. the DSDT pointer
 /// in the FADT). Returns `None` when the table is missing or malformed.
 pub fn map_sdt_bytes(phys_addr: u64, expected_sig: &[u8; 4]) -> Option<&'static [u8]> {
-    let vaddr = map_region(phys_addr, 8);
+    let vaddr = try_map_region(phys_addr, 8).ok()?;
     let hdr_len = unsafe {
         let p = vaddr as *const u8;
         u32::from_le_bytes([*p.add(4), *p.add(5), *p.add(6), *p.add(7)])
@@ -291,7 +304,7 @@ pub fn map_sdt_bytes(phys_addr: u64, expected_sig: &[u8; 4]) -> Option<&'static 
         );
         return None;
     }
-    let vaddr = map_region(phys_addr, hdr_len as u64);
+    let vaddr = try_map_region(phys_addr, hdr_len as u64).ok()?;
     let raw = unsafe { core::slice::from_raw_parts(vaddr as *const u8, hdr_len as usize) };
     if !checksum(raw) || &raw[0..4] != expected_sig {
         log::warn!("ACPI table at 0x{:x}: bad signature/checksum", phys_addr);

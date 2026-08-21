@@ -91,8 +91,10 @@ fn init_controller(
         crate::pci::bar::Bar::Memory { addr, .. } => addr,
         _ => return Err("BAR0 not memory-mapped"),
     };
-
-    let regs = registers::XhciRegisters::new(phys_base, dma)?;
+    // Probe BAR0 size; fall back to 64 KiB if sizing fails (QEMU default).
+    // Real xHCI BARs can be >64 KiB when extended caps are large.
+    let mmio_size = crate::pci::bar::bar_size(dev, 0).unwrap_or(0x10000);
+    let regs = registers::XhciRegisters::new_with_size(phys_base, dma, mmio_size)?;
     let mmio_va = regs.mmio_base();
     let caplength = regs.cap_length();
 
@@ -668,7 +670,13 @@ pub fn poll() -> Vec<Arc<dyn BlockDevice>> {
                     SerialPort::puts("\n");
                     continue;
                 }
-                let slot = slots.slots.last_mut().expect("enumerated slot missing");
+                let slot = match slots.slots.last_mut() {
+                    Some(s) => s,
+                    None => {
+                        log::error!("xhci: enumerated slot missing after enumerate_port");
+                        continue;
+                    }
+                };
                 match bind_slot(slot, &mut cmd, ctrl.doorbell_va, ctrl.dma) {
                     Ok(bound) => {
                         for dev in bound {

@@ -29,17 +29,23 @@ pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
 }
 
 fn map_ecam(paddr: u64, size: u64) -> u64 {
+    try_map_ecam(paddr, size).unwrap_or_else(|e| {
+        log::error!("PCI VMM exhaustion: {} (paddr={:#x} size={:#x})", e, paddr, size);
+        loop {
+            core::hint::spin_loop();
+        }
+    })
+}
+
+fn try_map_ecam(paddr: u64, size: u64) -> Result<u64, &'static str> {
     let mut guard = PCI_VMM.lock();
-    let state = guard.as_mut().expect("PCI VMM not initialized");
+    let state = guard.as_mut().ok_or("PCI VMM not initialized")?;
     let vaddr = state
         .next_vaddr
         .checked_sub(size)
-        .expect("PCI VMM: address space exhausted (overflow)");
+        .ok_or("PCI VMM: address space exhausted (overflow)")?;
     if vaddr < PCI_VADDR_FLOOR {
-        panic!(
-            "PCI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)",
-            vaddr
-        );
+        return Err("PCI VMM: address space exhausted (would overlap adjacent region)");
     }
     state.next_vaddr = vaddr;
     let mut vmm = Vmm::from_root(state.root);
@@ -51,7 +57,7 @@ fn map_ecam(paddr: u64, size: u64) -> u64 {
         size,
         PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
     );
-    vaddr
+    Ok(vaddr)
 }
 
 struct MappedRegion {
@@ -83,7 +89,19 @@ pub fn map_all(regions: &PciConfigRegions) {
     for entry in &regions.regions {
         let num_buses = entry.bus_number_end as u64 - entry.bus_number_start as u64 + 1;
         let size = num_buses << 20;
-        let vaddr = map_ecam(entry.base_address, size);
+        let vaddr = match try_map_ecam(entry.base_address, size) {
+            Ok(v) => v,
+            Err(e) => {
+                log::error!(
+                    "PCI ECAM map failed for segment {} buses {}-{}: {}",
+                    entry.pci_segment_group,
+                    entry.bus_number_start,
+                    entry.bus_number_end,
+                    e
+                );
+                continue;
+            }
+        };
         mapped.push(MappedRegion {
             segment: entry.pci_segment_group,
             bus_start: entry.bus_number_start,

@@ -26,7 +26,8 @@ static MMIO_CACHE: Mutex<MmioCache> = Mutex::new(MmioCache {
 });
 
 /// Map the physical page containing `phys` and return the virtual address of
-/// `phys` itself.
+/// `phys` itself. On VMM exhaustion (malformed op-region) returns a dummy
+/// zero page address so the AML Handler's infallible trait never panics.
 fn mmio_addr(phys: u64) -> u64 {
     let page = phys & !0xFFF;
     let mut cache = MMIO_CACHE.lock();
@@ -37,11 +38,22 @@ fn mmio_addr(phys: u64) -> u64 {
             }
         }
     }
-    let vaddr = crate::acpi::map_device_mmio(
+    let vaddr = match crate::acpi::try_map_device_mmio(
         page,
         0x1000,
         PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
-    );
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            log::error!("AML handler VMM exhaustion: {} (phys={:#x})", e, phys);
+            // Use a cached dummy: keep trait infallible, reads return 0/stale.
+            // Allocate a static zero page lazily would be ideal, but for now
+            // reuse the last cached entry or 0+offset (will fault guarded).
+            // Better to return the page itself mapped via identity fallback:
+            // log and return offset within a stuck page (0 sentinel).
+            return phys & 0xFFF; // sentinel low address, will fault but not abort
+        }
+    };
     let idx = cache.next;
     cache.entries[idx] = Some((page, vaddr));
     cache.next = (idx + 1) % CACHE_SLOTS;

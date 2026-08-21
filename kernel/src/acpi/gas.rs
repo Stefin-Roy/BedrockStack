@@ -2,16 +2,25 @@ use crate::acpi::platform::{AcpiError, Gas};
 use crate::mm::vmm::PageFlags;
 
 fn map_phys(paddr: u64, size: u64) -> u64 {
+    try_map_phys(paddr, size).unwrap_or_else(|e| {
+        log::error!("GAS map_phys failed: {} (paddr={:#x} size={})", e, paddr, size);
+        // Return 0 sentinel; caller will handle via mmio_read/write error propagation.
+        // Avoid `panic=abort` on VMM exhaustion from malformed GAS.
+        0
+    })
+}
+
+fn try_map_phys(paddr: u64, size: u64) -> Result<u64, &'static str> {
     let offset = paddr & 0xFFF;
     let aligned = paddr - offset;
     let total = size + offset;
     let pages = (total + 0xFFF) & !0xFFF;
-    let vaddr = crate::acpi::map_device_mmio(
+    let vaddr = crate::acpi::try_map_device_mmio(
         aligned,
         pages,
         PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
-    );
-    vaddr + offset
+    )?;
+    Ok(vaddr + offset)
 }
 
 fn mmio_read(addr: u64, width: u8) -> Result<u64, AcpiError> {
@@ -110,6 +119,9 @@ pub fn gas_read(gas: &Gas) -> Result<u64, AcpiError> {
         0 => {
             let size = ((width as u64 + 7) / 8).max(1);
             let vaddr = map_phys(gas.address, size);
+            if vaddr == 0 {
+                return Err(AcpiError::InvalidData);
+            }
             mmio_read(vaddr, width)
         }
         1 => port_in(gas.address as u16, width).map(|v| v as u64),
@@ -127,6 +139,9 @@ pub fn gas_write(gas: &Gas, value: u64) -> Result<(), AcpiError> {
         0 => {
             let size = ((width as u64 + 7) / 8).max(1);
             let vaddr = map_phys(gas.address, size);
+            if vaddr == 0 {
+                return Err(AcpiError::InvalidData);
+            }
             mmio_write(vaddr, value, width)
         }
         1 => port_out(gas.address as u16, value as u32, width),

@@ -66,7 +66,7 @@ impl BlockCache {
             self.sectors.insert(lba, CachedSector { data: buf });
             self.clock.push(lba);
         }
-        Ok(&self.sectors.get(&lba).unwrap().data)
+        Ok(&self.sectors.get(&lba).ok_or(())?.data)
     }
 
     fn read_raw(

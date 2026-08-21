@@ -65,29 +65,40 @@ pub fn update_alloc(alloc: *mut BitmapAllocator) {
 const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
 
 /// Map a physical MMIO region through the ACPI VMM.
+/// Returns `Err` on VMM exhaustion instead of panicking — a malformed ACPI
+/// table could otherwise force a `panic=abort`.
 pub fn map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> u64 {
+    try_map_device_mmio(paddr, size, flags).unwrap_or_else(|e| {
+        log::error!("ACPI VMM exhaustion: {} (paddr={:#x} size={:#x})", e, paddr, size);
+        // Exhaustion is fatal for this boot path; loop rather than `panic=abort`.
+        // Callers that can handle failure should use `try_map_device_mmio`.
+        loop {
+            core::hint::spin_loop();
+        }
+    })
+}
+
+/// Fallible variant — returns `Err` on VMM exhaustion or uninitialized state.
+pub fn try_map_device_mmio(paddr: u64, size: u64, flags: PageFlags) -> Result<u64, &'static str> {
     let mut guard = ACPI_STATE.lock();
     let state = guard
         .as_mut()
-        .expect("ACPI VMM not initialized — call init_vmm first");
+        .ok_or("ACPI VMM not initialized — call init_vmm first")?;
     // Page-round the reservation so successive small mappings can never
     // overlap within a shared page.
     let pages = (size + 0xFFF) & !0xFFF;
     let vaddr = state
         .next_vaddr
         .checked_sub(pages)
-        .expect("ACPI VMM: address space exhausted (overflow)");
+        .ok_or("ACPI VMM: address space exhausted (overflow)")?;
     if vaddr < ACPI_VADDR_FLOOR {
-        panic!(
-            "ACPI VMM: address space exhausted (vaddr {:#x} would overlap adjacent region)",
-            vaddr
-        );
+        return Err("ACPI VMM: address space exhausted (would overlap adjacent region)");
     }
     state.next_vaddr = vaddr;
     let mut vmm = Vmm::from_root(state.root);
     let alloc = unsafe { &mut *state.alloc };
     vmm.map(alloc, vaddr, paddr, pages, flags);
-    vaddr
+    Ok(vaddr)
 }
 
 fn sig(s: &[u8; 4]) -> u32 {

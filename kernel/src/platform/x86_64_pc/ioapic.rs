@@ -46,12 +46,18 @@ fn ioapic_read(state: &IoApicState, reg: u32) -> u32 {
 }
 
 /// Map the IOAPIC physical MMIO region into the virtual address space.
+/// On VMM exhaustion (malformed MADT) returns 0 sentinel; caller `init` will
+/// then create a state that reads as all-masked (no IRQs) rather than abort.
 fn map_ioapic_mmio(phys: u64) -> u64 {
-    crate::acpi::map_device_mmio(
+    crate::acpi::try_map_device_mmio(
         phys,
         4096,
         PageFlags::READ | PageFlags::WRITE | PageFlags::NO_CACHE,
     )
+    .unwrap_or_else(|e| {
+        log::error!("IOAPIC VMM exhaustion: {} (phys={:#x})", e, phys);
+        0
+    })
 }
 
 /// Initialise the IOAPIC driver.
@@ -60,6 +66,10 @@ fn map_ioapic_mmio(phys: u64) -> u64 {
 /// redirection entries so no stray interrupts fire before we set them up.
 pub fn init(phys_base: u64, gsi_base: u32) {
     let vaddr = map_ioapic_mmio(phys_base);
+    if vaddr == 0 {
+        log::error!("IOAPIC init failed: VMM mapping returned 0 for phys {:#x}", phys_base);
+        return;
+    }
 
     let state = IoApicState {
         base_virt: vaddr,

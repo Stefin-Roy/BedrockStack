@@ -86,7 +86,7 @@ fn resolve_parent(path: &str) -> Result<(Arc<Dentry>, String), VfsError> {
     if components.is_empty() {
         return Err(VfsError::InvalidInput);
     }
-    let leaf_name = String::from(*components.last().unwrap());
+    let leaf_name = String::from(*components.last().ok_or(VfsError::InvalidInput)?);
     let parent_components = &components[..components.len() - 1];
 
     let parent = if parent_components.is_empty() {
