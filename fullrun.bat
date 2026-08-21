@@ -28,6 +28,11 @@ set EXTRA_FEATURES=%3
 REM Set to 1 to gate the CPU slow mode feature (Intel-only, x86_64 only).
 if "%CPU_SLOW%"=="" set CPU_SLOW=1
 
+REM Vendored sources for kernel/boot only — third_party/dependencies is pruned via tools/prune-vendor.py.
+REM User crates (-Zbuild-std) stay on crates.io (see user/x86_64-bedrock-user.json comments).
+REM Cargo --config quoting: outer double quotes for cmd.exe, inner single quotes for TOML string.
+set "VENDOR_ARGS=--config ""source.crates-io.replace-with='vendored-sources'"" --config ""source.vendored-sources.directory='third_party/dependencies'"""
+
 if /i "%ARCH%"=="x86_64" if /i "%BOOT_MODE%"=="grub" goto :arch_x86_64_grub
 if /i "%ARCH%"=="x86_64" goto :arch_x86_64
 if /i "%ARCH%"=="riscv64" goto :arch_riscv64
@@ -82,7 +87,7 @@ if "%CPU_SLOW%"=="1" set BASE_FEATURES=cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=
 if not "%BASE_FEATURES%"=="" set CARGO_FEATURES=--features "%BASE_FEATURES%"
-cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
+cargo build --target x86_64-unknown-none -p kernel %VENDOR_ARGS% %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"
@@ -97,7 +102,7 @@ echo --- boot build --- >> "%LOG_FILE%"
 echo %date% %time% >> "%LOG_FILE%"
 set CARGO_FEATURES=
 if "%CPU_SLOW%"=="1" set CARGO_FEATURES=--features cpu_slow
-cargo build --target x86_64-unknown-uefi -p boot %CARGO_FEATURES% 2>&1
+cargo build --target x86_64-unknown-uefi -p boot %VENDOR_ARGS% %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: boot build failed with exit code %errorlevel%
     echo boot build FAILED: exit %errorlevel% >> "%LOG_FILE%"
@@ -188,7 +193,7 @@ set BASE_FEATURES=
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=
 if not "%BASE_FEATURES%"=="" set CARGO_FEATURES=--features "%BASE_FEATURES%"
-cargo build --target riscv64gc-unknown-none-elf -p kernel %CARGO_FEATURES% 2>&1
+cargo build --target riscv64gc-unknown-none-elf -p kernel %VENDOR_ARGS% %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"
@@ -294,7 +299,7 @@ set BASE_FEATURES=kernelmb2
 if "%CPU_SLOW%"=="1" set BASE_FEATURES=%BASE_FEATURES% cpu_slow
 if not "%EXTRA_FEATURES%"=="" set BASE_FEATURES=%BASE_FEATURES% %EXTRA_FEATURES%
 set CARGO_FEATURES=--features "%BASE_FEATURES%"
-cargo build --target x86_64-unknown-none -p kernel %CARGO_FEATURES% 2>&1
+cargo build --target x86_64-unknown-none -p kernel %VENDOR_ARGS% %CARGO_FEATURES% 2>&1
 if %errorlevel% neq 0 (
     echo [fullrun] ERROR: kernel build failed with exit code %errorlevel%
     echo kernel build FAILED: exit %errorlevel% >> "%LOG_FILE%"

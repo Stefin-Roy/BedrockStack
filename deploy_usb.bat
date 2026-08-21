@@ -3,6 +3,8 @@ setlocal EnableDelayedExpansion
 set SCRIPT_DIR=%~dp0
 set TARGET_DIR=%SCRIPT_DIR%target
 set USB_DIR=%SCRIPT_DIR%USB
+REM Vendored kernel/boot deps — third_party/dependencies pruned via tools/prune-vendor.py
+set "VENDOR_ARGS=--config ""source.crates-io.replace-with='vendored-sources'"" --config ""source.vendored-sources.directory='third_party/dependencies'"""
 
 set BOOT_MODE=%1
 if "%BOOT_MODE%"=="" set BOOT_MODE=uefi
@@ -11,14 +13,14 @@ if /i "%BOOT_MODE%"=="grub" goto :deploy_grub
 goto :deploy_uefi
 
 :deploy_uefi
-REM Build kernel with cpu_slow (release)
+REM Build kernel with cpu_slow (release) — vendored
 echo [1/4] Building kernel (release, features: cpu_slow)...
-cargo build --target x86_64-unknown-none -p kernel --features cpu_slow --release
+cargo build --target x86_64-unknown-none -p kernel --features cpu_slow --release %VENDOR_ARGS%
 if %errorlevel% neq 0 exit /b %errorlevel%
 
-REM Build bootloader with cpu_slow (release)
+REM Build bootloader with cpu_slow (release) — vendored
 echo [2/4] Building bootloader (release, features: cpu_slow)...
-cargo build --target x86_64-unknown-uefi -p boot --features cpu_slow --release
+cargo build --target x86_64-unknown-uefi -p boot --features cpu_slow --release %VENDOR_ARGS%
 if %errorlevel% neq 0 exit /b %errorlevel%
 
  REM Build user INIT (release)
@@ -50,8 +52,8 @@ goto :done
 
 :deploy_grub
 echo === GRUB+Multiboot2 USB deployment ===
-echo [1/3] Building kernel (release, kernelmb2)...
-cargo build --target x86_64-unknown-none -p kernel --features "kernelmb2 cpu_slow" --release
+echo [1/3] Building kernel (release, kernelmb2) — vendored...
+cargo build --target x86_64-unknown-none -p kernel --features "kernelmb2 cpu_slow" --release %VENDOR_ARGS%
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/3] Building user init (release)...

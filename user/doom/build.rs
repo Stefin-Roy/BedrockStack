@@ -41,6 +41,19 @@ fn hash(s: &str) -> u32 {
     h
 }
 
+/// Opt-in sccache prefix for WSL gcc. `SCCACHE=1` or `RUSTC_WRAPPER=sccache` enables `sccache gcc`.
+/// Install sccache in WSL (`cargo install sccache`) and on Windows for Rust (`cargo install sccache`).
+fn gcc_prefix() -> &'static str {
+    let want = std::env::var("SCCACHE").is_ok()
+        || std::env::var("RUSTC_WRAPPER")
+            .map(|v| v.contains("sccache"))
+            .unwrap_or(false)
+        || std::env::var("CC_WRAPPER")
+            .map(|v| v.contains("sccache"))
+            .unwrap_or(false);
+    if want { "sccache gcc" } else { "gcc" }
+}
+
 /// Translate a Windows path (`D:\a\b`) to the WSL view (`/mnt/d/a/b`).
 /// Handles the `\\?\` extended-length prefix that `canonicalize()` emits.
 fn to_wsl(p: &Path) -> String {
@@ -126,7 +139,9 @@ fn main() {
 
     let ws_wsl = to_wsl(&ws);
     let flag_key = WSL_GCC_FLAGS.join("\x1f");
+    let gcc_bin = gcc_prefix();
     let mut objs: Vec<String> = Vec::new();
+    let mut any_stale = false;
     for f in &files {
         let src = ws.join(f);
         println!("cargo:rerun-if-changed={}", src.display());
@@ -148,13 +163,26 @@ fn main() {
             _ => false,
         };
         if stale {
-            let cmd = format!(
-                "cd {} && gcc {} {} -o {} 2>&1",
-                ws_wsl,
-                WSL_GCC_FLAGS.join(" "),
-                to_wsl(&src),
-                to_wsl(&obj),
-            );
+            any_stale = true;
+            // When sccache is opted-in (SCCACHE/RUSTC_WRAPPER) we try `sccache gcc` if
+            // it exists inside WSL, otherwise fall back to plain `gcc` so the build
+            // still succeeds when only Windows sccache is installed.
+            let gcc_cmd = if gcc_bin == "sccache gcc" {
+                format!(
+                    "if command -v sccache >/dev/null 2>&1; then sccache gcc {flags} {src} -o {obj}; else gcc {flags} {src} -o {obj}; fi",
+                    flags = WSL_GCC_FLAGS.join(" "),
+                    src = to_wsl(&src),
+                    obj = to_wsl(&obj),
+                )
+            } else {
+                format!(
+                    "gcc {} {} -o {}",
+                    WSL_GCC_FLAGS.join(" "),
+                    to_wsl(&src),
+                    to_wsl(&obj),
+                )
+            };
+            let cmd = format!("cd {} && {} 2>&1", ws_wsl, gcc_cmd);
             match wsl_ok(&cmd) {
                 Ok(out) => {
                     if !out.trim().is_empty() {
@@ -173,15 +201,20 @@ fn main() {
     // replace the generated archive before collecting the current objects;
     // otherwise old small-model members would be linked alongside the new
     // large-model objects.
-    let _ = fs::remove_file(&archive);
-    let ar_cmd = format!(
-        "cd {} && ar rcs {} {}",
-        ws_wsl,
-        to_wsl(&archive),
-        objs.join(" "),
-    );
-    if let Err(e) = wsl_ok(&ar_cmd) {
-        panic!("ar failed: {e}");
+    // Only recreate archive if something was stale or archive is missing — avoids
+    // touching mtime on no-op builds (which would dirty the link fingerprint).
+    let need_archive = any_stale || !archive.exists();
+    if need_archive {
+        let _ = fs::remove_file(&archive);
+        let ar_cmd = format!(
+            "cd {} && ar rcs {} {}",
+            ws_wsl,
+            to_wsl(&archive),
+            objs.join(" "),
+        );
+        if let Err(e) = wsl_ok(&ar_cmd) {
+            panic!("ar failed: {e}");
+        }
     }
 
     println!("cargo:rustc-link-search=native={}", out.display());

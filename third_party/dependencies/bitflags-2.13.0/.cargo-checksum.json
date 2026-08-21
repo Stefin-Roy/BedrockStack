@@ -1,0 +1,27 @@
+{
+    "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
+    "files": {
+        "CHANGELOG.md": "3e8ff315f0c1615b7a54ac86d1645c8e7e722e7a083b17125ba4ca2bef8592f2",
+        "CODE_OF_CONDUCT.md": "42634d0f6d922f49857175af991802822f7f920487aefa2ee250a50d12251a66",
+        "CONTRIBUTING.md": "6c9f96eacb20af877ae2d16f024904f3038b93448a8488e9dbcac0df7f6439a5",
+        "Cargo.toml": "7fd26ca6a1546a98958b029f794a69e4f146d2d5ae387b784e6dda6111226a63",
+        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+        "LICENSE-MIT": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb",
+        "README.md": "ee99b7fa8e03fe8839cd4de81b0bee6d5fc621d81121b90952807061aab7aefb",
+        "SECURITY.md": "68704c8128fa2e776ed7cbda741fbf61ad52f998a96350ee7ee4dbf64c6573bc",
+        "spec.md": "f0657642c7cf470e6d6e55362aaab224b3df0f22cb7796b109bb41687acea8b1",
+        "src/example_generated.rs": "b924402c6ae9ed1ed0d67bdc0d8de1c0c557e10b5945e27cf6eca89fd26b4675",
+        "src/external.rs": "635bd48b03252b2bf1a48f22325c10a03a024019f054e0cbb6a061453fdcb557",
+        "src/external/arbitrary.rs": "43908bb4fe0a076078dcb3fa70c654aaed8c7b38aa66574414165a82037def83",
+        "src/external/bytemuck.rs": "3afcef382122867040fddd5e4153d633d1ed5596fe5d7dfac66a8e61c2513df5",
+        "src/external/serde.rs": "0f7339036f41cd93f29b21b954bc1f0fd747762f7a4f20d4ebfc848b20584dc8",
+        "src/internal.rs": "645b13af0c7302258df61239073a4b8203d09f27b6c17f8a6f1f8c3e427f5334",
+        "src/iter.rs": "5865e1763858b9064bab98913b85ce7ce88a28ad8d688b80dbd2c5c394b2b757",
+        "src/lib.rs": "d4c51a96b566ccdeb4db2b367952645c4828d026079cad18f743761386585639",
+        "src/parser.rs": "4e788b29f5d0542c409a8b43c703bcb4a6c2a57c181cadd17f565f0abb39681e",
+        "src/public.rs": "3ead0399297541b1d79d0167e1023da6068ba89c9ac44f13470f276a10881d56",
+        "src/tests.rs": "4850df3086d8a9d37095d918c07d250a7ef46bf9999f2f361605aa3495515379",
+        "src/traits.rs": "154244d22577c4825ab573e9b251084555d6b4f45d7660d6967559c0dc6798e2"
+    },
+    "package": "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+}

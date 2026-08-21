@@ -1,0 +1,15 @@
+{
+    "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
+    "files": {
+        "CHANGELOG.md": "93417c5471a03dc1480e4df1cd5c9a3f6346967da45f5993dbb9cc7ac206082a",
+        "Cargo.toml": "7849968cb60cdd8d0c87f66e67b5513f149101fb6049c486db0a80d06682e97a",
+        "LICENSE-APACHE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "LICENSE-MIT": "fe6a6f46ad26d0f7427fea4d1e3c225fed7bc731e65411073e87d18b5b6b70d7",
+        "README.md": "f65a8f8f3a5f8e72c20f9cb2e3feb4a484c247acf104cf9296ab3f5d97390776",
+        "src/error.rs": "287a8bc3020698de7597cc15d35131280959dc62b85be961efdd9519fb6c0285",
+        "src/guid.rs": "7e1413a68f5bc808a8d2052094c99a944ed1f14f52b544f52e7bfa9537ef0d2a",
+        "src/lib.rs": "c651ffb530ef1e7fa8c73143de5dc0c7f7ce201c28816b314be14f625aa88ba6",
+        "src/util.rs": "484d7624099eaa4808fc2d6e74d22e3cea9e85745cde5095fc6af0e904f3cf63"
+    },
+    "package": "0c8352f8c05e47892e7eaf13b34abd76a7f4aeaf817b716e88789381927f199c"
+}
