@@ -330,6 +330,17 @@ fn sys_write(frame: &mut SyscallFrame) {
     // — one copy, no allocations.  `r10` keeps its meaning as the byte offset
     // (`flags`).
     if path == "/dev/fb" {
+        // Caps check for /dev/fb write (needs RW on dev/fb + ancestors)
+        if let Some(caps) = crate::caps::current_caps() {
+            let parsed = match crate::unispace::path::parse(&path) {
+                Ok(p) => p,
+                Err(e) => { frame.rax = errno(e) as u64; return; }
+            };
+            if let Err(e) = crate::caps::check_path(Some(&caps), &parsed.components, None, crate::caps::Perm::RW) {
+                frame.rax = errno(e) as u64;
+                return;
+            }
+        }
         let src = frame.rsi;
         let len = frame.rdx;
         let root = match current_task_root() {
@@ -543,6 +554,7 @@ fn errno(e: UnispaceError) -> i64 {
         OutOfMemory => -12,                                // ENOMEM
         BadAddress => -14,                                 // EFAULT
         InvalidArgument => -22,                            // EINVAL
+        AccessDenied => -13,                               // EACCES
         MethodNotFound => -38,                             // ENOSYS
         Vfs(_) => -5,                                      // EIO
     }

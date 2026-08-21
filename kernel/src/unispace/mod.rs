@@ -128,6 +128,8 @@ pub enum UnispaceError {
     /// The request argument was structurally valid but semantically rejected
     /// (maps to `-EINVAL`, e.g. a non-page-aligned `munmap`).
     InvalidArgument,
+    /// Capability denied (R present but not RW) — maps to `-EACCES` (13).
+    AccessDenied,
     Vfs(VfsError),
 }
 
@@ -435,11 +437,32 @@ pub fn read_flags(
     max: usize,
     flags: u64,
 ) -> Result<(), UnispaceError> {
+    let parsed = path::parse(path)?;
+    let caps_opt = crate::caps::current_caps();
+    // Caps checks: ancestor R + leaf/method R
+    if let Some(ref caps) = caps_opt {
+        let leaf_want = crate::caps::Perm::R;
+        match parsed.method {
+            Some("desc") => {
+                // need leaf R + ancestors R
+                crate::caps::check_path(Some(caps), &parsed.components, None, leaf_want)?;
+            }
+            Some(m) => {
+                // per-method R (requires leaf R as well inside check_path)
+                crate::caps::check_path(Some(caps), &parsed.components, Some(m), leaf_want)?;
+            }
+            None => {
+                // will resolve to dir or file; both need leaf R
+                // For empty path ("/") leaf_path is "".
+                crate::caps::check_path(Some(caps), &parsed.components, None, leaf_want)?;
+            }
+        }
+    }
     let (obj, method) = resolve(path)?;
     match method {
         Some("desc") => {
             let mut v = Vec::new();
-            encode_object_desc(&*obj, &mut v)?;
+            encode_object_desc_filtered(&*obj, &parsed, caps_opt.as_deref(), &mut v)?;
             if v.len() > max {
                 return Err(UnispaceError::InvalidArgument);
             }
@@ -467,6 +490,11 @@ pub fn read_flags(
                 }
                 let mut entries = Vec::new();
                 obj.list(&mut entries)?;
+                // Filter by per-child R
+                let dir_path = crate::caps::join_path(&parsed.components);
+                if let Some(ref caps) = caps_opt {
+                    entries = crate::caps::filter_listing(caps, &dir_path, entries);
+                }
                 encode_listing(entries, out)
             } else {
                 obj.read_value_flags(out, max, flags)
@@ -490,6 +518,28 @@ pub fn write_flags(
     out: &mut Vec<u8>,
     flags: u64,
 ) -> Result<(), UnispaceError> {
+    let parsed = path::parse(path)?;
+    let caps_opt = crate::caps::current_caps();
+    if let Some(ref caps) = caps_opt {
+        match parsed.method {
+            Some("desc") => return Err(UnispaceError::Unsupported),
+            Some(m) => {
+                // invoke requires per-method RW
+                crate::caps::check_path(Some(caps), &parsed.components, Some(m), crate::caps::Perm::RW)?;
+                if flags != 0 {
+                    return Err(UnispaceError::Unsupported);
+                }
+            }
+            None => {
+                // dir write is IsADirectory regardless of caps, but we still gate leaf RW
+                // Check leaf RW for non-dir; dir case will error anyway but we hide existence if no RW?
+                // For symmetry, require RW on leaf for value writes.
+                crate::caps::check_path(Some(caps), &parsed.components, None, crate::caps::Perm::RW)?;
+            }
+        }
+    } else if parsed.method.is_some() && parsed.method != Some("desc") && flags != 0 {
+        return Err(UnispaceError::Unsupported);
+    }
     let (obj, method) = resolve(path)?;
     match method {
         Some("desc") => Err(UnispaceError::Unsupported),
@@ -503,7 +553,52 @@ pub fn write_flags(
             } else {
                 schema::decode_value(data, obj.methods()[idx].input)?
             };
-            obj.invoke(idx, value, out)
+            // Clone for post-invoke auto-grant (VFS create-like methods create a new child)
+            let value_clone = value.clone();
+            let res = obj.invoke(idx, value, out);
+            if res.is_ok() {
+                // Auto-grant RW on newly created child so creator can immediately use it.
+                // Only for directory objects and known creation methods.
+                if obj.kind() == ObjectKind::Dir {
+                    let leaf_path = crate::caps::join_path(&parsed.components);
+                    let child_name_opt: Option<String> = match m {
+                        "create" | "mkdir" | "symlink" | "mkfifo" | "mknod" => {
+                            match &value_clone {
+                                schema::Value::Struct(f) => match f.first() {
+                                    Some(schema::Value::Str(s)) => Some(s.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        }
+                        "link" | "rename" => {
+                            // link/rename second field is new name
+                            match &value_clone {
+                                schema::Value::Struct(f) => match f.get(1) {
+                                    Some(schema::Value::Str(s)) => Some(s.clone()),
+                                    _ => None,
+                                },
+                                _ => None,
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(child_name) = child_name_opt {
+                        let child_path = if leaf_path.is_empty() {
+                            child_name.clone()
+                        } else {
+                            alloc::format!("{}/{}", leaf_path, child_name)
+                        };
+                        let _ = crate::task::propagate_cap_to_parents(child_path.clone(), None, crate::caps::Perm::RW);
+                        // Also grant file/dir method caps for the new child (so creator can stat etc)
+                        // Propagate each method cap up the parent chain as well
+                        for method in ["stat", "truncate", "chmod", "chown", "utimens", "readlink", "create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod"] {
+                            let _ = crate::task::propagate_cap_to_parents(child_path.clone(), Some(String::from(method)), crate::caps::Perm::RW);
+                        }
+                    }
+                }
+            }
+            return res;
         }
         None => {
             if obj.kind() == ObjectKind::Dir {
@@ -519,6 +614,8 @@ pub fn write_flags(
 }
 
 fn encode_object_desc(obj: &dyn Object, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    // Unfiltered version — used only for kernel-bypass paths or tests that explicitly want full.
+    // Caps-filtered callers should use encode_object_desc_filtered.
     out.push(obj.kind().tag());
     match obj.owned_value_schema() {
         Some(s) => schema::encode_schema_owned(s, out),
@@ -534,6 +631,44 @@ fn encode_object_desc(obj: &dyn Object, out: &mut Vec<u8>) -> Result<(), Unispac
         let methods = obj.methods();
         out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
         for md in methods {
+            encode_method_desc(md, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn encode_object_desc_filtered(
+    obj: &dyn Object,
+    parsed: &path::ParsedPath,
+    caps: Option<&[crate::caps::Cap]>,
+    out: &mut Vec<u8>,
+) -> Result<(), UnispaceError> {
+    out.push(obj.kind().tag());
+    match obj.owned_value_schema() {
+        Some(s) => schema::encode_schema_owned(s, out),
+        None => schema::encode_schema(obj.value_schema(), out),
+    }
+    let leaf_path = crate::caps::join_path(&parsed.components);
+    if !obj.owned_methods().is_empty() {
+        let methods = obj.owned_methods();
+        let filtered = if let Some(caps) = caps {
+            crate::caps::filter_owned_methods_by_perm(caps, &leaf_path, methods)
+        } else {
+            methods.iter().collect::<Vec<_>>()
+        };
+        out.extend_from_slice(&(filtered.len() as u32).to_le_bytes());
+        for md in filtered {
+            encode_method_desc_owned(md, out)?;
+        }
+    } else {
+        let methods = obj.methods();
+        let filtered = if let Some(caps) = caps {
+            crate::caps::filter_methods_by_perm(caps, &leaf_path, methods)
+        } else {
+            methods.iter().collect::<Vec<_>>()
+        };
+        out.extend_from_slice(&(filtered.len() as u32).to_le_bytes());
+        for md in filtered {
             encode_method_desc(md, out)?;
         }
     }
