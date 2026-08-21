@@ -397,16 +397,30 @@ fn commit_pages(
     flags: PageFlags,
 ) -> Result<(), ()> {
     let mut va = vaddr;
+    // Collect phys frames to free on OOM; use dedicated vec to avoid translate-after-unmap races
+    let mut phys_vec: Vec<u64> = Vec::new();
     let mut mapped: Vec<u64> = Vec::new();
     for _ in 0..npages {
         let Some(phys) = alloc.alloc() else {
-            for &c in mapped.iter().rev() {
-                if let Some(p) = vmm.translate(c) {
-                    vmm.unmap_4k(alloc, c);
-                    unsafe {
-                        alloc.free(p);
-                    }
+            // Rollback already mapped pages in one batched unmap+single shootdown
+            if !mapped.is_empty() {
+                // mapped holds vaddrs; collect their phys from phys_vec
+                let mut frames: Vec<u64> = Vec::new();
+                let base = mapped[0];
+                let size = (mapped.len() as u64) * PAGE;
+                // Use the phys we stashed instead of translate to avoid double-free confusion
+                vmm.unmap_range_collect(alloc, base, size, &mut frames);
+                // Free using stashed phys count, but frames already contains them;
+                // prefer frames from VMM to keep accounting consistent
+                for p in frames {
+                    unsafe { alloc.free(p); }
                 }
+                // Any remaining phys in phys_vec beyond mapped len already not mapped
+                // (alloc succeeded but map failed? not here) — none.
+            }
+            // Free any phys that were allocated but not yet mapped (none in this path, but keep for symmetry)
+            for p in phys_vec.iter().skip(mapped.len()) {
+                unsafe { alloc.free(*p); }
             }
             return Err(());
         };
@@ -414,6 +428,7 @@ fn commit_pages(
             core::ptr::write_bytes(to_physmap(phys) as *mut u8, 0, PAGE as usize);
         }
         vmm.map_4k(alloc, va, phys, flags);
+        phys_vec.push(phys);
         mapped.push(va);
         va += PAGE;
     }
@@ -511,16 +526,24 @@ fn collides(asp: &AddressSpace, addr: u64, len: u64) -> bool {
 
 /// Translate a raw `prot` bitmask into `PageFlags`, enforcing W^X.
 fn prot_to_flags(prot: u64) -> Result<PageFlags, i64> {
+    if prot == 0 || prot & !0x7 != 0 {
+        return Err(EINVAL);
+    }
     let exec = prot & 4 != 0;
     let write = prot & 2 != 0;
+    let read = prot & 1 != 0;
     if exec && write {
         return Err(EINVAL); // W^X: an executable mapping is never writable
     }
-    let mut f = PageFlags::USER | PageFlags::READ;
+    let mut f = PageFlags::USER;
+    if read {
+        f |= PageFlags::READ;
+    }
     if exec {
         f |= PageFlags::EXECUTE;
     } else if write {
         f |= PageFlags::WRITE;
     }
+    // prot must have at least one of read/write/exec, and we already rejected 0
     Ok(f)
 }

@@ -12,8 +12,11 @@ static NEXT_MOUNT_ID: IrqMutex<u64> = IrqMutex::new(1);
 pub fn next_mount_id() -> u64 {
     let mut id = NEXT_MOUNT_ID.lock();
     let val = *id;
-    *id += 1;
-    val
+    // 0 is reserved (means "no mount"), never hand it out. Wrap safely.
+    let next = val.checked_add(1).unwrap_or(1);
+    *id = if next == 0 { 1 } else { next };
+    // Ensure we never return 0 even on overflow path
+    if val == 0 { 1 } else { val }
 }
 
 /// Parse "X>rest/of/path" into (drive_letter, inner_path).
@@ -48,12 +51,36 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
         }
 
         if name == ".." {
-            let upgrade = {
+            // If current is a mount root (its parent weak is empty but it has
+            // a covered weak), ascend to the covered dentry's mount point.
+            // This lets ".." escape a mount (e.g. A>/mnt/.. -> A>/).
+            let parent_opt = {
                 let guard = current.parent.lock();
                 guard.upgrade()
             };
-            if let Some(p) = upgrade {
+            if let Some(p) = parent_opt {
                 current = p;
+            } else {
+                // No parent: maybe a mount root. Try covered.
+                // Look up by mount_id of current's parent mount point?
+                // We stored covered weakly in DriveMount.covered, but need to
+                // find which mount's root == current. Use lookup_by_id on
+                // current's mount_id is not correct; instead check if current
+                // is a mounted root by searching DRIVE_MAP for matching root ptr.
+                // Simpler: if get_mount_point and parent empty, try to find
+                // mount where root ptr eq current and use its covered.
+                let mut covered_parent: Option<Arc<Dentry>> = None;
+                for (_, m) in super::DRIVE_MAP.iter() {
+                    if Arc::ptr_eq(&m.root, &current) {
+                        if let Some(w) = m.covered.lock().as_ref().and_then(|w| w.upgrade()) {
+                            covered_parent = Some(w);
+                        }
+                        break;
+                    }
+                }
+                if let Some(p) = covered_parent {
+                    current = p;
+                }
             }
             continue;
         }

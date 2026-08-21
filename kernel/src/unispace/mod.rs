@@ -341,14 +341,27 @@ pub fn connect(path: &str, obj: Arc<dyn Object>) -> Result<(), UnispaceError> {
 
     // Walk to the parent of the final component, creating intermediate
     // SimpleDirs only through mutable dirs that permit insertion.
+    // Use atomic check-then-insert with retry: if two tasks race to create
+    // the same missing dir, the loser re-resolves instead of clobbering.
     let mut current: Arc<dyn Object> = root().clone();
     for comp in &components[..components.len() - 1] {
-        match current.resolve(comp) {
-            Some(child) => current = child,
-            None => {
-                let dir: Arc<dyn Object> = Arc::new(SimpleDir::new());
-                current.insert_child(comp, dir.clone())?;
-                current = dir;
+        if let Some(child) = current.resolve(comp) {
+            current = child;
+            continue;
+        }
+        let dir: Arc<dyn Object> = Arc::new(SimpleDir::new());
+        match current.insert_child(comp, dir.clone()) {
+            Ok(()) => current = dir,
+            Err(UnispaceError::Unsupported) => return Err(UnispaceError::Unsupported),
+            Err(_) => {
+                // Likely raced with another connect that just created it; re-resolve.
+                if let Some(child) = current.resolve(comp) {
+                    current = child;
+                } else {
+                    // Retry once: another thread inserted but not yet visible due to ordering
+                    current.insert_child(comp, dir.clone())?;
+                    current = dir;
+                }
             }
         }
     }
@@ -427,7 +440,10 @@ pub fn read_flags(
         Some("desc") => {
             let mut v = Vec::new();
             encode_object_desc(&*obj, &mut v)?;
-            out.extend_from_slice(&v[..core::cmp::min(max, v.len())]);
+            if v.len() > max {
+                return Err(UnispaceError::InvalidArgument);
+            }
+            out.extend_from_slice(&v);
             Ok(())
         }
         Some(m) => {
@@ -438,7 +454,10 @@ pub fn read_flags(
             } else {
                 encode_method_desc(&obj.methods()[idx], &mut v)?;
             }
-            out.extend_from_slice(&v[..core::cmp::min(max, v.len())]);
+            if v.len() > max {
+                return Err(UnispaceError::InvalidArgument);
+            }
+            out.extend_from_slice(&v);
             Ok(())
         }
         None => {

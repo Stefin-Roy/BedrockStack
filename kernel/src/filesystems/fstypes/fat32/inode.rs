@@ -651,6 +651,7 @@ impl InodeOps for Fat32Inode {
     }
 
     fn getattr(&self) -> Result<Stat, VfsError> {
+        let mode = if self.file_type == FileType::Directory { 0o755 } else { 0o644 };
         Ok(Stat {
             ino: self.ino,
             size: if self.file_type == FileType::Directory {
@@ -660,6 +661,7 @@ impl InodeOps for Fat32Inode {
             },
             file_type: self.file_type,
             mtime: self.mtime.load(Ordering::Relaxed),
+            mode,
         })
     }
 

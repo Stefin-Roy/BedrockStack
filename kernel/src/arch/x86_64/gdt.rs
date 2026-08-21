@@ -39,27 +39,23 @@ static mut CPU_GDT: [MaybeUninit<GlobalDescriptorTable>; MAX_CPUS] =
 /// Selector for the user code segment (0x28, DPL3). Written once by the first
 /// CPU through `init()` — always the BSP, since it runs before any AP is woken.
 /// The GDT layout is identical on every CPU, so one value suffices.
-static mut USER_CODE_SEL: SegmentSelector = SegmentSelector::NULL;
-
-/// Selector for the user data segment (0x20, DPL3).
-static mut USER_DATA_SEL: SegmentSelector = SegmentSelector::NULL;
-
-/// Selector for the kernel code segment that SYSCALL lands in (0x18, DPL0).
-static mut SYSCALL_KERNEL_CS: SegmentSelector = SegmentSelector::NULL;
+static USER_CODE_SEL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+static USER_DATA_SEL: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
+static SYSCALL_KERNEL_CS: core::sync::atomic::AtomicU16 = core::sync::atomic::AtomicU16::new(0);
 
 /// User code selector (0x28). Valid after BSP `init()`.
 pub fn user_code_sel() -> SegmentSelector {
-    unsafe { USER_CODE_SEL }
+    SegmentSelector(USER_CODE_SEL.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// User data selector (0x20). Valid after BSP `init()`.
 pub fn user_data_sel() -> SegmentSelector {
-    unsafe { USER_DATA_SEL }
+    SegmentSelector(USER_DATA_SEL.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// Kernel CS that SYSCALL lands in (0x18). Valid after BSP `init()`.
 pub fn syscall_kernel_cs() -> SegmentSelector {
-    unsafe { SYSCALL_KERNEL_CS }
+    SegmentSelector(SYSCALL_KERNEL_CS.load(core::sync::atomic::Ordering::Relaxed))
 }
 
 /// Return the kernel GDT pointer (base + limit) for AP trampoline use.
@@ -108,10 +104,10 @@ pub fn init() {
 
         // The GDT layout is identical on every CPU, so these selectors are the
         // same everywhere. The BSP writes them first (no AP is woken yet);
-        // later AP writes are idempotent.
-        SYSCALL_KERNEL_CS = syscall_kernel_cs;
-        USER_DATA_SEL = user_data_sel;
-        USER_CODE_SEL = user_code_sel;
+        // later AP writes are idempotent. Use atomics to avoid static mut UB.
+        SYSCALL_KERNEL_CS.store(syscall_kernel_cs.0, core::sync::atomic::Ordering::Release);
+        USER_DATA_SEL.store(user_data_sel.0, core::sync::atomic::Ordering::Release);
+        USER_CODE_SEL.store(user_code_sel.0, core::sync::atomic::Ordering::Release);
 
         // Load the GDT, segments, and task register for this CPU.
         let gdt_ref = &*CPU_GDT[cpu_id].as_ptr();

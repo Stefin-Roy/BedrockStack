@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -23,6 +24,16 @@ pub trait InodeOps: Send + Sync {
     fn file_type(&self) -> FileType;
     fn ino(&self) -> u64;
     fn size(&self) -> u64;
+
+    /// Permission / time extensions — default is unsupported; tmpfs overrides.
+    fn chmod(&self, _mode: u32) -> Result<(), VfsError> { Err(VfsError::NotSupported) }
+    fn chown(&self, _uid: u32, _gid: u32) -> Result<(), VfsError> { Ok(()) }
+    fn utimens(&self, _mtime: u64) -> Result<(), VfsError> { Err(VfsError::NotSupported) }
+    fn symlink(&self, _name: &str, _target: &str) -> Result<Arc<dyn InodeOps>, VfsError> { Err(VfsError::NotSupported) }
+    fn readlink(&self) -> Result<String, VfsError> { Err(VfsError::NotSupported) }
+    fn link(&self, _old: &str, _new: &str) -> Result<(), VfsError> { Err(VfsError::NotSupported) }
+    fn mknod(&self, _name: &str, _mode: u32, _dev: u64) -> Result<Arc<dyn InodeOps>, VfsError> { Err(VfsError::NotSupported) }
+    fn mkfifo(&self, _name: &str, _mode: u32) -> Result<Arc<dyn InodeOps>, VfsError> { Err(VfsError::NotSupported) }
 
     /// Called by VFS before the inode is removed from the namespace (unlink,
     /// rmdir).  The filesystem can mark the inode for deferred cleanup — the

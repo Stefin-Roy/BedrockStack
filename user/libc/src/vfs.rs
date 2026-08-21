@@ -137,9 +137,10 @@ pub extern "C" fn getcwd(buf: *mut c_char, size: usize) -> *mut c_char {
 pub struct Stat {
     pub ino: u64,
     pub size: u64,
-    /// 0 = regular file, 1 = directory (matches `ObjectKind` tags).
+    /// 0 = regular, 1 = dir, 2 = symlink, 3 = fifo, 4 = char, 5 = block, 6 = socket
     pub kind: u32,
     pub mtime: u64,
+    pub mode: u32,
 }
 
 /// Split an absolute VFS path into `(parent, basename)` (both without
@@ -380,28 +381,44 @@ pub fn stat_rs(path: &[u8]) -> Result<Stat, c_int> {
         return Err(errno::ret(r) as c_int);
     }
     let le = |off: usize| u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+    let mode = if r >= 32 {
+        u32::from_le_bytes(buf[28..32].try_into().unwrap())
+    } else {
+        // Legacy 28-byte stat (no mode): reconstruct from kind.
+        if u32::from_le_bytes(buf[16..20].try_into().unwrap()) == 1 { 0o755 } else { 0o644 }
+    };
     Ok(Stat {
         ino: le(0),
         size: le(8),
         kind: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
         mtime: le(20),
+        mode,
     })
 }
 
 /// POSIX `stat(path, *buf)` where `buf` points to the C `struct stat`
 /// declared in `<sys/stat.h>` (32-byte layout: ino, size, mode, mtime).
-/// The VFS `kind` tag (0 = file, 1 = directory) is translated into
-/// `S_IFREG` / `S_IFDIR` mode bits.
+/// Kind is translated into `S_IF*` bits, permission bits come from `st.mode`.
 #[unsafe(no_mangle)]
 pub extern "C" fn stat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
     let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
     match stat_rs(p) {
         Ok(s) => {
+            let base = match s.kind {
+                1 => 0o040000, // S_IFDIR
+                2 => 0o120000, // S_IFLNK
+                3 => 0o010000, // S_IFIFO
+                4 => 0o020000, // S_IFCHR
+                5 => 0o060000, // S_IFBLK
+                6 => 0o140000, // S_IFSOCK
+                _ => 0o100000, // S_IFREG
+            };
+            let mode = base | (s.mode & 0o7777);
             unsafe {
                 core::ptr::write_bytes(buf, 0, 32);
                 *(buf as *mut u64) = s.ino;
                 *((buf as *mut u64).add(1)) = s.size;
-                *((buf as *mut u32).add(4)) = if s.kind == 1 { 0o040000 } else { 0o100000 };
+                *((buf as *mut u32).add(4)) = mode;
                 *((buf as *mut u64).add(3)) = s.mtime;
             }
             0
@@ -422,4 +439,317 @@ pub extern "C" fn lstat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
 /// Rust `access`-style check: `F_OK` tests existence via `:stat`.
 pub fn exists_rs(path: &[u8]) -> bool {
     stat_rs(path).is_ok()
+}
+
+fn file_method_u32(path: &[u8], method: &[u8], val: u32) -> c_int {
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(path, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(rpath, method, &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 4];
+    pay.copy_from_slice(&val.to_le_bytes());
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, 4, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+
+fn file_method_u64(path: &[u8], method: &[u8], val: u64) -> c_int {
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(path, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(rpath, method, &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 8];
+    pay.copy_from_slice(&val.to_le_bytes());
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, 8, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn chmod(path: *const core::ffi::c_char, mode: u32) -> c_int {
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    file_method_u32(p, b"chmod", mode & 0o7777)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fchmod(fd: c_int, mode: u32) -> c_int {
+    if fd < 0 {
+        errno::set(errno::EBADF);
+        return -1;
+    }
+    // Resolve fd to path via fd table and chmod that path.
+    if let Some(arr) = crate::fd::fd_path(fd) {
+        let len = arr.iter().position(|&b| b == 0).unwrap_or(0);
+        return file_method_u32(&arr[..len], b"chmod", mode & 0o7777);
+    }
+    // For std fds, no-op.
+    if fd <= 2 { return 0; }
+    errno::set(errno::EBADF);
+    -1
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fchmodat(dirfd: c_int, path: *const core::ffi::c_char, mode: u32, flags: c_int) -> c_int {
+    let _ = dirfd;
+    let _ = flags;
+    chmod(path, mode)
+}
+static mut UMASK_VAL: u32 = 0o022;
+#[unsafe(no_mangle)]
+pub extern "C" fn umask(mask: u32) -> u32 {
+    let old = unsafe { UMASK_VAL };
+    unsafe { UMASK_VAL = mask & 0o777; }
+    old
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn mkfifo(path: *const core::ffi::c_char, mode: u32) -> c_int {
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(p, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some((parent, base)) = split_path(rpath) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(parent, b"mkfifo", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 260];
+    let Some(name_enc) = enc_str(base, &mut pay) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let n = name_enc.len();
+    if n + 4 > pay.len() {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    }
+    pay[n..n + 4].copy_from_slice(&(mode & 0o777).to_le_bytes());
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, n + 4, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn mknod(path: *const core::ffi::c_char, mode: u32, dev: u32) -> c_int {
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(p, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some((parent, base)) = split_path(rpath) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(parent, b"mknod", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 268];
+    let Some(name_enc) = enc_str(base, &mut pay) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let n = name_enc.len();
+    if n + 12 > pay.len() {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    }
+    pay[n..n + 4].copy_from_slice(&mode.to_le_bytes());
+    pay[n + 4..n + 12].copy_from_slice(&(dev as u64).to_le_bytes());
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, n + 12, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn fstatat(dirfd: c_int, path: *const core::ffi::c_char, buf: *mut u8, flags: c_int) -> c_int {
+    let _ = dirfd;
+    let _ = flags;
+    stat(path, buf)
+}
+fn now_secs_user() -> u64 {
+    let mut buf = [0u8; 8];
+    let r = unsafe { crate::syscall::read_path(b"/kernel/timer:epoch_secs\0", &mut buf, 0) };
+    if r < 8 { return 0; }
+    // Actually :epoch_secs is a write method, not read. Try write_path.
+    let mut wbuf = [0u8; 8];
+    let rr = unsafe { crate::syscall::write_path(b"/kernel/timer:epoch_secs\0", &mut wbuf, 8, 0) };
+    if rr >= 8 {
+        return u64::from_le_bytes([wbuf[0], wbuf[1], wbuf[2], wbuf[3], wbuf[4], wbuf[5], wbuf[6], wbuf[7]]);
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn futimens(fd: c_int, times: *const u8) -> c_int {
+    let m = if times.is_null() {
+        now_secs_user()
+    } else {
+        unsafe {
+            let sec = *(times.add(16) as *const i64);
+            if sec < 0 { 0 } else { sec as u64 }
+        }
+    };
+    if fd < 0 {
+        errno::set(errno::EBADF);
+        return -1;
+    }
+    if let Some(arr) = crate::fd::fd_path(fd) {
+        let len = arr.iter().position(|&b| b == 0).unwrap_or(0);
+        return file_method_u64(&arr[..len], b"utimens", m);
+    }
+    if fd <= 2 {
+        return 0;
+    }
+    errno::set(errno::EBADF);
+    -1
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn utimensat(dirfd: c_int, path: *const core::ffi::c_char, times: *const u8, flags: c_int) -> c_int {
+    let _ = dirfd;
+    let _ = flags;
+    let mtime = if times.is_null() {
+        now_secs_user()
+    } else {
+        unsafe { *(times.add(16) as *const i64) as u64 }
+    };
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    file_method_u64(p, b"utimens", mtime)
+}
+
+/// Create a symlink `linkpath -> target`.
+#[unsafe(no_mangle)]
+pub extern "C" fn symlink(target: *const core::ffi::c_char, linkpath: *const core::ffi::c_char) -> c_int {
+    if target.is_null() || linkpath.is_null() {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    let t = unsafe { core::slice::from_raw_parts(target as *const u8, crate::string::strlen(target)) };
+    let p = unsafe { core::slice::from_raw_parts(linkpath as *const u8, crate::string::strlen(linkpath)) };
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(p, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some((parent, base)) = split_path(rpath) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(parent, b"symlink", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 520];
+    let Some(a) = enc_str(base, &mut pay) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let alen = a.len();
+    let Some(b) = enc_str(t, &mut pay[alen..]) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let total = alen + b.len();
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, total, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+
+/// Hard link `oldpath -> newpath` (same directory only, like rename).
+#[unsafe(no_mangle)]
+pub extern "C" fn link(oldpath: *const core::ffi::c_char, newpath: *const core::ffi::c_char) -> c_int {
+    let o = unsafe { core::slice::from_raw_parts(oldpath as *const u8, crate::string::strlen(oldpath)) };
+    let n = unsafe { core::slice::from_raw_parts(newpath as *const u8, crate::string::strlen(newpath)) };
+    let mut ro = [0u8; 512];
+    let mut rn = [0u8; 512];
+    let Some(ro) = resolve_into(o, &mut ro) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some(rn) = resolve_into(n, &mut rn) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some((oparent, obase)) = split_path(ro) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    let Some((nparent, nbase)) = split_path(rn) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    if oparent != nparent {
+        errno::set(errno::ENOSYS);
+        return -1;
+    }
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(oparent, b"link", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut pay = [0u8; 520];
+    let Some(a) = enc_str(obase, &mut pay) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let alen = a.len();
+    let Some(b) = enc_str(nbase, &mut pay[alen..]) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let total = alen + b.len();
+    let r = errno::ret(unsafe { write_path(mp, &mut pay, total, 0) });
+    if r < 0 { -1 } else { 0 }
+}
+
+/// `readlink(path, buf, bufsiz)` — read symlink target via `:readlink` or fallback to file read.
+#[unsafe(no_mangle)]
+pub extern "C" fn readlink(path: *const core::ffi::c_char, buf: *mut c_char, bufsiz: usize) -> isize {
+    if path.is_null() || buf.is_null() {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(p, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    // Try :readlink method on the symlink itself.
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(rpath, b"readlink", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let mut out = [0u8; 512];
+    let r = unsafe { write_path(mp, &mut out, 512, 0) };
+    if r >= 0 {
+        let n = r as usize;
+        if n < 4 { return 0; }
+        let len = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
+        let avail = core::cmp::min(len, core::cmp::min(n - 4, bufsiz));
+        unsafe { core::ptr::copy_nonoverlapping(out[4..].as_ptr(), buf as *mut u8, avail); }
+        return avail as isize;
+    }
+    // Fallback: read file value directly.
+    let mut tmp = [0u8; 512];
+    let rr = unsafe { crate::syscall::read_path(rpath, &mut tmp, 0) };
+    if rr < 0 {
+        errno::set((-rr) as c_int);
+        return -1;
+    }
+    let n = core::cmp::min(rr as usize, bufsiz);
+    unsafe { core::ptr::copy_nonoverlapping(tmp.as_ptr(), buf as *mut u8, n); }
+    n as isize
 }

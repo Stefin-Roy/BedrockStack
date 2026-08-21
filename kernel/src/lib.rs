@@ -179,10 +179,16 @@ impl Kernel {
         allocator.reserve_region(kernel_start_phys, kernel_end_phys);
 
         SerialPort::puts("[kernel] Kernel::new: framebuffer\n");
-        let fb_size = (framebuffer.stride as u64)
+        let fb_size = match (framebuffer.stride as u64)
             .checked_mul(framebuffer.height as u64)
             .and_then(|v| v.checked_mul(framebuffer.bpp as u64))
-            .expect("framebuffer size overflow") as usize;
+        {
+            Some(s) => s as usize,
+            None => {
+                SerialPort::puts("[kernel] WARN: framebuffer size overflow, no fb\n");
+                0
+            }
+        };
         // Belt-and-suspenders: reserve the framebuffer's physical range in the
         // allocator so we never hand out the GPU's own memory as system RAM.
         allocator.reserve_range(framebuffer.address, fb_size as u64);

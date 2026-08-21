@@ -104,7 +104,19 @@ fn queue() -> &'static InputQueue {
 
 /// Register an input device.  Returns the UInputL-owned device id.
 pub fn register_device(name: &'static str, capabilities: u32, poll: Option<fn()>) -> u32 {
-    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    let mut id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    if id == 0 {
+        // 0 is reserved for "no grab", skip it
+        id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        if id == 0 {
+            id = 1;
+            NEXT_ID.store(2, Ordering::Relaxed);
+        }
+    }
+    // Ensure we never hand out 0 even on wrap
+    if id == 0 {
+        id = 1;
+    }
     DEVICES.lock().push(InputDevice {
         id,
         name,
@@ -178,25 +190,31 @@ pub fn read_event() -> Option<InputEvent> {
             if grab != 0 && ev.device_id != grab {
                 continue; // grabbed by another consumer — skip
             }
-            // Notify subscribers (copies), then hand the event to the reader.
-            let subs = SUBSCRIBERS.lock();
-            for s in subs.iter() {
-                if s.type_ == ev.type_ {
-                    (s.handler)(&ev);
+            // Snapshot subscribers without holding lock across handler call
+            let handlers: Vec<(InputType, fn(&InputEvent))> = {
+                let subs = SUBSCRIBERS.lock();
+                subs.iter().map(|s| (s.type_, s.handler)).collect()
+            };
+            for (ty, h) in handlers {
+                if ty == ev.type_ {
+                    (h)(&ev);
                 }
             }
             return Some(ev);
         }
         // Queue empty — let poll-driven devices produce events.
-        let mut fed = false;
-        {
+        // Snapshot poll hooks without holding DEVICES lock across call
+        let polls: Vec<Option<fn()>> = {
             let devs = DEVICES.lock();
-            for d in devs.iter() {
-                if let Some(poll) = d.poll {
-                    (poll)();
-                    fed = true;
-                }
-            }
+            devs.iter().map(|d| d.poll).collect()
+        };
+        if polls.is_empty() || polls.iter().all(|p| p.is_none()) {
+            return None;
+        }
+        let mut fed = false;
+        for poll in polls.into_iter().flatten() {
+            (poll)();
+            fed = true;
         }
         if !fed {
             return None;

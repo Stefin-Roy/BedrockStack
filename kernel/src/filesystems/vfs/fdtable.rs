@@ -84,7 +84,11 @@ impl FdTable {
             .ok_or(VfsError::BadFileDescriptor)?;
         if new_fd as usize >= inner.fds.len() {
             inner.fds.resize(new_fd as usize + 1, None);
+        } else {
+            // If new_fd was previously free-listed, remove it so alloc() doesn't reuse it.
+            inner.free_list.retain(|&x| x != new_fd);
         }
+        // Overwriting an occupied slot drops the old FileDescription (close semantics).
         inner.fds[new_fd as usize] = Some(entry);
         Ok(())
     }

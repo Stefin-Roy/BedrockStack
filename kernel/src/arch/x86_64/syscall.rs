@@ -250,7 +250,8 @@ pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
     match frame.rax {
         0 => sys_read(frame),
         1 => sys_write(frame),
-        _ => frame.rax = (-1i64) as u64,
+        _ => frame.rax = (-38i64) as u64, // ENOSYS
+
     }
 }
 
@@ -451,8 +452,7 @@ fn validate_user_range(root: u64, ptr: u64, len: u64, writable: bool) -> Result<
 /// to the first 0x00 are validated (never an up-front full `MAX_COPY` window:
 /// a user address space maps far less than that contiguously). Bounded by
 /// `MAX_COPY` bytes and the `USER_BOUNDARY`. Decodes UTF-8, returning
-/// `-EINVAL` on bad bytes. If no NUL is found within the cap, the collected
-/// bytes are returned as-is (still bounded).
+/// `-EINVAL` on bad bytes. Returns `ENAMETOOLONG` if no NUL within cap.
 pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
     if ptr >= USER_BOUNDARY {
         return Err(-14); // EFAULT
@@ -460,6 +460,7 @@ pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
     let root = current_task_root()?;
     let mut out: Vec<u8> = Vec::new();
     let mut va = ptr;
+    let mut found_nul = false;
     while va < USER_BOUNDARY && va - ptr < MAX_COPY {
         let page = va & !0xFFF;
         // Validate this page is present and user-accessible before reading it.
@@ -478,6 +479,7 @@ pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
         match src.iter().position(|&b| b == 0) {
             Some(i) => {
                 out.extend_from_slice(&src[..i]);
+                found_nul = true;
                 break;
             }
             None => {
@@ -485,6 +487,13 @@ pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
                 va = cap;
             }
         }
+    }
+    if !found_nul && out.len() as u64 >= MAX_COPY {
+        return Err(-36); // ENAMETOOLONG
+    }
+    if !found_nul && out.len() > 0 {
+        // Truncated without NUL and hit USER_BOUNDARY before MAX_COPY
+        return Err(-22); // EINVAL
     }
     String::from_utf8(out).map_err(|_| -22) // EINVAL
 }

@@ -6,6 +6,7 @@ use core::ffi::{
 
 #[unsafe(no_mangle)]
 pub extern "C" fn exit(code: c_int) -> ! {
+    run_atexit();
     crate::process::exit(code as usize)
 }
 
@@ -341,12 +342,377 @@ pub unsafe extern "C" fn bsearch(
     }
 }
 
-// ── environment / shell (no env, no shell) ────────────────────────────
+// ── atexit ────────────────────────────────────────────────────────
 
-/// `getenv(name)` — no environment exists; always NULL.
+type AtExitFn = unsafe extern "C" fn();
+
+const ATEXIT_MAX: usize = 32;
+static mut ATEXIT_FNS: [Option<AtExitFn>; ATEXIT_MAX] = [None; ATEXIT_MAX];
+static mut ATEXIT_LEN: usize = 0;
+
 #[unsafe(no_mangle)]
-pub extern "C" fn getenv(_name: *const c_char) -> *mut c_char {
-    core::ptr::null_mut()
+pub extern "C" fn atexit(f: AtExitFn) -> c_int {
+    unsafe {
+        if ATEXIT_LEN >= ATEXIT_MAX {
+            return -1;
+        }
+        ATEXIT_FNS[ATEXIT_LEN] = Some(f);
+        ATEXIT_LEN += 1;
+        0
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn at_quick_exit(f: AtExitFn) -> c_int {
+    atexit(f)
+}
+
+fn run_atexit() {
+    unsafe {
+        while ATEXIT_LEN > 0 {
+            ATEXIT_LEN -= 1;
+            if let Some(f) = ATEXIT_FNS[ATEXIT_LEN] {
+                f();
+            }
+        }
+    }
+}
+
+// Patch `exit` to run atexit handlers.
+#[unsafe(no_mangle)]
+pub extern "C" fn exit_with_atexit(code: c_int) -> ! {
+    run_atexit();
+    crate::process::exit(code as usize)
+}
+
+// ── aligned allocation ──────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
+    if alignment == 0 || !alignment.is_power_of_two() || size % alignment != 0 {
+        crate::errno::set(crate::errno::EINVAL);
+        return core::ptr::null_mut();
+    }
+    if alignment <= 16 {
+        return crate::mem::malloc(size);
+    }
+    // Over-allocate and align manually; store original pointer before aligned block.
+    let extra = alignment + core::mem::size_of::<*mut c_void>();
+    let raw = crate::mem::malloc(size + extra) as *mut u8;
+    if raw.is_null() {
+        return core::ptr::null_mut();
+    }
+    let aligned = ((raw as usize + extra) & !(alignment - 1)) as *mut u8;
+    // store raw pointer just before aligned
+    unsafe {
+        let slot = (aligned as *mut *mut u8).sub(1);
+        *slot = raw;
+    }
+    aligned as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn posix_memalign(memptr: *mut *mut c_void, alignment: usize, size: usize) -> c_int {
+    if memptr.is_null() || !alignment.is_power_of_two() || alignment % core::mem::size_of::<*mut c_void>() != 0 {
+        return crate::errno::EINVAL;
+    }
+    let p = aligned_alloc(alignment, size);
+    if p.is_null() {
+        return crate::errno::ENOMEM;
+    }
+    unsafe { *memptr = p };
+    0
+}
+
+// ── realpath / mkstemp family ─────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c_char {
+    if path.is_null() {
+        crate::errno::set(crate::errno::EINVAL);
+        return core::ptr::null_mut();
+    }
+    let mut tmp = [0u8; 512];
+    let plen = crate::string::strlen(path);
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, plen) };
+    let Some(abs) = crate::vfs::resolve_into(p, &mut tmp) else {
+        crate::errno::set(crate::errno::ENAMETOOLONG);
+        return core::ptr::null_mut();
+    };
+    let out = if resolved.is_null() {
+        let buf = crate::mem::malloc(abs.len()) as *mut c_char;
+        if buf.is_null() {
+            crate::errno::set(crate::errno::ENOMEM);
+            return core::ptr::null_mut();
+        }
+        buf
+    } else {
+        resolved
+    };
+    unsafe {
+        core::ptr::copy_nonoverlapping(abs.as_ptr(), out as *mut u8, abs.len());
+    }
+    out
+}
+
+fn fill_template(tmpl: *mut c_char, suffixlen: usize) -> bool {
+    if tmpl.is_null() {
+        return false;
+    }
+    let len = crate::string::strlen(tmpl);
+    if len < 6 + suffixlen {
+        return false;
+    }
+    let base = len - suffixlen - 6;
+    unsafe {
+        for i in 0..6 {
+            if *tmpl.add(base + i) != b'X' as c_char {
+                return false;
+            }
+        }
+        // Replace XXXXXX with pseudo-random alphanum via srand/rand state plus counter.
+        static mut MK_CNT: u32 = 0;
+        let cnt = MK_CNT;
+        MK_CNT = MK_CNT.wrapping_add(1);
+        let mut seed = cnt.wrapping_mul(1103515245).wrapping_add(12345);
+        let chars = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+        for i in 0..6 {
+            seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+            let idx = (seed as usize) % chars.len();
+            *tmpl.add(base + i) = chars[idx] as c_char;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mkstemp(tmpl: *mut c_char) -> c_int {
+    if !fill_template(tmpl, 0) {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let fd = unsafe { crate::fd::open(tmpl as *const c_char, crate::fd::O_RDWR | crate::fd::O_CREAT | crate::fd::O_EXCL, 0o600) };
+    if fd < 0 { -1 } else { fd }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mkstemps(tmpl: *mut c_char, suffixlen: c_int) -> c_int {
+    let sl = if suffixlen < 0 { 0 } else { suffixlen as usize };
+    if !fill_template(tmpl, sl) {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let fd = unsafe { crate::fd::open(tmpl as *const c_char, crate::fd::O_RDWR | crate::fd::O_CREAT | crate::fd::O_EXCL, 0o600) };
+    if fd < 0 { -1 } else { fd }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mkdtemp(tmpl: *mut c_char) -> *mut c_char {
+    if !fill_template(tmpl, 0) {
+        crate::errno::set(crate::errno::EINVAL);
+        return core::ptr::null_mut();
+    }
+    let r = crate::vfs::mkdir_rs(unsafe { core::slice::from_raw_parts(tmpl as *const u8, crate::string::strlen(tmpl)) });
+    if r < 0 {
+        return core::ptr::null_mut();
+    }
+    tmpl
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn mktemp(tmpl: *mut c_char) -> *mut c_char {
+    if !fill_template(tmpl, 0) {
+        crate::errno::set(crate::errno::EINVAL);
+        return core::ptr::null_mut();
+    }
+    tmpl
+}
+
+// ── lldiv / strtold ─────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct lldiv_t {
+    pub quot: c_longlong,
+    pub rem: c_longlong,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn lldiv(numer: c_longlong, denom: c_longlong) -> lldiv_t {
+    lldiv_t { quot: numer / denom, rem: numer % denom }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct imaxdiv_t {
+    pub quot: i64,
+    pub rem: i64,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn imaxabs(j: i64) -> i64 { j.wrapping_abs() }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn imaxdiv(numer: i64, denom: i64) -> imaxdiv_t {
+    imaxdiv_t { quot: numer / denom, rem: numer % denom }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strtoimax(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> i64 {
+    strtoll(s, endptr, base) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strtoumax(s: *const c_char, endptr: *mut *mut c_char, base: c_int) -> u64 {
+    strtoull(s, endptr, base) as u64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wcstoimax(_s: *const i32, _endptr: *mut *mut i32, _base: c_int) -> i64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn wcstoumax(_s: *const i32, _endptr: *mut *mut i32, _base: c_int) -> u64 { 0 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strtold(s: *const c_char, endptr: *mut *mut c_char) -> f64 {
+    // No long double; alias to strtod (double) — C locale, single precision suffices.
+    let v = strtod(s, endptr);
+    v as f64
+}
+
+// ── environment ─────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+struct EnvEntry {
+    name: [u8; 64],
+    nlen: usize,
+    value: [u8; 256],
+    vlen: usize,
+    used: bool,
+}
+const ENV_MAX: usize = 32;
+static mut ENV: [EnvEntry; ENV_MAX] = [EnvEntry { name: [0; 64], nlen: 0, value: [0; 256], vlen: 0, used: false }; ENV_MAX];
+
+fn env_find(name: &[u8]) -> Option<usize> {
+    unsafe {
+        for i in 0..ENV_MAX {
+            if ENV[i].used && ENV[i].nlen == name.len() && &ENV[i].name[..name.len()] == name {
+                return Some(i);
+            }
+        }
+        None
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getenv(name: *const c_char) -> *mut c_char {
+    if name.is_null() {
+        return core::ptr::null_mut();
+    }
+    let n = crate::string::strlen(name);
+    let key = unsafe { core::slice::from_raw_parts(name as *const u8, n) };
+    if let Some(idx) = env_find(key) {
+        unsafe { ENV[idx].value.as_mut_ptr() as *mut c_char }
+    } else {
+        core::ptr::null_mut()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn setenv(name: *const c_char, value: *const c_char, overwrite: c_int) -> c_int {
+    if name.is_null() || value.is_null() || unsafe { *name == 0 } || unsafe { core::slice::from_raw_parts(name as *const u8, crate::string::strlen(name)).contains(&b'=') } {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let n = crate::string::strlen(name);
+    let v = crate::string::strlen(value);
+    if n >= 64 || v >= 256 {
+        crate::errno::set(crate::errno::ENAMETOOLONG);
+        return -1;
+    }
+    let key = unsafe { core::slice::from_raw_parts(name as *const u8, n) };
+    let val = unsafe { core::slice::from_raw_parts(value as *const u8, v) };
+    if let Some(idx) = env_find(key) {
+        if overwrite == 0 {
+            return 0;
+        }
+        unsafe {
+            ENV[idx].value[..v].copy_from_slice(val);
+            ENV[idx].value[v] = 0;
+            ENV[idx].vlen = v;
+        }
+        return 0;
+    }
+    unsafe {
+        for i in 0..ENV_MAX {
+            if !ENV[i].used {
+                ENV[i].name[..n].copy_from_slice(key);
+                ENV[i].name[n] = 0;
+                ENV[i].nlen = n;
+                ENV[i].value[..v].copy_from_slice(val);
+                ENV[i].value[v] = 0;
+                ENV[i].vlen = v;
+                ENV[i].used = true;
+                return 0;
+            }
+        }
+    }
+    crate::errno::set(crate::errno::ENOMEM);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn unsetenv(name: *const c_char) -> c_int {
+    if name.is_null() || unsafe { *name == 0 } || unsafe { core::slice::from_raw_parts(name as *const u8, crate::string::strlen(name)).contains(&b'=') } {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let n = crate::string::strlen(name);
+    let key = unsafe { core::slice::from_raw_parts(name as *const u8, n) };
+    if let Some(idx) = env_find(key) {
+        unsafe { ENV[idx].used = false; }
+    }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn putenv(s: *mut c_char) -> c_int {
+    if s.is_null() {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let len = crate::string::strlen(s);
+    let bytes = unsafe { core::slice::from_raw_parts(s as *const u8, len) };
+    let Some(eq) = bytes.iter().position(|&c| c == b'=') else {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    };
+    let name = unsafe { core::slice::from_raw_parts(s as *const u8, eq) };
+    let value = unsafe { core::slice::from_raw_parts(s.add(eq + 1) as *const u8, len - eq - 1) };
+    if name.is_empty() {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    // Copy to temp NUL terminated buffers for setenv.
+    let mut nbuf = [0u8; 64];
+    let mut vbuf = [0u8; 256];
+    if name.len() >= nbuf.len() || value.len() >= vbuf.len() {
+        crate::errno::set(crate::errno::ENAMETOOLONG);
+        return -1;
+    }
+    nbuf[..name.len()].copy_from_slice(name);
+    nbuf[name.len()] = 0;
+    vbuf[..value.len()].copy_from_slice(value);
+    vbuf[value.len()] = 0;
+    setenv(nbuf.as_ptr() as *const c_char, vbuf.as_ptr() as *const c_char, 1)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn clearenv() -> c_int {
+    unsafe {
+        for i in 0..ENV_MAX { ENV[i].used = false; }
+    }
+    0
 }
 
 /// `system(cmd)` — no shell; always fails with ENOENT.

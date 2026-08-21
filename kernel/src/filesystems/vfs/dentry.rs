@@ -54,14 +54,14 @@ impl Dentry {
 }
 
 pub struct Dcache {
-    map: spin::Mutex<HashMap<(u64, String), Weak<Dentry>>>,
+    map: crate::filesystems::vfs::irq::IrqMutex<HashMap<(u64, String), Weak<Dentry>>>,
 }
 
 static DCACHE: Once<Dcache> = Once::new();
 
 pub fn dcache() -> &'static Dcache {
     DCACHE.call_once(|| Dcache {
-        map: spin::Mutex::new(HashMap::new()),
+        map: crate::filesystems::vfs::irq::IrqMutex::new(HashMap::new()),
     })
 }
 

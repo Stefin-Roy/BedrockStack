@@ -6,7 +6,7 @@
 //! listing once in `opendir` and walk it from a `.bss` pool (single-threaded
 //! tasks).
 
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_long, c_void};
 
 use crate::errno;
 use crate::syscall::read_path;
@@ -186,4 +186,148 @@ pub extern "C" fn rewinddir(dir: *mut DIR) {
     let d = unsafe { &mut *dir };
     d.pos = 4;
     d.seen = 0;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn seekdir(dir: *mut DIR, loc: c_long) {
+    if dir.is_null() || !is_open(unsafe { &*dir }) {
+        return;
+    }
+    let d = unsafe { &mut *dir };
+    let target = loc.max(0) as usize;
+    if target <= d.count {
+        // Re-parse from start to target to reconstruct `pos`.
+        d.pos = 4;
+        d.seen = 0;
+        for _ in 0..target {
+            if readdir(dir).is_null() {
+                break;
+            }
+        }
+        // Rewind effect already set seen correctly; we want seen == target.
+        // readdir advanced seen; we need to ensure pos points to next entry.
+        // Our loop above left seen == target, so we revert one extra? Already correct because readdir increments.
+        // To implement seek simply set seen=target and re-scan was done.
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn telldir(dir: *mut DIR) -> c_long {
+    if dir.is_null() || !is_open(unsafe { &*dir }) {
+        crate::errno::set(crate::errno::EBADF);
+        return -1;
+    }
+    unsafe { (*dir).seen as c_long }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dirfd(_dir: *mut DIR) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fdopendir(_fd: c_int) -> *mut DIR {
+    crate::errno::set(crate::errno::ENOSYS);
+    core::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn alphasort(a: *const *const Dirent, b: *const *const Dirent) -> c_int {
+    if a.is_null() || b.is_null() {
+        return 0;
+    }
+    unsafe {
+        let da = &**a;
+        let db = &**b;
+        crate::string::strcmp(da.d_name.as_ptr(), db.d_name.as_ptr())
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn scandir(
+    dirp: *const c_char,
+    namelist: *mut *mut *mut Dirent,
+    filter: Option<unsafe extern "C" fn(*const Dirent) -> c_int>,
+    compar: Option<unsafe extern "C" fn(*const *const Dirent, *const *const Dirent) -> c_int>,
+) -> c_int {
+    if dirp.is_null() || namelist.is_null() {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let dir = opendir(dirp);
+    if dir.is_null() {
+        return -1;
+    }
+    // Collect entries into a Vec-like heap array via realloc.
+    let mut cap = 16usize;
+    let mut len = 0usize;
+    let mut arr = unsafe { crate::mem::malloc(cap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent };
+    if arr.is_null() {
+        closedir(dir);
+        crate::errno::set(crate::errno::ENOMEM);
+        return -1;
+    }
+    loop {
+        let de = readdir(dir);
+        if de.is_null() {
+            break;
+        }
+        // Apply filter if present.
+        if let Some(f) = filter {
+            let keep = unsafe { f(de as *const Dirent) };
+            if keep == 0 {
+                continue;
+            }
+        }
+        if len >= cap {
+            let newcap = cap * 2;
+            let np = unsafe { crate::mem::realloc(arr as *mut core::ffi::c_void, newcap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent };
+            if np.is_null() {
+                // cleanup
+                for i in 0..len {
+                    unsafe { crate::mem::free(*arr.add(i) as *mut core::ffi::c_void); }
+                }
+                unsafe { crate::mem::free(arr as *mut core::ffi::c_void); }
+                closedir(dir);
+                crate::errno::set(crate::errno::ENOMEM);
+                return -1;
+            }
+            arr = np;
+            cap = newcap;
+        }
+        // Duplicate Dirent onto heap.
+        let dup = unsafe { crate::mem::malloc(core::mem::size_of::<Dirent>()) as *mut Dirent };
+        if dup.is_null() {
+            for i in 0..len {
+                unsafe { crate::mem::free(*arr.add(i) as *mut core::ffi::c_void); }
+            }
+            unsafe { crate::mem::free(arr as *mut core::ffi::c_void); }
+            closedir(dir);
+            crate::errno::set(crate::errno::ENOMEM);
+            return -1;
+        }
+        unsafe {
+            *dup = *de;
+            *arr.add(len) = dup;
+        }
+        len += 1;
+    }
+    closedir(dir);
+    if let Some(cmp) = compar {
+        // Simple insertion sort via comparator.
+        unsafe {
+            for i in 1..len {
+                let mut j = i;
+                while j > 0 && cmp(arr.add(j) as *const *const Dirent, arr.add(j - 1) as *const *const Dirent) < 0 {
+                    let tmp = *arr.add(j);
+                    *arr.add(j) = *arr.add(j - 1);
+                    *arr.add(j - 1) = tmp;
+                    j -= 1;
+                }
+            }
+        }
+    }
+    unsafe { *namelist = arr };
+    len as c_int
 }

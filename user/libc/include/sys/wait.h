@@ -23,6 +23,7 @@ extern "C" {
 
 pid_t wait(int *status);
 pid_t waitpid(pid_t pid, int *status, int options);
+int waitid(int idtype, int id, void *infop, int options);
 
 #ifdef __cplusplus
 }

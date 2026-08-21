@@ -895,3 +895,42 @@ pub unsafe extern "C" fn sprintf(s: *mut c_char, fmt: *const c_char, args: ...) 
         vsprintf(s, fmt, ap)
     }
 }
+
+// ── helpers for stdio's dprintf / asprintf family ─────────────────────
+
+/// Heap sink for `asprintf` — grows via `malloc`/`realloc`.
+pub struct HeapSink {
+    pub ptr: *mut u8,
+    pub cap: usize,
+    pub len: usize,
+}
+
+impl Sink for HeapSink {
+    fn write(&mut self, b: &[u8]) {
+        let need = self.len + b.len();
+        if need > self.cap {
+            let newcap = need.next_power_of_two().max(128);
+            let np = unsafe { crate::mem::realloc(self.ptr as *mut core::ffi::c_void, newcap) };
+            if np.is_null() {
+                return;
+            }
+            self.ptr = np as *mut u8;
+            self.cap = newcap;
+        }
+        if self.len < self.cap {
+            let n = core::cmp::min(b.len(), self.cap - self.len);
+            unsafe {
+                core::ptr::copy_nonoverlapping(b.as_ptr(), self.ptr.add(self.len), n);
+            }
+            self.len += b.len();
+        } else {
+            self.len += b.len();
+        }
+    }
+}
+
+/// Format `fmt+ap` into `sink` (single pass, no `va_copy` needed).
+pub unsafe fn format_to_sink(sink: &mut dyn Sink, fmt: *const c_char, ap: VaList) -> c_int {
+    let mut ap2 = ap;
+    render(sink, fmt_slice(fmt), &mut ap2)
+}

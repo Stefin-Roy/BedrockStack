@@ -6,6 +6,11 @@ use alloc::string::String;
 pub enum FileType {
     Regular,
     Directory,
+    Symlink,
+    Fifo,
+    CharDevice,
+    BlockDevice,
+    Socket,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +53,7 @@ pub struct Stat {
     pub size: u64,
     pub file_type: FileType,
     pub mtime: u64,
+    pub mode: u32,
 }
 
 #[derive(Debug, Clone)]

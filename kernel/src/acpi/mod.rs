@@ -52,6 +52,15 @@ pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
     });
 }
 
+/// Update the allocator pointer after the BitmapAllocator has been moved
+/// (e.g. into Kernel). The ACPI VMM stashes a raw pointer, so it must be
+/// rebased when the allocator moves.
+pub fn update_alloc(alloc: *mut BitmapAllocator) {
+    if let Some(state) = ACPI_STATE.lock().as_mut() {
+        state.alloc = alloc;
+    }
+}
+
 /// ACPI VMM floor — 512 MB of virtual space for ACPI tables (generous).
 const ACPI_VADDR_FLOOR: u64 = ACPI_VADDR_BASE - 0x2000_0000;
 

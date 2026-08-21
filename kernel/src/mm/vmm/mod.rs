@@ -322,6 +322,14 @@ impl Vmm {
                 let group = v >> 21;
                 if group != group_first >> 21 {
                     if group_first != u64::MAX {
+                        if pending.remaining() < 3 {
+                            if removed_any || !pending.is_empty() {
+                                flush_tlb();
+                                shootdown_tlb();
+                            }
+                            pending.flush(alloc);
+                            removed_any = false;
+                        }
                         self.reclaim_tables(&mut pending, group_first);
                         if pending.is_full() {
                             flush_tlb();
@@ -335,7 +343,9 @@ impl Vmm {
             }
             v += 4096;
             if pending.is_full() {
-                if removed_any {
+                // Always flush+shootdown when we have pending table frames,
+                // even if removed_any is false (orphaned intermediate tables).
+                if removed_any || !pending.is_empty() {
                     flush_tlb();
                     shootdown_tlb();
                 }
@@ -344,6 +354,11 @@ impl Vmm {
             }
         }
         if group_first != u64::MAX {
+            if pending.remaining() < 3 && !pending.is_empty() {
+                flush_tlb();
+                shootdown_tlb();
+                pending.flush(alloc);
+            }
             self.reclaim_tables(&mut pending, group_first);
         }
         if removed_any || !pending.is_empty() {
@@ -395,6 +410,14 @@ impl Vmm {
                     let group = v >> 21;
                     if group != group_first >> 21 {
                         if group_first != u64::MAX {
+                            if pending.remaining() < 3 {
+                                if removed_any || !pending.is_empty() {
+                                    flush_tlb();
+                                    shootdown_tlb();
+                                }
+                                pending.flush(alloc);
+                                removed_any = false;
+                            }
                             self.reclaim_tables(&mut pending, group_first);
                             if pending.is_full() {
                                 flush_tlb();
@@ -409,7 +432,7 @@ impl Vmm {
             }
             v += 4096;
             if pending.is_full() {
-                if removed_any {
+                if removed_any || !pending.is_empty() {
                     flush_tlb();
                     shootdown_tlb();
                 }
@@ -418,6 +441,11 @@ impl Vmm {
             }
         }
         if group_first != u64::MAX {
+            if pending.remaining() < 3 && !pending.is_empty() {
+                flush_tlb();
+                shootdown_tlb();
+                pending.flush(alloc);
+            }
             self.reclaim_tables(&mut pending, group_first);
         }
         if removed_any || !pending.is_empty() {
@@ -606,6 +634,10 @@ impl PendingFrames {
         );
         self.frames[self.len] = frame;
         self.len += 1;
+    }
+
+    pub fn remaining(&self) -> usize {
+        PENDING_CAPACITY - self.len
     }
 
     pub fn is_full(&self) -> bool {

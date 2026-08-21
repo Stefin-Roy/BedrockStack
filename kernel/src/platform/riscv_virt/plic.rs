@@ -61,8 +61,11 @@ pub fn init() {
     }
 }
 
+static PLIC_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 /// Enable a specific interrupt source for S-mode.
 pub fn enable_irq(irq: u32) {
+    let _guard = PLIC_LOCK.lock();
     let context = scontext();
     let word = (irq as usize) / 32;
     let bit = (irq as usize) % 32;
@@ -75,6 +78,7 @@ pub fn enable_irq(irq: u32) {
 
 /// Disable a specific interrupt source.
 pub fn disable_irq(irq: u32) {
+    let _guard = PLIC_LOCK.lock();
     let context = scontext();
     let word = (irq as usize) / 32;
     let bit = (irq as usize) % 32;

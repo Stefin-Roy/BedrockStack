@@ -132,6 +132,14 @@ pub extern "C" fn waitpid(
     target as crate::ffi::c_int
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn waitid(_idtype: crate::ffi::c_int, id: crate::ffi::c_int, infop: *mut crate::ffi::c_void, options: crate::ffi::c_int) -> crate::ffi::c_int {
+    let _ = infop;
+    let _ = options;
+    let r = waitpid(id, core::ptr::null_mut(), 0);
+    if r < 0 { -1 } else { 0 }
+}
+
 /// POSIX `kill(pid, sig)` — the kernel parks the target; signal numbers are
 /// ignored (the task is simply ended).
 #[unsafe(no_mangle)]
