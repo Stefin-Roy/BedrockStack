@@ -138,7 +138,9 @@ pub fn mount(
     let root_dentry = Dentry::new("", Some(root_inode));
     root_dentry.set_mount_point(true);
 
-    let mount = DriveMount::new(path::next_mount_id(), root_dentry, sb, device);
+    let mid = path::next_mount_id();
+    root_dentry.set_mount_id(mid);
+    let mount = DriveMount::new(mid, root_dentry, sb, device);
     DRIVE_MAP.assign(drive, Arc::new(mount))?;
     log::info!("VFS: mounted {} on {}>", fstype, drive);
     Ok(())
@@ -156,8 +158,9 @@ pub fn mount_virtual(source: &str, drive: char) -> Result<(), VfsError> {
 
     let bind_dentry = Dentry::new("", Some(src_inode));
     bind_dentry.set_mount_point(true);
-
-    let mount = DriveMount::new(path::next_mount_id(), bind_dentry, sb, None);
+    let mid = path::next_mount_id();
+    bind_dentry.set_mount_id(mid);
+    let mount = DriveMount::new(mid, bind_dentry, sb, None);
     DRIVE_MAP.assign(drive, Arc::new(mount))?;
     log::info!("VFS: bind-mounted {} on {}>", source, drive);
     Ok(())
@@ -210,6 +213,15 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
             }
         }
     }
+    // Check no open FDs reference this drive BEFORE flushing/shutdown.
+    // Do it before expensive FS operations to avoid wasted work; also
+    // re-check after to close TOCTOU with concurrent open().
+    let mount = DRIVE_MAP.lookup(drive)?;
+    for fd in FD_TABLE.iter_active() {
+        if dentry_belongs_to_mount(&fd.dentry, &mount.root) {
+            return Err(VfsError::MountBusy);
+        }
+    }
     // Flush FS data (FAT cache, FSInfo, dirty bit) before unmount
     sync_drive(drive)?;
     {
@@ -217,7 +229,7 @@ pub fn unmount(drive: char) -> Result<(), VfsError> {
         mount.sb.ops.shutdown()?;
     }
 
-    // Check no open FDs reference this drive
+    // Re-validate no new FD was opened between check and shutdown
     let mount = DRIVE_MAP.lookup(drive)?;
     for fd in FD_TABLE.iter_active() {
         if dentry_belongs_to_mount(&fd.dentry, &mount.root) {

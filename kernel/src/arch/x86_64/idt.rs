@@ -182,9 +182,9 @@ device_irq_guard!(irq_45, 45);
 device_irq_guard!(irq_46, 46);
 device_irq_guard!(irq_47, 47);
 device_irq_guard!(irq_48, 48);
-static mut VEC34_COUNT: u64 = 0;
+static VEC34_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 pub fn vec34_count() -> u64 {
-    unsafe { VEC34_COUNT }
+    VEC34_COUNT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 extern "x86-interrupt" fn irq_34(frame: InterruptStackFrame) {
@@ -192,9 +192,7 @@ extern "x86-interrupt" fn irq_34(frame: InterruptStackFrame) {
     if u {
         swapgs();
     }
-    unsafe {
-        VEC34_COUNT += 1;
-    }
+    VEC34_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     device_irq_handler(34);
     if u {
         swapgs();

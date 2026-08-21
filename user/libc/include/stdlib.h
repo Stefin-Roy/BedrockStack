@@ -51,12 +51,30 @@ float  strtof(const char *s, char **endptr);
 double strtod(const char *s, char **endptr);
 
 void  qsort(void *base, size_t nmemb, size_t size,
-            int (*cmp)(const void *, const void *));
+             int (*cmp)(const void *, const void *));
 void *bsearch(const void *key, const void *base, size_t nmemb, size_t size,
-              int (*cmp)(const void *, const void *));
+               int (*cmp)(const void *, const void *));
+
+int   atexit(void (*func)(void));
+int   at_quick_exit(void (*func)(void));
+void *aligned_alloc(size_t alignment, size_t size);
+int   posix_memalign(void **memptr, size_t alignment, size_t size);
+char *realpath(const char *path, char *resolved_path);
+int   mkstemp(char *templ);
+int   mkstemps(char *templ, int suffixlen);
+char *mkdtemp(char *templ);
+char *mktemp(char *templ);
 
 char *getenv(const char *name);
+int   setenv(const char *name, const char *value, int overwrite);
+int   unsetenv(const char *name);
+int   putenv(char *string);
+int   clearenv(void);
 int   system(const char *cmd);
+
+typedef struct { long long quot, rem; } lldiv_t;
+lldiv_t lldiv(long long numer, long long denom);
+long double strtold(const char *s, char **endptr);
 
 #ifdef __cplusplus
 }

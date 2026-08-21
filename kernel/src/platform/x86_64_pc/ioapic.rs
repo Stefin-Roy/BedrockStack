@@ -69,7 +69,8 @@ pub fn init(phys_base: u64, gsi_base: u32) {
     };
 
     let ver = ioapic_read(&state, REG_IOAPIC_VER);
-    let entries = (ver >> 16) & 0xFF;
+    let max_entry = (ver >> 16) & 0xFF;
+    let entries = max_entry + 1;
     let state = IoApicState { entries, ..state };
 
     SerialPort::puts("[ioapic] base=0x");
@@ -103,7 +104,7 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 
     let index = 0x10 + 2 * (gsi - state.gsi_base);
     let vector = state.next_vector;
-    if vector < 32 {
+    if vector >= 49 || vector < 33 {
         SerialPort::puts("[ioapic] WARN: interrupt vectors exhausted, cannot enable GSI ");
         SerialPort::put_u64(gsi as u64);
         SerialPort::puts("\n");
@@ -139,7 +140,10 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 /// Mask (disable) a GSI.
 pub fn mask_irq(gsi: u32) {
     let mut guard = IOAPIC.lock();
-    let state = guard.as_mut().expect("IOAPIC not initialized");
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
     if gsi < state.gsi_base || gsi >= state.gsi_base + state.entries {
         return;
     }
@@ -151,7 +155,10 @@ pub fn mask_irq(gsi: u32) {
 /// Unmask (enable) a GSI.
 pub fn unmask_irq(gsi: u32) {
     let mut guard = IOAPIC.lock();
-    let state = guard.as_mut().expect("IOAPIC not initialized");
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return,
+    };
     if gsi < state.gsi_base || gsi >= state.gsi_base + state.entries {
         return;
     }

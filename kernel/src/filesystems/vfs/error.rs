@@ -17,6 +17,7 @@ pub enum VfsError {
     InvalidDevice,
     FileTooLarge,
     ReadOnly,
+    NotSupported,
 }
 
 impl fmt::Display for VfsError {
@@ -37,6 +38,7 @@ impl fmt::Display for VfsError {
             VfsError::InvalidDevice => write!(f, "invalid device"),
             VfsError::FileTooLarge => write!(f, "file too large"),
             VfsError::ReadOnly => write!(f, "read-only file system"),
+            VfsError::NotSupported => write!(f, "operation not supported"),
         }
     }
 }

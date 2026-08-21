@@ -35,6 +35,37 @@ pub static TRUNCATE_INPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
+pub static CHMOD_INPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "mode",
+    ty: &schema::SCHEMA_U32,
+}]);
+
+pub static CHOWN_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "uid", ty: &schema::SCHEMA_U32 },
+    schema::Field { name: "gid", ty: &schema::SCHEMA_U32 },
+]);
+
+pub static UTIMENS_INPUT: Schema = Schema::Struct(&[schema::Field {
+    name: "mtime",
+    ty: &schema::SCHEMA_U64,
+}]);
+
+pub static SYMLINK_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "name", ty: &schema::SCHEMA_STR },
+    schema::Field { name: "target", ty: &schema::SCHEMA_STR },
+]);
+
+pub static MKFIFO_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "name", ty: &schema::SCHEMA_STR },
+    schema::Field { name: "mode", ty: &schema::SCHEMA_U32 },
+]);
+
+pub static MKNOD_INPUT: Schema = Schema::Struct(&[
+    schema::Field { name: "name", ty: &schema::SCHEMA_STR },
+    schema::Field { name: "mode", ty: &schema::SCHEMA_U32 },
+    schema::Field { name: "dev", ty: &schema::SCHEMA_U64 },
+]);
+
 pub static STAT_OUTPUT: Schema = Schema::Struct(&[
     schema::Field {
         name: "ino",
@@ -52,6 +83,10 @@ pub static STAT_OUTPUT: Schema = Schema::Struct(&[
         name: "mtime",
         ty: &schema::SCHEMA_U64,
     },
+    schema::Field {
+        name: "mode",
+        ty: &schema::SCHEMA_U32,
+    },
 ]);
 
 // Shared `:stat` method — identical schema on directories and files so
@@ -64,7 +99,7 @@ const STAT_METHOD: MethodDesc = MethodDesc {
     output: &STAT_OUTPUT,
 };
 
-static DIR_METHODS: [MethodDesc; 6] = [
+static DIR_METHODS: [MethodDesc; 10] = [
     MethodDesc {
         name: "create",
         input: &CREATE_INPUT,
@@ -90,30 +125,76 @@ static DIR_METHODS: [MethodDesc; 6] = [
         input: &RENAME_INPUT,
         output: &schema::SCHEMA_UNIT,
     },
+    MethodDesc {
+        name: "symlink",
+        input: &SYMLINK_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "link",
+        input: &RENAME_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "mkfifo",
+        input: &MKFIFO_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "mknod",
+        input: &MKNOD_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
     STAT_METHOD,
 ];
 
-static FILE_METHODS: [MethodDesc; 2] = [
+static FILE_METHODS: [MethodDesc; 6] = [
     STAT_METHOD,
     MethodDesc {
         name: "truncate",
         input: &TRUNCATE_INPUT,
         output: &schema::SCHEMA_UNIT,
     },
+    MethodDesc {
+        name: "chmod",
+        input: &CHMOD_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "chown",
+        input: &CHOWN_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "utimens",
+        input: &UTIMENS_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "readlink",
+        input: &schema::SCHEMA_UNIT,
+        output: &schema::SCHEMA_STR,
+    },
 ];
 
-/// Emit the packed `{ino, size, kind, mtime}` stat record for `ops`.
+/// Emit the packed `{ino, size, kind, mtime, mode}` stat record for `ops`.
 fn stat_output(ops: &dyn InodeOps, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     let st = ops.getattr()?;
     let kind = match st.file_type {
         FileType::Regular => 0u32,
         FileType::Directory => 1u32,
+        FileType::Symlink => 2u32,
+        FileType::Fifo => 3u32,
+        FileType::CharDevice => 4u32,
+        FileType::BlockDevice => 5u32,
+        FileType::Socket => 6u32,
     };
     let value = Value::Struct(vec![
         Value::U64(st.ino),
         Value::U64(st.size),
         Value::Enum(kind),
         Value::U64(st.mtime),
+        Value::U64(st.mode as u64),
     ]);
     schema::encode_value(&value, &STAT_OUTPUT, out)
 }
@@ -143,7 +224,12 @@ fn wrap(dentry: Arc<Dentry>) -> Option<Arc<dyn Object>> {
             dentry: dentry.clone(),
             ops: inode.ops.clone(),
         })),
-        FileType::Regular => Some(Arc::new(VfsFile {
+        FileType::Regular
+        | FileType::Symlink
+        | FileType::Fifo
+        | FileType::CharDevice
+        | FileType::BlockDevice
+        | FileType::Socket => Some(Arc::new(VfsFile {
             ops: inode.ops.clone(),
         })),
     }
@@ -197,6 +283,9 @@ impl Object for VfsDir {
             let kind = match e.file_type {
                 FileType::Regular => ObjectKind::File,
                 FileType::Directory => ObjectKind::Dir,
+                FileType::Symlink => ObjectKind::File,
+                FileType::Fifo => ObjectKind::Device,
+                FileType::CharDevice | FileType::BlockDevice | FileType::Socket => ObjectKind::Device,
             };
             out.push(ListingEntry { name: e.name, kind });
         }
@@ -241,7 +330,43 @@ impl Object for VfsDir {
                 self.ops.rename(old, new)?;
                 Ok(())
             }
-            5 => stat_output(self.ops.as_ref(), out),
+            5 => {
+                let name = arg_str(&v, 0)?;
+                let target = arg_str(&v, 1)?;
+                self.ops.symlink(name, target)?;
+                Ok(())
+            }
+            6 => {
+                let old = arg_str(&v, 0)?;
+                let new = arg_str(&v, 1)?;
+                self.ops.link(old, new)?;
+                Ok(())
+            }
+            7 => {
+                let name = arg_str(&v, 0)?;
+                let mode = match &v {
+                    Value::Struct(f) => match f.get(1) {
+                        Some(Value::U64(m)) => *m as u32,
+                        _ => return Err(UnispaceError::SchemaMismatch),
+                    },
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                self.ops.mkfifo(name, mode)?;
+                Ok(())
+            }
+            8 => {
+                let name = arg_str(&v, 0)?;
+                let (mode, dev) = match &v {
+                    Value::Struct(f) => (
+                        match f.get(1) { Some(Value::U64(m)) => *m as u32, _ => return Err(UnispaceError::SchemaMismatch) },
+                        match f.get(2) { Some(Value::U64(d)) => *d, _ => return Err(UnispaceError::SchemaMismatch) },
+                    ),
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                self.ops.mknod(name, mode, dev)?;
+                Ok(())
+            }
+            9 => stat_output(self.ops.as_ref(), out),
             _ => Err(UnispaceError::MethodNotFound),
         }
     }
@@ -335,6 +460,49 @@ impl Object for VfsFile {
                 };
                 self.ops.truncate(len)?;
                 Ok(())
+            }
+            2 => {
+                let mode = match v {
+                    Value::Struct(fields) => match fields.get(0) {
+                        Some(Value::U64(m)) => *m as u32,
+                        _ => return Err(UnispaceError::SchemaMismatch),
+                    },
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                self.ops.chmod(mode)?;
+                Ok(())
+            }
+            3 => {
+                let (uid, gid) = match v {
+                    Value::Struct(fields) => (
+                        match fields.get(0) { Some(Value::U64(u)) => *u as u32, _ => return Err(UnispaceError::SchemaMismatch) },
+                        match fields.get(1) { Some(Value::U64(g)) => *g as u32, _ => return Err(UnispaceError::SchemaMismatch) },
+                    ),
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                self.ops.chown(uid, gid)?;
+                Ok(())
+            }
+            4 => {
+                let mtime = match v {
+                    Value::Struct(fields) => match fields.get(0) {
+                        Some(Value::U64(m)) => *m,
+                        _ => return Err(UnispaceError::SchemaMismatch),
+                    },
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                self.ops.utimens(mtime)?;
+                Ok(())
+            }
+            5 => {
+                // readlink: input Unit, output Str
+                match v {
+                    Value::Unit => {},
+                    _ => return Err(UnispaceError::SchemaMismatch),
+                };
+                let target = self.ops.readlink()?;
+                let out_val = Value::Str(target);
+                schema::encode_value(&out_val, &schema::SCHEMA_STR, out)
             }
             _ => Err(UnispaceError::MethodNotFound),
         }

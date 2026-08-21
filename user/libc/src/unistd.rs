@@ -182,3 +182,163 @@ pub extern "C" fn pause() -> c_int {
     crate::process::sleep_ms(u64::MAX);
     -1
 }
+
+// ── pathconf / confstr ──────────────────────────────────────────────
+
+pub const _PC_NAME_MAX: c_int = 4;
+pub const _PC_PATH_MAX: c_int = 5;
+pub const _PC_PIPE_BUF: c_int = 6;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pathconf(_path: *const c_char, name: c_int) -> c_long {
+    match name {
+        _PC_NAME_MAX => 255,
+        _PC_PATH_MAX => 4096,
+        _PC_PIPE_BUF => 512,
+        _ => {
+            crate::errno::set(crate::errno::EINVAL);
+            -1
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fpathconf(_fd: c_int, name: c_int) -> c_long {
+    pathconf(core::ptr::null(), name)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn confstr(_name: c_int, _buf: *mut c_char, _len: usize) -> usize {
+    crate::errno::set(crate::errno::EINVAL);
+    0
+}
+
+// ── gethostname ─────────────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn gethostname(name: *mut c_char, len: usize) -> c_int {
+    if name.is_null() || len == 0 {
+        crate::errno::set(crate::errno::EINVAL);
+        return -1;
+    }
+    let host = b"bedrock";
+    let n = core::cmp::min(host.len(), len - 1);
+    unsafe {
+        core::ptr::copy_nonoverlapping(host.as_ptr(), name as *mut u8, n);
+        *name.add(n) = 0;
+    }
+    0
+}
+
+// ── getopt ──────────────────────────────────────────────────────────
+
+static mut OPTIND_G: c_int = 1;
+static mut OPTARG_G: *mut c_char = core::ptr::null_mut();
+static mut OPTERR_G: c_int = 1;
+static mut OPTOPT_G: c_int = 0;
+
+#[unsafe(no_mangle)]
+pub static mut optind: c_int = 1;
+#[unsafe(no_mangle)]
+pub static mut optarg: *mut c_char = core::ptr::null_mut();
+#[unsafe(no_mangle)]
+pub static mut opterr: c_int = 1;
+#[unsafe(no_mangle)]
+pub static mut optopt: c_int = 0;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn getopt(argc: c_int, argv: *const *const c_char, optstring: *const c_char) -> c_int {
+    if argc <= 0 || argv.is_null() || optstring.is_null() {
+        return -1;
+    }
+    unsafe {
+        if optind as usize >= argc as usize {
+            return -1;
+        }
+        let arg = *argv.add(optind as usize);
+        if arg.is_null() || *arg == 0 || *arg as u8 != b'-' || *arg.add(1) == 0 {
+            return -1;
+        }
+        if *arg.add(1) as u8 == b'-' {
+            optind += 1;
+            return -1;
+        }
+        let opt = *arg.add(1) as u8;
+        optopt = opt as c_int;
+        // Find in optstring
+        let mut p = optstring;
+        let mut found = false;
+        let mut needs_arg = false;
+        while *p != 0 {
+            if *p as u8 == opt {
+                found = true;
+                if *p.add(1) as u8 == b':' {
+                    needs_arg = true;
+                }
+                break;
+            }
+            p = p.add(1);
+        }
+        if !found {
+            if opterr != 0 {
+                crate::errno::set(crate::errno::EINVAL);
+            }
+            optind += 1;
+            return b'?' as c_int;
+        }
+        if needs_arg {
+            if optind + 1 < argc {
+                let next = *argv.add((optind + 1) as usize);
+                optarg = next as *mut c_char;
+                optind += 2;
+            } else {
+                optind += 1;
+                return b'?' as c_int;
+            }
+        } else {
+            optind += 1;
+        }
+        opt as c_int
+    }
+}
+
+// ── pipe / chown ───────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn pipe(_fds: *mut c_int) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn chown(_path: *const c_char, _owner: c_int, _group: c_int) -> c_int {
+    0 // no ownership model — succeed
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fchown(_fd: c_int, _owner: c_int, _group: c_int) -> c_int {
+    0
+}
+
+// ── exec family stubs ───────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn execv(_path: *const c_char, _argv: *const *const c_char) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn execvp(_file: *const c_char, _argv: *const *const c_char) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn execl(_path: *const c_char, _arg: *const c_char, mut _args: ...) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn execlp(_file: *const c_char, _arg: *const c_char, mut _args: ...) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}

@@ -40,9 +40,15 @@ fn send_ipi_raw(dest_apic_id: u32, icr_low: u32) {
             let icr = ((dest_apic_id as u64) << 32) | (icr_low as u64);
             wrmsr(IA32_X2APIC_ICR_MSR, icr);
         } else {
-            // Wait for previous IPI to complete (delivery status bit = 0)
+            // Wait for previous IPI to complete (delivery status bit = 0) with timeout.
+            let mut spins = 0u32;
             while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
                 core::hint::spin_loop();
+                spins = spins.wrapping_add(1);
+                if spins > 1_000_000 {
+                    SerialPort::puts("[apic] WARN: IPI delivery stuck, dropping\n");
+                    break;
+                }
             }
             lapic_write(LAPIC_ICR_HIGH, (dest_apic_id & 0xFF) << 24);
             lapic_write(LAPIC_ICR_LOW, icr_low);
@@ -328,8 +334,10 @@ fn calibrate_via_pit() -> u32 {
     }
 
     if timed_out {
-        SerialPort::puts("[apic] WARN: PIT calibration timed out, using fallback\n");
-        return 1_000_000;
+        SerialPort::puts("[apic] FATAL: PIT calibration timed out\n");
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
 
     // Sample TSC at PIT expiry.
@@ -344,8 +352,10 @@ fn calibrate_via_pit() -> u32 {
     SerialPort::puts("\n");
 
     if elapsed == 0 {
-        SerialPort::puts("[apic] WARN: zero elapsed ticks, using fallback\n");
-        return 1_000_000;
+        SerialPort::puts("[apic] FATAL: zero elapsed APIC ticks\n");
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
 
     // APIC frequency (Hz):
@@ -385,8 +395,10 @@ fn calibrate_via_pit() -> u32 {
     SerialPort::puts(" Hz)\n");
 
     if count == 0 {
-        SerialPort::puts("[apic] WARN: zero calibrated count, using fallback\n");
-        return 1_000_000;
+        SerialPort::puts("[apic] FATAL: zero calibrated count\n");
+        loop {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)) }
+        }
     }
 
     count

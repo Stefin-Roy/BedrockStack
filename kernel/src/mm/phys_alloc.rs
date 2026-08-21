@@ -349,9 +349,9 @@ impl BitmapAllocator {
                     i = lead + 1;
                 }
                 while i < nbits {
-                    if w & (1 << i) == 0 {
+                    if w & (1u64 << i) == 0 {
                         let s = i;
-                        while i < nbits && w & (1 << i) == 0 {
+                        while i < nbits && w & (1u64 << i) == 0 {
                             i += 1;
                         }
                         let len = i - s;

@@ -3,7 +3,7 @@
 //! Only the double-precision entry points are exported for the common
 //! porting surface; float variants delegate through `libm`'s `*f` forms.
 
-use core::ffi::{c_double, c_float, c_int, c_long};
+use core::ffi::{c_char, c_double, c_float, c_int, c_long, c_longlong};
 
 macro_rules! d {
     ($name:ident, $lm:ident) => {
@@ -222,4 +222,54 @@ pub extern "C" fn signbit(x: c_double) -> c_int {
 #[unsafe(no_mangle)]
 pub extern "C" fn nextafter(x: c_double, y: c_double) -> c_double {
     libm::nextafter(x, y)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nexttoward(x: c_double, _y: f64) -> c_double {
+    x
+}
+
+d!(erf, erf, f erff);
+d!(erfc, erfc, f erfcf);
+d!(lgamma, lgamma, f lgammaf);
+d!(tgamma, tgamma, f tgammaf);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn j0(x: c_double) -> c_double { libm::j0(x) }
+#[unsafe(no_mangle)]
+pub extern "C" fn j1(x: c_double) -> c_double { libm::j1(x) }
+#[unsafe(no_mangle)]
+pub extern "C" fn y0(x: c_double) -> c_double { libm::y0(x) }
+#[unsafe(no_mangle)]
+pub extern "C" fn y1(x: c_double) -> c_double { libm::y1(x) }
+#[unsafe(no_mangle)]
+pub extern "C" fn yn(n: c_int, x: c_double) -> c_double { libm::yn(n, x) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nan(_tag: *const c_char) -> c_double { f64::NAN }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn logb(x: c_double) -> c_double { libm::ilogb(x) as c_double }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ilogb(x: c_double) -> c_int { libm::ilogb(x) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn remquo(x: c_double, y: c_double, quo: *mut c_int) -> c_double {
+    let r = libm::remainder(x, y);
+    if !quo.is_null() { unsafe { *quo = 0; } }
+    r
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn scalbln(x: c_double, n: c_long) -> c_double { libm::scalbn(x, n as i32) }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn llrint(x: c_double) -> c_longlong { libm::round(x) as c_longlong }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn modff(x: c_float, iptr: *mut c_float) -> c_float {
+    let t = libm::truncf(x);
+    unsafe { *iptr = t; }
+    x - t
 }

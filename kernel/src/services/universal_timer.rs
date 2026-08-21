@@ -452,20 +452,28 @@ const POLL_FALLBACK_NS: u64 = 10_000_000;
 /// boot context (no current task), where there is nothing to schedule and
 /// HLT is correct.
 pub fn wait_until_cond_coop(deadline_ns: u64, slice_ns: u64, done: &dyn Fn() -> bool) -> bool {
-    if crate::smp::current_per_cpu().current_task.is_null() {
-        return wait_until_cond(deadline_ns, done);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if crate::smp::current_per_cpu().current_task.is_null() {
+            return wait_until_cond(deadline_ns, done);
+        }
+        loop {
+            if done() {
+                return true;
+            }
+            let now = universal_timer().now_ns();
+            if now >= deadline_ns {
+                // One last chance — the condition may have just become true.
+                return done();
+            }
+            let slice = slice_ns.min(deadline_ns - now).max(1);
+            crate::task::sleep_current(slice);
+        }
     }
-    loop {
-        if done() {
-            return true;
-        }
-        let now = universal_timer().now_ns();
-        if now >= deadline_ns {
-            // One last chance — the condition may have just become true.
-            return done();
-        }
-        let slice = slice_ns.min(deadline_ns - now).max(1);
-        crate::task::sleep_current(slice);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = slice_ns;
+        return wait_until_cond(deadline_ns, done);
     }
 }
 

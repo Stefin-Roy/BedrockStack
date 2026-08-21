@@ -212,3 +212,64 @@ unsafe impl GlobalAlloc for OsAlloc {
 
 #[global_allocator]
 pub static ALLOC: OsAlloc = OsAlloc;
+
+// ── compiler builtins for freestanding user target ───────────────────
+// The x86_64-bedrock-user target is freestanding (no libc), so core expects
+// these mem primitives to be provided by the image. Provide simple, non-overlapping
+// versions; the kernel's own user target previously relied on the same symbols
+// being supplied by the toolchain's `compiler_builtins` rlib, but with
+// `-Zbuild-std=core,alloc` they are not exported.
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
+    let mut i = 0usize;
+    while i < n {
+        *s.add(i) = (c & 0xFF) as u8;
+        i += 1;
+    }
+    s
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    let mut i = 0usize;
+    while i < n {
+        *dst.add(i) = *src.add(i);
+        i += 1;
+    }
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+    if dst as usize <= src as usize || dst as usize >= src as usize + n {
+        // non-overlapping or src before dst with no overlap: forward copy
+        let mut i = 0usize;
+        while i < n {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+    } else {
+        // overlapping, dst inside src: copy backwards
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            *dst.add(i) = *src.add(i);
+        }
+    }
+    dst
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+    let mut i = 0usize;
+    while i < n {
+        let av = *a.add(i);
+        let bv = *b.add(i);
+        if av != bv {
+            return (av as i32) - (bv as i32);
+        }
+        i += 1;
+    }
+    0
+}

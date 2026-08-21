@@ -56,6 +56,9 @@ int     setgid(gid_t gid);
 int     getgroups(int size, int *list);
 
 long    sysconf(int name);
+long    pathconf(const char *path, int name);
+long    fpathconf(int fd, int name);
+long    confstr(int name, char *buf, size_t len);
 
 void   *sbrk(intptr_t increment);
 int     brk(void *addr);
@@ -64,11 +67,31 @@ pid_t   getpid(void);
 pid_t   getppid(void);
 pid_t   fork(void);
 int     execve(const char *path, char *const argv[], char *const envp[]);
+int     execv(const char *path, char *const argv[]);
+int     execvp(const char *file, char *const argv[]);
+int     execl(const char *path, const char *arg, ...);
+int     execlp(const char *file, const char *arg, ...);
 void    _exit(int status) __attribute__((noreturn));
 int     pause(void);
 
 unsigned int sleep(unsigned int seconds);
 int          usleep(unsigned int useconds);
+int     gethostname(char *name, size_t len);
+int     getopt(int argc, char *const argv[], const char *optstring);
+extern char *optarg;
+extern int optind, opterr, optopt;
+int     pipe(int fds[2]);
+int     link(const char *oldpath, const char *newpath);
+int     symlink(const char *target, const char *linkpath);
+ssize_t readlink(const char *path, char *buf, size_t bufsiz);
+int     chown(const char *path, uid_t owner, gid_t group);
+int     fchown(int fd, uid_t owner, gid_t group);
+int     unlink(const char *path);
+int     rmdir(const char *path);
+
+#define _PC_NAME_MAX 4
+#define _PC_PATH_MAX 5
+#define _PC_PIPE_BUF 6
 
 #ifdef __cplusplus
 }

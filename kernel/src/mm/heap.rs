@@ -907,6 +907,7 @@ pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
     unsafe {
         PHYS_ALLOCATOR = phys as *mut BitmapAllocator;
     }
+    crate::acpi::update_alloc(phys as *mut BitmapAllocator);
 }
 
 /// Return a raw pointer to the physical allocator (may be null if uninitialised).
@@ -1079,27 +1080,38 @@ static PER_CPU_CACHE: [spin::Mutex<PerCpuCache>; crate::smp::MAX_CPUS] = [
 
 /// Try to satisfy `layout` from the current CPU's private cache.
 ///
-/// Returns a suitable payload, or `null` if the cache is empty or its head
-/// block is too small/misaligned for `layout` (the block is left in the cache).
+/// Scans the entire LIFO for a fitting block instead of probing only the head,
+/// so a large alignment/size request does not starve while smaller cached blocks
+/// could satisfy it. Costs O(CPU_CACHE_CAP) (64) in worst case.
 fn per_cpu_alloc_cached(layout: Layout) -> *mut u8 {
     let cpu = crate::smp::current_cpu_id() as usize;
     let mut cache = PER_CPU_CACHE[cpu].lock();
-    let p = cache.pop();
-    if p.is_null() {
+    if cache.head.is_null() {
         return core::ptr::null_mut();
     }
-    // Reject candidates that cannot hold `layout`.  The back-pointer (kept at
-    // `p - 8`, untouched while cached) recovers the block header whose `size`
-    // is the usable extent of the freed payload.
-    let header = unsafe { BlockHeader::from_payload(p) };
-    let usable = unsafe { (header as usize) + (*header).size } - (p as usize);
     let align = layout.align().max(BLOCK_ALIGN);
-    if usable >= layout.size() && (p as usize) % align == 0 {
-        p
-    } else {
-        cache.push(p);
-        core::ptr::null_mut()
+    let need = layout.size();
+    // Scan for first fitting entry, unlink it.
+    let mut prev: *mut u8 = core::ptr::null_mut();
+    let mut cur = cache.head;
+    while !cur.is_null() {
+        let next = unsafe { *(cur as *const *mut u8) };
+        let header = unsafe { BlockHeader::from_payload(cur) };
+        let usable = unsafe { (header as usize) + (*header).size } - (cur as usize);
+        if usable >= need && (cur as usize) % align == 0 {
+            // Unlink cur
+            if prev.is_null() {
+                cache.head = next;
+            } else {
+                unsafe { *(prev as *mut *mut u8) = next; }
+            }
+            cache.count -= 1;
+            return cur;
+        }
+        prev = cur;
+        cur = next;
     }
+    core::ptr::null_mut()
 }
 
 /// Park `payload` in the current CPU's cache.

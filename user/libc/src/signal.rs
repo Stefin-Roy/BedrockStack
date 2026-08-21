@@ -66,8 +66,79 @@ pub extern "C" fn sigfillset(set: *mut SigSet) -> c_int {
     0
 }
 
+#[repr(C)]
+pub struct SigAction {
+    pub sa_handler: *mut c_void,
+    pub sa_mask: SigSet,
+    pub sa_flags: c_int,
+    pub sa_sigaction: *mut c_void,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigaddset(set: *mut SigSet, sig: c_int) -> c_int {
+    if set.is_null() || sig <= 0 || sig > 64 {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    unsafe { (*set).bits[0] |= 1usize << (sig as usize - 1); }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigdelset(set: *mut SigSet, sig: c_int) -> c_int {
+    if set.is_null() || sig <= 0 || sig > 64 {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    unsafe { (*set).bits[0] &= !(1usize << (sig as usize - 1)); }
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigismember(set: *const SigSet, sig: c_int) -> c_int {
+    if set.is_null() || sig <= 0 || sig > 64 {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    unsafe { (((*set).bits[0] >> (sig as usize - 1)) & 1) as c_int }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigprocmask(_how: c_int, _set: *const SigSet, _old: *mut SigSet) -> c_int {
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigpending(set: *mut SigSet) -> c_int {
+    sigemptyset(set)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigsuspend(_mask: *const SigSet) -> c_int {
+    crate::process::sleep_ms(u64::MAX);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigwait(_set: *const SigSet, _sig: *mut c_int) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn killpg(_pgrp: c_int, _sig: c_int) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn sigqueue(_pid: c_int, _sig: c_int, _val: c_int) -> c_int {
+    crate::errno::set(crate::errno::ENOSYS);
+    -1
+}
+
 /// `sigaction()` — record nothing; always succeeds.
 #[unsafe(no_mangle)]
-pub extern "C" fn sigaction(_sig: c_int, _act: *const c_void, _oldact: *mut c_void) -> c_int {
+pub extern "C" fn sigaction(_sig: c_int, _act: *const SigAction, _oldact: *mut SigAction) -> c_int {
     0
 }

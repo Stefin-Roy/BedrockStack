@@ -58,7 +58,27 @@ unsigned int alarm(unsigned int seconds);
 
 int sigemptyset(sigset_t *set);
 int sigfillset(sigset_t *set);
-int sigaction(int sig, const void *act, void *oldact);
+int sigaddset(sigset_t *set, int sig);
+int sigdelset(sigset_t *set, int sig);
+int sigismember(const sigset_t *set, int sig);
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int sigpending(sigset_t *set);
+int sigsuspend(const sigset_t *mask);
+int sigwait(const sigset_t *set, int *sig);
+int killpg(int pgrp, int sig);
+int sigqueue(int pid, int sig, int val);
+struct sigaction {
+    void (*sa_handler)(int);
+    sigset_t sa_mask;
+    int sa_flags;
+    void (*sa_sigaction)(int, void*, void*);
+};
+int sigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
+#define SIG_BLOCK 0
+#define SIG_UNBLOCK 1
+#define SIG_SETMASK 2
+#define SA_NOCLDSTOP 1
+#define SA_RESTART 2
 
 #ifdef __cplusplus
 }

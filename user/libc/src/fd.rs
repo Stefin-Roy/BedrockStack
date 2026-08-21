@@ -22,6 +22,10 @@ pub const O_EXCL: c_int = 0o200;
 pub const O_TRUNC: c_int = 0o1000;
 pub const O_APPEND: c_int = 0o2000;
 pub const O_NONBLOCK: c_int = 0o4000;
+pub const O_CLOEXEC: c_int = 0o2000000;
+pub const O_DIRECTORY: c_int = 0o200000;
+pub const O_NOFOLLOW: c_int = 0o400000;
+pub const O_SYNC: c_int = 0o10000;
 
 // ── fd table ──────────────────────────────────────────────────────────
 
@@ -395,11 +399,21 @@ pub extern "C" fn fstat(fd: c_int, buf: *mut u8) -> c_int {
     }
     match crate::vfs::stat_rs(&f.path[..f.plen]) {
         Ok(s) => {
+            let base = match s.kind {
+                1 => 0o040000,
+                2 => 0o120000,
+                3 => 0o010000,
+                4 => 0o020000,
+                5 => 0o060000,
+                6 => 0o140000,
+                _ => 0o100000,
+            };
+            let mode = base | (s.mode & 0o7777);
             unsafe {
                 core::ptr::write_bytes(buf, 0, 32);
                 *(buf as *mut u64) = s.ino;
                 *((buf as *mut u64).add(1)) = s.size;
-                *((buf as *mut u32).add(4)) = if s.kind == 1 { 0o040000 } else { 0o100000 };
+                *((buf as *mut u32).add(4)) = mode;
                 *((buf as *mut u64).add(3)) = s.mtime;
             }
             0
@@ -433,7 +447,19 @@ pub extern "C" fn ftruncate(fd: c_int, length: c_long) -> c_int {
     crate::vfs::truncate_rs(&f.path[..f.plen], length as u64)
 }
 
-/// Minimal `fcntl`: supports F_GETFL and F_SETFL (ignores most flags).
+/// `openat(dirfd, path, flags, ...)` — dirfd ignored except AT_FDCWD (-100); otherwise same as `open`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
+    let _ = dirfd;
+    open(path, flags, mode)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn posix_fadvise(_fd: c_int, _offset: c_long, _len: c_long, _advice: c_int) -> c_int {
+    0
+}
+
+/// Minimal `fcntl`: supports F_DUPFD/F_GETFD/F_SETFD/F_GETFL/F_SETFL.
 #[unsafe(no_mangle)]
 pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
     let f = match fd_ref(fd) {
@@ -444,6 +470,22 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
         }
     };
     match cmd {
+        0 => {
+            // F_DUPFD — duplicate to lowest fd >= arg.
+            if arg < 3 { return dup(fd); }
+            // Find or allocate.
+            let copy = *f;
+            // Simplistic: ignore `arg` hint beyond checking free.
+            dup(fd)
+        }
+        1 => {
+            // F_GETFD — no CLOEXEC tracking; return 0.
+            0
+        }
+        2 => {
+            // F_SETFD — ignore FD_CLOEXEC.
+            0
+        }
         3 => {
             // F_GETFL
             let mut fl = if f.readable && f.writable {
@@ -463,9 +505,37 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
             f.append = arg & O_APPEND != 0;
             0
         }
+        5 | 6 | 7 => {
+            // F_GETLK / F_SETLK — no locks; succeed.
+            0
+        }
         _ => {
             errno::set(errno::ENOSYS);
             -1
         }
     }
+}
+
+/// Helper for `fileno(FILE*)`: true when `fd`'s path equals `file_path`.
+pub fn fileno_path(fd: c_int, file_path: &[u8]) -> bool {
+    let Some(f) = fd_ref(fd) else { return false };
+    if !f.used { return false }
+    if f.plen != file_path.len() { return false }
+    f.path[..f.plen] == file_path[..]
+}
+
+/// Helper for `fdopen(int, mode)`: retrieve the NUL-terminated path for `fd`.
+pub fn fd_path(fd: c_int) -> Option<[u8; 128]> {
+    if fd < 0 || fd as usize >= FD_POOL {
+        return None;
+    }
+    if fd <= 2 {
+        return None; // std fds are not in table but caller handles them separately
+    }
+    let f = fd_ref(fd)?;
+    if !f.used { return None }
+    let mut arr = [0u8; 128];
+    arr[..f.plen].copy_from_slice(&f.path[..f.plen]);
+    arr[f.plen] = 0;
+    Some(arr)
 }

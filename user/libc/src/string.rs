@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_int, c_void};
+use core::ffi::{c_char, c_int, c_long, c_longlong, c_void};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn strlen(s: *const c_char) -> usize {
@@ -429,4 +429,237 @@ pub extern "C" fn strtok_r(
 pub extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_char {
     static mut SAVE: *mut c_char = core::ptr::null_mut();
     unsafe { strtok_r(s, delim, core::ptr::addr_of_mut!(SAVE)) }
+}
+
+/// `strsep` — BSD tokeniser that handles empty tokens (updates `*stringp`).
+#[unsafe(no_mangle)]
+pub extern "C" fn strsep(stringp: *mut *mut c_char, delim: *const c_char) -> *mut c_char {
+    if stringp.is_null() || delim.is_null() {
+        return core::ptr::null_mut();
+    }
+    unsafe {
+        let s = *stringp;
+        if s.is_null() {
+            return core::ptr::null_mut();
+        }
+        let tok = s;
+        let mut set = [false; 256];
+        let mut i = 0usize;
+        while *delim.add(i) != 0 {
+            set[*delim.add(i) as u8 as usize] = true;
+            i += 1;
+        }
+        let mut p = s;
+        while *p != 0 && !set[*p as u8 as usize] {
+            p = p.add(1);
+        }
+        if *p != 0 {
+            *p = 0;
+            *stringp = p.add(1);
+        } else {
+            *stringp = core::ptr::null_mut();
+        }
+        tok
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn memccpy(dst: *mut c_void, src: *const c_void, c: c_int, n: usize) -> *mut c_void {
+    let ch = (c & 0xFF) as u8;
+    unsafe {
+        let d = dst as *mut u8;
+        let s = src as *const u8;
+        for i in 0..n {
+            let b = *s.add(i);
+            *d.add(i) = b;
+            if b == ch {
+                return d.add(i + 1) as *mut c_void;
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn memrchr(s: *const c_void, c: c_int, n: usize) -> *mut c_void {
+    let target = (c & 0xFF) as u8;
+    unsafe {
+        let p = s as *const u8;
+        for i in (0..n).rev() {
+            if *p.add(i) == target {
+                return p.add(i) as *mut c_void;
+            }
+        }
+        core::ptr::null_mut()
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn explicit_bzero(s: *mut c_void, n: usize) {
+    unsafe { core::ptr::write_bytes(s as *mut u8, 0, n); }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stpcpy(dst: *mut c_char, src: *const c_char) -> *mut c_char {
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let c = *src.add(i);
+            *dst.add(i) = c;
+            if c == 0 {
+                return dst.add(i);
+            }
+            i += 1;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn stpncpy(dst: *mut c_char, src: *const c_char, n: usize) -> *mut c_char {
+    unsafe {
+        let mut i = 0usize;
+        while i < n && *src.add(i) != 0 {
+            *dst.add(i) = *src.add(i);
+            i += 1;
+        }
+        while i < n {
+            *dst.add(i) = 0;
+            i += 1;
+        }
+        dst.add(core::cmp::min(crate::string::strnlen(src, n), n))
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strndup(s: *const c_char, n: usize) -> *mut c_char {
+    if s.is_null() {
+        return core::ptr::null_mut();
+    }
+    let len = core::cmp::min(strnlen(s, n), n);
+    unsafe {
+        let p = crate::mem::malloc(len + 1) as *mut c_char;
+        if p.is_null() {
+            return core::ptr::null_mut();
+        }
+        core::ptr::copy_nonoverlapping(s as *const u8, p as *mut u8, len);
+        *p.add(len) = 0;
+        p
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strchrnul(s: *const c_char, c: c_int) -> *mut c_char {
+    let target = (c & 0xFF) as u8;
+    unsafe {
+        let mut i = 0usize;
+        loop {
+            let b = *s.add(i) as u8;
+            if b == target {
+                return s.add(i) as *mut c_char;
+            }
+            if b == 0 {
+                return s.add(i) as *mut c_char;
+            }
+            i += 1;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strlcpy(dst: *mut c_char, src: *const c_char, size: usize) -> usize {
+    let slen = strlen(src);
+    if size > 0 {
+        let copy = core::cmp::min(slen, size - 1);
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst as *mut u8, copy);
+            *dst.add(copy) = 0;
+        }
+    }
+    slen
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strlcat(dst: *mut c_char, src: *const c_char, size: usize) -> usize {
+    let dlen = strnlen(dst, size);
+    let slen = strlen(src);
+    if dlen < size {
+        let copy = core::cmp::min(slen, size - dlen - 1);
+        unsafe {
+            core::ptr::copy_nonoverlapping(src as *const u8, dst.add(dlen) as *mut u8, copy);
+            *dst.add(dlen + copy) = 0;
+        }
+    }
+    dlen + slen
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn strsignal(sig: c_int) -> *mut c_char {
+    // Map to errno msg or generic.
+    let m: &[u8] = match sig {
+        1 => b"SIGHUP",
+        2 => b"SIGINT",
+        3 => b"SIGQUIT",
+        4 => b"SIGILL",
+        6 => b"SIGABRT",
+        8 => b"SIGFPE",
+        9 => b"SIGKILL",
+        11 => b"SIGSEGV",
+        13 => b"SIGPIPE",
+        14 => b"SIGALRM",
+        15 => b"SIGTERM",
+        _ => b"Unknown signal",
+    };
+    static mut BUF: [u8; 32] = [0; 32];
+    unsafe {
+        let p = core::ptr::addr_of_mut!(BUF) as *mut u8;
+        let n = core::cmp::min(m.len(), 31);
+        core::ptr::copy_nonoverlapping(m.as_ptr(), p, n);
+        *p.add(n) = 0;
+        p as *mut c_char
+    }
+}
+
+// ── strings.h extensions ────────────────────────────────────────────
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ffs(i: c_int) -> c_int {
+    if i == 0 { 0 } else { (i as u32).trailing_zeros() as c_int + 1 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ffsl(i: c_long) -> c_int {
+    if i == 0 { 0 } else { (i as u64).trailing_zeros() as c_int + 1 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn ffsll(i: c_longlong) -> c_int {
+    if i == 0 { 0 } else { (i as u64).trailing_zeros() as c_int + 1 }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
+    unsafe {
+        let pa = a as *const u8;
+        let pb = b as *const u8;
+        for i in 0..n {
+            if *pa.add(i) != *pb.add(i) {
+                return (*pa.add(i) as c_int) - (*pb.add(i) as c_int);
+            }
+        }
+        0
+    }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn bcopy(src: *const c_void, dst: *mut c_void, n: usize) {
+    unsafe { core::ptr::copy(src as *const u8, dst as *mut u8, n); }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn bzero(s: *mut c_void, n: usize) {
+    unsafe { core::ptr::write_bytes(s as *mut u8, 0, n); }
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn index(s: *const c_char, c: c_int) -> *mut c_char {
+    strchr(s, c)
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn rindex(s: *const c_char, c: c_int) -> *mut c_char {
+    strrchr(s, c)
 }

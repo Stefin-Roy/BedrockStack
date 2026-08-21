@@ -259,11 +259,13 @@ impl InodeOps for NtfsInode {
     }
 
     fn getattr(&self) -> Result<Stat, VfsError> {
+        let mode = if self.file_type == FileType::Directory { 0o755 } else { 0o444 };
         Ok(Stat {
             ino: self.mft_no,
             size: self.size,
             file_type: self.file_type,
             mtime: self.mtime,
+            mode,
         })
     }
 
