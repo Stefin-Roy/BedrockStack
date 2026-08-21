@@ -1,0 +1,12 @@
+{
+    "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
+    "files": {
+        "CHANGELOG.md": "06670f83f7aeafd06ecb8db9084e061f16842dc1e1ee362bec1b9d313de6e280",
+        "Cargo.toml": "ebb00d0123501bef48131a47adab5579fb77cfa67e554a60b6d486f8e7aa9ea0",
+        "LICENSE-APACHE": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+        "LICENSE-MIT": "b4bffc4405a1f9c005b7083e309b8d9cabdab21964320350e7c5d24426533aba",
+        "README.md": "63bc0b2d0b8eb384b6df35308eac96297c3d4dc8e8e805bffcf0a352adb76eb8",
+        "src/lib.rs": "829b90495b6962492d0ddd644b61b1702043dad7f3989c2a1cef2d7260703588"
+    },
+    "package": "4687412b5ac74d245d5bfb1733ede50c31be19bf8a4b6a967a29b451bab49e67"
+}

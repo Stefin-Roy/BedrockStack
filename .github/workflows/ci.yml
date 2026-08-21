@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  vendor-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview, rust-src
+          targets: x86_64-unknown-none,x86_64-unknown-uefi,riscv64gc-unknown-none-elf
+      - name: Check vendored dependencies are in sync
+        run: |
+          cargo vendor --versioned-dirs third_party/dependencies --locked
+          python tools/prune-vendor.py
+          git diff --exit-code -- third_party/dependencies
+          if [ $? -ne 0 ]; then
+            echo "::error::Vendored crates drifted from Cargo.lock. Run: cargo vendor --versioned-dirs third_party/dependencies --locked && python tools/prune-vendor.py"
+            exit 1
+          fi
+          git diff --exit-code -- Cargo.lock
+          if [ $? -ne 0 ]; then
+            echo "::error::Cargo.lock drifted. Commit it."
+            exit 1
+          fi
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: llvm-tools-preview, rust-src
+          targets: x86_64-unknown-none,x86_64-unknown-uefi,riscv64gc-unknown-none-elf
+      - name: Cache cargo + sccache (opt-in)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ~/.cache/sccache
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+      - name: Install sccache (opt-in)
+        run: cargo install sccache --locked || true
+      - name: Build (offline, vendored — kernel only)
+        env:
+          RUSTC_WRAPPER: sccache
+          SCCACHE_CACHE_SIZE: 2G
+        run: |
+          sccache --start-server || true
+          cargo build --target x86_64-unknown-none -p kernel --offline --frozen --config "source.crates-io.replace-with='vendored-sources'" --config "source.vendored-sources.directory='third_party/dependencies'"
+          cargo build --target riscv64gc-unknown-none-elf -p kernel --offline --frozen --config "source.crates-io.replace-with='vendored-sources'" --config "source.vendored-sources.directory='third_party/dependencies'"
+          sccache --show-stats || true
+      - name: Build boot (online, crates.io — not vendored per request)
+        run: |
+          cargo build --target x86_64-unknown-uefi -p boot
