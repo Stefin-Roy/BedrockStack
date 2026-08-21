@@ -354,13 +354,28 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     precreate("/A:mkdir", "init", &mut payload, &mut out);
     precreate("/A/init:create", "test", &mut payload, &mut out);
 
-    let (root, entry, user_stack_top, vm) = match create_process(&elf, alloc) {
+    let (mut root, entry, user_stack_top, vm) = match create_process(&elf, alloc) {
         Ok(x) => x,
         Err(e) => {
             log::warn!("[sched] failed to load INIT: {}", e);
             return;
         }
     };
+    // Install manual fullcaps for INIT (no wildcard)
+    {
+        let caps = crate::caps::full_caps_for_init();
+        if let Some((ptr, len, phys)) = crate::task::install_caps(root, caps, alloc) {
+            // Temporarily create a Task-like stub to hold caps until enter_userspace creates the real Task.
+            // Instead, pass via global stash that enter_userspace will pick up: store in root->caps mapping via
+            // a one-slot stash. For simplicity, we leak and let enter_userspace_with_caps take it.
+            // We'll stash phys/ptr/len in a static so enter_userspace can adopt them.
+            crate::task::stash_init_caps(ptr, len, phys);
+        } else {
+            log::warn!("[sched] caps page alloc failed for INIT");
+        }
+        // Ensure root still has caps page mapped (install_caps mapped it)
+        // No extra step: install_caps already mapped.
+    }
 
     SerialPort::puts("[sched] init at 0x");
     SerialPort::put_hex(entry);

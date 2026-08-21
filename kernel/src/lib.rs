@@ -26,6 +26,7 @@ pub mod smp;
 #[cfg(target_arch = "x86_64")]
 pub mod task;
 pub mod unispace;
+pub mod caps;
 #[cfg(target_arch = "x86_64")]
 pub mod usb;
 

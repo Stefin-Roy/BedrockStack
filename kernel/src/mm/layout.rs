@@ -100,6 +100,15 @@ pub const FB_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x9000_0000;
 pub const LAPIC_VADDR_BASE: u64 = FB_VADDR_FLOOR - 0x1000_0000;
 pub const LAPIC_VADDR_FLOOR: u64 = LAPIC_VADDR_BASE - 0x1000_0000;
 
+/// Capability supervisor page: per-process 4K frame mapped supervisor-only
+/// (READ, no USER) at a fixed low-half VA. Must be outside `usermem`'s
+/// allocatable range (which caps at `user_ceiling` ≈ stack guard bottom), so
+/// choose a VA above the user stack top (0x7FFF00000000) but below USER_BOUNDARY
+/// (0x800000000000). This VA is private per PML4 (low half, not shared via
+/// `clone_high_half`'s PML4 256..511 copy) and supervisor-only so ring3 faults.
+pub const CAP_SLOT_VA: u64 = 0x0000_7FFF_8000_0000;
+pub const CAP_SLOT_SIZE: u64 = 4096;
+
 // ── Runtime region table ───────────────────────────────────────────
 //
 // Each device window allocates *downward* from its `base` (upper bound)

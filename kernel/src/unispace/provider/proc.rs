@@ -138,6 +138,37 @@ static SPAWN_INPUT: Schema = Schema::Struct(&[
     },
 ]);
 
+/// `write(/proc/<pid>:spawn_caps, { path, args, caps })`.
+static CAP_ENTRY: Schema = Schema::Struct(&[
+    schema::Field {
+        name: "path",
+        ty: &schema::SCHEMA_STR,
+    },
+    schema::Field {
+        name: "method",
+        ty: &schema::SCHEMA_STR,
+    },
+    schema::Field {
+        name: "perm",
+        ty: &schema::SCHEMA_U32,
+    },
+]);
+static CAP_LIST: Schema = Schema::List(&CAP_ENTRY);
+static SPAWN_CAPS_INPUT: Schema = Schema::Struct(&[
+    schema::Field {
+        name: "path",
+        ty: &schema::SCHEMA_STR,
+    },
+    schema::Field {
+        name: "args",
+        ty: &schema::SCHEMA_STR,
+    },
+    schema::Field {
+        name: "caps",
+        ty: &CAP_LIST,
+    },
+]);
+
 /// `spawn` output: the new task's pid.
 static SPAWN_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     name: "pid",
@@ -206,7 +237,7 @@ static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-static PROC_METHODS: [MethodDesc; 8] = [
+static PROC_METHODS: [MethodDesc; 9] = [
     MethodDesc {
         name: "exit",
         input: &EXIT_INPUT,
@@ -225,6 +256,11 @@ static PROC_METHODS: [MethodDesc; 8] = [
     MethodDesc {
         name: "spawn",
         input: &SPAWN_INPUT,
+        output: &SPAWN_OUTPUT,
+    },
+    MethodDesc {
+        name: "spawn_caps",
+        input: &SPAWN_CAPS_INPUT,
         output: &SPAWN_OUTPUT,
     },
     MethodDesc {
@@ -454,9 +490,15 @@ impl Object for ProcDir {
             3 => {
                 let path = arg_str(&v, 0)?;
                 let args = arg_str(&v, 1)?;
-                spawn_proc(path, args, out)
+                spawn_proc(path, args, None, out)
             }
             4 => {
+                let path = arg_str(&v, 0)?;
+                let args = arg_str(&v, 1)?;
+                let caps = arg_caps(&v, 2)?;
+                spawn_proc(path, args, Some(caps), out)
+            }
+            5 => {
                 // brk: grow/shrink/query the *current* task's break. Must run
                 // on the caller's CR3 — never self.pid's address space.
                 let new_break = arg_u64(&v, 0)?;
@@ -464,7 +506,7 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(b)]);
                 schema::encode_value(&v, &BRK_OUTPUT, out)
             }
-            5 => {
+            6 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 let prot = arg_u64(&v, 2)?;
@@ -473,13 +515,13 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(base)]);
                 schema::encode_value(&v, &MMAP_OUTPUT, out)
             }
-            6 => {
+            7 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 mem_method(|vm, alloc| crate::mm::usermem::munmap(vm, addr, len, alloc))?;
                 Ok(())
             }
-            7 => {
+            8 => {
                 // wait: block until a *child* of the caller exits and consume
                 // its exit code.  Mirrors :kill — the path's pid is ignored;
                 // the target is named in the payload.
@@ -828,7 +870,9 @@ impl Object for StdDir {
 /// Mirrors the boot path in `task::load::load_init_from_esp`.  Records the
 /// spawner as the child's parent (via `current_pid`) and passes `args` through
 /// for the child to read at `/proc/self/args`.
-fn spawn_proc(path: &str, args: &str, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+/// `caps` is `None` for legacy `spawn` (clone parent caps), `Some(caps)` for
+/// `spawn_caps` (explicit subset, validated).
+fn spawn_proc(path: &str, args: &str, caps: Option<Vec<crate::caps::Cap>>, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
     let mut elf = Vec::new();
     super::super::read(path, &mut elf, usize::MAX)?;
 
@@ -838,6 +882,33 @@ fn spawn_proc(path: &str, args: &str, out: &mut Vec<u8>) -> Result<(), UnispaceE
 
     let (kernel_stack_top, slot) =
         crate::task::alloc_kernel_stack(alloc).ok_or(UnispaceError::Unsupported)?;
+
+    // Capability handling: determine child caps
+    let child_caps: Vec<crate::caps::Cap> = match caps {
+        Some(provided) => {
+            // Validate each cap
+            for c in &provided {
+                crate::caps::validate_cap(c)?;
+                if c.perm as u8 == 2 {
+                    return Err(UnispaceError::InvalidArgument);
+                }
+            }
+            if provided.len() > crate::caps::MAX_CAPS_PER_TASK {
+                return Err(UnispaceError::OutOfMemory);
+            }
+            // Subset check vs parent (kernel bypass when current_caps is None)
+            if let Some(pc) = crate::caps::current_caps() {
+                if !crate::caps::is_subset(&pc, &provided) {
+                    return Err(UnispaceError::InvalidArgument);
+                }
+            }
+            provided
+        }
+        None => {
+            // Legacy clone: inherit parent caps
+            crate::caps::current_caps().unwrap_or_default()
+        }
+    };
 
     // 5-word iretq frame at the top of the kernel stack (RIP, CS, RFLAGS,
     // RSP, SS) — `user_iret` pops exactly this.
@@ -860,6 +931,22 @@ fn spawn_proc(path: &str, args: &str, out: &mut Vec<u8>) -> Result<(), UnispaceE
     task.vm = vm;
     task.args = String::from(args);
     task.parent_pid = current_pid().unwrap_or(0);
+    // Install caps page for child before spawn (maps CAP_SLOT_VA in child's root)
+    if !child_caps.is_empty() {
+        if let Some((ptr, len, phys)) = crate::task::install_caps(root, child_caps, alloc) {
+            task.caps_ptr = ptr;
+            task.caps_len = len;
+            task.caps_phys = phys;
+        } else {
+            // Rollback: free kernel stack and root
+            crate::task::free_kernel_stack(slot, alloc);
+            crate::mm::vmm::destroy_root(root, alloc);
+            return Err(UnispaceError::OutOfMemory);
+        }
+    } else {
+        // No caps: still need empty caps page? Not required; leave phys 0 -> child will be deny-all (empty).
+        // But we still want child to be able to map caps page lazily if needed later.
+    }
     let pid = crate::task::spawn(task);
     attach(pid);
     let v = Value::Struct(vec![Value::U64(pid)]);
@@ -904,4 +991,46 @@ fn arg_str(v: &Value, idx: usize) -> Result<&str, UnispaceError> {
         },
         _ => Err(UnispaceError::SchemaMismatch),
     }
+}
+
+/// Extract caps list from a struct-typed method input (index 2).
+fn arg_caps(v: &Value, idx: usize) -> Result<Vec<crate::caps::Cap>, UnispaceError> {
+    let caps_val = match v {
+        Value::Struct(fields) => fields.get(idx).ok_or(UnispaceError::SchemaMismatch)?,
+        _ => return Err(UnispaceError::SchemaMismatch),
+    };
+    let list = match caps_val {
+        Value::List(items) => items,
+        _ => return Err(UnispaceError::SchemaMismatch),
+    };
+    let mut out = Vec::new();
+    for item in list {
+        let fields = match item {
+            Value::Struct(f) => f,
+            _ => return Err(UnispaceError::SchemaMismatch),
+        };
+        if fields.len() != 3 {
+            return Err(UnispaceError::SchemaMismatch);
+        }
+        let path = match &fields[0] {
+            Value::Str(s) => s.clone(),
+            _ => return Err(UnispaceError::SchemaMismatch),
+        };
+        let method_raw = match &fields[1] {
+            Value::Str(s) => s.clone(),
+            _ => return Err(UnispaceError::SchemaMismatch),
+        };
+        let method = if method_raw.is_empty() { None } else { Some(method_raw) };
+        let perm_u32 = match &fields[2] {
+            Value::U64(n) => *n as u32,
+            _ => return Err(UnispaceError::SchemaMismatch),
+        };
+        let perm = match perm_u32 {
+            1 => crate::caps::Perm::R,
+            3 => crate::caps::Perm::RW,
+            _ => return Err(UnispaceError::InvalidArgument),
+        };
+        out.push(crate::caps::Cap { path, method, perm });
+    }
+    Ok(out)
 }
