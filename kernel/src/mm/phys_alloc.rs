@@ -479,9 +479,19 @@ impl PhysicalMemoryAllocator for BitmapAllocator {
         }
     }
 
-    fn free_frames(&mut self, addr: u64, _count: usize) {
-        unsafe {
-            self.free(addr);
+    fn free_frames(&mut self, addr: u64, count: usize) {
+        // `count` was previously ignored, leaking N-1 frames on every
+        // `alloc_contiguous(N)` free. Iterate per-frame so the bitmap and
+        // `next_free` stay consistent. Caller guarantees `addr` page-aligned.
+        if count == 0 {
+            return;
+        }
+        debug_assert!(addr % 4096 == 0, "free_frames: unaligned addr {:#x}", addr);
+        for i in 0..count {
+            let frame = addr + (i as u64) * 4096;
+            unsafe {
+                self.free(frame);
+            }
         }
     }
 

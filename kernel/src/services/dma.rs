@@ -29,6 +29,14 @@ pub fn init_dma_allocator(root: u64, alloc: *mut BitmapAllocator) -> &'static dy
     DMA_ALLOCATOR.call_once(|| KernelDma::new(root, alloc))
 }
 
+/// Update the stashed allocator pointer after the `BitmapAllocator` moves
+/// (mirrors `heap::set_phys_allocator` / `acpi::update_alloc`).
+pub fn update_dma_alloc(alloc: *mut BitmapAllocator) {
+    if let Some(kdma) = DMA_ALLOCATOR.get() {
+        kdma.inner.lock().alloc = alloc;
+    }
+}
+
 /// Translation cache shared across the kernel.
 const TRANS_CACHE_SIZE: usize = 64;
 struct TransCacheInner {
@@ -55,8 +63,24 @@ impl TransCacheInner {
         self.next = self.next.wrapping_add(1);
         Some(pa)
     }
+    fn invalidate_range(&mut self, vaddr: u64, size: u64) {
+        if size == 0 {
+            return;
+        }
+        let start = vaddr & !0xFFF;
+        let end = (vaddr + size + 0xFFF) & !0xFFF;
+        for (v, _) in self.entries.iter_mut() {
+            if *v >= start && *v < end {
+                *v = 0;
+            }
+        }
+    }
 }
 static TRANS_CACHE: Mutex<TransCacheInner> = Mutex::new(TransCacheInner::new());
+
+pub fn invalidate_trans_cache(vaddr: u64, size: u64) {
+    TRANS_CACHE.lock().invalidate_range(vaddr, size);
+}
 
 // ── KernelDma provider ──────────────────────────────────────────────
 

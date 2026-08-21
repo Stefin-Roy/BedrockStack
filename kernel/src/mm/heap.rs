@@ -3,6 +3,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
+use crate::filesystems::vfs::irq::IrqMutex;
 use crate::mm::layout::{HEAP_FLOOR, HEAP_GUARD_BYTES, HEAP_TOP};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
@@ -53,8 +54,21 @@ impl BlockHeader {
     /// A header cannot in general be recovered by rounding a payload address:
     /// an allocation with a large alignment can have padding between its
     /// header and payload.  `alloc_inner` stores this back-pointer instead.
+    ///
+    /// # Safety
+    /// `ptr` must be a payload previously returned by `alloc_inner` and not yet
+    /// freed. The 8 bytes at `ptr - BACKPTR_SIZE` must hold a valid
+    /// `*mut BlockHeader` (written by `alloc_inner`).
     unsafe fn from_payload(ptr: *mut u8) -> *mut BlockHeader {
-        unsafe { *((ptr as usize - BACKPTR_SIZE) as *const *mut BlockHeader) }
+        debug_assert!(!ptr.is_null(), "from_payload: null pointer");
+        debug_assert!(
+            (ptr as usize) >= BACKPTR_SIZE,
+            "from_payload: ptr too low {:#x}",
+            ptr as usize
+        );
+        let header_ptr = unsafe { *((ptr as usize - BACKPTR_SIZE) as *const *mut BlockHeader) };
+        debug_assert!(!header_ptr.is_null(), "from_payload: header was null");
+        header_ptr
     }
 
     fn end(&self) -> usize {
@@ -886,6 +900,11 @@ impl HeapInner {
 }
 
 static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
+// Keep plain `Mutex` (not `IrqMutex`) for the global heap: growth may
+// trigger `VMM::map` → `shootdown_tlb()` which waits for IPI acks. An
+// `IrqMutex` would hold IRQs disabled across that wait, deadlocking if the
+// target CPU is spinning on `HEAP` with IRQs off (e.g. inside a `VFS IrqMutex`).
+// The per-CPU cache (below) *is* `IrqMutex` so IRQ-time `free` never spins.
 static HEAP: Mutex<HeapInner> = Mutex::new(HeapInner::empty());
 
 /// Raw pointer to the physical allocator, stashed so `alloc()` can grow the heap.
@@ -904,10 +923,25 @@ static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
 /// once the final location is known so heap growth and DMA allocations
 /// continue to work.
 pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
+    let new_ptr = phys as *mut BitmapAllocator;
     unsafe {
-        PHYS_ALLOCATOR = phys as *mut BitmapAllocator;
+        let old = PHYS_ALLOCATOR;
+        // Once set, the allocator must live at a stable address (`Kernel` owns it).
+        // A move without updating would leave the stashed pointer dangling;
+        // updating to the same address is idempotent (e.g. `lib.rs:run()` re-point).
+        if !old.is_null() && old != new_ptr {
+            // Log the re-point — useful if `Kernel::new` → `init` → `run` moves
+            // the allocator; staying silent would hide a use-after-move.
+            SerialPort::puts("[heap] set_phys_allocator re-point ");
+            SerialPort::put_hex(old as u64);
+            SerialPort::puts(" -> ");
+            SerialPort::put_hex(new_ptr as u64);
+            SerialPort::puts("\n");
+        }
+        PHYS_ALLOCATOR = new_ptr;
     }
-    crate::acpi::update_alloc(phys as *mut BitmapAllocator);
+    crate::acpi::update_alloc(new_ptr);
+    crate::services::dma::update_dma_alloc(new_ptr);
 }
 
 /// Return a raw pointer to the physical allocator (may be null if uninitialised).
@@ -1059,23 +1093,26 @@ impl PerCpuCache {
     }
 }
 
-static PER_CPU_CACHE: [spin::Mutex<PerCpuCache>; crate::smp::MAX_CPUS] = [
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
-    spin::Mutex::new(PerCpuCache::const_empty()),
+/// Per-CPU free-block staging — `IrqMutex` so an IRQ handler freeing on the
+/// same CPU while the interrupted thread holds its own cache cannot spin
+/// forever. The cache link lives in payload bytes, so IRQ-time free is valid.
+static PER_CPU_CACHE: [IrqMutex<PerCpuCache>; crate::smp::MAX_CPUS] = [
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
+    IrqMutex::new(PerCpuCache::const_empty()),
 ];
 
 /// Try to satisfy `layout` from the current CPU's private cache.

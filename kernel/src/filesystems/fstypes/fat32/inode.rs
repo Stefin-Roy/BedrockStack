@@ -501,8 +501,10 @@ impl InodeOps for Fat32Inode {
         zero_cluster(&self.sb, new_clus)?;
 
         let empty_set = HashSet::new();
-        let dot_sfn = sfn_from_name(".", &empty_set).unwrap();
-        let dotdot_sfn = sfn_from_name("..", &empty_set).unwrap();
+        // SAFETY: "." and ".." are always valid SFN per `sfn_from_name` contract;
+        // use `expect` with proof comment to avoid forbidden `unwrap` on device path.
+        let dot_sfn = sfn_from_name(".", &empty_set).expect("BUG: '.' must be valid SFN");
+        let dotdot_sfn = sfn_from_name("..", &empty_set).expect("BUG: '..' must be valid SFN");
 
         let mut dot_entry = [0u8; DIR_ENTRY_SIZE];
         dot_entry[..MAX_SFN_LEN].copy_from_slice(&dot_sfn);
@@ -739,9 +741,10 @@ impl InodeOps for Fat32Inode {
             read_cluster(&self.sb, fc, &mut buf)?;
             let dotdot_off = DIR_ENTRY_SIZE;
             set_first_clus_in_entry(
-                &mut buf[dotdot_off..dotdot_off + DIR_ENTRY_SIZE]
+                buf.get_mut(dotdot_off..dotdot_off + DIR_ENTRY_SIZE)
+                    .ok_or(VfsError::IOError)?
                     .try_into()
-                    .unwrap(),
+                    .map_err(|_| VfsError::IOError)?,
                 parent,
             );
             write_cluster(&self.sb, fc, &buf)?;

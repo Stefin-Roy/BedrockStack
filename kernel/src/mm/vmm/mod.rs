@@ -296,6 +296,7 @@ impl Vmm {
         if removed {
             flush_tlb();
             shootdown_tlb();
+            crate::services::dma::invalidate_trans_cache(vaddr, 4096);
             pending.flush(alloc);
         }
         removed
@@ -364,7 +365,11 @@ impl Vmm {
         if removed_any || !pending.is_empty() {
             flush_tlb();
             shootdown_tlb();
+            crate::services::dma::invalidate_trans_cache(vaddr, size);
             pending.flush(alloc);
+        } else {
+            // Even if no leaf was removed, the range may have been cached.
+            crate::services::dma::invalidate_trans_cache(vaddr, size);
         }
     }
 
@@ -451,7 +456,10 @@ impl Vmm {
         if removed_any || !pending.is_empty() {
             flush_tlb();
             shootdown_tlb();
+            crate::services::dma::invalidate_trans_cache(vaddr, size);
             pending.flush(alloc);
+        } else {
+            crate::services::dma::invalidate_trans_cache(vaddr, size);
         }
     }
 

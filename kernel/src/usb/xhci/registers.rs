@@ -50,7 +50,8 @@ pub const PORTSC_CEC: u32 = 1 << 23;
 pub const PORTSC_STATUS_BITS: u32 =
     PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
 
-const MMIO_SIZE: u64 = 0x10000;
+const DEFAULT_MMIO_SIZE: u64 = 0x10000;
+const MMIO_SIZE: u64 = DEFAULT_MMIO_SIZE;
 
 pub struct XhciRegisters {
     mmio_va: u64,
@@ -62,7 +63,22 @@ pub struct XhciRegisters {
 
 impl XhciRegisters {
     pub fn new(phys_base: u64, dma: &dyn DmaAllocator) -> Result<Self, &'static str> {
-        let mmio_va = dma.map_mmio(phys_base, MMIO_SIZE)?;
+        Self::new_with_size(phys_base, dma, DEFAULT_MMIO_SIZE)
+    }
+
+    pub fn new_with_size(
+        phys_base: u64,
+        dma: &dyn DmaAllocator,
+        mut mmio_size: u64,
+    ) -> Result<Self, &'static str> {
+        // Real xHCI BARs may exceed 64 KiB when extended caps spill past 0x10000.
+        // Probe callers should pass a sized value; fallback to default if zero.
+        if mmio_size == 0 {
+            mmio_size = DEFAULT_MMIO_SIZE;
+        }
+        // Round up to page size for VMM.
+        mmio_size = (mmio_size + 0xFFF) & !0xFFF;
+        let mmio_va = dma.map_mmio(phys_base, mmio_size)?;
 
         let caplength = unsafe { core::ptr::read_volatile(mmio_va as *const u8) };
         let op_base = mmio_va + caplength as u64;

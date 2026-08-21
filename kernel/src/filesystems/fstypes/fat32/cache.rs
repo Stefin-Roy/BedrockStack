@@ -40,7 +40,7 @@ impl FatCache {
             self.sectors.insert(lba, buf);
             self.clock.push(lba);
         }
-        Ok(self.sectors.get(&lba).unwrap())
+        self.sectors.get(&lba).ok_or(VfsError::IOError)
     }
 
     pub fn get_or_read_mut(
@@ -56,13 +56,13 @@ impl FatCache {
             self.clock.push(lba);
         }
         self.dirty.insert(lba);
-        Ok(self.sectors.get_mut(&lba).unwrap())
+        self.sectors.get_mut(&lba).ok_or(VfsError::IOError)
     }
 
     pub fn flush(&mut self, device: &dyn BlockDevice, bpb: &Bpb) -> Result<(), VfsError> {
         let is_mirrored = bpb.ext_flags & 0x80 == 0;
         for &lba in self.dirty.iter() {
-            let data = self.sectors.get(&lba).unwrap();
+            let data = self.sectors.get(&lba).ok_or(VfsError::IOError)?;
             write_sectors(device, lba, 1, data)?;
             if is_mirrored {
                 for fat_num in 1..bpb.num_fats {

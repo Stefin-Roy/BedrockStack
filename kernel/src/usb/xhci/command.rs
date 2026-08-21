@@ -25,7 +25,8 @@ fn wait_for_completion() -> Result<(u8, u8), &'static str> {
         SerialPort::puts("[xhci] CMD TIMEOUT\n");
         return Err("command completion timeout");
     }
-    let (slot_id, cc, _param) = super::event::last_command_completion().unwrap();
+    let (slot_id, cc, _param) = super::event::last_command_completion()
+        .ok_or("command completion lost")?;
     if cc == 1 {
         Ok((slot_id, cc))
     } else {

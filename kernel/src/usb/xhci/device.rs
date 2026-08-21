@@ -139,7 +139,8 @@ fn wait_for_transfer_timeout(slot_id: u8, ep_id: u8, timeout_ns: u64) -> Result<
     if !completed {
         return Err("transfer timeout");
     }
-    let (_sid, _eid, cc, _remaining) = event::last_transfer_completion().unwrap();
+    let (_sid, _eid, cc, _remaining) = event::last_transfer_completion()
+        .ok_or("transfer completion lost")?;
     // Success (1), Short Packet (13), and the isochronous pair Isoch Buffer
     // Overrun (10) / Underrun (11) all count as an executed transfer — the
     // last two are the normal outcome when a device sends more/fewer bytes
