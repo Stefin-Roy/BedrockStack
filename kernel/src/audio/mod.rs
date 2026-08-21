@@ -6,23 +6,26 @@
 //! machine has no PCI audio device, so the subsystem stays idle there
 //! (`init()` is a no-op).
 //!
-//! The engine is a **feeding ring**: the HDA DMA ring for each direction is
-//! started once at init and left running for the kernel's lifetime, and
-//! playback/capture are driven synchronously by whoever calls them — there is
-//! no kernel pump task and no request queue.  A call to `play_pcm`/
-//! `record_pcm` stages the caller's samples into the next free DMA slot and
-//! returns; when the ring is full (playback) or empty (capture) the caller
-//! parks cooperatively until the DMA advances.  Back-to-back calls chain
-//! gaplessly because the ring never stops, and a stalled producer plays
-//! silence (the ISR zeroes each consumed output slot) instead of stale audio.
-//! The HDA completion ISR is the only asynchronous actor: it bumps the
-//! ring cursors and clears the just-consumed output slot.
+//! The engine is a **feeding ring** + **fire-forget pump**: the HDA DMA ring
+//! for each direction is started once at init and left running for the
+//! kernel's lifetime (isr zeroes consumed slots → silence, no stale-loop
+//! repetition after provider finished). Playback `play_pcm`/`play_tone` are
+//! **non-blocking** when the pump task is alive: samples are queued into a
+//! bounded `PUMP_QUEUE` (cap 4) and the caller returns immediately — the pump
+//! chains them gaplessly through the running ring. When the ring is full the
+//! pump parks cooperatively (never HLTs BSP) until DMA advances; when the pump
+//! is not yet alive (boot context, no device) the call falls back to the
+//! legacy synchronous feeding-ring submit so early boot still works.
+//! Capture `record_pcm` remains synchronous blocking (future work may decouple
+//! it).
 
 pub mod codec;
 pub mod hda;
 
+use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Once;
+use spin::{Mutex, Once};
 
 /// The fixed stream format the engine drives: 48 kHz, 16-bit signed, stereo.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -66,6 +69,142 @@ pub trait AudioDevice: Send + Sync {
 
 static DEVICE: Once<&'static dyn AudioDevice> = Once::new();
 static READY: AtomicBool = AtomicBool::new(false);
+
+// ── Playback pump ───────────────────────────────────────────────────
+//
+// The old pump (`212a754`) used a `CBL=u32::MAX` cyclic BDL that kept the
+// DMA cycling forever with stale PCM after the provider finished — the ring
+// repetition bug. The current feeding ring is always-running with ISR zeroing
+// (hda.rs `out_completed_reconcile` zeroes each consumed `delta`), so drained
+// slots play silence. The pump therefore simply dequeues Vec<i16> chunks and
+// forwards them to the feeding ring's `submit_playback`; DMA never replays
+// stale data because the isr clears it, and the pump never touches BDL
+// directly. This keeps fire-forget (callers enqueue and return) without the
+// repetition hazard.
+//
+// Bounded queue: 4 entries × up to ~8188 B (DOOM chunk) ≈ 32 KiB, plus
+// occasional tone (10s → 1.9 MiB) still fits but a large tone will occupy
+// one slot. Enqueuers park cooperatively (task::sleep_current 0.5ms slices)
+// when full, never HLT the BSP. Total pipeline with the 16×1024 ring
+// (≈85 ms staged cap ≈80 ms) is ≈ 255 ms worst before enqueuers park.
+
+/// Keep queue shallow to bound latency: 16×1024 ring ≈80 ms staged cap plus
+/// 4× ≈42.6 ms DOOM chunks ≈ 250 ms worst. Fire-forget still holds —
+/// enqueuers park only when truly full.
+const PUMP_QUEUE_CAP: usize = 4;
+static PUMP_QUEUE: Mutex<VecDeque<Vec<i16>>> = Mutex::new(VecDeque::new());
+static PUMP_ALIVE: AtomicBool = AtomicBool::new(false);
+
+/// Persistent sine phase (raw f64 bits) across `play_tone` calls, so
+/// consecutive tones chain without a phase-reset click.
+static TONE_PHASE_BITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Queue `samples` for the pump. Returns immediately; the pump plays it
+/// through the feeding ring. If the pump is not running (boot context, no
+/// device, spawn failed) falls back to synchronous `submit_playback` so early
+/// boot still audible. When the bounded queue is full, the caller parks
+/// cooperatively (yielding) until the pump frees a slot — never HLTs the BSP
+/// when a task context exists (AUD-028).
+fn enqueue_playback(samples: Vec<i16>) -> Result<(), &'static str> {
+    if samples.is_empty() {
+        return Ok(());
+    }
+    if !PUMP_ALIVE.load(Ordering::Acquire) {
+        // Pump not alive: boot context or no device — synchronous fallback.
+        return match DEVICE.get() {
+            Some(d) => d.submit_playback(&samples),
+            None => Err("audio device not initialised"),
+        };
+    }
+    loop {
+        {
+            let mut q = PUMP_QUEUE.lock();
+            if q.len() < PUMP_QUEUE_CAP {
+                q.push_back(samples);
+                return Ok(());
+            }
+        }
+        // Queue full — park cooperatively. If no current task (should not
+        // happen when pump is alive, but be safe) fall back to HLT wait.
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::smp::current_per_cpu().current_task.is_null() {
+                crate::services::universal_timer::sleep_ms(1);
+            } else {
+                crate::task::sleep_current(500_000);
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            crate::services::universal_timer::sleep_ms(1);
+        }
+    }
+}
+
+/// Spawn the playback pump kernel task. Call once from `Kernel::run()` after
+/// `task::init()` and only when an audio device is live. No-op if already
+/// running or no device. The pump lives for the kernel lifetime: pops queued
+/// requests and forwards them to the feeding ring's `submit_playback`, which
+/// handles the real-time pacing and ISR zeroing — so there is no ring
+/// repetition after the provider finishes (drained slots are silence).
+#[cfg(target_arch = "x86_64")]
+pub fn spawn_pump(alloc: &mut crate::mm::phys_alloc::BitmapAllocator) {
+    if !is_ready() {
+        return;
+    }
+    if PUMP_ALIVE.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let root = crate::task::kernel_root();
+    let (top, slot) = match crate::task::alloc_kernel_stack(alloc) {
+        Some(v) => v,
+        None => {
+            PUMP_ALIVE.store(false, Ordering::Release);
+            crate::drivers::serial::SerialPort::puts("[audio] pump: no kernel stack\n");
+            return;
+        }
+    };
+    let mut task = crate::task::Task::new(
+        top,
+        root,
+        0,
+        crate::task::TaskContext::new(top - 8, audio_pump_entry as *const () as usize as u64),
+    );
+    task.kstack_slot = slot;
+    crate::task::spawn(task);
+    crate::drivers::serial::SerialPort::puts("[audio] pump task spawned\n");
+}
+
+#[cfg(target_arch = "x86_64")]
+extern "C" fn audio_pump_entry() -> ! {
+    use crate::drivers::serial::SerialPort as SP;
+    SP::puts("[audio] pump: entry\n");
+    loop {
+        let chunk = {
+            let mut q = PUMP_QUEUE.lock();
+            q.pop_front()
+        };
+        let Some(chunk) = chunk else {
+            // Queue empty — park briefly until next enqueue.
+            crate::task::sleep_current(500_000);
+            continue;
+        };
+        // Forward to feeding ring. This may park cooperatively when the
+        // 16×1024 ring is full (≈80 ms headroom), but the pump is the sole
+        // long-term producer so no other task is blocked; enqueuers remain
+        // fire-forget up to queue cap. ISR zeroes consumed slots, so after
+        // the last chunk drains we play silence — no stale repetition.
+        let dev = match DEVICE.get() {
+            Some(d) => *d,
+            None => continue,
+        };
+        if let Err(e) = dev.submit_playback(&chunk) {
+            SP::puts("[audio] pump submit failed: ");
+            SP::puts(e);
+            SP::puts("\n");
+        }
+    }
+}
 
 /// Probe for an audio controller and bring the first working one up.
 ///
@@ -141,14 +280,28 @@ pub fn device_name() -> Option<&'static str> {
     DEVICE.get().map(|d| d.name())
 }
 
-/// Play interleaved 16-bit signed stereo PCM at 48 kHz.  Synchronous in the
-/// feeding-ring sense: stages the samples into the running DMA ring and
-/// returns once staged (parking only when the ring is momentarily full).
+/// Play interleaved 16-bit signed stereo PCM at 48 kHz.
+///
+/// Fire-forget when the pump is alive: samples are queued (copied) and the
+/// caller returns immediately; the pump chains them gaplessly through the
+/// always-running feeding ring (ISR zero → silence, no repetition). Without a
+/// running pump (boot context) this stages synchronously into the ring and
+/// may park cooperatively when full.
 pub fn play_pcm(samples: &[i16]) -> Result<(), &'static str> {
-    match DEVICE.get() {
-        Some(d) => d.submit_playback(samples),
-        None => Err("audio device not initialised"),
+    // Cheap empty check before allocation.
+    if samples.is_empty() {
+        return Ok(());
     }
+    if samples.len() % 2 != 0 {
+        return Err("odd sample count (stereo requires even)");
+    }
+    if !PUMP_ALIVE.load(Ordering::Acquire) {
+        return match DEVICE.get() {
+            Some(d) => d.submit_playback(samples),
+            None => Err("audio device not initialised"),
+        };
+    }
+    enqueue_playback(samples.to_vec())
 }
 
 /// True once the live device can capture (an ADC path is wired).
@@ -169,10 +322,13 @@ pub fn record_pcm(dest: &mut [i16]) -> Result<(), &'static str> {
     }
 }
 
-/// Play a sine tone for `ms` milliseconds.  Synchronous in the feeding-ring
-/// sense: synthesises the whole tone, then stages it into the running DMA
-/// ring (parking only when the ring is momentarily full).  Rejects tones
-/// longer than 10 seconds to avoid unbounded allocation.
+/// Play a sine tone for `ms` milliseconds.
+///
+/// Fire-forget when the pump is alive: synthesises the tone into a heap
+/// Vec and enqueues it; the pump plays it. Without a pump stages
+/// synchronously. Rejects tones longer than 10 seconds to bound allocation
+/// (≈1.9 MiB @ 48k stereo). The oscillator phase persists across calls, so
+/// back-to-back tones chain without a hard waveform reset (an audible click).
 pub fn play_tone(freq_hz: u32, ms: u64) -> Result<(), &'static str> {
     if ms > 10_000 {
         return Err("tone too long (max 10 s)");
@@ -181,12 +337,24 @@ pub fn play_tone(freq_hz: u32, ms: u64) -> Result<(), &'static str> {
     let mut samples = alloc::vec::Vec::with_capacity(frames * CHANNELS);
     samples.resize(frames * CHANNELS, 0i16);
     let step = 2.0 * core::f64::consts::PI * freq_hz as f64 / SAMPLE_RATE as f64;
+    let two_pi = 2.0 * core::f64::consts::PI;
+    let mut phase = f64::from_bits(TONE_PHASE_BITS.load(Ordering::Relaxed));
     for f in 0..frames {
-        let v = (sin_approx(step * f as f64) * 0.35 * 32767.0) as i16;
+        let v = (sin_approx(phase) * 0.35 * 32767.0) as i16;
         samples[f * CHANNELS] = v;
         samples[f * CHANNELS + 1] = v;
+        phase += step;
     }
-    play_pcm(&samples)
+    // Keep the accumulator bounded; `sin_approx` folds any angle anyway.
+    phase %= two_pi;
+    TONE_PHASE_BITS.store(phase.to_bits(), Ordering::Relaxed);
+    if !PUMP_ALIVE.load(Ordering::Acquire) {
+        return match DEVICE.get() {
+            Some(d) => d.submit_playback(&samples),
+            None => Err("audio device not initialised"),
+        };
+    }
+    enqueue_playback(samples)
 }
 
 /// Bhaskara I rational approximation of `sin(x)`, valid on `[0, π]`.

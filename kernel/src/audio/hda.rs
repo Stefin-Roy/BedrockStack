@@ -25,16 +25,26 @@ const STREAM_TAG: u32 = 1;
 const INPUT_TAG: u32 = 2;
 
 // ── Feeding-ring geometry ───────────────────────────────────────────
-/// Per-slot size in bytes. 2048 B = 512 stereo frames ≈ 10.7 ms at 48 kHz.
-const RING_SLOT_BYTES: usize = 2048;
-/// Ring depth: 8 slots ≈ 85.3 ms total buffer capacity.
-const RING_SLOTS: usize = 8;
-/// One contiguous DMA buffer per direction: 16,384 bytes.
+/// 16×1024 B = 16 KiB ≈85.3 ms total. Per-slot 256 frames ≈5.3 ms @ 48 kHz,
+/// 128B-aligned per HDA §3.6.3. Deep enough to ride out multi-ms producer
+/// stalls (FAT32 reads between INIT's WAV chunks, TCG DOOM frame bursts)
+/// without underrunning; the producer staging cap leaves one slot unused so
+/// DMA never aliases. ISR zeroes consumed deltas → silence on underrun, no
+/// stale repetition (old CBL=u32::MAX pump).
+const RING_SLOT_BYTES: usize = 1024;
+const RING_SLOTS: usize = 16;
 const RING_BUF_BYTES: usize = RING_SLOT_BYTES * RING_SLOTS;
 
-/// Producer staging cap (7 slots ≈ 74.6 ms of staged audio).
-/// Leaves 1 slot of wrap clearance behind the write head.
+/// Producer staging cap (15 slots ≈80 ms of staged audio).
 const MAX_STAGED_BYTES: usize = RING_BUF_BYTES - RING_SLOT_BYTES;
+
+/// Underrun/cold-start guard: on realignment the write head skips this many
+/// slots past the reconciled play head and the skipped gap is zeroed. Two
+/// slots (≈10.7 ms) keeps fresh writes clear of bytes the DMA may still be
+/// reading even when the completion cursor lags the hardware LPIB by up to a
+/// reconcile interval — writing flush to `c` produced torn samples and let
+/// the ISR zero freshly staged audio (the "noise between chunks").
+const REALIGN_GUARD_SLOTS: usize = 2;
 
 // ── Controller register offsets ────────────────────────────────────
 mod regs {
@@ -169,6 +179,19 @@ fn in_captured_reconcile() {
     }
 }
 
+/// Throttled serial notice for playback underrun realignments. The first
+/// event logs immediately and later events every 64th, so a pathological
+/// stall storm cannot flood COM1 while stalls stay observable.
+fn log_playback_realign() {
+    static COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    if n == 0 || n % 64 == 63 {
+        SerialPort::puts("[audio] hda: playback underrun realign #");
+        SerialPort::put_u64(n + 1);
+        SerialPort::puts("\n");
+    }
+}
+
 fn hda_irq_handler() {
     let mmio = HDA_MMIO.load(Ordering::Relaxed);
     if mmio == 0 {
@@ -222,9 +245,10 @@ fn ring_wait_until(done: &dyn Fn() -> bool) {
             service_polled_completions();
             done()
         };
+        // 2.7 ms slot → 3 ms window, 0.5 ms slice for tight refill.
         let _ = crate::services::universal_timer::wait_until_cond_coop(
-            crate::services::universal_timer::now_ns() + 10_000_000,
-            1_000_000,
+            crate::services::universal_timer::now_ns() + 3_000_000,
+            500_000,
             &check,
         );
     }
@@ -449,7 +473,6 @@ impl AudioDevice for HdaAudio {
         if samples.len() % 2 != 0 {
             return Err("odd sample count (stereo requires even)");
         }
-        let _guard = OUT_LOCK.lock();
         let nbytes = samples.len() * 2;
         let slot = OUT_SLOT_BYTES.load(Ordering::Relaxed) as usize;
         let slots = OUT_RING_SLOTS.load(Ordering::Relaxed) as usize;
@@ -461,18 +484,64 @@ impl AudioDevice for HdaAudio {
 
         let mut off = 0usize;
         while off < nbytes {
-            let mut p = OUT_PRODUCED.load(Ordering::Relaxed);
-            let c = OUT_COMPLETED.load(Ordering::Acquire);
+            // Advisory headroom probe outside the lock: once the staging cap
+            // is hit, park cooperatively until a completion frees space. The
+            // authoritative decision is remade under OUT_LOCK below.
+            let probe = OUT_PRODUCED
+                .load(Ordering::Relaxed)
+                .saturating_sub(OUT_COMPLETED.load(Ordering::Acquire));
+            if probe >= MAX_STAGED_BYTES as u64 {
+                ring_wait_until(&|| {
+                    let p2 = OUT_PRODUCED.load(Ordering::Relaxed);
+                    let c2 = OUT_COMPLETED.load(Ordering::Acquire);
+                    p2.saturating_sub(c2) < MAX_STAGED_BYTES as u64
+                });
+                continue;
+            }
 
-            // Cold start or buffer underrun: DMA caught up to write head.
-            // Realign directly to c so playback starts immediately without gaps.
+            // Authoritative producer critical section. Cursor read, realign,
+            // write placement, byte copy, and produced-advance are one atomic
+            // step: concurrent producers cannot pick the same write position
+            // (lost-update corruption) and the write head is never observed
+            // half-committed against the DMA. The lock is dropped before any
+            // wait — it is never held across a park.
+            let guard = OUT_LOCK.lock();
+
+            // Reconcile first so `c` tracks the hardware play head as closely
+            // as possible before anything is placed. Safe under OUT_LOCK: the
+            // ISR advances the same cursors via atomic swap (never takes this
+            // lock), so multi-caller reconcile is race-free by construction.
+            out_completed_reconcile();
+            let c = OUT_COMPLETED.load(Ordering::Acquire);
+            let mut p = OUT_PRODUCED.load(Ordering::Relaxed);
+
+            // Cold start or true underrun (the DMA caught up to or passed the
+            // write head): skip the write head past the live play position,
+            // leaving a zeroed guard gap. Writing flush to `c` would land on
+            // bytes the DMA may still be reading — the cursor lags LPIB by up
+            // to one reconcile interval — which produced torn samples and let
+            // the ISR zero freshly staged audio ("noise between chunks"). The
+            // gap plays as clean silence instead.
             if p <= c {
-                p = c;
-                OUT_PRODUCED.store(p, Ordering::Relaxed);
+                let gap = REALIGN_GUARD_SLOTS * slot;
+                let start = (c as usize) % ring;
+                unsafe {
+                    if start + gap <= ring {
+                        core::ptr::write_bytes(buf_virt.add(start), 0, gap);
+                    } else {
+                        let first = ring - start;
+                        core::ptr::write_bytes(buf_virt.add(start), 0, first);
+                        core::ptr::write_bytes(buf_virt, 0, gap - first);
+                    }
+                }
+                p = c + gap as u64;
+                OUT_PRODUCED.store(p, Ordering::Release);
+                log_playback_realign();
             }
 
             let ahead = p - c;
             if ahead >= MAX_STAGED_BYTES as u64 {
+                drop(guard);
                 ring_wait_until(&|| {
                     let p2 = OUT_PRODUCED.load(Ordering::Relaxed);
                     let c2 = OUT_COMPLETED.load(Ordering::Acquire);
@@ -493,6 +562,7 @@ impl AudioDevice for HdaAudio {
                 );
             }
             OUT_PRODUCED.store(p + take as u64, Ordering::Release);
+            drop(guard);
             off += take;
         }
         Ok(())
@@ -512,7 +582,7 @@ impl AudioDevice for HdaAudio {
         if dest.len() % 2 != 0 {
             return Err("odd sample count (stereo requires even)");
         }
-        let _guard = IN_LOCK.lock();
+        // Like playback, hold IN_LOCK only around the copy, not the wait.
         let nbytes = dest.len() * 2;
         let slot = IN_SLOT_BYTES.load(Ordering::Relaxed) as usize;
         let slots = IN_RING_SLOTS.load(Ordering::Relaxed) as usize;
@@ -544,6 +614,7 @@ impl AudioDevice for HdaAudio {
             let pos = (con as usize) % ring;
             let take = (nbytes - off).min(avail).min(ring - pos);
             let src = unsafe { buf_virt.add(pos) };
+            let guard = IN_LOCK.lock();
             unsafe {
                 core::ptr::copy_nonoverlapping(
                     src,
@@ -552,6 +623,7 @@ impl AudioDevice for HdaAudio {
                 );
             }
             IN_CONSUMED.store(con + take as u64, Ordering::Release);
+            drop(guard);
             off += take;
         }
         Ok(())

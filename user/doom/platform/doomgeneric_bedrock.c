@@ -188,6 +188,14 @@ void DG_DrawFrame(void)
     }
 
     bedrock_fb_write(0, frame, (size_t)total);
+
+    /* Cooperative yield once per rendered frame. The kernel scheduler is
+     * purely cooperative with no preemption, so without this a long TCG
+     * frame starves the kernel audio pump past the HDA ring's staged
+     * window and playback underruns. sleep_ms(0) parks this task and lets
+     * the idle loop requeue it after any ready work — the pump — has run.
+     */
+    bedrock_sleep_ms(0);
 }
 
 /* ── DG_SleepMs / DG_GetTicksMs ─────────────────────────────────────── */
