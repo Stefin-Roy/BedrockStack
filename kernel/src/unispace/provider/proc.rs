@@ -126,19 +126,7 @@ static KILL_INPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-/// `write(/proc/<pid>:spawn, { path, args })`.
-static SPAWN_INPUT: Schema = Schema::Struct(&[
-    schema::Field {
-        name: "path",
-        ty: &schema::SCHEMA_STR,
-    },
-    schema::Field {
-        name: "args",
-        ty: &schema::SCHEMA_STR,
-    },
-]);
-
-/// `write(/proc/<pid>:spawn_caps, { path, args, caps })`.
+/// `write(/proc/<pid>:spawn_caps, { path, args, caps })` — replaces legacy `spawn`.
 static CAP_ENTRY: Schema = Schema::Struct(&[
     schema::Field {
         name: "path",
@@ -237,7 +225,7 @@ static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-static PROC_METHODS: [MethodDesc; 9] = [
+static PROC_METHODS: [MethodDesc; 8] = [
     MethodDesc {
         name: "exit",
         input: &EXIT_INPUT,
@@ -252,11 +240,6 @@ static PROC_METHODS: [MethodDesc; 9] = [
         name: "kill",
         input: &KILL_INPUT,
         output: &schema::SCHEMA_UNIT,
-    },
-    MethodDesc {
-        name: "spawn",
-        input: &SPAWN_INPUT,
-        output: &SPAWN_OUTPUT,
     },
     MethodDesc {
         name: "spawn_caps",
@@ -436,6 +419,9 @@ impl Object for ProcDir {
         if name == "args" {
             return Some(Arc::new(ArgsObject { pid: self.pid }) as Arc<dyn Object>);
         }
+        if name == "caps" {
+            return Some(Arc::new(CapsObject { pid: self.pid }) as Arc<dyn Object>);
+        }
         if name == "std" {
             return Some(Arc::new(StdDir::of(self)) as Arc<dyn Object>);
         }
@@ -453,6 +439,10 @@ impl Object for ProcDir {
         });
         out.push(ListingEntry {
             name: String::from("args"),
+            kind: ObjectKind::Service,
+        });
+        out.push(ListingEntry {
+            name: String::from("caps"),
             kind: ObjectKind::Service,
         });
         out.push(ListingEntry {
@@ -490,15 +480,10 @@ impl Object for ProcDir {
             3 => {
                 let path = arg_str(&v, 0)?;
                 let args = arg_str(&v, 1)?;
-                spawn_proc(path, args, None, out)
+                let caps = arg_caps(&v, 2)?;
+                spawn_proc(path, args, caps, out)
             }
             4 => {
-                let path = arg_str(&v, 0)?;
-                let args = arg_str(&v, 1)?;
-                let caps = arg_caps(&v, 2)?;
-                spawn_proc(path, args, Some(caps), out)
-            }
-            5 => {
                 // brk: grow/shrink/query the *current* task's break. Must run
                 // on the caller's CR3 — never self.pid's address space.
                 let new_break = arg_u64(&v, 0)?;
@@ -506,7 +491,7 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(b)]);
                 schema::encode_value(&v, &BRK_OUTPUT, out)
             }
-            6 => {
+            5 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 let prot = arg_u64(&v, 2)?;
@@ -515,13 +500,13 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(base)]);
                 schema::encode_value(&v, &MMAP_OUTPUT, out)
             }
-            7 => {
+            6 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 mem_method(|vm, alloc| crate::mm::usermem::munmap(vm, addr, len, alloc))?;
                 Ok(())
             }
-            8 => {
+            7 => {
                 // wait: block until a *child* of the caller exits and consume
                 // its exit code.  Mirrors :kill — the path's pid is ignored;
                 // the target is named in the payload.
@@ -649,6 +634,51 @@ impl Object for ArgsObject {
     fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
         let args = crate::task::task_args(self.pid).ok_or(UnispaceError::NotFound)?;
         schema::encode_value(&Value::Str(args), &schema::SCHEMA_STR, out)
+    }
+
+    fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
+        Err(UnispaceError::Unsupported)
+    }
+}
+
+// ── /proc/<pid>/caps ───────────────────────────────────────────────
+
+/// Service leaf: `read` yields the task's capability set.
+/// Value is `list<{path: str, method: str, perm: u32}>` matching `CAP_LIST` wire.
+/// `method == ""` encodes `None`. Read requires `R` on `proc/self/caps` (ancestor `R` on `proc`/`proc/self`).
+struct CapsObject {
+    pid: u64,
+}
+
+impl Object for CapsObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Service
+    }
+
+    fn value_schema(&self) -> &'static Schema {
+        &CAP_LIST
+    }
+
+    fn methods(&self) -> &'static [MethodDesc] {
+        &[]
+    }
+
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
+        // `caps_snapshot` returns Some(empty) for user tasks with no caps, None for unknown pid.
+        // Kernel threads (vm==0) with bypass would have returned None; treat as NotFound.
+        let caps = crate::task::caps_snapshot(self.pid).ok_or(UnispaceError::NotFound)?;
+        let mut items = Vec::with_capacity(caps.len());
+        for c in caps {
+            let method_str = c.method.unwrap_or_default();
+            let perm_u32 = c.perm as u32;
+            items.push(Value::Struct(vec![
+                Value::Str(c.path),
+                Value::Str(method_str),
+                Value::U64(perm_u32 as u64),
+            ]));
+        }
+        let v = Value::List(items);
+        schema::encode_value(&v, &CAP_LIST, out)
     }
 
     fn write_value(&self, _v: Value) -> Result<(), UnispaceError> {
@@ -869,45 +899,83 @@ impl Object for StdDir {
 /// Load `path` as an ELF, build its address space, and spawn it as a task.
 /// Mirrors the boot path in `task::load::load_init_from_esp`.  Records the
 /// spawner as the child's parent (via `current_pid`) and passes `args` through
-/// for the child to read at `/proc/self/args`.
-/// `caps` is `None` for legacy `spawn` (clone parent caps), `Some(caps)` for
-/// `spawn_caps` (explicit subset, validated).
-fn spawn_proc(path: &str, args: &str, caps: Option<Vec<crate::caps::Cap>>, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+/// for the child to read at `/proc/self/args`. `caps` is the explicit subset,
+/// validated against the parent.
+fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+    crate::drivers::serial::SerialPort::puts("[proc] spawn_caps path=");
+    crate::drivers::serial::SerialPort::puts(path);
+    crate::drivers::serial::SerialPort::puts(" args=");
+    crate::drivers::serial::SerialPort::puts(args);
+    crate::drivers::serial::SerialPort::puts(" caps=");
+    crate::drivers::serial::SerialPort::put_u64(caps.len() as u64);
+    crate::drivers::serial::SerialPort::puts("\n");
     let mut elf = Vec::new();
-    super::super::read(path, &mut elf, usize::MAX)?;
+    if let Err(e) = super::super::read(path, &mut elf, usize::MAX) {
+        crate::drivers::serial::SerialPort::puts("[proc] spawn read ELF failed: ");
+        crate::drivers::serial::SerialPort::puts(alloc::format!("{:?}", e).as_str());
+        crate::drivers::serial::SerialPort::puts("\n");
+        return Err(e);
+    }
 
     let alloc = crate::mm::heap::get_phys_allocator_mut();
     let (root, entry, user_stack_top, vm) =
-        crate::task::load::create_process(&elf, alloc).map_err(|_| UnispaceError::DecodeError)?;
+        crate::task::load::create_process(&elf, alloc).map_err(|e| {
+            crate::drivers::serial::SerialPort::puts("[proc] create_process failed: ");
+            crate::drivers::serial::SerialPort::puts(e);
+            crate::drivers::serial::SerialPort::puts("\n");
+            UnispaceError::DecodeError
+        })?;
 
     let (kernel_stack_top, slot) =
         crate::task::alloc_kernel_stack(alloc).ok_or(UnispaceError::Unsupported)?;
 
-    // Capability handling: determine child caps
-    let child_caps: Vec<crate::caps::Cap> = match caps {
-        Some(provided) => {
-            // Validate each cap
-            for c in &provided {
-                crate::caps::validate_cap(c)?;
-                if c.perm as u8 == 2 {
-                    return Err(UnispaceError::InvalidArgument);
-                }
+    // Capability handling: explicit subset, validated
+    let child_caps: Vec<crate::caps::Cap> = {
+        let provided = caps;
+        for c in &provided {
+            if let Err(e) = crate::caps::validate_cap(c) {
+                crate::drivers::serial::SerialPort::puts("[proc] validate_cap failed for ");
+                crate::drivers::serial::SerialPort::puts(&c.path);
+                crate::drivers::serial::SerialPort::puts(":");
+                if let Some(m) = &c.method { crate::drivers::serial::SerialPort::puts(m); }
+                crate::drivers::serial::SerialPort::puts(" err=");
+                crate::drivers::serial::SerialPort::puts(alloc::format!("{:?}", e).as_str());
+                crate::drivers::serial::SerialPort::puts("\n");
+                return Err(e);
             }
-            if provided.len() > crate::caps::MAX_CAPS_PER_TASK {
-                return Err(UnispaceError::OutOfMemory);
+            if c.perm as u8 == 2 {
+                crate::drivers::serial::SerialPort::puts("[proc] invalid perm 2\n");
+                return Err(UnispaceError::InvalidArgument);
             }
-            // Subset check vs parent (kernel bypass when current_caps is None)
-            if let Some(pc) = crate::caps::current_caps() {
-                if !crate::caps::is_subset(&pc, &provided) {
-                    return Err(UnispaceError::InvalidArgument);
-                }
-            }
-            provided
         }
-        None => {
-            // Legacy clone: inherit parent caps
-            crate::caps::current_caps().unwrap_or_default()
+        if provided.len() > crate::caps::MAX_CAPS_PER_TASK {
+            crate::drivers::serial::SerialPort::puts("[proc] caps too many\n");
+            return Err(UnispaceError::OutOfMemory);
         }
+        // Subset check vs parent (kernel bypass when current_caps is None)
+        if let Some(pc) = crate::caps::current_caps() {
+            if !crate::caps::is_subset(&pc, &provided) {
+                crate::drivers::serial::SerialPort::puts("[proc] subset check failed parent=");
+                crate::drivers::serial::SerialPort::put_u64(pc.len() as u64);
+                crate::drivers::serial::SerialPort::puts(" child=");
+                crate::drivers::serial::SerialPort::put_u64(provided.len() as u64);
+                crate::drivers::serial::SerialPort::puts("\n");
+                for c in &provided {
+                    if !crate::caps::has_perm(&pc, &c.path, c.method.as_deref(), c.perm) {
+                        crate::drivers::serial::SerialPort::puts("  missing: ");
+                        crate::drivers::serial::SerialPort::puts(&c.path);
+                        if let Some(m)=&c.method { crate::drivers::serial::SerialPort::puts(":"); crate::drivers::serial::SerialPort::puts(m); }
+                        crate::drivers::serial::SerialPort::puts(" perm=");
+                        crate::drivers::serial::SerialPort::put_u64(c.perm as u64);
+                        crate::drivers::serial::SerialPort::puts("\n");
+                    }
+                }
+                return Err(UnispaceError::InvalidArgument);
+            }
+        } else {
+            crate::drivers::serial::SerialPort::puts("[proc] no parent caps (kernel bypass)\n");
+        }
+        provided
     };
 
     // 5-word iretq frame at the top of the kernel stack (RIP, CS, RFLAGS,
@@ -933,9 +1001,8 @@ fn spawn_proc(path: &str, args: &str, caps: Option<Vec<crate::caps::Cap>>, out: 
     task.parent_pid = current_pid().unwrap_or(0);
     // Install caps page for child before spawn (maps CAP_SLOT_VA in child's root)
     if !child_caps.is_empty() {
-        if let Some((ptr, len, phys)) = crate::task::install_caps(root, child_caps, alloc) {
-            task.caps_ptr = ptr;
-            task.caps_len = len;
+        if let Some(phys) = crate::task::install_caps(root, &child_caps, alloc) {
+            task.caps_arc = Some(alloc::sync::Arc::new(child_caps));
             task.caps_phys = phys;
         } else {
             // Rollback: free kernel stack and root
@@ -948,6 +1015,9 @@ fn spawn_proc(path: &str, args: &str, caps: Option<Vec<crate::caps::Cap>>, out: 
         // But we still want child to be able to map caps page lazily if needed later.
     }
     let pid = crate::task::spawn(task);
+    crate::drivers::serial::SerialPort::puts("[proc] spawned pid=");
+    crate::drivers::serial::SerialPort::put_u64(pid);
+    crate::drivers::serial::SerialPort::puts("\n");
     attach(pid);
     let v = Value::Struct(vec![Value::U64(pid)]);
     schema::encode_value(&v, &SPAWN_OUTPUT, out)

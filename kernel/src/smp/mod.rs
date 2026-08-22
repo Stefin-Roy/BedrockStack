@@ -148,6 +148,14 @@ pub struct PerCpu {
     pub syscall_rsp0: u64,
     /// Raw pointer to the currently running task (opaque to the smp layer).
     pub current_task: *mut core::ffi::c_void,
+    /// Set when a reschedule is needed (tick or wake). Checked on IRQ/syscall return.
+    pub need_resched: AtomicBool,
+    /// Nesting count for preemptive-critical sections. While >0 tick does not preempt.
+    pub preempt_count: AtomicU32,
+    /// Per-CPU tick counter for scheduler quantum tracking.
+    pub sched_ticks: AtomicU64,
+    /// True when this CPU's scheduler has been initialized (after task::init).
+    pub sched_active: AtomicBool,
 }
 
 /// Byte offset of `PerCpu::syscall_rsp0` within the struct, for the syscall
@@ -170,6 +178,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -181,6 +193,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -192,6 +208,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -203,6 +223,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -214,6 +238,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -225,6 +253,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -236,6 +268,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -247,6 +283,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -258,6 +298,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -269,6 +313,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -280,6 +328,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -291,6 +343,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -302,6 +358,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -313,6 +373,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -324,6 +388,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
     PerCpu {
         self_ptr: core::ptr::null(),
@@ -335,6 +403,10 @@ static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
         serial_locked: AtomicU64::new(0),
         syscall_rsp0: 0,
         current_task: core::ptr::null_mut(),
+        need_resched: AtomicBool::new(false),
+        preempt_count: AtomicU32::new(0),
+        sched_ticks: AtomicU64::new(0),
+        sched_active: AtomicBool::new(false),
     },
 ];
 
@@ -444,6 +516,10 @@ pub unsafe fn early_init_bsp() {
     pc.started.store(1, Ordering::Relaxed);
     pc.syscall_rsp0 = 0;
     pc.current_task = core::ptr::null_mut();
+    pc.need_resched.store(false, Ordering::Relaxed);
+    pc.preempt_count.store(0, Ordering::Relaxed);
+    pc.sched_ticks.store(0, Ordering::Relaxed);
+    pc.sched_active.store(false, Ordering::Relaxed);
 
     set_cpu_state(0, CpuState::Online);
 
@@ -457,6 +533,84 @@ pub unsafe fn early_init_bsp() {
     // `slot_mut(0)` callers (e.g. `set_bsp_hardware_id`) don't trip the
     // re-entrancy assert.
     slot_release(0);
+}
+
+// ── Preemptive scheduler PerCpu helpers ───────────────────────────────
+
+/// Disable preemption on this CPU (nesting). Must be paired with `preempt_enable`.
+#[inline]
+pub fn preempt_disable() {
+    let pc = current_per_cpu();
+    pc.preempt_count.fetch_add(1, Ordering::Relaxed);
+    // compiler fence prevents reordering of critical section
+    core::sync::atomic::compiler_fence(Ordering::Acquire);
+}
+
+/// Enable preemption. If this drops count to zero and need_resched is set, caller should resched.
+#[inline]
+pub fn preempt_enable() {
+    core::sync::atomic::compiler_fence(Ordering::Release);
+    let pc = current_per_cpu();
+    let prev = pc.preempt_count.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "preempt_enable without disable");
+}
+
+/// Returns true when preemption is enabled (count ==0).
+#[inline]
+pub fn preempt_is_enabled() -> bool {
+    let pc = try_current_per_cpu();
+    match pc {
+        Some(p) => p.preempt_count.load(Ordering::Relaxed) == 0,
+        None => true,
+    }
+}
+
+/// Mark current CPU as needing reschedule.
+#[inline]
+pub fn set_need_resched() {
+    if let Some(pc) = try_current_per_cpu() {
+        pc.need_resched.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Clear need_resched, returns previous value.
+#[inline]
+pub fn take_need_resched() -> bool {
+    if let Some(pc) = try_current_per_cpu() {
+        pc.need_resched.swap(false, Ordering::Relaxed)
+    } else {
+        false
+    }
+}
+
+/// Test without clearing.
+#[inline]
+pub fn need_resched() -> bool {
+    if let Some(pc) = try_current_per_cpu() {
+        pc.need_resched.load(Ordering::Relaxed)
+    } else {
+        false
+    }
+}
+
+#[inline]
+pub fn inc_sched_ticks() -> u64 {
+    let pc = current_per_cpu();
+    pc.sched_ticks.fetch_add(1, Ordering::Relaxed) + 1
+}
+
+pub fn set_sched_active(cpu: u32, active: bool) {
+    let pc = per_cpu_by_id(cpu);
+    // SAFETY: per_cpu_by_id returns &'static PerCpu, but sched_active is AtomicBool, no &mut needed
+    pc.sched_active.store(active, Ordering::Release);
+}
+
+pub fn is_sched_active() -> bool {
+    if let Some(pc) = try_current_per_cpu() {
+        pc.sched_active.load(Ordering::Acquire)
+    } else {
+        false
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -545,6 +699,12 @@ pub unsafe fn init(
         pc.is_bsp = false;
         pc.started.store(0, Ordering::Relaxed);
         pc.stack_top = stack_top;
+        pc.syscall_rsp0 = 0;
+        pc.current_task = core::ptr::null_mut();
+        pc.need_resched.store(false, Ordering::Relaxed);
+        pc.preempt_count.store(0, Ordering::Relaxed);
+        pc.sched_ticks.store(0, Ordering::Relaxed);
+        pc.sched_active.store(false, Ordering::Relaxed);
         slot_release(cpu_id as usize);
 
         ap_list.push(ApContext {

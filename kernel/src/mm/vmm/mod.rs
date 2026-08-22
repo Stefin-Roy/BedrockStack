@@ -32,7 +32,9 @@ pub use self::x86_64::make_read_only;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::prepopulate_window;
 #[cfg(target_arch = "x86_64")]
-pub use self::x86_64::translate_user;
+pub use self::x86_64::{translate_user, translate_user_range_ok};
+#[cfg(target_arch = "riscv64")]
+pub use self::riscv64::translate_user_range_ok;
 
 #[cfg(target_arch = "riscv64")]
 mod riscv64;

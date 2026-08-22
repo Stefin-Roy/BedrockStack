@@ -363,13 +363,10 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     };
     // Install manual fullcaps for INIT (no wildcard)
     {
-        let caps = crate::caps::full_caps_for_init();
-        if let Some((ptr, len, phys)) = crate::task::install_caps(root, caps, alloc) {
-            // Temporarily create a Task-like stub to hold caps until enter_userspace creates the real Task.
-            // Instead, pass via global stash that enter_userspace will pick up: store in root->caps mapping via
-            // a one-slot stash. For simplicity, we leak and let enter_userspace_with_caps take it.
-            // We'll stash phys/ptr/len in a static so enter_userspace can adopt them.
-            crate::task::stash_init_caps(ptr, len, phys);
+        let caps = alloc::sync::Arc::new(crate::caps::full_caps_for_init());
+        if let Some(phys) = crate::task::install_caps(root, &caps, alloc) {
+            // Stash the Arc'd set; enter_userspace adopts it into the real Task.
+            crate::task::stash_init_caps(caps, phys);
         } else {
             log::warn!("[sched] caps page alloc failed for INIT");
         }

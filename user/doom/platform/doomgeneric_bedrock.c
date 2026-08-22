@@ -35,6 +35,8 @@ extern uint64_t bedrock_now_ns(void);
 extern intptr_t bedrock_sleep_ms(uint64_t ms);
 extern intptr_t bedrock_read_events(void *buf, size_t cap);
 extern void     bedrock_exit(int32_t code) __attribute__((noreturn));
+extern intptr_t bedrock_serial(const void *src, size_t len);
+static void dlog(const char *s) { if(s) bedrock_serial(s, strlen(s)); }
 
 /* ── framebuffer mode (matches src/main.rs BedrockFbMode, 29 bytes) ─── */
 
@@ -65,12 +67,22 @@ static void DG_QuitHandler(void)
 
 void DG_Init(void)
 {
-    if (bedrock_fb_mode(&g_fb) == 0 &&
+    dlog("[doom] DG_Init enter\n");
+    int32_t r = bedrock_fb_mode(&g_fb);
+    dlog("[doom] bedrock_fb_mode r=");
+    {
+        char tmp[16]; int v = r; int n=0; char rev[16]; int rr=0;
+        if(v==0) tmp[n++]='0'; else { int neg=v<0; if(neg) v=-v; while(v>0){ rev[rr++]='0'+(v%10); v/=10; } if(neg) tmp[n++]='-'; while(rr--) tmp[n++]=rev[rr]; } tmp[n]=0; dlog(tmp); dlog("\n");
+    }
+    if (r == 0 &&
         g_fb.present != 0 &&
         g_fb.width > 0 && g_fb.height > 0 &&
         g_fb.stride >= g_fb.width && g_fb.bpp > 0)
     {
         g_fb_present = 1;
+        dlog("[doom] fb present\n");
+    } else {
+        dlog("[doom] fb NOT present\n");
     }
 
     /* The engine's quit path (M_QuitResponse -> I_Quit) returns without
@@ -415,11 +427,16 @@ int main(int argc, char **argv)
 {
     (void)argc;
     (void)argv;
+    dlog("[doom] main enter\n");
+    // chdir already done by Rust entry_main; log args for proof
+    dlog("[doom] fixed argv: -iwad /B/EFI/BEDROCK/FREEDOOM.WAD -mmap\n");
     g_fixed_argv[0] = g_argv0;
     g_fixed_argv[1] = g_argv1;
     g_fixed_argv[2] = g_argv2;
     g_fixed_argv[3] = g_argv3;
+    dlog("[doom] calling doomgeneric_Create\n");
     doomgeneric_Create(4, g_fixed_argv);
+    dlog("[doom] doomgeneric_Create returned\n");
 
     for (;;)
     {

@@ -15,6 +15,22 @@ unsafe extern "C" {
     fn run_checks() -> c_int;
 }
 
+fn posix_child_caps() -> &'static [libc::process::Cap<'static>] {
+    &[
+        libc::process::Cap { path: "proc", method: None, perm: 3 },
+        libc::process::Cap { path: "proc/self", method: None, perm: 3 },
+        libc::process::Cap { path: "proc/self", method: Some("exit"), perm: 3 },
+        libc::process::Cap { path: "proc/self", method: Some("brk"), perm: 3 },
+        libc::process::Cap { path: "proc/self", method: Some("mmap"), perm: 3 },
+        libc::process::Cap { path: "proc/self", method: Some("munmap"), perm: 3 },
+        libc::process::Cap { path: "proc/self/args", method: None, perm: 1 },
+        libc::process::Cap { path: "proc/self/caps", method: None, perm: 1 },
+        libc::process::Cap { path: "proc/self/std", method: None, perm: 3 },
+        libc::process::Cap { path: "proc/self/std/out", method: None, perm: 3 },
+        libc::process::Cap { path: "proc/self/std/err", method: None, perm: 3 },
+    ]
+}
+
 /// Rust-API side: spawn a copy of ourselves as a child and verify the
 /// parent/child relationship end to end.
 fn rust_checks() -> c_int {
@@ -29,7 +45,24 @@ fn rust_checks() -> c_int {
         fails += 1;
     }
 
-    let child = libc::process::spawn("/B/EFI/BEDROCK/POSIXCHECK", "child");
+    // caps introspection via /proc/self/caps
+    if libc::caps::has_cap("proc/self/caps", None, libc::caps::R) {
+        libc::stdio::puts(c"RUST PASS caps has_cap".as_ptr());
+    } else {
+        libc::stdio::puts(c"RUST FAIL caps has_cap".as_ptr());
+        fails += 1;
+    }
+    match libc::caps::current_caps() {
+        Ok(v) if !v.is_empty() => {
+            libc::stdio::puts(c"RUST PASS caps list".as_ptr());
+        }
+        _ => {
+            libc::stdio::puts(c"RUST FAIL caps list".as_ptr());
+            fails += 1;
+        }
+    }
+
+    let child = libc::process::spawn("/B/EFI/BEDROCK/POSIXCHECK", "child", posix_child_caps());
     if child > 0 {
         let code = libc::process::wait(child as u64);
         if code == 7 {

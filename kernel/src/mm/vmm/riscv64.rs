@@ -273,6 +273,22 @@ pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
     ))
 }
 
+/// Batched range check — per-page fallback for riscv64 (no caching needed
+/// here; syscall hotpath is x86_64-only, riscv64 has no user syscalls).
+pub fn translate_user_range_ok(root: u64, ptr: u64, len: u64, need_writable: bool) -> bool {
+    if len == 0 { return true; }
+    let mut va = ptr & !0xFFF;
+    let pages = (((ptr & 0xFFF) + len + 0xFFF) >> 12) as usize;
+    for _ in 0..pages {
+        match translate_user(root, va) {
+            Some((_, user, w)) if user && (!need_writable || w) => {},
+            _ => return false,
+        }
+        va = va.wrapping_add(0x1000);
+    }
+    true
+}
+
 /// Switch to the given root table (physical address of L2).
 ///
 /// # Safety

@@ -187,8 +187,13 @@ pub extern "C" fn entry_main() -> usize {
     // `.savegame/doomsav0.dsg`) against the process CWD, which defaults to
     // `/` — the read-only unispace registry root.  Repoint the CWD at the
     // writable tmpfs (`A>`) so saves land in `/A/.savegame/`.
-    unsafe {
-        libc::vfs::chdir(b"/A\0".as_ptr() as *const core::ffi::c_char);
+    let ch = unsafe { libc::vfs::chdir(b"/A\0".as_ptr() as *const core::ffi::c_char) };
+    if ch != 0 {
+        let s = b"[doom] chdir /A failed\n";
+        let _ = bedrock_serial(s.as_ptr(), s.len());
+    } else {
+        let s = b"[doom] chdir /A ok\n";
+        let _ = bedrock_serial(s.as_ptr(), s.len());
     }
 
     let argv0 = DOOM_ARGV0.as_ptr() as *const c_char;
@@ -201,6 +206,39 @@ pub extern "C" fn entry_main() -> usize {
         let slice = core::slice::from_raw_parts_mut(base, ARGS_CAP);
         libc::process::args(slice)
     };
+    unsafe {
+        let msg = b"[doom] bedrock_args len=";
+        let _ = bedrock_serial(msg.as_ptr(), msg.len());
+        // crude decimal
+        let mut tmp = [0u8; 20];
+        let mut n = 0usize;
+        let mut v = if nargs < 0 { 0 } else { nargs as u64 };
+        let neg = nargs < 0;
+        if neg {
+            tmp[n] = b'-';
+            n += 1;
+            if nargs == -1 {
+                // -1 -> 0xffff... but print as -1
+                tmp[n] = b'1';
+                n += 1;
+            } else {
+                v = (-nargs) as u64;
+                let mut digits = [0u8; 20];
+                let mut d = 20usize;
+                if v == 0 { digits[19]=b'0'; d=19; } else { while v>0 { d-=1; digits[d]=b'0'+(v%10) as u8; v/=10; } }
+                for i in d..20 { tmp[n]=digits[i]; n+=1; }
+            }
+        } else {
+            if v==0 { tmp[n]=b'0'; n+=1; } else {
+                let mut digits=[0u8;20]; let mut d=20usize;
+                while v>0 { d-=1; digits[d]=b'0'+(v%10) as u8; v/=10; }
+                for i in d..20 { tmp[n]=digits[i]; n+=1; }
+            }
+        }
+        let nl = b"\n";
+        let _ = bedrock_serial(tmp.as_ptr(), n);
+        let _ = bedrock_serial(nl.as_ptr(), 1);
+    }
     if nargs > 0 {
         let mut n = nargs as usize;
         if n > ARGS_CAP {

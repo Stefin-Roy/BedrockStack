@@ -433,6 +433,108 @@ pub fn translate_user(root: u64, vaddr: u64) -> Option<(u64, bool, bool)> {
     ))
 }
 
+/// Batched permission check for a contiguous user VA range — caches the
+/// upper-level table entries across consecutive pages so a multi-megabyte
+/// buffer (e.g. a `/dev/fb` blit) costs ~1 physmap load per page instead of
+/// 4. Huge pages are handled; permission must hold on every page.
+pub fn translate_user_range_ok(root: u64, ptr: u64, len: u64, need_writable: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    const PRESENT: u64 = 1 << 0;
+    const WRITABLE: u64 = 1 << 1;
+    const USER: u64 = 1 << 2;
+    const PS: u64 = 1 << 7;
+    let mut va = ptr & !0xFFF;
+    let pages = (((ptr & 0xFFF) + len + 0xFFF) >> 12) as usize;
+    let mut cached: Option<(usize, usize, usize, u64, u64, u64, bool)> = None;
+    // (i0, i1, i2, e0, e1, e2, have_e2)
+    for _ in 0..pages {
+        let i0 = ((va >> 39) & 0x1FF) as usize;
+        let i1 = ((va >> 30) & 0x1FF) as usize;
+        let i2 = ((va >> 21) & 0x1FF) as usize;
+        let i3 = ((va >> 12) & 0x1FF) as usize;
+        let (e0, e1, e2, have_e2, leaf_writable, leaf_user) = if let Some((ci0, ci1, ci2, ce0, ce1, ce2, ch)) = cached {
+            if ci0 == i0 && ci1 == i1 && ci2 == i2 {
+                // Same PD/PT as previous page — leaf only.
+                let writable: bool;
+                let user_ok: bool;
+                if ce1 & PS != 0 {
+                    writable = ce1 & WRITABLE != 0;
+                    user_ok = true; // user already validated at cached levels
+                } else if ch && (ce2 & PS != 0) {
+                    writable = ce2 & WRITABLE != 0;
+                    user_ok = true;
+                } else {
+                    // Need PT leaf for this i3.
+                    let pt = pte_deref(pte_frame(ce2));
+                    let e3 = unsafe { read_pte(pt, i3) };
+                    if e3 & PRESENT == 0 {
+                        return false;
+                    }
+                    writable = e3 & WRITABLE != 0;
+                    user_ok = e3 & USER != 0;
+                }
+                if need_writable && !writable {
+                    return false;
+                }
+                if !user_ok {
+                    return false;
+                }
+                va = va.wrapping_add(0x1000);
+                continue;
+            }
+            (ce0, ce1, ce2, ch, false, false)
+        } else {
+            (0, 0, 0, false, false, false)
+        };
+        // Full walk for this page, then cache upper entries.
+        let pml4 = pte_deref(root);
+        let ne0 = unsafe { read_pte(pml4, i0) };
+        if ne0 & PRESENT == 0 || ne0 & USER == 0 {
+            return false;
+        }
+        let pdpt = pte_deref(pte_frame(ne0));
+        let ne1 = unsafe { read_pte(pdpt, i1) };
+        if ne1 & PRESENT == 0 || ne1 & USER == 0 {
+            return false;
+        }
+        if ne1 & PS != 0 {
+            if need_writable && ne1 & WRITABLE == 0 {
+                return false;
+            }
+            cached = Some((i0, i1, i2, ne0, ne1, 0, false));
+            va = va.wrapping_add(0x1000);
+            continue;
+        }
+        let pd = pte_deref(pte_frame(ne1));
+        let ne2 = unsafe { read_pte(pd, i2) };
+        if ne2 & PRESENT == 0 || ne2 & USER == 0 {
+            return false;
+        }
+        if ne2 & PS != 0 {
+            if need_writable && ne2 & WRITABLE == 0 {
+                return false;
+            }
+            cached = Some((i0, i1, i2, ne0, ne1, ne2, true));
+            va = va.wrapping_add(0x1000);
+            continue;
+        }
+        let pt = pte_deref(pte_frame(ne2));
+        let e3 = unsafe { read_pte(pt, i3) };
+        if e3 & PRESENT == 0 || e3 & USER == 0 {
+            return false;
+        }
+        if need_writable && e3 & WRITABLE == 0 {
+            return false;
+        }
+        cached = Some((i0, i1, i2, ne0, ne1, ne2, true));
+        let _ = (e0, e1, e2, have_e2, leaf_writable, leaf_user);
+        va = va.wrapping_add(0x1000);
+    }
+    true
+}
+
 /// PS (huge-page) bit position in a level-2/3 entry.
 const PS: u64 = 1 << 7;
 

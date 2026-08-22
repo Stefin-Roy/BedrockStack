@@ -17,6 +17,141 @@ extern crate alloc;
 
 use core::alloc::Layout;
 
+const R: u8 = 1;
+const RW: u8 = 3;
+
+fn child_caps() -> &'static [libc::process::Cap<'static>] {
+    &[
+        libc::process::Cap { path: "proc", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("exit"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("brk"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("mmap"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("munmap"), perm: RW },
+        libc::process::Cap { path: "proc/self/args", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/caps", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/std", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/err", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: Some("get"), perm: R },
+    ]
+}
+
+fn posixcheck_caps() -> &'static [libc::process::Cap<'static>] {
+    &[
+        // VFS /A for file ops
+        libc::process::Cap { path: "A", method: None, perm: RW },
+        libc::process::Cap { path: "A", method: Some("create"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mkdir"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("rmdir"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("unlink"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("rename"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("symlink"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("link"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mkfifo"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mknod"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("stat"), perm: RW },
+        // B/EFI/BEDROCK/POSIXCHECK
+        libc::process::Cap { path: "B", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK/POSIXCHECK", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK/POSIXCHECK", method: Some("stat"), perm: R },
+        // sys for uname/sysconf
+        libc::process::Cap { path: "sys", method: None, perm: R },
+        libc::process::Cap { path: "sys/version", method: None, perm: R },
+        libc::process::Cap { path: "sys/cpus", method: None, perm: R },
+        // kernel timer
+        libc::process::Cap { path: "kernel", method: None, perm: R },
+        libc::process::Cap { path: "kernel/timer", method: None, perm: R },
+        libc::process::Cap { path: "kernel/timer", method: Some("sleep"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("sleep_ms"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("until"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("epoch_secs"), perm: RW },
+        // proc
+        libc::process::Cap { path: "proc", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("exit"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("spawn_caps"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("brk"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("mmap"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("munmap"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("wait"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("yield"), perm: RW },
+        libc::process::Cap { path: "proc/self/status", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/args", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/caps", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/std", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/in", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/err", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: Some("get"), perm: R },
+        libc::process::Cap { path: "proc/self/std/err", method: Some("get"), perm: R },
+        // file methods for /A files (auto-granted but pre-grant for stat)
+        libc::process::Cap { path: "A", method: Some("truncate"), perm: RW },
+    ]
+}
+
+fn doom_caps() -> &'static [libc::process::Cap<'static>] {
+    &[
+        // VFS
+        libc::process::Cap { path: "A", method: None, perm: RW },
+        libc::process::Cap { path: "A", method: Some("create"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mkdir"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("rmdir"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("unlink"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("rename"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("symlink"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("link"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mkfifo"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("mknod"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("stat"), perm: RW },
+        libc::process::Cap { path: "B", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK/DOOM", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK/DOOM", method: Some("stat"), perm: RW },
+        libc::process::Cap { path: "B/EFI/BEDROCK/FREEDOOM.WAD", method: None, perm: R },
+        libc::process::Cap { path: "B/EFI/BEDROCK/FREEDOOM.WAD", method: Some("stat"), perm: RW },
+        // devices
+        libc::process::Cap { path: "dev", method: None, perm: R },
+        libc::process::Cap { path: "dev/fb", method: None, perm: RW },
+        libc::process::Cap { path: "dev/fb", method: Some("mode"), perm: RW },
+        libc::process::Cap { path: "dev/fb", method: Some("clear"), perm: RW },
+        libc::process::Cap { path: "driver", method: None, perm: R },
+        libc::process::Cap { path: "driver/debugserial", method: None, perm: RW },
+        libc::process::Cap { path: "driver/audio", method: None, perm: RW },
+        libc::process::Cap { path: "driver/audio", method: Some("play_pcm"), perm: RW },
+        libc::process::Cap { path: "driver/audio", method: Some("play_tone"), perm: RW },
+        libc::process::Cap { path: "input", method: None, perm: R },
+        libc::process::Cap { path: "input/events", method: None, perm: R },
+        libc::process::Cap { path: "kernel", method: None, perm: R },
+        libc::process::Cap { path: "kernel/timer", method: None, perm: R },
+        libc::process::Cap { path: "kernel/timer", method: Some("sleep"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("sleep_ms"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("until"), perm: RW },
+        libc::process::Cap { path: "kernel/timer", method: Some("epoch_secs"), perm: RW },
+        // proc
+        libc::process::Cap { path: "proc", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("exit"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("brk"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("mmap"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("munmap"), perm: RW },
+        libc::process::Cap { path: "proc/self", method: Some("yield"), perm: RW },
+        libc::process::Cap { path: "proc/self/status", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/args", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/caps", method: None, perm: R },
+        libc::process::Cap { path: "proc/self/std", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/in", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/err", method: None, perm: RW },
+        libc::process::Cap { path: "proc/self/std/out", method: Some("get"), perm: R },
+        libc::process::Cap { path: "proc/self/std/err", method: Some("get"), perm: R },
+        libc::process::Cap { path: "proc/self/std/in", method: Some("get"), perm: R },
+    ]
+}
+
 /// Paint a vertical RGB gradient across the whole framebuffer.
 /// Paint a 2D RGB gradient (red spans x, green spans y) over the visible
 /// framebuffer region, leaving stride padding untouched.
@@ -379,6 +514,11 @@ fn wait_for_key() {
 
 /// Dump a finished child's captured stdout to ours (diagnostic aid).
 fn drain_child_stdout(pid: isize) {
+    drain_child_stream(pid, b"/std/out\0", b"[child stdout]\n");
+    drain_child_stream(pid, b"/std/err\0", b"[child stderr]\n");
+}
+
+fn drain_child_stream(pid: isize, suffix: &[u8], header: &[u8]) {
     let mut spath = [0u8; 40];
     let mut slen = 0usize;
     for &b in b"/proc/" {
@@ -401,24 +541,53 @@ fn drain_child_stdout(pid: isize) {
         spath[slen] = digits[i];
         slen += 1;
     }
-    for &b in b"/std/out\0" {
+    for &b in suffix {
         spath[slen] = b;
         slen += 1;
     }
     // Keep the large drain buffer in `.bss`; the user stack is only 32 KiB.
-    static mut CHILD_STDOUT_SCRATCH: [u8; libc::IO_CHUNK_BYTES] = [0; libc::IO_CHUNK_BYTES];
+    static mut CHILD_DRAIN_SCRATCH: [u8; libc::IO_CHUNK_BYTES] = [0; libc::IO_CHUNK_BYTES];
     let sbuf = unsafe {
         core::slice::from_raw_parts_mut(
-            core::ptr::addr_of_mut!(CHILD_STDOUT_SCRATCH) as *mut u8,
+            core::ptr::addr_of_mut!(CHILD_DRAIN_SCRATCH) as *mut u8,
             libc::IO_CHUNK_BYTES,
         )
     };
+    let mut first = true;
+    let mut total: usize = 0;
     loop {
         let sr = unsafe { libc::syscall::read_path(&spath[..slen], sbuf, 0) };
-        if sr <= 0 {
+        if sr < 0 {
+            // Surface cap/ENOENT errors so missing proc/<pid> caps are visible
+            if total == 0 {
+                serial_puts(b"[drain] read ");
+                serial_write(suffix);
+                serial_puts(b" pid=");
+                serial_put_u64_hex(pid as u64);
+                serial_puts(b" err=");
+                // sr is negative errno like -2, -13 etc.
+                let code = (-sr) as u64;
+                serial_put_u64_hex(code);
+                serial_puts(b"\n");
+            }
             break;
         }
+        if sr == 0 {
+            break;
+        }
+        if first {
+            serial_write(header);
+            first = false;
+        }
+        total += sr as usize;
         serial_write(&sbuf[..sr as usize]);
+    }
+    if total > 0 {
+        serial_puts(b"[drain] done ");
+        serial_write(suffix);
+        serial_puts(b" total=");
+        serial_put_u64_hex(total as u64);
+        serial_puts(b"\n");
     }
 }
 
@@ -613,14 +782,19 @@ pub extern "C" fn entry_main() -> usize {
         return 3;
     }
     libc::stdio::puts(c"write/read ok".as_ptr());
+    serial_puts(b"[INIT] write/read ok, before spawn\n");
 
     // 2. Spawn a copy of ourselves as a child (args="child"), wait for it, and
     //    echo its captured stdout. The child's std/out stream survives as long
     //    as its /proc dir, so it is readable after :wait until the idle reaper
-    //    runs.
-    let pid = libc::process::spawn("/B/EFI/BEDROCK/INIT", "child");
+    //    runs. Spawn is now capability-checked — explicit subset required.
+    serial_puts(b"[INIT] spawning child\n");
+    let pid = libc::process::spawn("/B/EFI/BEDROCK/INIT", "child", child_caps());
+    serial_puts(b"[INIT] spawn returned\n");
+    serial_puts_dec(b"[INIT] spawn pid=", pid as u64, b"\n");
     if pid < 0 {
         libc::stdio::puts(c"spawn failed".as_ptr());
+        serial_puts(b"[INIT] spawn failed path\n");
         return 5;
     }
     unsafe {
@@ -695,7 +869,7 @@ pub extern "C" fn entry_main() -> usize {
     //    task, so it must not exit while the OS keeps running.
     // 5a. First run the POSIX conformance harness and report its outcome.
     serial_puts(b"[INIT] running POSIXCHECK\n");
-    let pcheck = libc::process::spawn("/B/EFI/BEDROCK/POSIXCHECK", "");
+    let pcheck = libc::process::spawn("/B/EFI/BEDROCK/POSIXCHECK", "", posixcheck_caps());
     if pcheck < 0 {
         serial_puts_dec(b"[INIT] POSIXCHECK spawn failed rc=", pcheck as u64, b"\n");
     } else {
@@ -715,13 +889,17 @@ pub extern "C" fn entry_main() -> usize {
         // the keypress and auto-launch DOOM to test the hardcoded -iwad path.
         // wait_for_key();
         serial_puts(b"[INIT] auto-jumping to DOOM\n");
-        let pid = libc::process::spawn("/B/EFI/BEDROCK/DOOM", "-iwad /B/EFI/BEDROCK/FREEDOOM.WAD");
+        let pid = libc::process::spawn("/B/EFI/BEDROCK/DOOM", "-iwad /B/EFI/BEDROCK/FREEDOOM.WAD", doom_caps());
         if pid < 0 {
+            serial_puts_dec(b"[INIT] DOOM spawn failed rc=", pid as u64, b"\n");
             unsafe {
                 libc::stdio::printf(c"DOOM spawn failed (%d)\n".as_ptr(), pid);
             }
+            // Back off so the paint loop doesn't hot-spin on persistent failure
+            libc::process::sleep_ms(200);
             continue;
         }
+        serial_puts_dec(b"[INIT] DOOM spawned pid=", pid as u64, b"\n");
         unsafe {
             libc::stdio::printf(c"DOOM pid=%d\n".as_ptr(), pid);
         }

@@ -257,18 +257,69 @@ pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
 
 // ── Syscall implementations ──────────────────────────────────────────
 
+/// Zero-copy scan of a NUL-terminated path directly from user memory.
+///
+/// Validates every page as user-readable before forming a slice into it
+/// (there is no #PF handler for user pointers). Returns the raw path str
+/// and its `ParsedPath`, both borrowing the validated user VA for the
+/// duration of the syscall (CR3 never changes mid-syscall under the
+/// cooperative BSP-only scheduler). Heap cost: one `Vec<&str>` inside
+/// `ParsedPath`; the raw bytes themselves stay in user memory (no
+/// `String`/`Vec<u8>` copy).
+fn scan_user_path(ptr: u64) -> Result<(&'static str, crate::unispace::path::ParsedPath<'static>), i64> {
+    // SAFETY: syscall runs on task CR3 throughout; validated pages stay
+    // mapped; scheduler is BSP-cooperative so no concurrent unmap.
+    // Transmute to 'static is sound for the syscall duration; the borrow
+    // ends before sysretq.
+    if ptr >= USER_BOUNDARY {
+        return Err(-14);
+    }
+    let root = current_task_root()?;
+    let mut va = ptr;
+    let mut nul_off: Option<u64> = None;
+    while va < USER_BOUNDARY && va - ptr < MAX_COPY {
+        let page = va & !0xFFF;
+        match crate::mm::vmm::translate_user(root, page) {
+            Some((_, user, _)) if user => {}
+            _ => return Err(-14),
+        }
+        let page_end = page + 0x1000;
+        let cap = core::cmp::min(page_end, core::cmp::min(USER_BOUNDARY, ptr + MAX_COPY));
+        if cap <= va { break; }
+        let src = unsafe { core::slice::from_raw_parts(va as *const u8, (cap - va) as usize) };
+        if let Some(i) = src.iter().position(|&b| b == 0) {
+            nul_off = Some(va + i as u64 - ptr);
+            break;
+        }
+        va = cap;
+    }
+    let len = match nul_off {
+        Some(off) => off as usize,
+        None => {
+            // No NUL within scan window: distinguish ENAMETOOLONG vs EINVAL
+            let scanned = (va - ptr) as usize;
+            if scanned as u64 >= MAX_COPY { return Err(-36); }
+            return Err(-22);
+        }
+    };
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+    let s = core::str::from_utf8(bytes).map_err(|_| -22i64)?;
+    // SAFETY: `s` borrows validated user VA that lives through the syscall.
+    let s_static: &'static str = unsafe { core::mem::transmute::<&str, &'static str>(s) };
+    let parsed = crate::unispace::path::parse(s_static).map_err(|e| errno(e))?;
+    Ok((s_static, parsed))
+}
+
 /// 0 read(path, buf, buf_len): read the object's value into `buf`.
 ///
 /// The kernel never buffers more than `buf_len` bytes of the object, so a
 /// hostile/reckless read cannot exhaust the heap regardless of how large the
 /// source object is; `copy_user_out` further validates the buffer pages.
+#[allow(unused_variables)]
 fn sys_read(frame: &mut SyscallFrame) {
-    let path = match copy_user_cstring(frame.rdi) {
-        Ok(p) => p,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
+    let (raw, parsed) = match scan_user_path(frame.rdi) {
+        Ok(v) => v,
+        Err(e) => { frame.rax = e as u64; return; }
     };
     #[cfg(feature = "heap_trace")]
     let trace_t0_ms = crate::services::universal_timer::now_ns() / 1_000_000;
@@ -277,7 +328,7 @@ fn sys_read(frame: &mut SyscallFrame) {
         use crate::drivers::serial::SerialPort;
         let cap = core::cmp::min(frame.rdx, MAX_COPY);
         SerialPort::puts("[sys-read] path=");
-        SerialPort::puts(&path);
+        SerialPort::puts(&raw);
         SerialPort::puts(" want=");
         SerialPort::put_u64(cap);
         SerialPort::puts(" t0=");
@@ -285,8 +336,8 @@ fn sys_read(frame: &mut SyscallFrame) {
         SerialPort::puts("\n");
     }
     let mut data = Vec::new();
-    let r = unispace::read_flags(
-        &path,
+    let r = unispace::read_parsed(
+        &parsed,
         &mut data,
         core::cmp::min(frame.rdx, MAX_COPY) as usize,
         frame.r10,
@@ -295,7 +346,7 @@ fn sys_read(frame: &mut SyscallFrame) {
     {
         use crate::drivers::serial::SerialPort;
         SerialPort::puts("[sys-read] path=");
-        SerialPort::puts(&path);
+        SerialPort::puts(&raw);
         SerialPort::puts(" -> ");
         SerialPort::put_u64(data.len() as u64);
         SerialPort::puts(" bytes dt=");
@@ -316,27 +367,21 @@ fn sys_read(frame: &mut SyscallFrame) {
 /// schema, apply it, and rewrite the provider's output (or error detail) into
 /// `buf` in place. Returns the number of output bytes — not the input length.
 fn sys_write(frame: &mut SyscallFrame) {
-    let path = match copy_user_cstring(frame.rdi) {
-        Ok(p) => p,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
+    let (raw, parsed) = match scan_user_path(frame.rdi) {
+        Ok(v) => v,
+        Err(e) => { frame.rax = e as u64; return; }
     };
     // Fast-path: whole-buffer write-through to `/dev/fb`.  A full-screen blit
     // is a few MB; routing it through the general path (schema decode + the
     // response zero-fill) would waste a full page-walk and copy.  Here we
     // validate the user pages and copy straight from user VA into the scanout
     // — one copy, no allocations.  `r10` keeps its meaning as the byte offset
-    // (`flags`).
-    if path == "/dev/fb" {
-        // Caps check for /dev/fb write (needs RW on dev/fb + ancestors)
+    // (`flags`). Raw comparison keeps both "/dev/fb" and "dev/fb" spellings
+    // matching the original `String == "/dev/fb"` check (leading slash optional
+    // per path::parse, but raw is verbatim).
+    if raw == "/dev/fb" {
         if let Some(caps) = crate::caps::current_caps() {
-            let parsed = match crate::unispace::path::parse(&path) {
-                Ok(p) => p,
-                Err(e) => { frame.rax = errno(e) as u64; return; }
-            };
-            if let Err(e) = crate::caps::check_path(Some(&caps), &parsed.components, None, crate::caps::Perm::RW) {
+            if let Err(e) = crate::caps::check_path_on(Some(caps.as_slice()), &parsed.components, None, crate::caps::Perm::RW) {
                 frame.rax = errno(e) as u64;
                 return;
             }
@@ -345,10 +390,7 @@ fn sys_write(frame: &mut SyscallFrame) {
         let len = frame.rdx;
         let root = match current_task_root() {
             Ok(r) => r,
-            Err(e) => {
-                frame.rax = e as u64;
-                return;
-            }
+            Err(e) => { frame.rax = e as u64; return; }
         };
         if !user_range_ok(src, len) || validate_user_range(root, src, len, false).is_err() {
             frame.rax = (-14i64) as u64;
@@ -366,15 +408,12 @@ fn sys_write(frame: &mut SyscallFrame) {
     // The buffer is read in and rewritten in place, so validate the whole
     // range once (present, user-accessible, writable — writable subsumes
     // readable) and copy straight from user VA into the provider, no `Vec`
-    // input copy.  `write_flags` decodes `data` synchronously and never
+    // input copy.  `write_parsed` decodes `data` synchronously and never
     // retains it, so handing it the validated user slice is safe; the
     // response is copied back raw after.
     let root = match current_task_root() {
         Ok(r) => r,
-        Err(e) => {
-            frame.rax = e as u64;
-            return;
-        }
+        Err(e) => { frame.rax = e as u64; return; }
     };
     if !user_range_ok(frame.rsi, frame.rdx)
         || validate_user_range(root, frame.rsi, frame.rdx, true).is_err()
@@ -383,7 +422,7 @@ fn sys_write(frame: &mut SyscallFrame) {
         return;
     }
     let data = unsafe { core::slice::from_raw_parts(frame.rsi as *const u8, frame.rdx as usize) };
-    match unispace::write_flags(&path, data, &mut resp, frame.r10) {
+    match unispace::write_parsed(&parsed, data, &mut resp, frame.r10) {
         Ok(()) => {
             let n = copy_validated_out(frame.rsi, frame.rdx, &resp);
             frame.rax = n as u64;
@@ -431,7 +470,8 @@ fn user_range_ok(ptr: u64, len: u64) -> bool {
 
 /// Validate that every page touched by `[ptr, ptr+len)` is present and
 /// user-accessible in `root`. When `writable`, also requires the leaf to be
-/// writable.
+/// writable. Uses the batched walker that caches upper-level entries across
+/// consecutive pages (~1 physmap load per page instead of 4).
 fn validate_user_range(root: u64, ptr: u64, len: u64, writable: bool) -> Result<(), i64> {
     if !user_range_ok(ptr, len) {
         return Err(-14); // EFAULT
@@ -439,20 +479,9 @@ fn validate_user_range(root: u64, ptr: u64, len: u64, writable: bool) -> Result<
     if len == 0 {
         return Ok(());
     }
-    let start = ptr & !0xFFF;
-    let end = (ptr + len - 1) & !0xFFF;
-    let mut va = start;
-    loop {
-        match crate::mm::vmm::translate_user(root, va) {
-            Some((_, user, w)) if user && (!writable || w) => {}
-            _ => return Err(-14),
-        }
-        if va == end {
-            break;
-        }
-        va += 0x1000;
-    }
-    Ok(())
+    // Fast batched path — caches upper table entries across pages.
+    let ok = crate::mm::vmm::translate_user_range_ok(root, ptr, len, writable);
+    if ok { Ok(()) } else { Err(-14) }
 }
 
 /// Copy a NUL-terminated string from user memory.

@@ -222,6 +222,28 @@ pub trait Object: Send + Sync {
         }
     }
 
+    /// Raw-blob value write fast path. For objects whose value schema is
+    /// `Schema::Blob`, the generic decode (`Value::Bytes(b.to_vec())`) costs a
+    /// full payload copy plus an allocation per syscall; this hook hands the
+    /// wire bytes straight to the object instead. Return `None` to fall back
+    /// to the generic decode+`write_value_flags` path. Only consulted when the
+    /// effective schema is `Blob`, so bypassing decode here is semantically
+    /// identical (Blob decoding consumes the whole buffer verbatim).
+    fn write_blob_flags(&self, _data: &[u8], _flags: u64) -> Option<Result<(), UnispaceError>> {
+        None
+    }
+
+    /// Whether `Arc`s returned by [`Object::resolve`] on this object are stable
+    /// identities whose validity persists across calls (no per-call synthesis,
+    /// no dependence on state invisible to the namespace generation counter).
+    /// Used by the resolution cache: an intermediate chain of cacheable dirs
+    /// lets the resolved leaf be cached between namespace mutations. Opt-in —
+    /// the default is `false`; dynamic providers (`/proc/self:*`) and anything
+    /// backed by live disk state must not claim it.
+    fn cacheable(&self) -> bool {
+        false
+    }
+
     fn invoke(&self, _method: usize, _v: Value, _out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         Err(UnispaceError::MethodNotFound)
     }
@@ -394,20 +416,94 @@ pub fn disconnect(path: &str) -> Result<bool, UnispaceError> {
 
 // ── Resolution & dispatch ──────────────────────────────────────────────
 
-/// Resolve a path to its target object and optional `:method` selector.
-pub fn resolve(path: &str) -> Result<(Arc<dyn Object>, Option<&str>), UnispaceError> {
-    let parsed = path::parse(path)?;
+// Resolution cache: direct-mapped shards keyed by an FNV-1a hash of the path
+// components. Entries are validated against the namespace generation counter
+// (bumped by every SimpleDir insert/remove), so a mutation anywhere in a
+// cached chain invalidates all cached resolutions in one store. Only chains
+// of `cacheable()` objects (static dirs) produce entries — dynamic providers
+// and VFS-backed subtrees always take the walk.
+const RESOLVE_SHARDS: usize = 128;
+struct ResolveEntry {
+    hash: u64,
+    generation: u64,
+    obj: Arc<dyn Object>,
+}
+static RESOLVE_CACHE: [spin::Mutex<Option<ResolveEntry>>; RESOLVE_SHARDS] = {
+    // `spin::Mutex::new` is const; build the array without heap.
+    #[allow(clippy::declare_interior_mutable_const)]
+    const EMPTY: spin::Mutex<Option<ResolveEntry>> = spin::Mutex::new(None);
+    [EMPTY; RESOLVE_SHARDS]
+};
+
+fn path_hash(components: &[&str]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (i, c) in components.iter().enumerate() {
+        if i > 0 {
+            h ^= 0x2f as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for b in c.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+    }
+    h
+}
+
+fn cache_lookup(components: &[&str]) -> Option<Arc<dyn Object>> {
+    let hash = path_hash(components);
+    let shard = &RESOLVE_CACHE[(hash % RESOLVE_SHARDS as u64) as usize];
+    let guard = shard.lock();
+    let e = guard.as_ref()?;
+    if e.hash != hash || e.generation != dir::tree_gen() {
+        return None;
+    }
+    Some(e.obj.clone())
+}
+
+fn cache_store(components: &[&str], obj: Arc<dyn Object>) {
+    let hash = path_hash(components);
+    let shard = &RESOLVE_CACHE[(hash % RESOLVE_SHARDS as u64) as usize];
+    let mut guard = shard.lock();
+    *guard = Some(ResolveEntry { hash, generation: dir::tree_gen(), obj });
+}
+
+/// Resolve an already-parsed path to its target object and optional `:method`
+/// selector. Hot path: consults the resolution cache first (one lock), falling
+/// back to the per-component walk only on a miss or namespace change.
+pub fn resolve_parsed<'a, 'p>(parsed: &'p path::ParsedPath<'a>) -> Result<(Arc<dyn Object>, Option<&'a str>), UnispaceError> {
+    let components = &parsed.components;
+    if !components.is_empty() {
+        if let Some(hit) = cache_lookup(components) {
+            return Ok((hit, parsed.method));
+        }
+    }
     let mut current: Arc<dyn Object> = root().clone();
-    for comp in &parsed.components {
+    let mut chain_cacheable = true;
+    for comp in components {
         if current.kind() != ObjectKind::Dir {
             return Err(UnispaceError::NotADirectory);
         }
         match current.resolve(comp) {
-            Some(obj) => current = obj,
+            Some(obj) => {
+                // The child is trustworthy-as-cached only if every dir on the
+                // way down is cacheable AND the child itself is.
+                chain_cacheable &= current.cacheable();
+                current = obj;
+            }
             None => return Err(UnispaceError::NotFound),
         }
     }
+    if chain_cacheable && current.cacheable() && !components.is_empty() {
+        cache_store(components, current.clone());
+    }
     Ok((current, parsed.method))
+}
+
+/// Resolve a path string to its target object and optional `:method` selector.
+pub fn resolve(path: &str) -> Result<(Arc<dyn Object>, Option<&str>), UnispaceError> {
+    let parsed = path::parse(path)?;
+    resolve_parsed(&parsed)
 }
 
 fn find_method(obj: &dyn Object, name: &str) -> Option<usize> {
@@ -438,31 +534,31 @@ pub fn read_flags(
     flags: u64,
 ) -> Result<(), UnispaceError> {
     let parsed = path::parse(path)?;
+    read_parsed(&parsed, out, max, flags)
+}
+
+/// Parse-free variant of [`read_flags`] for callers that already hold a
+/// parsed path (the syscall layer scans the user string directly).
+pub fn read_parsed(
+    parsed: &path::ParsedPath<'_>,
+    out: &mut Vec<u8>,
+    max: usize,
+    flags: u64,
+) -> Result<(), UnispaceError> {
     let caps_opt = crate::caps::current_caps();
+    let caps_ref: Option<&[crate::caps::Cap]> = caps_opt.as_ref().map(|a| a.as_slice());
     // Caps checks: ancestor R + leaf/method R
-    if let Some(ref caps) = caps_opt {
+    if let Some(caps) = caps_ref {
         let leaf_want = crate::caps::Perm::R;
-        match parsed.method {
-            Some("desc") => {
-                // need leaf R + ancestors R
-                crate::caps::check_path(Some(caps), &parsed.components, None, leaf_want)?;
-            }
-            Some(m) => {
-                // per-method R (requires leaf R as well inside check_path)
-                crate::caps::check_path(Some(caps), &parsed.components, Some(m), leaf_want)?;
-            }
-            None => {
-                // will resolve to dir or file; both need leaf R
-                // For empty path ("/") leaf_path is "".
-                crate::caps::check_path(Some(caps), &parsed.components, None, leaf_want)?;
-            }
-        }
+        // per-method R (requires leaf R as well inside check_path); "desc"
+        // and plain value reads both need leaf R + ancestors R.
+        crate::caps::check_path_on(Some(caps), &parsed.components, parsed.method.filter(|m| *m != "desc"), leaf_want)?;
     }
-    let (obj, method) = resolve(path)?;
+    let (obj, method) = resolve_parsed(parsed)?;
     match method {
         Some("desc") => {
             let mut v = Vec::new();
-            encode_object_desc_filtered(&*obj, &parsed, caps_opt.as_deref(), &mut v)?;
+            encode_object_desc_filtered(&*obj, parsed, caps_ref, &mut v)?;
             if v.len() > max {
                 return Err(UnispaceError::InvalidArgument);
             }
@@ -491,9 +587,8 @@ pub fn read_flags(
                 let mut entries = Vec::new();
                 obj.list(&mut entries)?;
                 // Filter by per-child R
-                let dir_path = crate::caps::join_path(&parsed.components);
-                if let Some(ref caps) = caps_opt {
-                    entries = crate::caps::filter_listing(caps, &dir_path, entries);
+                if let Some(caps) = caps_ref {
+                    entries = crate::caps::filter_listing_on(caps, &parsed.components, entries);
                 }
                 encode_listing(entries, out)
             } else {
@@ -519,28 +614,39 @@ pub fn write_flags(
     flags: u64,
 ) -> Result<(), UnispaceError> {
     let parsed = path::parse(path)?;
+    write_parsed(&parsed, data, out, flags)
+}
+
+/// Parse-free variant of [`write_flags`] for callers that already hold a
+/// parsed path (the syscall layer scans the user string directly).
+pub fn write_parsed(
+    parsed: &path::ParsedPath<'_>,
+    data: &[u8],
+    out: &mut Vec<u8>,
+    flags: u64,
+) -> Result<(), UnispaceError> {
     let caps_opt = crate::caps::current_caps();
-    if let Some(ref caps) = caps_opt {
+    let caps_ref: Option<&[crate::caps::Cap]> = caps_opt.as_ref().map(|a| a.as_slice());
+    if let Some(caps) = caps_ref {
         match parsed.method {
             Some("desc") => return Err(UnispaceError::Unsupported),
             Some(m) => {
                 // invoke requires per-method RW
-                crate::caps::check_path(Some(caps), &parsed.components, Some(m), crate::caps::Perm::RW)?;
+                crate::caps::check_path_on(Some(caps), &parsed.components, Some(m), crate::caps::Perm::RW)?;
                 if flags != 0 {
                     return Err(UnispaceError::Unsupported);
                 }
             }
             None => {
                 // dir write is IsADirectory regardless of caps, but we still gate leaf RW
-                // Check leaf RW for non-dir; dir case will error anyway but we hide existence if no RW?
                 // For symmetry, require RW on leaf for value writes.
-                crate::caps::check_path(Some(caps), &parsed.components, None, crate::caps::Perm::RW)?;
+                crate::caps::check_path_on(Some(caps), &parsed.components, None, crate::caps::Perm::RW)?;
             }
         }
     } else if parsed.method.is_some() && parsed.method != Some("desc") && flags != 0 {
         return Err(UnispaceError::Unsupported);
     }
-    let (obj, method) = resolve(path)?;
+    let (obj, method) = resolve_parsed(parsed)?;
     match method {
         Some("desc") => Err(UnispaceError::Unsupported),
         Some(m) => {
@@ -553,48 +659,46 @@ pub fn write_flags(
             } else {
                 schema::decode_value(data, obj.methods()[idx].input)?
             };
-            // Clone for post-invoke auto-grant (VFS create-like methods create a new child)
-            let value_clone = value.clone();
-            let res = obj.invoke(idx, value, out);
-            if res.is_ok() {
-                // Auto-grant RW on newly created child so creator can immediately use it.
-                // Only for directory objects and known creation methods.
-                if obj.kind() == ObjectKind::Dir {
-                    let leaf_path = crate::caps::join_path(&parsed.components);
-                    let child_name_opt: Option<String> = match m {
-                        "create" | "mkdir" | "symlink" | "mkfifo" | "mknod" => {
-                            match &value_clone {
-                                schema::Value::Struct(f) => match f.first() {
-                                    Some(schema::Value::Str(s)) => Some(s.clone()),
-                                    _ => None,
-                                },
-                                _ => None,
-                            }
-                        }
-                        "link" | "rename" => {
-                            // link/rename second field is new name
-                            match &value_clone {
-                                schema::Value::Struct(f) => match f.get(1) {
-                                    Some(schema::Value::Str(s)) => Some(s.clone()),
-                                    _ => None,
-                                },
-                                _ => None,
-                            }
-                        }
+            // Post-invoke auto-grant: creation-like methods on a directory
+            // grant RW on the new child to the creator. Extract just the child
+            // name up front — never deep-clone the whole decoded payload.
+            let is_dir = obj.kind() == ObjectKind::Dir;
+            #[cfg_attr(not(target_arch = "x86_64"), allow(unused_variables))]
+            let child_name_opt: Option<String> = if is_dir {
+                let field = match m {
+                    "create" | "mkdir" | "symlink" | "mkfifo" | "mknod" => 0,
+                    "link" | "rename" => 1,
+                    _ => usize::MAX,
+                };
+                if field != usize::MAX {
+                    match &value {
+                        schema::Value::Struct(f) => match f.get(field) {
+                            Some(schema::Value::Str(s)) => Some(s.clone()),
+                            _ => None,
+                        },
                         _ => None,
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let res = obj.invoke(idx, value, out);
+            #[cfg(target_arch = "x86_64")]
+            if res.is_ok() && is_dir {
+                if let Some(child_name) = child_name_opt {
+                    let leaf_path = crate::caps::join_path(&parsed.components);
+                    let child_path = if leaf_path.is_empty() {
+                        child_name.clone()
+                    } else {
+                        alloc::format!("{}/{}", leaf_path, child_name)
                     };
-                    if let Some(child_name) = child_name_opt {
-                        let child_path = if leaf_path.is_empty() {
-                            child_name.clone()
-                        } else {
-                            alloc::format!("{}/{}", leaf_path, child_name)
-                        };
-                        let _ = crate::task::propagate_cap_to_parents(child_path.clone(), None, crate::caps::Perm::RW);
-                        // Also grant file/dir method caps for the new child (so creator can stat etc)
-                        // Propagate each method cap up the parent chain as well
-                        for method in ["stat", "truncate", "chmod", "chown", "utimens", "readlink", "create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod"] {
-                            let _ = crate::task::propagate_cap_to_parents(child_path.clone(), Some(String::from(method)), crate::caps::Perm::RW);
-                        }
+                    let _ = crate::task::propagate_cap_to_parents(child_path.clone(), None, crate::caps::Perm::RW);
+                    // Also grant file/dir method caps for the new child (so creator can stat etc)
+                    // Propagate each method cap up the parent chain as well
+                    for method in ["stat", "truncate", "chmod", "chown", "utimens", "readlink", "create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod"] {
+                        let _ = crate::task::propagate_cap_to_parents(child_path.clone(), Some(String::from(method)), crate::caps::Perm::RW);
                     }
                 }
             }
@@ -603,6 +707,18 @@ pub fn write_flags(
         None => {
             if obj.kind() == ObjectKind::Dir {
                 return Err(UnispaceError::IsADirectory);
+            }
+            // Blob-schema objects take the raw bytes directly — no Value
+            // decode copy. The fallback decode path stays for any object
+            // that declines the fast hook.
+            let blob_schema = match obj.owned_value_schema() {
+                Some(s) => matches!(s, schema::OwnedSchema::Blob),
+                None => matches!(obj.value_schema(), Schema::Blob),
+            };
+            if blob_schema {
+                if let Some(r) = obj.write_blob_flags(data, flags) {
+                    return r;
+                }
             }
             let value = match obj.owned_value_schema() {
                 Some(s) => schema::decode_value_owned(data, s)?,

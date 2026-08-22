@@ -14,6 +14,7 @@ fn oom(_layout: core::alloc::Layout) -> ! {
     crate::stdlib::abort()
 }
 
+pub mod caps;
 pub mod crt;
 pub mod ctype;
 pub mod dirent;

@@ -20,6 +20,7 @@ mod switch;
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use spin::Mutex;
@@ -72,10 +73,11 @@ pub struct Task {
     /// Capability supervisor page: physical frame backing `CAP_SLOT_VA` (supervisor-only,
     /// READ, no USER) in this task's PML4. `0` when none.
     pub caps_phys: u64,
-    /// Owner pointer to the cloned Vec<Cap> for fast checks (heap). Null when none.
-    pub caps_ptr: usize,
-    /// Number of caps in `caps_ptr` Vec (redundant, for quick introspection).
-    pub caps_len: usize,
+    /// Authoritative in-kernel capability set, Arc-shared. `current_caps()`
+    /// snapshots it with a single refcount bump; grants go through
+    /// `Arc::make_mut` copy-on-write. `None` = no caps yet (bypass for kernel
+    /// tasks with `vm == 0`, deny-all for user tasks).
+    pub caps_arc: Option<Arc<Vec<crate::caps::Cap>>>,
     /// Number of 4K pages mapped at CAP_SLOT_VA for the supervisor mirror (0 when none).
     pub caps_pages: usize,
 }
@@ -95,8 +97,7 @@ impl Task {
             parent_pid: 0,
             args: String::new(),
             caps_phys: 0,
-            caps_ptr: 0,
-            caps_len: 0,
+            caps_arc: None,
             caps_pages: 0,
         }
     }
@@ -129,6 +130,42 @@ fn lineage_chain(mut pid: u64) -> Vec<u64> {
     }
     out
 }
+/// True if `ancestor` is an ancestor of `descendant` via durable lineage (including direct parent).
+/// Used by caps to allow `proc/<pid>/...` alias to `proc/self/...` when caller is ancestor.
+pub fn is_ancestor(ancestor: u64, descendant: u64) -> bool {
+    if ancestor == descendant {
+        return true;
+    }
+    let map = lineage_map().lock();
+    let mut cur = descendant;
+    let mut depth = 0usize;
+    while depth < 128 {
+        if let Some(&ppid) = map.get(&cur) {
+            if ppid == ancestor {
+                return true;
+            }
+            if ppid == 0 {
+                break;
+            }
+            cur = ppid;
+            depth += 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Current task pid, if any.
+pub fn current_pid() -> Option<u64> {
+    let pc = crate::smp::current_per_cpu();
+    if pc.current_task.is_null() {
+        return None;
+    }
+    let t = unsafe { &*(pc.current_task as *const Task) };
+    Some(t.id)
+}
+
 fn lineage_gc() {
     // Collect live pids (those with a Task still allocated)
     let mut live: Vec<u64> = Vec::new();
@@ -201,53 +238,66 @@ pub fn alloc_kernel_stack(alloc: &mut BitmapAllocator) -> Option<(u64, usize)> {
     Some((base + KSTACK_SIZE, slot))
 }
 
-/// Allocate and map a capability supervisor page for `root` at `CAP_SLOT_VA`
-/// (supervisor-only READ, no USER). Returns the physical frame backing it.
-/// One 4K page per task; the caller fills it via `caps::serialize_to_page`.
+/// Allocate and map a capability supervisor window for `root` at `CAP_SLOT_VA`
+/// (supervisor-only READ, no USER). Returns the base physical frame (2 contiguous 4K).
+/// The caller fills it via `caps::serialize_to_page`.
 pub fn alloc_caps_page(root: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
-    let phys = alloc.alloc()?;
+    let phys = alloc.alloc_contiguous(2)?;
     let va = crate::mm::layout::CAP_SLOT_VA;
     unsafe {
         core::ptr::write_bytes(crate::mm::layout::to_physmap(phys) as *mut u8, 0, 4096);
+        core::ptr::write_bytes(crate::mm::layout::to_physmap(phys + 4096) as *mut u8, 0, 4096);
     }
     let mut vmm = Vmm::from_root(root);
     vmm.map_4k(alloc, va, phys, PageFlags::READ);
+    vmm.map_4k(alloc, va + 4096, phys + 4096, PageFlags::READ);
     Some(phys)
 }
 
-/// Unmap and free the capability supervisor page for `root`.
+/// Unmap and free the capability supervisor window for `root`.
 pub fn free_caps_page(root: u64, alloc: &mut BitmapAllocator) {
     let va = crate::mm::layout::CAP_SLOT_VA;
     let mut vmm = Vmm::from_root(root);
     let mut frames: Vec<u64> = Vec::new();
     // translate before unmap to capture phys for freeing (destroy_root would also free,
-    // but caps page is per-task and we want deterministic reclaim before destroy_root).
-    let phys = vmm.translate(va);
+    // but caps window is per-task and we want deterministic reclaim before destroy_root).
+    let phys0 = vmm.translate(va);
+    let phys1 = vmm.translate(va + 4096);
     vmm.unmap_range_collect(alloc, va, crate::mm::layout::CAP_SLOT_SIZE, &mut frames);
-    // If vmm didn't collect leaf (supervisor page), use translated phys directly
+    // If vmm didn't collect leaves (supervisor pages), fall back to translated phys
     if frames.is_empty() {
-        if let Some(p) = phys {
+        if let Some(p) = phys0 {
             unsafe { alloc.free(p); }
         }
+        if let Some(p) = phys1 {
+            if Some(p) != phys0 { unsafe { alloc.free(p); } }
+        }
+        // Also handle case where alloc_contiguous gave phys+4096 contiguous but translate only got base
+        // (should not happen; already tried translate for va+4096)
+        if phys0.is_some() && phys1.is_none() {
+            let _ = phys0;
+        }
     } else {
-        for p in frames { unsafe { alloc.free(p); } }
+        for p in &frames { unsafe { alloc.free(*p); } }
+        // In case unmap_range_collect collected only one leaf due to partial mapping, free the other via translate
+        if frames.len() == 1 {
+            if let Some(p1) = phys1 {
+                if !frames.contains(&p1) { unsafe { alloc.free(p1); } }
+            }
+            if let Some(p0) = phys0 {
+                if !frames.contains(&p0) { unsafe { alloc.free(p0); } }
+            }
+        }
     }
 }
 
-/// Clone caps Vec<Cap> onto heap and serialize to supervisor page. Returns (caps_ptr, caps_len, caps_phys).
-pub fn install_caps(root: u64, caps: Vec<crate::caps::Cap>, alloc: &mut BitmapAllocator) -> Option<(usize, usize, u64)> {
-    let len = caps.len();
+/// Serialize caps to the supervisor mirror page and map it into `root`.
+/// Returns the physical frame (2 pages, see `alloc_caps_page`). The caller
+/// owns the authoritative set as an `Arc<Vec<Cap>>` on the Task.
+pub fn install_caps(root: u64, caps: &[crate::caps::Cap], alloc: &mut BitmapAllocator) -> Option<u64> {
     let phys = alloc_caps_page(root, alloc)?;
-    crate::caps::serialize_to_page(&caps, phys);
-    let boxed = Box::new(caps);
-    let ptr = Box::into_raw(boxed) as usize;
-    Some((ptr, len, phys))
-}
-
-/// Drop the heap Vec<Cap> and free its allocation (no page free).
-pub fn drop_caps_heap(ptr: usize) {
-    if ptr == 0 { return; }
-    unsafe { drop(Box::from_raw(ptr as *mut Vec<crate::caps::Cap>)); }
+    crate::caps::serialize_to_page(caps, phys);
+    Some(phys)
 }
 
 /// Grant a capability to the task with `pid`, allocating a supervisor page if needed.
@@ -256,20 +306,21 @@ pub fn grant_cap_to_pid(pid: u64, cap: crate::caps::Cap) -> Result<(), crate::un
     crate::caps::validate_cap(&cap)?;
     // Helper to try to grant to a &mut Task
     fn do_grant(task: &mut Task, cap: crate::caps::Cap) -> Result<(), crate::unispace::UnispaceError> {
-        if task.caps_ptr == 0 {
+        if task.caps_arc.is_none() {
             let alloc = crate::mm::heap::get_phys_allocator_mut();
-            let mut new_caps = Vec::new();
-            new_caps.push(cap);
-            if let Some((ptr, len, phys)) = install_caps(task.root, new_caps, alloc) {
-                task.caps_ptr = ptr;
-                task.caps_len = len;
+            let new_caps = Vec::new();
+            if let Some(phys) = install_caps(task.root, &new_caps, alloc) {
                 task.caps_phys = phys;
-                return Ok(());
+                task.caps_arc = Some(Arc::new(new_caps));
             } else {
                 return Err(crate::unispace::UnispaceError::OutOfMemory);
             }
         }
-        let caps = unsafe { &mut *(task.caps_ptr as *mut Vec<crate::caps::Cap>) };
+        let arc = match task.caps_arc.as_mut() {
+            Some(a) => a,
+            None => return Err(crate::unispace::UnispaceError::OutOfMemory),
+        };
+        let caps = Arc::make_mut(arc);
         if caps.len() >= crate::caps::MAX_CAPS_PER_TASK {
             return Err(crate::unispace::UnispaceError::OutOfMemory);
         }
@@ -287,7 +338,6 @@ pub fn grant_cap_to_pid(pid: u64, cap: crate::caps::Cap) -> Result<(), crate::un
             }
         }
         caps.push(cap);
-        task.caps_len = caps.len();
         if task.caps_phys != 0 {
             crate::caps::serialize_to_page(caps, task.caps_phys);
         }
@@ -454,12 +504,12 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Stash for INIT caps — installed by `load_init_from_esp` before `enter_userspace`.
-static INIT_CAPS_STASH: Mutex<Option<(usize, usize, u64)>> = Mutex::new(None);
+static INIT_CAPS_STASH: Mutex<Option<(Arc<Vec<crate::caps::Cap>>, u64)>> = Mutex::new(None);
 
-pub fn stash_init_caps(ptr: usize, len: usize, phys: u64) {
-    *INIT_CAPS_STASH.lock() = Some((ptr, len, phys));
+pub fn stash_init_caps(caps: Arc<Vec<crate::caps::Cap>>, phys: u64) {
+    *INIT_CAPS_STASH.lock() = Some((caps, phys));
 }
-fn take_init_caps() -> Option<(usize, usize, u64)> {
+fn take_init_caps() -> Option<(Arc<Vec<crate::caps::Cap>>, u64)> {
     INIT_CAPS_STASH.lock().take()
 }
 
@@ -590,8 +640,11 @@ pub fn wake_sleepers() {
 /// consumes it or its parent dies), so a parent can collect it.  A Dead task
 /// is never requeued, so this never returns.
 pub fn exit_current(code: u64) -> ! {
-    log::info!("[sched] task exit({})", code);
-    SerialPort::puts("[sched] task exit(code=");
+    let pid = CURRENT.lock().as_ref().map(|t| t.id).unwrap_or(0);
+    log::info!("[sched] task exit(pid={} code={})", pid, code);
+    SerialPort::puts("[sched] task exit(pid=");
+    SerialPort::put_u64(pid);
+    SerialPort::puts(" code=");
     SerialPort::put_u64(code);
     SerialPort::puts(")\n");
     if let Some(t) = CURRENT.lock().as_mut() {
@@ -621,7 +674,10 @@ fn kill_current() -> ! {
 /// task Dead and parks it, abandoning the handler's iretq frame — control never
 /// returns to the faulting user context.
 pub fn kill_user_fault() -> ! {
-    SerialPort::puts("[sched] user fault — killing current task\n");
+    let pid = CURRENT.lock().as_ref().map(|t| t.id).unwrap_or(0);
+    SerialPort::puts("[sched] user fault — killing pid=");
+    SerialPort::put_u64(pid);
+    SerialPort::puts("\n");
     if let Some(t) = CURRENT.lock().as_mut() {
         t.exit_code = KILLED_EXIT_CODE;
     }
@@ -1039,6 +1095,63 @@ pub fn task_exit_code(pid: u64) -> Option<u64> {
         .map(|t| t.exit_code)
 }
 
+/// Snapshot of `pid`'s capability set, if the task exists (live or zombie).
+/// Deep-clones the task's Arc'd caps so the caller can read without holding locks.
+pub fn caps_snapshot(pid: u64) -> Option<Vec<crate::caps::Cap>> {
+    // Helper to clone from a Task reference.
+    fn clone_from_task(t: &Task) -> Option<Vec<crate::caps::Cap>> {
+        match &t.caps_arc {
+            // Task with no caps: empty set for user tasks, bypass is handled by caller via None
+            None => {
+                if t.vm == 0 {
+                    None
+                } else {
+                    Some(Vec::new())
+                }
+            }
+            Some(arc) => Some((**arc).clone()),
+        }
+    }
+    if let Some(t) = CURRENT.lock().as_ref() {
+        if t.id == pid {
+            return clone_from_task(t);
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid {
+                return clone_from_task(t);
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid {
+                return clone_from_task(t);
+            }
+        }
+    }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid {
+                return clone_from_task(t);
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid {
+                return clone_from_task(t);
+            }
+        }
+    }
+    None
+}
+
 /// Tear down one dead task: destroy its private page tables, free its kernel
 /// stack, release its user-memory registration, detach its `/proc` dir, and
 /// drop the task box.
@@ -1048,18 +1161,18 @@ pub fn task_exit_code(pid: u64) -> Option<u64> {
 /// BSP-only, so the dead root is never the active CR3).
 fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
     let root = task.root;
-    // Free caps page before destroying root so its leaf is still present for unmap
+    // Free caps window before destroying root so its leaves are still present for unmap
     if task.caps_phys != 0 {
         // If root still live, unmap the slot (destroy_root would free low-half anyway, but be explicit)
         if root != 0 && root != kernel_root() {
             free_caps_page(root, alloc);
-        } else if task.caps_phys != 0 {
-            // kernel thread caps phys still needs free
-            unsafe { alloc.free(task.caps_phys); }
+        } else {
+            // kernel thread caps phys still needs free (2 pages)
+            unsafe {
+                alloc.free(task.caps_phys);
+                alloc.free(task.caps_phys + 4096);
+            }
         }
-    }
-    if task.caps_ptr != 0 {
-        drop_caps_heap(task.caps_ptr);
     }
     if root != 0 && root != kernel_root() {
         crate::mm::vmm::destroy_root(root, alloc);
@@ -1268,9 +1381,8 @@ pub fn enter_userspace(
     task.kstack_slot = slot;
     task.vm = vm;
     // Adopt stashed INIT caps if present (load_init_from_esp installed them on this root)
-    if let Some((ptr, len, phys)) = take_init_caps() {
-        task.caps_ptr = ptr;
-        task.caps_len = len;
+    if let Some((caps, phys)) = take_init_caps() {
+        task.caps_arc = Some(caps);
         task.caps_phys = phys;
     }
     task.id = next_id();

@@ -1,7 +1,10 @@
+pub use crate::caps::Cap;
 use crate::errno;
 use crate::syscall::{read_path, write_path};
 
 static mut LAST_SPAWNED: u64 = 0;
+
+pub use crate::caps::{OwnedCap, CapSet, R as CAP_R, RW as CAP_RW, has_cap};
 
 /// Read the full `/proc/self/status` snapshot into `buf` (28 bytes).
 fn read_status() -> [u8; 32] {
@@ -48,19 +51,40 @@ pub fn sched_yield() -> isize {
     errno::ret(r)
 }
 
-pub fn spawn(path: &str, args: &str) -> isize {
-    let mut buf = [0u8; 512];
-    let plen = path.len();
-    let alen = args.len();
-    let total = 8 + plen + alen;
-    if total > buf.len() {
+/// Spawn with explicit capability subset — `caps` must be subset of caller's caps.
+/// Replaces the legacy `spawn` (which is removed); every spawn now requires an explicit
+/// cap list. Encodes `struct{path:str, args:str, caps:list<{path:str,method:str,perm:u32}>}`
+/// into a heap buffer and invokes `/proc/self:spawn_caps`. `perm` must be 1 (R) or 3 (RW).
+pub fn spawn(path: &str, args: &str, caps: &[Cap]) -> isize {
+    // Estimate: 4+plen +4+alen +4 + caps*(4+path +4+method +4)
+    let mut cap_bytes = 0usize;
+    for c in caps {
+        cap_bytes = cap_bytes.saturating_add(12 + c.path.len() + c.method.unwrap_or("").len());
+    }
+    let total = 8 + path.len() + args.len() + 4 + cap_bytes;
+    // Guard against hostile huge lists that would OOM the heap.
+    if caps.len() > 8192 || total > 8192 {
         return -1;
     }
-    buf[0..4].copy_from_slice(&(plen as u32).to_le_bytes());
-    buf[4..4 + plen].copy_from_slice(path.as_bytes());
-    buf[4 + plen..8 + plen].copy_from_slice(&(alen as u32).to_le_bytes());
-    buf[8 + plen..total].copy_from_slice(args.as_bytes());
-    let r = unsafe { write_path(b"/proc/self:spawn\0", &mut buf, total, 0) };
+    // Use stack buffer to avoid heap OOM abort (Vec allocation would abort on OOM via global oom handler).
+    // total is bounded 8192, fits on stack; use static scratch via heap fallback only if needed.
+    let mut stack_buf = [0u8; 8192];
+    let mut off = 0usize;
+    stack_buf[off..off+4].copy_from_slice(&(path.len() as u32).to_le_bytes()); off+=4;
+    stack_buf[off..off+path.len()].copy_from_slice(path.as_bytes()); off+=path.len();
+    stack_buf[off..off+4].copy_from_slice(&(args.len() as u32).to_le_bytes()); off+=4;
+    stack_buf[off..off+args.len()].copy_from_slice(args.as_bytes()); off+=args.len();
+    stack_buf[off..off+4].copy_from_slice(&(caps.len() as u32).to_le_bytes()); off+=4;
+    for c in caps {
+        stack_buf[off..off+4].copy_from_slice(&(c.path.len() as u32).to_le_bytes()); off+=4;
+        stack_buf[off..off+c.path.len()].copy_from_slice(c.path.as_bytes()); off+=c.path.len();
+        let m = c.method.unwrap_or("");
+        stack_buf[off..off+4].copy_from_slice(&(m.len() as u32).to_le_bytes()); off+=4;
+        stack_buf[off..off+m.len()].copy_from_slice(m.as_bytes()); off+=m.len();
+        stack_buf[off..off+4].copy_from_slice(&(c.perm as u32).to_le_bytes()); off+=4;
+    }
+    let len = off;
+    let r = unsafe { write_path(b"/proc/self:spawn_caps\0", &mut stack_buf[..len], len, 0) };
     if r < 0 {
         return errno::ret(r);
     }
@@ -68,7 +92,7 @@ pub fn spawn(path: &str, args: &str) -> isize {
         return -1;
     }
     let pid = u64::from_le_bytes([
-        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        stack_buf[0], stack_buf[1], stack_buf[2], stack_buf[3], stack_buf[4], stack_buf[5], stack_buf[6], stack_buf[7],
     ]);
     unsafe {
         LAST_SPAWNED = pid;

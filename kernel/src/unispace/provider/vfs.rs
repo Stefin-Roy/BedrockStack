@@ -447,6 +447,27 @@ impl Object for VfsFile {
         }
     }
 
+    fn write_blob_flags(&self, data: &[u8], flags: u64) -> Option<Result<(), UnispaceError>> {
+        let res = if flags & 0x1 != 0 {
+            if flags & 0x1FE != 0 {
+                return Some(Err(UnispaceError::Unsupported));
+            }
+            self.write_bytes_at(self.ops.size(), data)
+        } else {
+            if flags & 0x1FE != 0 {
+                return Some(Err(UnispaceError::Unsupported));
+            }
+            let offset = flags >> 8;
+            if offset == 0 {
+                if let Err(e) = self.ops.truncate(0) {
+                    return Some(Err(e.into()));
+                }
+            }
+            self.write_bytes_at(offset, data)
+        };
+        Some(res)
+    }
+
     fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
         match method {
             0 => stat_output(self.ops.as_ref(), out),

@@ -24,6 +24,7 @@
 #include "m_misc.h"
 #include "w_file.h"
 #include "z_zone.h"
+#include <errno.h>
 
 typedef struct
 {
@@ -33,6 +34,11 @@ typedef struct
 
 extern wad_file_class_t mem_wad_file;
 
+extern int bedrock_serial(const void *src, size_t len);
+static void wmem_log(const char *msg)
+{
+    if (msg) bedrock_serial(msg, strlen(msg));
+}
 static wad_file_t *W_Mem_OpenFile(char *path)
 {
     mem_wad_file_t *result;
@@ -41,10 +47,28 @@ static wad_file_t *W_Mem_OpenFile(char *path)
     byte *buf;
     size_t got;
 
+    wmem_log("[w_mem] open ");
+    wmem_log(path);
+    wmem_log("\n");
     fstream = fopen(path, "rb");
 
     if (fstream == NULL)
     {
+        wmem_log("[w_mem] fopen failed errno=");
+        // crude decimal of errno
+        {
+            char tmp[32];
+            int n = 0;
+            int e = errno;
+            if (e < 0) e = -e;
+            if (e == 0) tmp[n++]='0';
+            else { char rev[16]; int r=0; while(e>0){ rev[r++]='0'+(e%10); e/=10; } while(r--) tmp[n++]=rev[r]; }
+            tmp[n]=0;
+            wmem_log(tmp);
+            wmem_log(" path=");
+            wmem_log(path);
+            wmem_log("\n");
+        }
         return NULL;
     }
 
@@ -52,14 +76,31 @@ static wad_file_t *W_Mem_OpenFile(char *path)
 
     if (length <= 0)
     {
+        wmem_log("[w_mem] M_FileLength <=0\n");
         fclose(fstream);
         return NULL;
+    }
+
+    {
+        char tmp[64];
+        // log length
+        wmem_log("[w_mem] length ");
+        {
+            long v = length;
+            char rev[32]; int r=0, n=0;
+            if(v==0) tmp[n++]='0';
+            else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+            tmp[n]=0;
+            wmem_log(tmp);
+            wmem_log("\n");
+        }
     }
 
     buf = (byte *)malloc((size_t)length);
 
     if (buf == NULL)
     {
+        wmem_log("[w_mem] malloc failed\n");
         fclose(fstream);
         return NULL;
     }
@@ -68,10 +109,12 @@ static wad_file_t *W_Mem_OpenFile(char *path)
 
     if (got != (size_t)length)
     {
+        wmem_log("[w_mem] fread short\n");
         free(buf);
         fclose(fstream);
         return NULL;
     }
+    wmem_log("[w_mem] open ok\n");
 
     result = Z_Malloc(sizeof(mem_wad_file_t), PU_STATIC, 0);
     result->wad.file_class = &mem_wad_file;

@@ -8,6 +8,24 @@ use crate::filesystems::vfs::irq::IrqMutex;
 use super::schema::{MethodDesc, Schema, Value};
 use super::{DIR_SCHEMA, ListingEntry, Object, ObjectKind, UnispaceError};
 
+// ── Namespace generation counter ───────────────────────────────────────
+//
+// Bumped on every SimpleDir child insert/remove. The resolution cache stamps
+// entries with the generation at resolve time; any structural mutation
+// anywhere in a SimpleDir-backed chain invalidates every cached resolution
+// in one load-compare. VFS/proc providers do not participate (their objects
+// are not `cacheable()`), so their mutations need no bump.
+static TREE_GEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Current namespace generation (see module-level comment in `dir.rs`).
+pub fn tree_gen() -> u64 {
+    TREE_GEN.load(core::sync::atomic::Ordering::Acquire)
+}
+
+fn bump_tree_gen() {
+    TREE_GEN.fetch_add(1, core::sync::atomic::Ordering::Release);
+}
+
 /// A provider-side map-backed directory.  The unispace root `/` is one of
 /// these; providers may instantiate their own for static subtrees.  This is a
 /// provider utility — unispace core owns no tree state beyond the root itself.
@@ -24,10 +42,15 @@ impl SimpleDir {
 
     pub fn insert(&self, name: &str, obj: Arc<dyn Object>) {
         self.children.lock().insert(String::from(name), obj);
+        bump_tree_gen();
     }
 
     pub fn remove(&self, name: &str) -> bool {
-        self.children.lock().remove(name).is_some()
+        let removed = self.children.lock().remove(name).is_some();
+        if removed {
+            bump_tree_gen();
+        }
+        removed
     }
 }
 
@@ -46,6 +69,10 @@ impl Object for SimpleDir {
 
     fn resolve(&self, name: &str) -> Option<Arc<dyn Object>> {
         self.children.lock().get(name).cloned()
+    }
+
+    fn cacheable(&self) -> bool {
+        true
     }
 
     fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
