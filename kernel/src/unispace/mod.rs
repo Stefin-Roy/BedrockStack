@@ -48,6 +48,8 @@ pub mod schema;
 
 use alloc::string::String;
 use alloc::sync::Arc;
+#[cfg(feature = "selftest")]
+use alloc::vec;
 use alloc::vec::Vec;
 use spin::Once;
 
