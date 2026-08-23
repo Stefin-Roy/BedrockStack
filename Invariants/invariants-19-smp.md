@@ -82,6 +82,18 @@ Scans all 16 slots, returns `Some((&mut PerCpu, cpu_id))` on match.
 Used by interrupt handlers that receive hardware (APIC/hart) IDs.
 - Location: `kernel/src/smp/mod.rs:149-157`
 
+**SMP-013 — `PerCpu.current_task` is `AtomicPtr<c_void>` (S5):**
+Opaque per-CPU current task pointer for syscall/caps fast-path. `store(Relaxed)` on `schedule`/`enter_userspace`, `load(Relaxed)` on `current_pid`/`syscall`. `#[repr(C)]` offset unchanged; `AtomicPtr` same size as `*mut`.
+- Location: `kernel/src/smp/mod.rs:148-152`, `kernel/src/task/mod.rs:160-167`
+
+**SMP-014 — Preemptive scaffolding (cooperative for now):**
+`need_resched: AtomicBool`, `preempt_count: AtomicU32`, `sched_ticks: AtomicU64`, `sched_active: AtomicBool` per CPU, helpers `preempt_disable/enable`, `set_need_resched/take_need_resched`, `inc_sched_ticks`, `set_sched_active/is_sched_active`. Tick does not yet set `need_resched`; `schedule` asserts `preempt_is_enabled()`; future preemptive must use `IrqSafeLock` (SCHED-L003).
+- Location: `kernel/src/smp/mod.rs:152-158,540-614`
+
+**SMP-015 — `PerCpu.syscall_rsp0` mirrored TSS.rsp0:**
+`set_kernel_stack_meta(top)` writes `gdt::set_kernel_stack(top)` + `PerCpu.syscall_rsp0=top` so `syscall_entry` `gs:[PERCPU_SYSCALL_RSP0_OFF]` loads without TSS. Updated on every `schedule`/`enter_userspace`.
+- Location: `kernel/src/smp/mod.rs:145-147`, `kernel/src/task/mod.rs:856-861`
+
 ---
 
 ## Safety Invariants

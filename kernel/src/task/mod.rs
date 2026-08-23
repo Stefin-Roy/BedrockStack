@@ -117,13 +117,13 @@ pub fn lineage_insert(pid: u64, parent: u64) {
 fn lineage_chain(mut pid: u64) -> Vec<u64> {
     let map = lineage_map().lock();
     let mut out = Vec::new();
-    let mut visited = 0usize;
-    while visited < 128 {
+    let mut seen = hashbrown::HashSet::new();
+    // Unbounded walk until 0 or missing; cycle-guarded via HashSet.
+    while seen.insert(pid) {
         if let Some(&ppid) = map.get(&pid) {
             if ppid == 0 { break; }
             out.push(ppid);
             pid = ppid;
-            visited += 1;
         } else {
             break;
         }
@@ -138,8 +138,8 @@ pub fn is_ancestor(ancestor: u64, descendant: u64) -> bool {
     }
     let map = lineage_map().lock();
     let mut cur = descendant;
-    let mut depth = 0usize;
-    while depth < 128 {
+    let mut seen = hashbrown::HashSet::new();
+    while seen.insert(cur) {
         if let Some(&ppid) = map.get(&cur) {
             if ppid == ancestor {
                 return true;
@@ -148,7 +148,6 @@ pub fn is_ancestor(ancestor: u64, descendant: u64) -> bool {
                 break;
             }
             cur = ppid;
-            depth += 1;
         } else {
             break;
         }
@@ -159,10 +158,11 @@ pub fn is_ancestor(ancestor: u64, descendant: u64) -> bool {
 /// Current task pid, if any.
 pub fn current_pid() -> Option<u64> {
     let pc = crate::smp::current_per_cpu();
-    if pc.current_task.is_null() {
+    let ptr = pc.current_task.load(Ordering::Relaxed);
+    if ptr.is_null() {
         return None;
     }
-    let t = unsafe { &*(pc.current_task as *const Task) };
+    let t = unsafe { &*(ptr as *const Task) };
     Some(t.id)
 }
 
@@ -175,21 +175,18 @@ fn lineage_gc() {
     for (t, _) in WAITERS.lock().iter() { live.push(t.id); }
     for t in ZOMBIES.lock().iter() { live.push(t.id); }
     for t in RECLAIM.lock().iter() { live.push(t.id); }
-    // Mark all ancestors of live pids as needed
+    // Mark all ancestors of live pids as needed (unbounded, cycle-guarded)
     let mut needed = hashbrown::HashSet::new();
     {
         let map = lineage_map().lock();
         for &pid in &live {
             let mut cur = pid;
-            let mut depth = 0usize;
-            while depth < 128 {
+            let mut seen = hashbrown::HashSet::new();
+            while seen.insert(cur) {
                 if let Some(&ppid) = map.get(&cur) {
                     if ppid == 0 { break; }
                     needed.insert(ppid);
-                    // Also need to keep the link for the current pid itself if it is ancestor of another?
-                    // Keep lineage entry for every pid that is ancestor of live
                     cur = ppid;
-                    depth += 1;
                 } else { break; }
             }
         }
@@ -226,14 +223,41 @@ pub fn alloc_kernel_stack(alloc: &mut BitmapAllocator) -> Option<(u64, usize)> {
     let slot = in_use.iter().position(|&b| !b)?;
     let base = KSTACK_VADDR_BASE - (slot as u64) * KSTACK_SIZE;
     let mut vmm = Vmm::from_root(kernel_root());
+    // Track allocated frames for rollback on OOM mid-way (S7).
+    let mut allocated: [u64; KSTACK_PAGES] = [0; KSTACK_PAGES];
+    let mut allocated_len = 0usize;
     for i in 0..KSTACK_PAGES {
-        let pa = alloc.alloc()?;
+        let pa = match alloc.alloc() {
+            Some(p) => p,
+            None => {
+                // Roll back any pages already mapped for this slot.
+                for j in 0..allocated_len {
+                    let va = base + (j as u64) * 4096;
+                    let mut rollback_vmm = Vmm::from_root(kernel_root());
+                    // Collect and free via unmap_range path (TLB shootdown needed)
+                    let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+                    rollback_vmm.unmap_range_collect(alloc, va, 4096, &mut frames);
+                    for phys in &frames { unsafe { alloc.free(*phys); } }
+                    // Also free if translate missed due to supervisor flag? fallback free original.
+                    // The frame was zeroed but not yet freed, free the original pa directly if not in frames.
+                    let orig = allocated[j];
+                    if !frames.contains(&orig) { unsafe { alloc.free(orig); } }
+                }
+                return None;
+            }
+        };
         unsafe {
             core::ptr::write_bytes(crate::mm::layout::to_physmap(pa) as *mut u8, 0, 4096);
         }
         let va = base + (i as u64) * 4096;
         vmm.map_4k(alloc, va, pa, PageFlags::READ | PageFlags::WRITE);
+        allocated[allocated_len] = pa;
+        allocated_len += 1;
     }
+    // Assert KSTACK window's PML4 slot (511) is now present and shared. If
+    // this were a new higher-half slot, `map_4k` already called
+    // `sync_clone_half` (VMM) so clones share the PDPT. Debug-only check.
+    debug_assert!(Vmm::from_root(kernel_root()).translate(base).is_some());
     in_use[slot] = true;
     Some((base + KSTACK_SIZE, slot))
 }
@@ -259,35 +283,10 @@ pub fn free_caps_page(root: u64, alloc: &mut BitmapAllocator) {
     let va = crate::mm::layout::CAP_SLOT_VA;
     let mut vmm = Vmm::from_root(root);
     let mut frames: Vec<u64> = Vec::new();
-    // translate before unmap to capture phys for freeing (destroy_root would also free,
-    // but caps window is per-task and we want deterministic reclaim before destroy_root).
-    let phys0 = vmm.translate(va);
-    let phys1 = vmm.translate(va + 4096);
     vmm.unmap_range_collect(alloc, va, crate::mm::layout::CAP_SLOT_SIZE, &mut frames);
-    // If vmm didn't collect leaves (supervisor pages), fall back to translated phys
-    if frames.is_empty() {
-        if let Some(p) = phys0 {
-            unsafe { alloc.free(p); }
-        }
-        if let Some(p) = phys1 {
-            if Some(p) != phys0 { unsafe { alloc.free(p); } }
-        }
-        // Also handle case where alloc_contiguous gave phys+4096 contiguous but translate only got base
-        // (should not happen; already tried translate for va+4096)
-        if phys0.is_some() && phys1.is_none() {
-            let _ = phys0;
-        }
-    } else {
-        for p in &frames { unsafe { alloc.free(*p); } }
-        // In case unmap_range_collect collected only one leaf due to partial mapping, free the other via translate
-        if frames.len() == 1 {
-            if let Some(p1) = phys1 {
-                if !frames.contains(&p1) { unsafe { alloc.free(p1); } }
-            }
-            if let Some(p0) = phys0 {
-                if !frames.contains(&p0) { unsafe { alloc.free(p0); } }
-            }
-        }
+    debug_assert!(frames.len() <= 2, "caps window should be at most 2 pages");
+    for p in frames {
+        unsafe { alloc.free(p); }
     }
 }
 
@@ -401,10 +400,11 @@ pub fn propagate_cap_to_parents(path: String, method: Option<String>, perm: crat
     // Walk durable lineage chain
     let pid_opt = {
         let pc = crate::smp::current_per_cpu();
-        if pc.current_task.is_null() {
+        let ptr = pc.current_task.load(Ordering::Relaxed);
+        if ptr.is_null() {
             None
         } else {
-            let t = unsafe { &*(pc.current_task as *const Task) };
+            let t = unsafe { &*(ptr as *const Task) };
             Some(t.id)
         }
     };
@@ -495,7 +495,12 @@ static SLEEPING: Mutex<Vec<(u64, &'static mut Task)>> = Mutex::new(Vec::new());
 
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
 /// first `switch_to` away from it; restored when no ready task remains.
-static mut IDLE: Task = Task::new(0, 0, 0, TaskContext::zeroed());
+/// Uses `UnsafeCell` instead of `static mut` to avoid `static_mut_refs` UB
+/// (MONIKA invasive fix S5). Only the BSP scheduler touches this, but the
+/// compiler must not assume `&mut` aliasing across `switch_to` asm.
+struct IdleCell(core::cell::UnsafeCell<Task>);
+unsafe impl Sync for IdleCell {}
+static IDLE: IdleCell = IdleCell(core::cell::UnsafeCell::new(Task::new(0, 0, 0, TaskContext::zeroed())));
 
 /// Kernel page-table root. Kernel threads share it; it is also the root to
 /// restore when parking an exiting task into idle.
@@ -519,8 +524,9 @@ fn next_id() -> u64 {
 
 fn idle_ctx() -> *mut TaskContext {
     // The idle anchor task lives in a static; writing its context is inherent
-    // to capturing/restoring the scheduler register state.
-    unsafe { core::ptr::addr_of_mut!(IDLE.ctx) }
+    // to capturing/restoring the scheduler register state. `UnsafeCell` gives
+    // a raw `*mut` without creating a `&mut` reference (S5).
+    unsafe { core::ptr::addr_of_mut!((*IDLE.0.get()).ctx) }
 }
 
 /// Record the kernel page-table root. Call once from `Kernel::run` before any
@@ -539,10 +545,11 @@ pub fn kernel_root() -> u64 {
 /// `None` when in kernel context (no current task, or a kernel-only task).
 pub fn current_vm() -> Option<usize> {
     let pc = crate::smp::current_per_cpu();
-    if pc.current_task.is_null() {
+    let ptr = pc.current_task.load(Ordering::Relaxed);
+    if ptr.is_null() {
         return None;
     }
-    let t = unsafe { &*(pc.current_task as *const Task) };
+    let t = unsafe { &*(ptr as *const Task) };
     let vm = t.vm;
     if vm == 0 { None } else { Some(vm) }
 }
@@ -958,7 +965,12 @@ fn zombie_present(pid: u64) -> bool {
     ZOMBIES.lock().iter().any(|t| t.id == pid)
 }
 
-/// True if `pid` is live: running, ready, sleeping, or parked waiting.
+/// True if `pid` is live: running, ready, sleeping, parked waiting, or zombie
+/// (parked Dead retaining exit code). A zombie parent still counts as live for
+/// orphan checks — its child is kept until the parent is reaped, not the moment
+/// the parent parks into ZOMBIES (otherwise `kill` of a waiter could free its
+/// child before the waiter consumes the exit code). RECLAIM tasks are not live
+/// (already consumed, awaiting teardown).
 fn pid_live(pid: u64) -> bool {
     if let Some(t) = CURRENT.lock().as_ref() {
         if t.id == pid {
@@ -972,6 +984,9 @@ fn pid_live(pid: u64) -> bool {
         return true;
     }
     if WAITERS.lock().iter().any(|(t, _)| t.id == pid) {
+        return true;
+    }
+    if ZOMBIES.lock().iter().any(|t| t.id == pid) {
         return true;
     }
     false
@@ -1239,7 +1254,23 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
 /// The outgoing task is requeued only if it is still `Running` (a voluntary
 /// yield). A `Dead` task (from `exit_current`) is parked and the scheduler
 /// drops to idle. No spin lock is held across `switch_to`.
+///
+/// BSP-only cooperative: interrupts remain enabled, but `schedule` itself is
+/// not re-entered from IRQ. Future preemptive wiring must wrap with
+/// `preempt_disable`/`preempt_enable` and use `IrqSafeLock`.
 pub fn schedule() {
+    // Cooperative BSP-only: timer ISR never touches scheduler locks (S9).
+    // If preemptive tick is ever wired, this must be wrapped with
+    // `preempt_disable`/`preempt_enable` and locks switched to `IrqSafeLock`.
+    // For now assert we are not in IRQ context (interrupts may be enabled,
+    // but we are not re-entered).
+    debug_assert!(crate::smp::preempt_is_enabled(), "schedule: preempt disabled nested?");
+    // Wake expired sleepers before picking the next task so a burst of
+    // sleepers never starves while Ready tasks continuously yield. This was
+    // previously only in the idle loops (Kernel::run / enter_userspace) which
+    // starved sleepers under load (S1).
+    wake_sleepers();
+
     let prev = CURRENT.lock().take();
     let mut q = QUEUE.lock();
 
@@ -1259,13 +1290,11 @@ pub fn schedule() {
             let stack_top = t.kernel_stack_top;
             let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
             set_kernel_stack_meta(stack_top);
-            crate::smp::current_per_cpu().current_task = t as *mut Task as *mut core::ffi::c_void;
+            crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
             *CURRENT.lock() = Some(t);
             (ctx_ptr, root)
         }
         None => {
-            *CURRENT.lock() = None;
-            crate::smp::current_per_cpu().current_task = core::ptr::null_mut();
             // No ready task.
             match prev {
                 Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
@@ -1275,6 +1304,8 @@ pub fn schedule() {
                     // loop reap or a parent's :wait; a ZzZ task is already
                     // registered in the sleeping/waiter list, so it is simply
                     // left out of the queue.  `pctx` stays valid either way.
+                    crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
+                    *CURRENT.lock() = None;
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     drop(q);
@@ -1287,14 +1318,23 @@ pub fn schedule() {
                     return;
                 }
                 Some(p) => {
-                    // Self-yield with an empty queue: requeue and return
-                    // without switching.
-                    p.state = TaskState::Ready;
-                    q.push_back(&mut *p);
+                    // Self-yield with an empty queue: keep running. Previously
+                    // this requeued into QUEUE and left CURRENT=None /
+                    // PerCpu.current_task=null while the task continued on its
+                    // stack (S0). Now restore CURRENT/PerCpu and keep Running.
+                    let stack_top = p.kernel_stack_top;
+                    let ptr = &mut *p as *mut Task as *mut core::ffi::c_void;
+                    // Keep state Running (p was Running before take).
+                    debug_assert!(p.state == TaskState::Running);
+                    crate::smp::current_per_cpu().current_task.store(ptr, Ordering::Relaxed);
+                    *CURRENT.lock() = Some(p);
+                    set_kernel_stack_meta(stack_top);
                     drop(q);
                     return;
                 }
                 None => {
+                    crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
+                    *CURRENT.lock() = None;
                     drop(q);
                     return;
                 }
@@ -1393,7 +1433,7 @@ pub fn enter_userspace(
     let pid = t.id;
     let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
     set_kernel_stack_meta(kernel_stack_top);
-    crate::smp::current_per_cpu().current_task = t as *mut Task as *mut core::ffi::c_void;
+    crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
     *CURRENT.lock() = Some(t);
 
     unsafe {
@@ -1410,17 +1450,22 @@ pub fn enter_userspace(
         match process_state(pid) {
             Some(TaskState::Dead) | None => break,
             _ => {
-                // Requeue sleepers whose deadline has passed.  Without this,
-                // a kernel task parked via sleep_current (e.g. the audio
-                // pump) alongside a parked INIT would leave the scheduler
-                // with nothing ready, and this idle loop would spin forever
-                // waking nobody — a permanent freeze.
+                // Requeue sleepers whose deadline has passed.  `schedule()`
+                // already wakes, but keep this wake for the case where
+                // `schedule` found no Ready and returned without switching
+                // (self-yield fast-path now keeps Running, so wake inside
+                // schedule covers the rest).
                 wake_sleepers();
                 schedule();
                 // Park until the earliest sleeping deadline so the loop
-                // doesn't hot-spin while only sleepers remain.
+                // doesn't hot-spin while only sleepers remain. When no
+                // sleeper exists we must still halt until the next IRQ
+                // (e.g. INIT parked in WAITERS, audio pump sleeping) — the
+                // old loop spun at 100% here (S3).
                 if let Some(d) = earliest_sleep_deadline() {
                     crate::services::universal_timer::wait_until(d.saturating_add(1));
+                } else {
+                    crate::arch::CurrentArch::halt();
                 }
             }
         }

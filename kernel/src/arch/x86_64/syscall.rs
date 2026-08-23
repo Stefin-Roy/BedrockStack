@@ -454,10 +454,11 @@ const MAX_COPY: u64 = 16 * 1024 * 1024;
 /// Page-table root of the task that made this syscall.
 fn current_task_root() -> Result<u64, i64> {
     let pc = crate::smp::current_per_cpu();
-    if pc.current_task.is_null() {
+    let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr.is_null() {
         return Err(-1);
     }
-    Ok(unsafe { (*(pc.current_task as *const crate::task::Task)).root })
+    Ok(unsafe { (*(ptr as *const crate::task::Task)).root })
 }
 
 /// True if `[ptr, ptr+len)` lies fully inside the user canonical range.

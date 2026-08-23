@@ -128,7 +128,7 @@ fn enqueue_playback(samples: Vec<i16>) -> Result<(), &'static str> {
         // happen when pump is alive, but be safe) fall back to HLT wait.
         #[cfg(target_arch = "x86_64")]
         {
-            if crate::smp::current_per_cpu().current_task.is_null() {
+            if crate::smp::current_per_cpu().current_task.load(core::sync::atomic::Ordering::Relaxed).is_null() {
                 crate::services::universal_timer::sleep_ms(1);
             } else {
                 crate::task::sleep_current(500_000);

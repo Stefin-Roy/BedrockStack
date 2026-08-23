@@ -304,10 +304,11 @@ pub fn detach(pid: u64) {
 /// The running task's pid, or `None` in kernel context (current_task null).
 fn current_pid() -> Option<u64> {
     let pc = crate::smp::current_per_cpu();
-    if pc.current_task.is_null() {
+    let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr.is_null() {
         return None;
     }
-    let t = unsafe { &*(pc.current_task as *const crate::task::Task) };
+    let t = unsafe { &*(ptr as *const crate::task::Task) };
     Some(t.id)
 }
 
@@ -790,7 +791,7 @@ impl Object for StdStream {
                     // Blocking get needs a running task to park; in pure kernel
                     // context (no current task) it would busy-spin, so refuse.
                     let pc = crate::smp::current_per_cpu();
-                    if pc.current_task.is_null() {
+                    if pc.current_task.load(core::sync::atomic::Ordering::Relaxed).is_null() {
                         return Err(UnispaceError::Unsupported);
                     }
                     // Blocking get: park until the stream yields bytes.

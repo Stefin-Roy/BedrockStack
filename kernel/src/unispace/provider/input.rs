@@ -346,7 +346,7 @@ impl Object for KbdObject {
                     // kernel context (no current task) it would busy-spin, so
                     // refuse instead.
                     let pc = crate::smp::current_per_cpu();
-                    if pc.current_task.is_null() {
+                    if pc.current_task.load(core::sync::atomic::Ordering::Relaxed).is_null() {
                         return Err(UnispaceError::Unsupported);
                     }
                     // Blocking get: park until the keymap yields a character.

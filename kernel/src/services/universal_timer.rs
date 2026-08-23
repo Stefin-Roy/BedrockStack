@@ -454,7 +454,7 @@ const POLL_FALLBACK_NS: u64 = 10_000_000;
 pub fn wait_until_cond_coop(deadline_ns: u64, slice_ns: u64, done: &dyn Fn() -> bool) -> bool {
     #[cfg(target_arch = "x86_64")]
     {
-        if crate::smp::current_per_cpu().current_task.is_null() {
+        if crate::smp::current_per_cpu().current_task.load(core::sync::atomic::Ordering::Relaxed).is_null() {
             return wait_until_cond(deadline_ns, done);
         }
         loop {

@@ -428,10 +428,11 @@ pub fn current_caps() -> Option<alloc::sync::Arc<Vec<Cap>>> {
     #[cfg(target_arch = "x86_64")]
     {
         let pc = crate::smp::current_per_cpu();
-        if pc.current_task.is_null() {
+        let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+        if ptr.is_null() {
             return None;
         }
-        let t = unsafe { &*(pc.current_task as *const crate::task::Task) };
+        let t = unsafe { &*(ptr as *const crate::task::Task) };
         match t.caps_arc.as_ref() {
             // No caps yet — kernel roots (vm==0) bypass; user tasks are deny-all.
             None => {
@@ -457,10 +458,11 @@ pub fn current_caps_borrowed() -> Option<&'static [Cap]> {
     #[cfg(target_arch = "x86_64")]
     {
         let pc = crate::smp::current_per_cpu();
-        if pc.current_task.is_null() {
+        let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+        if ptr.is_null() {
             return None;
         }
-        let t = unsafe { &*(pc.current_task as *const crate::task::Task) };
+        let t = unsafe { &*(ptr as *const crate::task::Task) };
         match t.caps_arc.as_ref() {
             None => {
                 if t.vm == 0 {
@@ -485,10 +487,11 @@ pub fn grant_to_current(path: String, method: Option<String>, perm: Perm) -> Res
     #[cfg(target_arch = "x86_64")]
     {
         let pc = crate::smp::current_per_cpu();
-        if pc.current_task.is_null() {
+        let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+        if ptr.is_null() {
             return Ok(());
         }
-        let t = unsafe { &mut *(pc.current_task as *mut crate::task::Task) };
+        let t = unsafe { &mut *(ptr as *mut crate::task::Task) };
         // If task has no caps allocation yet (empty child), allocate now
         if t.caps_arc.is_none() {
             let alloc = crate::mm::heap::get_phys_allocator_mut();
