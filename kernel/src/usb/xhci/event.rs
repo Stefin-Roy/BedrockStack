@@ -1,8 +1,6 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use spin::Mutex;
 
-use crate::drivers::serial::SerialPort;
-
 macro_rules! usb_trace {
     ($($arg:tt)*) => {
         #[cfg(feature = "usb_trace")]

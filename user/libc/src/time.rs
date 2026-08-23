@@ -243,7 +243,7 @@ pub extern "C" fn gmtime_r(t: *const c_long, result: *mut Tm) -> *mut Tm {
     if t.is_null() || result.is_null() {
         return core::ptr::null_mut();
     }
-    let mut secs = unsafe { *t as i64 };
+    let secs = unsafe { *t } as i64;
     // Use simple algorithm: days since 1970-01-01.
     let days = secs.div_euclid(86400);
     let mut rem = secs.rem_euclid(86400);
@@ -290,7 +290,7 @@ static mut GMTIME_BUF: Tm = Tm { tm_sec: 0, tm_min: 0, tm_hour: 0, tm_mday: 1, t
 
 #[unsafe(no_mangle)]
 pub extern "C" fn gmtime(t: *const c_long) -> *mut Tm {
-    unsafe { gmtime_r(t, core::ptr::addr_of_mut!(GMTIME_BUF)) }
+    gmtime_r(t, core::ptr::addr_of_mut!(GMTIME_BUF))
 }
 
 #[unsafe(no_mangle)]
@@ -373,7 +373,7 @@ impl core::fmt::Write for AsctimeBuf<'_> {
 static mut ASC_BUF: [u8; 64] = [0; 64];
 #[unsafe(no_mangle)]
 pub extern "C" fn asctime(tm: *const Tm) -> *mut c_char {
-    unsafe { asctime_r(tm, core::ptr::addr_of_mut!(ASC_BUF) as *mut c_char) }
+    asctime_r(tm, core::ptr::addr_of_mut!(ASC_BUF) as *mut c_char)
 }
 static mut CTIME_BUF: [u8; 64] = [0; 64];
 #[unsafe(no_mangle)]

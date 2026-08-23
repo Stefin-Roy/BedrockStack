@@ -9,19 +9,6 @@ fn checksum(buf: &[u8]) -> bool {
     buf.iter().fold(0u8, |a, b| a.wrapping_add(*b)) == 0
 }
 
-fn map_region(paddr: u64, size: u64) -> u64 {
-    // Fallible ACPI VMM path: malformed size must not `panic=abort`.
-    // Tables parsing is fallible (`Result`) so try_map failure is propagated
-    // via a sentinel that callers validate; where `?` is needed we use
-    // `try_map_region` instead.
-    try_map_region(paddr, size).unwrap_or_else(|e| {
-        log::error!("ACPI tables: map_region failed: {} (paddr={:#x} size={:#x})", e, paddr, size);
-        // Sentinel — callers that deref this will fault or bounds-check,
-        // but we avoid `panic=abort` on the VMM reservation itself.
-        0
-    })
-}
-
 fn try_map_region(paddr: u64, size: u64) -> Result<u64, &'static str> {
     let offset = paddr & 0xFFF;
     let aligned = paddr - offset;

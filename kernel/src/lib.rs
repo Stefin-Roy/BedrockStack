@@ -35,7 +35,6 @@ use arch::CurrentArch;
 use boot::{FramebufferInfo, MemoryRegion};
 use framebuffer::Framebuffer;
 
-use crate::drivers::serial::SerialPort;
 use mm::heap;
 use mm::phys_alloc::BitmapAllocator;
 use mm::vmm;

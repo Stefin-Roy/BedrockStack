@@ -354,7 +354,7 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     precreate("/A:mkdir", "init", &mut payload, &mut out);
     precreate("/A/init:create", "test", &mut payload, &mut out);
 
-    let (mut root, entry, user_stack_top, vm) = match create_process(&elf, alloc) {
+    let (root, entry, user_stack_top, vm) = match create_process(&elf, alloc) {
         Ok(x) => x,
         Err(e) => {
             log::warn!("[sched] failed to load INIT: {}", e);

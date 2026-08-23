@@ -37,7 +37,7 @@ fn cache_flush_line(addr: *const u8) {
     static CHECKED: AtomicBool = AtomicBool::new(false);
     static HAS_OPT: AtomicBool = AtomicBool::new(false);
     if !CHECKED.load(Ordering::Relaxed) {
-        let res = unsafe { core::arch::x86_64::__cpuid(7) };
+        let res = core::arch::x86_64::__cpuid(7);
         HAS_OPT.store((res.ebx >> 23) & 1 == 1, Ordering::Relaxed);
         CHECKED.store(true, Ordering::Relaxed);
     }
@@ -70,7 +70,6 @@ mod port_off {
     pub const IE: u32 = 0x14;
     pub const CMD: u32 = 0x18;
     pub const TFD: u32 = 0x20;
-    pub const SIG: u32 = 0x24;
     pub const SSTS: u32 = 0x28;
     pub const SCTL: u32 = 0x2C;
     pub const SERR: u32 = 0x30;

@@ -87,7 +87,7 @@ pub const _SC_PHYS_PAGES: c_int = 85;
 #[unsafe(no_mangle)]
 pub extern "C" fn sysconf(name: c_int) -> c_long {
     match name {
-        _SC_PAGESIZE | _SC_PAGE_SIZE => 4096,
+        _SC_PAGESIZE => 4096, // _SC_PAGE_SIZE == _SC_PAGESIZE (30)
         _SC_NPROCESSORS_CONF | _SC_NPROCESSORS_ONLN => {
             let mut buf = [0u8; 4];
             let r = unsafe { read_path(b"/sys/cpus\0", &mut buf, 0) };
@@ -134,7 +134,7 @@ pub extern "C" fn uname(u: *mut Utsname) -> c_int {
         rel[0] = b'?';
     }
     unsafe {
-        let mut set = |dst: &mut [c_char; 65], src: &[u8]| {
+        let set = |dst: &mut [c_char; 65], src: &[u8]| {
             let n = core::cmp::min(src.len(), 64);
             *dst = [0; 65];
             for i in 0..n {
@@ -231,11 +231,6 @@ pub extern "C" fn gethostname(name: *mut c_char, len: usize) -> c_int {
 }
 
 // ── getopt ──────────────────────────────────────────────────────────
-
-static mut OPTIND_G: c_int = 1;
-static mut OPTARG_G: *mut c_char = core::ptr::null_mut();
-static mut OPTERR_G: c_int = 1;
-static mut OPTOPT_G: c_int = 0;
 
 #[unsafe(no_mangle)]
 pub static mut optind: c_int = 1;

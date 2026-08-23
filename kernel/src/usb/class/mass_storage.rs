@@ -73,12 +73,6 @@ fn scsi_inquiry_cdb() -> [u8; 16] {
     cdb
 }
 
-fn scsi_test_unit_ready_cdb() -> [u8; 16] {
-    let mut cdb = [0u8; 16];
-    cdb[0] = 0x00;
-    cdb
-}
-
 struct UsbMassStorageInner {
     doorbell_va: u64,
     slot_id: u8,

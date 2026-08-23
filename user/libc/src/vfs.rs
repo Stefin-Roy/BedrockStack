@@ -21,8 +21,8 @@ static mut CWD_LEN: usize = 0;
 
 /// Called from `__libc_init`: seed the CWD to `/`.
 pub fn vfs_init() {
-    let c = unsafe { core::ptr::addr_of_mut!(CWD) };
-    let l = unsafe { core::ptr::addr_of_mut!(CWD_LEN) };
+    let c = core::ptr::addr_of_mut!(CWD);
+    let l = core::ptr::addr_of_mut!(CWD_LEN);
     unsafe {
         (*c)[0] = b'/';
         (*c)[1] = 0;
@@ -90,8 +90,8 @@ pub extern "C" fn chdir(path: *const c_char) -> c_int {
     };
     match stat_rs(abs) {
         Ok(s) if s.kind == 1 => {
-            let c = unsafe { core::ptr::addr_of_mut!(CWD) };
-            let l = unsafe { core::ptr::addr_of_mut!(CWD_LEN) };
+            let c = core::ptr::addr_of_mut!(CWD);
+            let l = core::ptr::addr_of_mut!(CWD_LEN);
             if abs.len() > 128 {
                 errno::set(errno::ENAMETOOLONG);
                 return -1;

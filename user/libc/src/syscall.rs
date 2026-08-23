@@ -28,26 +28,30 @@ pub unsafe fn syscall(n: usize, a: usize, b: usize, c: usize, d: usize) -> isize
 
 /// Raw read. `path` must be NUL-terminated. Returns bytes read or -errno.
 pub unsafe fn read_path(path: &[u8], buf: &mut [u8], flags: u64) -> isize {
-    syscall(
-        SYS_READ,
-        path.as_ptr() as usize,
-        buf.as_mut_ptr() as usize,
-        buf.len(),
-        flags as usize,
-    )
+    unsafe {
+        syscall(
+            SYS_READ,
+            path.as_ptr() as usize,
+            buf.as_mut_ptr() as usize,
+            buf.len(),
+            flags as usize,
+        )
+    }
 }
 
 /// Raw write. `path` NUL-terminated. `buf[..len]` is the input; on return the
 /// provider output (if any) is in `buf[..ret]`. Returns output bytes or -errno.
 /// The buffer is consumed in place and zero-filled past the output.
 pub unsafe fn write_path(path: &[u8], buf: &mut [u8], len: usize, flags: u64) -> isize {
-    syscall(
-        SYS_WRITE,
-        path.as_ptr() as usize,
-        buf.as_mut_ptr() as usize,
-        len,
-        flags as usize,
-    )
+    unsafe {
+        syscall(
+            SYS_WRITE,
+            path.as_ptr() as usize,
+            buf.as_mut_ptr() as usize,
+            len,
+            flags as usize,
+        )
+    }
 }
 
 /// Chunked write that does NOT clobber the caller's `data`: copies each

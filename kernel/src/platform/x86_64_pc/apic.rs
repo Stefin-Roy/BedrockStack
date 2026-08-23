@@ -35,24 +35,22 @@ fn cpu_has_apic() -> bool {
 /// destination field). In x2APIC mode the full 32-bit ID is written to the
 /// ICR MSR directly.
 fn send_ipi_raw(dest_apic_id: u32, icr_low: u32) {
-    unsafe {
-        if X2APIC_MODE.load(Ordering::Relaxed) {
-            let icr = ((dest_apic_id as u64) << 32) | (icr_low as u64);
-            wrmsr(IA32_X2APIC_ICR_MSR, icr);
-        } else {
-            // Wait for previous IPI to complete (delivery status bit = 0) with timeout.
-            let mut spins = 0u32;
-            while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-                core::hint::spin_loop();
-                spins = spins.wrapping_add(1);
-                if spins > 1_000_000 {
-                    SerialPort::puts("[apic] WARN: IPI delivery stuck, dropping\n");
-                    break;
-                }
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        let icr = ((dest_apic_id as u64) << 32) | (icr_low as u64);
+        wrmsr(IA32_X2APIC_ICR_MSR, icr);
+    } else {
+        // Wait for previous IPI to complete (delivery status bit = 0) with timeout.
+        let mut spins = 0u32;
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+            spins = spins.wrapping_add(1);
+            if spins > 1_000_000 {
+                SerialPort::puts("[apic] WARN: IPI delivery stuck, dropping\n");
+                break;
             }
-            lapic_write(LAPIC_ICR_HIGH, (dest_apic_id & 0xFF) << 24);
-            lapic_write(LAPIC_ICR_LOW, icr_low);
         }
+        lapic_write(LAPIC_ICR_HIGH, (dest_apic_id & 0xFF) << 24);
+        lapic_write(LAPIC_ICR_LOW, icr_low);
     }
 }
 
@@ -254,20 +252,18 @@ pub fn send_sipi_ipi(dest_apic_id: u32, page: u8) {
 
 /// Send IPI to all CPUs except self (broadcast to all-but-self).
 pub fn send_ipi_all_except_self(vector: u8) {
-    unsafe {
-        if X2APIC_MODE.load(Ordering::Relaxed) {
-            // x2APIC shorthand lives in ICR bits 18:16. Delivery mode 000
-            // (fixed) is implicit. destination shorthand = 11 (all excluding self)
-            let icr = (vector as u64) | (3 << 18);
-            wrmsr(IA32_X2APIC_ICR_MSR, icr);
-        } else {
-            while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
-                core::hint::spin_loop();
-            }
-            // destination shorthand = 10 (all except self)
-            lapic_write(LAPIC_ICR_HIGH, 0);
-            lapic_write(LAPIC_ICR_LOW, (3 << 18) | (vector as u32));
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        // x2APIC shorthand lives in ICR bits 18:16. Delivery mode 000
+        // (fixed) is implicit. destination shorthand = 11 (all excluding self)
+        let icr = (vector as u64) | (3 << 18);
+        wrmsr(IA32_X2APIC_ICR_MSR, icr);
+    } else {
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
         }
+        // destination shorthand = 10 (all except self)
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(LAPIC_ICR_LOW, (3 << 18) | (vector as u32));
     }
 }
 

@@ -1,7 +1,7 @@
 use core::ffi::{c_char, c_int, c_long, c_longlong, c_void};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn strlen(s: *const c_char) -> usize {
+pub unsafe extern "C" fn strlen(s: *const c_char) -> usize {
     if s.is_null() {
         return 0;
     }
@@ -428,7 +428,7 @@ pub extern "C" fn strtok_r(
 #[unsafe(no_mangle)]
 pub extern "C" fn strtok(s: *mut c_char, delim: *const c_char) -> *mut c_char {
     static mut SAVE: *mut c_char = core::ptr::null_mut();
-    unsafe { strtok_r(s, delim, core::ptr::addr_of_mut!(SAVE)) }
+    strtok_r(s, delim, core::ptr::addr_of_mut!(SAVE))
 }
 
 /// `strsep` — BSD tokeniser that handles empty tokens (updates `*stringp`).
@@ -568,7 +568,7 @@ pub extern "C" fn strchrnul(s: *const c_char, c: c_int) -> *mut c_char {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn strlcpy(dst: *mut c_char, src: *const c_char, size: usize) -> usize {
-    let slen = strlen(src);
+    let slen = unsafe { strlen(src) };
     if size > 0 {
         let copy = core::cmp::min(slen, size - 1);
         unsafe {
@@ -582,7 +582,7 @@ pub extern "C" fn strlcpy(dst: *mut c_char, src: *const c_char, size: usize) -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn strlcat(dst: *mut c_char, src: *const c_char, size: usize) -> usize {
     let dlen = strnlen(dst, size);
-    let slen = strlen(src);
+    let slen = unsafe { strlen(src) };
     if dlen < size {
         let copy = core::cmp::min(slen, size - dlen - 1);
         unsafe {
@@ -635,7 +635,7 @@ pub extern "C" fn ffsll(i: c_longlong) -> c_int {
     if i == 0 { 0 } else { (i as u64).trailing_zeros() as c_int + 1 }
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
+pub unsafe extern "C" fn bcmp(a: *const c_void, b: *const c_void, n: usize) -> c_int {
     unsafe {
         let pa = a as *const u8;
         let pb = b as *const u8;

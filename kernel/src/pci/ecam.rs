@@ -28,15 +28,6 @@ pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
     });
 }
 
-fn map_ecam(paddr: u64, size: u64) -> u64 {
-    try_map_ecam(paddr, size).unwrap_or_else(|e| {
-        log::error!("PCI VMM exhaustion: {} (paddr={:#x} size={:#x})", e, paddr, size);
-        loop {
-            core::hint::spin_loop();
-        }
-    })
-}
-
 fn try_map_ecam(paddr: u64, size: u64) -> Result<u64, &'static str> {
     let mut guard = PCI_VMM.lock();
     let state = guard.as_mut().ok_or("PCI VMM not initialized")?;

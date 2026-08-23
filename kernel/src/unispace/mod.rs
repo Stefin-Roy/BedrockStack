@@ -48,7 +48,6 @@ pub mod schema;
 
 use alloc::string::String;
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
 use spin::Once;
 
@@ -727,30 +726,6 @@ pub fn write_parsed(
             obj.write_value_flags(value, flags)
         }
     }
-}
-
-fn encode_object_desc(obj: &dyn Object, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
-    // Unfiltered version — used only for kernel-bypass paths or tests that explicitly want full.
-    // Caps-filtered callers should use encode_object_desc_filtered.
-    out.push(obj.kind().tag());
-    match obj.owned_value_schema() {
-        Some(s) => schema::encode_schema_owned(s, out),
-        None => schema::encode_schema(obj.value_schema(), out),
-    }
-    if !obj.owned_methods().is_empty() {
-        let methods = obj.owned_methods();
-        out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
-        for md in methods {
-            encode_method_desc_owned(md, out)?;
-        }
-    } else {
-        let methods = obj.methods();
-        out.extend_from_slice(&(methods.len() as u32).to_le_bytes());
-        for md in methods {
-            encode_method_desc(md, out)?;
-        }
-    }
-    Ok(())
 }
 
 fn encode_object_desc_filtered(

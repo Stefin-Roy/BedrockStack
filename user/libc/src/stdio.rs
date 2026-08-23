@@ -1,4 +1,4 @@
-use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
+use core::ffi::{c_char, c_int, c_long, c_void};
 use core::ptr;
 
 use crate::errno;
@@ -53,7 +53,7 @@ pub extern "C" fn puts(s: *const c_char) -> c_int {
         errno::set(22); // EINVAL
         return -1;
     }
-    let len = crate::string::strlen(s);
+    let len = unsafe { crate::string::strlen(s) };
     let mut line = [0u8; 256];
     let n = core::cmp::min(len, line.len() - 1);
     if n > 0 {
@@ -592,7 +592,7 @@ pub extern "C" fn fputs(s: *const c_char, f: *mut FILE) -> c_int {
         errno::set(errno::EINVAL);
         return -1;
     }
-    let len = crate::string::strlen(s);
+    let len = unsafe { crate::string::strlen(s) };
     if fwrite(s as *const c_void, 1, len, f) == len {
         0
     } else {
@@ -626,6 +626,7 @@ pub extern "C" fn ftello(f: *mut FILE) -> c_long {
     ftell(f)
 }
 
+#[allow(non_camel_case_types)]
 pub type fpos_t = c_long;
 
 #[unsafe(no_mangle)]
@@ -705,7 +706,7 @@ pub extern "C" fn fdopen(fd: c_int, mode: *const c_char) -> *mut FILE {
         errno::set(errno::EBADF);
         return ptr::null_mut();
     };
-    let mlen = crate::string::strlen(mode);
+    let mlen = unsafe { crate::string::strlen(mode) };
     let m = unsafe { core::slice::from_raw_parts(mode as *const u8, mlen) };
     let Some((readable, writable, append, _trunc)) = parse_mode(m) else {
         errno::set(errno::EINVAL);
@@ -785,10 +786,9 @@ pub extern "C" fn tmpfile() -> *mut FILE {
         let n = TMP_COUNTER;
         TMP_COUNTER = TMP_COUNTER.wrapping_add(1);
         let mut name = [0u8; 64];
-        let mut len = 0usize;
         let prefix = b"/A/tmpfile_";
         name[..prefix.len()].copy_from_slice(prefix);
-        len = prefix.len();
+        let mut len = prefix.len();
         // hex counter
         let mut v = n;
         if v == 0 {
@@ -831,10 +831,9 @@ pub extern "C" fn tmpnam(s: *mut c_char) -> *mut c_char {
         let n = TMP_COUNTER;
         TMP_COUNTER = TMP_COUNTER.wrapping_add(1);
         let mut tmp = [0u8; 64];
-        let mut len = 0usize;
         let prefix = b"/A/tmpnam_";
         tmp[..prefix.len()].copy_from_slice(prefix);
-        len = prefix.len();
+        let mut len = prefix.len();
         let mut v = n;
         if v == 0 {
             tmp[len] = b'0';
@@ -955,7 +954,7 @@ pub unsafe extern "C" fn vdprintf(fd: c_int, fmt: *const c_char, ap: core::ffi::
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dprintf(fd: c_int, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vdprintf(fd, fmt, ap)
     }
 }
@@ -1001,7 +1000,7 @@ pub unsafe extern "C" fn vasprintf(strp: *mut *mut c_char, fmt: *const c_char, a
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn asprintf(strp: *mut *mut c_char, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vasprintf(strp, fmt, ap)
     }
 }

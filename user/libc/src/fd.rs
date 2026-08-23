@@ -9,7 +9,7 @@
 use core::ffi::{c_char, c_int, c_long, c_uint, c_void};
 
 use crate::errno;
-use crate::syscall::{read_path, write_data, write_path};
+use crate::syscall::{read_path, write_path};
 
 // ── open(2) flags (Linux x86_64 numbers) ──────────────────────────────
 
@@ -59,14 +59,14 @@ fn fd_ref(fd: c_int) -> Option<&'static mut Fd> {
     if fd < 3 || fd as usize >= FD_POOL {
         return None;
     }
-    let p = unsafe { core::ptr::addr_of_mut!(FDS) } as *mut Fd;
+    let p = core::ptr::addr_of_mut!(FDS) as *mut Fd;
     Some(unsafe { &mut *p.add(fd as usize) })
 }
 
 /// NUL-terminated path slice for an fd.
 fn alloc_fd(path: &[u8], readable: bool, writable: bool, append: bool) -> c_int {
     for i in 3..FD_POOL {
-        let p = unsafe { core::ptr::addr_of_mut!(FDS) } as *mut Fd;
+        let p = core::ptr::addr_of_mut!(FDS) as *mut Fd;
         let f = unsafe { &mut *p.add(i) };
         if !f.used {
             f.path = [0; PATH_CAP];
@@ -133,7 +133,7 @@ pub unsafe extern "C" fn open(path: *const c_char, flags: c_int, mode: c_uint) -
 /// POSIX `creat(path, mode)` — open write-only with O_CREAT|O_TRUNC.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn creat(path: *const c_char, mode: c_uint) -> c_int {
-    open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)
+    unsafe { open(path, O_WRONLY | O_CREAT | O_TRUNC, mode) }
 }
 
 // ── close / dup ───────────────────────────────────────────────────────
@@ -451,7 +451,7 @@ pub extern "C" fn ftruncate(fd: c_int, length: c_long) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn openat(dirfd: c_int, path: *const c_char, flags: c_int, mode: c_uint) -> c_int {
     let _ = dirfd;
-    open(path, flags, mode)
+    unsafe { open(path, flags, mode) }
 }
 
 #[unsafe(no_mangle)]
@@ -473,8 +473,6 @@ pub extern "C" fn fcntl(fd: c_int, cmd: c_int, arg: c_int) -> c_int {
         0 => {
             // F_DUPFD — duplicate to lowest fd >= arg.
             if arg < 3 { return dup(fd); }
-            // Find or allocate.
-            let copy = *f;
             // Simplistic: ignore `arg` hint beyond checking free.
             dup(fd)
         }

@@ -141,7 +141,7 @@ pub const ENOTSUP: c_int = 95;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __errno_location() -> *mut c_int {
-    unsafe { core::ptr::addr_of_mut!(ERRNO) }
+    core::ptr::addr_of_mut!(ERRNO)
 }
 
 /// Convert a raw syscall return: if negative, store -ret as errno and return
@@ -349,7 +349,7 @@ pub extern "C" fn perror(s: *const c_char) {
     let mut tmp = [0u8; 256];
     let mut len = 0usize;
     if has_prefix {
-        let slen = crate::string::strlen(s);
+        let slen = unsafe { crate::string::strlen(s) };
         let n = core::cmp::min(slen, tmp.len() - 3 - m.len());
         unsafe {
             core::ptr::copy_nonoverlapping(s as *const u8, tmp.as_mut_ptr(), n);

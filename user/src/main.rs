@@ -460,58 +460,6 @@ fn paint_gradient(mode: &libc::fb::FbMode) {
     }
 }
 
-/// Poll `/input/events` (non-blocking) and report whether a key was pressed.
-/// Wire: `u32 LE count` then `count` 24-byte entries
-/// `{ts:u64, device:u32, type:u32, code:u32, value:i32}` (all LE); a key
-/// press has `type == 1 && value != 0`.
-fn key_pressed() -> bool {
-    let mut buf = [0u8; 1024];
-    let r = unsafe { libc::syscall::read_path(b"/input/events\0", &mut buf, 0) };
-    if r < 0 {
-        serial_puts(b"[INIT] input read ERROR r=");
-        serial_put_u64_hex(r as u64);
-        serial_puts(b"\n");
-        return false;
-    }
-    if r < 4 {
-        return false;
-    }
-    let avail = (r as usize).min(buf.len());
-    let n = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    // Never trust the count before bounding it by the bytes actually read.
-    if n > (avail - 4) / 24 {
-        return false;
-    }
-    let mut i = 4usize;
-    let mut pressed = false;
-    while i < 4 + n * 24 {
-        let etype = u32::from_le_bytes([buf[i + 12], buf[i + 13], buf[i + 14], buf[i + 15]]);
-        let value = i32::from_le_bytes([buf[i + 20], buf[i + 21], buf[i + 22], buf[i + 23]]);
-        if etype == 1 && value != 0 {
-            pressed = true;
-        }
-        i += 24;
-    }
-    if n > 0 {
-        serial_puts(b"[INIT] input read n=");
-        serial_put_u64_hex(n as u64);
-        serial_puts(b" pressed=");
-        serial_put_u64_hex(pressed as u64);
-        serial_puts(b"\n");
-    }
-    pressed
-}
-
-/// Spin until the next key press.
-fn wait_for_key() {
-    loop {
-        if key_pressed() {
-            return;
-        }
-        libc::process::sleep_ms(20);
-    }
-}
-
 /// Dump a finished child's captured stdout to ours (diagnostic aid).
 fn drain_child_stdout(pid: isize) {
     drain_child_stream(pid, b"/std/out\0", b"[child stdout]\n");
@@ -701,10 +649,9 @@ fn serial_write(s: &[u8]) {
 /// Serial-print a `prefix <decimal> suffix` line (e.g. an exit code report).
 fn serial_puts_dec(prefix: &[u8], v: u64, suffix: &[u8]) {
     let mut buf = [0u8; 128];
-    let mut n = 0usize;
     let plen = prefix.len().min(buf.len());
     buf[..plen].copy_from_slice(&prefix[..plen]);
-    n = plen;
+    let mut n = plen;
     let mut digits = [0u8; 20];
     let mut d = 20usize;
     if v == 0 {
@@ -882,9 +829,7 @@ pub extern "C" fn entry_main() -> usize {
     loop {
         serial_puts(b"[INIT] reached paint loop\n");
         paint_gradient(&mode);
-        unsafe {
-            libc::stdio::puts(c"fb: press any key to launch DOOM".as_ptr());
-        }
+        libc::stdio::puts(c"fb: press any key to launch DOOM".as_ptr());
         // DIAGNOSTIC: keyboard delivery stalls after the boot path, so skip
         // the keypress and auto-launch DOOM to test the hardcoded -iwad path.
         // wait_for_key();

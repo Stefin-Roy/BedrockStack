@@ -51,7 +51,6 @@ pub const PORTSC_STATUS_BITS: u32 =
     PORTSC_CSC | PORTSC_PEC | PORTSC_WRC | PORTSC_OCC | PORTSC_PRC | PORTSC_PLC | PORTSC_CEC;
 
 const DEFAULT_MMIO_SIZE: u64 = 0x10000;
-const MMIO_SIZE: u64 = DEFAULT_MMIO_SIZE;
 
 pub struct XhciRegisters {
     mmio_va: u64,

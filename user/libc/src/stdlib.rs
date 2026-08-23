@@ -26,70 +26,72 @@ pub extern "C" fn abort() -> ! {
 /// prefix when `base` is 0 (auto-detect), and digits. Returns the magnitude,
 /// bytes consumed, validity, and whether a `-` sign was seen.
 unsafe fn parse_int(s: *const c_char, base: c_int) -> (u64, usize, bool, bool) {
-    let mut i = 0usize;
-    while matches!(
-        *s.add(i) as u8,
-        b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'
-    ) {
-        i += 1;
-    }
-    let mut neg = false;
-    match *s.add(i) as u8 {
-        b'-' => {
-            neg = true;
+    unsafe {
+        let mut i = 0usize;
+        while matches!(
+            *s.add(i) as u8,
+            b' ' | b'\t' | b'\n' | b'\r' | b'\x0b' | b'\x0c'
+        ) {
             i += 1;
         }
-        b'+' => i += 1,
-        _ => {}
-    }
-    let mut base = base as u64;
-    if base == 0 {
-        if *s.add(i) as u8 == b'0' {
-            match *s.add(i + 1) as u8 {
-                b'x' | b'X' => {
-                    base = 16;
-                    i += 2;
-                }
-                b'b' | b'B' => {
-                    base = 2;
-                    i += 2;
-                }
-                _ => base = 8,
+        let mut neg = false;
+        match *s.add(i) as u8 {
+            b'-' => {
+                neg = true;
+                i += 1;
             }
-        } else {
-            base = 10;
+            b'+' => i += 1,
+            _ => {}
         }
-    } else if base == 16 && *s.add(i) as u8 == b'0' && matches!(*s.add(i + 1) as u8, b'x' | b'X') {
-        i += 2;
-    }
-    if base < 2 || base > 36 {
-        return (0, i, false, neg);
-    }
-    let mut val: u64 = 0;
-    let mut any = false;
-    let mut overflow = false;
-    loop {
-        let ch = *s.add(i) as u8;
-        let d = match ch {
-            b'0'..=b'9' => (ch - b'0') as u64,
-            b'a'..=b'z' => (ch - b'a' + 10) as u64,
-            b'A'..=b'Z' => (ch - b'A' + 10) as u64,
-            _ => break,
-        };
-        if d >= base {
-            break;
+        let mut base = base as u64;
+        if base == 0 {
+            if *s.add(i) as u8 == b'0' {
+                match *s.add(i + 1) as u8 {
+                    b'x' | b'X' => {
+                        base = 16;
+                        i += 2;
+                    }
+                    b'b' | b'B' => {
+                        base = 2;
+                        i += 2;
+                    }
+                    _ => base = 8,
+                }
+            } else {
+                base = 10;
+            }
+        } else if base == 16 && *s.add(i) as u8 == b'0' && matches!(*s.add(i + 1) as u8, b'x' | b'X') {
+            i += 2;
         }
-        any = true;
-        if val > u64::MAX / base || val.saturating_mul(base).saturating_add(d) > u64::MAX {
-            overflow = true;
+        if base < 2 || base > 36 {
+            return (0, i, false, neg);
         }
-        val = val.wrapping_mul(base).wrapping_add(d);
-        i += 1;
+        let mut val: u64 = 0;
+        let mut any = false;
+        let mut overflow = false;
+        loop {
+            let ch = *s.add(i) as u8;
+            let d = match ch {
+                b'0'..=b'9' => (ch - b'0') as u64,
+                b'a'..=b'z' => (ch - b'a' + 10) as u64,
+                b'A'..=b'Z' => (ch - b'A' + 10) as u64,
+                _ => break,
+            };
+            if d >= base {
+                break;
+            }
+            any = true;
+            if val > u64::MAX / base || val.saturating_mul(base).saturating_add(d) > u64::MAX {
+                overflow = true;
+            }
+            val = val.wrapping_mul(base).wrapping_add(d);
+            i += 1;
+        }
+        if !any || overflow {
+            return (0, i, false, neg);
+        }
+        (val, i, true, neg)
     }
-    if !any || overflow {
-        return (0, i, false, neg);
-    }
-    (val, i, true, neg)
 }
 
 /// Finish a parsed integer: apply the sign for a signed result.
@@ -433,7 +435,7 @@ pub extern "C" fn realpath(path: *const c_char, resolved: *mut c_char) -> *mut c
         return core::ptr::null_mut();
     }
     let mut tmp = [0u8; 512];
-    let plen = crate::string::strlen(path);
+    let plen = unsafe { crate::string::strlen(path) };
     let p = unsafe { core::slice::from_raw_parts(path as *const u8, plen) };
     let Some(abs) = crate::vfs::resolve_into(p, &mut tmp) else {
         crate::errno::set(crate::errno::ENAMETOOLONG);
@@ -459,7 +461,7 @@ fn fill_template(tmpl: *mut c_char, suffixlen: usize) -> bool {
     if tmpl.is_null() {
         return false;
     }
-    let len = crate::string::strlen(tmpl);
+    let len = unsafe { crate::string::strlen(tmpl) };
     if len < 6 + suffixlen {
         return false;
     }
@@ -609,7 +611,7 @@ pub extern "C" fn getenv(name: *const c_char) -> *mut c_char {
     if name.is_null() {
         return core::ptr::null_mut();
     }
-    let n = crate::string::strlen(name);
+    let n = unsafe { crate::string::strlen(name) };
     let key = unsafe { core::slice::from_raw_parts(name as *const u8, n) };
     if let Some(idx) = env_find(key) {
         unsafe { ENV[idx].value.as_mut_ptr() as *mut c_char }
@@ -624,8 +626,8 @@ pub extern "C" fn setenv(name: *const c_char, value: *const c_char, overwrite: c
         crate::errno::set(crate::errno::EINVAL);
         return -1;
     }
-    let n = crate::string::strlen(name);
-    let v = crate::string::strlen(value);
+    let n = unsafe { crate::string::strlen(name) };
+    let v = unsafe { crate::string::strlen(value) };
     if n >= 64 || v >= 256 {
         crate::errno::set(crate::errno::ENAMETOOLONG);
         return -1;
@@ -667,7 +669,7 @@ pub extern "C" fn unsetenv(name: *const c_char) -> c_int {
         crate::errno::set(crate::errno::EINVAL);
         return -1;
     }
-    let n = crate::string::strlen(name);
+    let n = unsafe { crate::string::strlen(name) };
     let key = unsafe { core::slice::from_raw_parts(name as *const u8, n) };
     if let Some(idx) = env_find(key) {
         unsafe { ENV[idx].used = false; }
@@ -681,7 +683,7 @@ pub extern "C" fn putenv(s: *mut c_char) -> c_int {
         crate::errno::set(crate::errno::EINVAL);
         return -1;
     }
-    let len = crate::string::strlen(s);
+    let len = unsafe { crate::string::strlen(s) };
     let bytes = unsafe { core::slice::from_raw_parts(s as *const u8, len) };
     let Some(eq) = bytes.iter().position(|&c| c == b'=') else {
         crate::errno::set(crate::errno::EINVAL);

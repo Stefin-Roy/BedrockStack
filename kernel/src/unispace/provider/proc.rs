@@ -288,9 +288,9 @@ pub fn attach(pid: u64) {
         pid_key(pid),
         Arc::new(ProcDir {
             pid,
-            stdin: StdStream::new("in"),
-            stdout: StdStream::new("out"),
-            stderr: StdStream::new("err"),
+            stdin: StdStream::new(),
+            stdout: StdStream::new(),
+            stderr: StdStream::new(),
         }),
     );
 }
@@ -701,14 +701,12 @@ const STREAM_CAP: usize = 64 * 1024;
 /// to every reader, and `attach` creates one `StdStream` per pid.
 #[derive(Clone)]
 struct StdStream {
-    name: &'static str,
     buf: Arc<Mutex<Vec<u8>>>,
 }
 
 impl StdStream {
-    fn new(name: &'static str) -> Self {
+    fn new() -> Self {
         StdStream {
-            name,
             buf: Arc::new(Mutex::new(Vec::new())),
         }
     }

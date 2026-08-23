@@ -10,8 +10,6 @@ use crate::acpi::AcpiSubsystem;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::services::KernelServices;
 use crate::services::acpi::AcpiProvider;
-use crate::services::dma::DmaAllocator;
-use crate::services::pci_device::PciDeviceManager;
 
 pub fn x86_services(
     root: u64,

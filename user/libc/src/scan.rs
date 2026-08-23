@@ -8,7 +8,7 @@
 
 use core::ffi::{
     VaList, c_char, c_double, c_float, c_int, c_long, c_longlong, c_short, c_uchar, c_uint,
-    c_ulong, c_ulonglong, c_ushort, c_void,
+    c_ulong, c_ulonglong, c_ushort,
 };
 
 use crate::stdio::FILE;
@@ -127,27 +127,13 @@ fn is_space(b: u8) -> bool {
 
 /// Consume up to `width` chars from `src`, storing them in `out` (which must
 /// be big enough). Returns the number consumed (or None on immediate EOF).
-fn read_token(src: &mut dyn ScanSrc, out: &mut [u8], width: usize) -> Option<usize> {
-    let mut n = 0usize;
-    while n < width {
-        match src.getc() {
-            Some(b) => {
-                out[n] = b;
-                n += 1;
-            }
-            None => break,
-        }
-    }
-    Some(n)
-}
-
 /// Parse an integer token. `base`: 10 (d/u), 8 (o), 16 (x/X), or -1 for %i
 /// autodetection. Returns `(magnitude, negative, ok)`.
 fn scan_int(src: &mut dyn ScanSrc, base: i32, width: usize) -> Option<(u64, bool, bool)> {
     let mut tok = [0u8; 64];
     let mut n = 0usize;
     let mut neg = false;
-    let mut started = false;
+    let started = false;
 
     // Sign.
     if n < width {
@@ -169,7 +155,6 @@ fn scan_int(src: &mut dyn ScanSrc, base: i32, width: usize) -> Option<(u64, bool
             }
         }
     }
-    started = n > 0;
 
     let mut effective_base = base as u32;
     if base < 0 {
@@ -753,7 +738,7 @@ pub unsafe extern "C" fn vsscanf(s: *const c_char, fmt: *const c_char, ap: VaLis
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sscanf(s: *const c_char, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vsscanf(s, fmt, ap)
     }
 }
@@ -768,7 +753,7 @@ pub unsafe extern "C" fn vfscanf(f: *mut FILE, fmt: *const c_char, ap: VaList) -
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fscanf(f: *mut FILE, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vfscanf(f, fmt, ap)
     }
 }
@@ -783,7 +768,7 @@ pub unsafe extern "C" fn vscanf(fmt: *const c_char, ap: VaList) -> c_int {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn scanf(fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vscanf(fmt, ap)
     }
 }

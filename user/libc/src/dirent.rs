@@ -6,7 +6,7 @@
 //! listing once in `opendir` and walk it from a `.bss` pool (single-threaded
 //! tasks).
 
-use core::ffi::{c_char, c_int, c_long, c_void};
+use core::ffi::{c_char, c_int, c_long};
 
 use crate::errno;
 use crate::syscall::read_path;
@@ -63,7 +63,7 @@ static mut DIRS: [DIR; DIR_POOL] = [DIR_INIT; DIR_POOL];
 
 fn dir_slot() -> Option<&'static mut DIR> {
     for i in 0..DIR_POOL {
-        let p = unsafe { core::ptr::addr_of_mut!(DIRS) } as *mut DIR;
+        let p = core::ptr::addr_of_mut!(DIRS) as *mut DIR;
         let d = unsafe { &mut *p.add(i) };
         // A slot is free when its snap_len is 0 (no active snapshot).
         if d.snap_len == 0 {
@@ -84,7 +84,7 @@ pub extern "C" fn opendir(path: *const c_char) -> *mut DIR {
         errno::set(errno::EINVAL);
         return core::ptr::null_mut();
     }
-    let plen = crate::string::strlen(path);
+    let plen = unsafe { crate::string::strlen(path) };
     if plen == 0 || plen >= 128 {
         errno::set(errno::ENAMETOOLONG);
         return core::ptr::null_mut();
@@ -105,14 +105,13 @@ pub extern "C" fn opendir(path: *const c_char) -> *mut DIR {
     d.pos = 0;
     d.count = 0;
     d.seen = 0;
-    let mut snap_len = d.snap.len();
     let r = unsafe { read_path(&d.path[..plen + 1], &mut d.snap, 0) };
     if r < 0 {
         errno::set((-r) as c_int);
         d.snap_len = 0;
         return core::ptr::null_mut();
     }
-    snap_len = r as usize;
+    let snap_len = r as usize;
     d.snap_len = snap_len;
     // First four bytes are the u32 entry count.
     if snap_len < 4 {
@@ -262,7 +261,7 @@ pub extern "C" fn scandir(
     // Collect entries into a Vec-like heap array via realloc.
     let mut cap = 16usize;
     let mut len = 0usize;
-    let mut arr = unsafe { crate::mem::malloc(cap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent };
+    let mut arr = crate::mem::malloc(cap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent;
     if arr.is_null() {
         closedir(dir);
         crate::errno::set(crate::errno::ENOMEM);
@@ -282,13 +281,13 @@ pub extern "C" fn scandir(
         }
         if len >= cap {
             let newcap = cap * 2;
-            let np = unsafe { crate::mem::realloc(arr as *mut core::ffi::c_void, newcap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent };
+            let np = crate::mem::realloc(arr as *mut core::ffi::c_void, newcap * core::mem::size_of::<*mut Dirent>()) as *mut *mut Dirent;
             if np.is_null() {
                 // cleanup
                 for i in 0..len {
-                    unsafe { crate::mem::free(*arr.add(i) as *mut core::ffi::c_void); }
+                    crate::mem::free(unsafe { *arr.add(i) } as *mut core::ffi::c_void);
                 }
-                unsafe { crate::mem::free(arr as *mut core::ffi::c_void); }
+                crate::mem::free(arr as *mut core::ffi::c_void);
                 closedir(dir);
                 crate::errno::set(crate::errno::ENOMEM);
                 return -1;
@@ -297,12 +296,12 @@ pub extern "C" fn scandir(
             cap = newcap;
         }
         // Duplicate Dirent onto heap.
-        let dup = unsafe { crate::mem::malloc(core::mem::size_of::<Dirent>()) as *mut Dirent };
+        let dup = crate::mem::malloc(core::mem::size_of::<Dirent>()) as *mut Dirent;
         if dup.is_null() {
             for i in 0..len {
-                unsafe { crate::mem::free(*arr.add(i) as *mut core::ffi::c_void); }
+                crate::mem::free(unsafe { *arr.add(i) } as *mut core::ffi::c_void);
             }
-            unsafe { crate::mem::free(arr as *mut core::ffi::c_void); }
+            crate::mem::free(arr as *mut core::ffi::c_void);
             closedir(dir);
             crate::errno::set(crate::errno::ENOMEM);
             return -1;

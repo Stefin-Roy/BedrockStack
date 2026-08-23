@@ -1079,18 +1079,6 @@ impl PerCpuCache {
         self.head = payload;
         self.count += 1;
     }
-
-    fn pop(&mut self) -> *mut u8 {
-        let p = self.head;
-        if p.is_null() {
-            return core::ptr::null_mut();
-        }
-        unsafe {
-            self.head = *(p as *mut *mut u8);
-        }
-        self.count -= 1;
-        p
-    }
 }
 
 /// Per-CPU free-block staging — `IrqMutex` so an IRQ handler freeing on the

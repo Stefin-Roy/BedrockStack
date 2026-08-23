@@ -61,14 +61,14 @@ pub extern "sysv64" fn kernel_main(
     kernel.run();
 }
 
-/// Low 64-bit `_start` stub for the UEFI bootloader path (non-`kernelmb2`).
-///
-/// The kernel is linked higher-half, so `e_entry` must be a LOW stub that
-/// installs the static `.boottables` (CR3 = `__boot_pml4`) and long-jumps
-/// into the high `kernel_main`.  The UEFI-provided sysv64 args
-/// (rdi/rsi/rdx/rcx/r8 = memory_map_ptr/len/framebuffer/stack_guard/rsdp)
-/// are already in exactly the registers `kernel_main` expects, and none of
-/// the setup instructions below clobber them, so they pass straight through.
+// Low 64-bit `_start` stub for the UEFI bootloader path (non-`kernelmb2`).
+//
+// The kernel is linked higher-half, so `e_entry` must be a LOW stub that
+// installs the static `.boottables` (CR3 = `__boot_pml4`) and long-jumps
+// into the high `kernel_main`.  The UEFI-provided sysv64 args
+// (rdi/rsi/rdx/rcx/r8 = memory_map_ptr/len/framebuffer/stack_guard/rsdp)
+// are already in exactly the registers `kernel_main` expects, and none of
+// the setup instructions below clobber them, so they pass straight through.
 #[cfg(all(target_arch = "x86_64", not(feature = "kernelmb2")))]
 core::arch::global_asm!(
     r#"

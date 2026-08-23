@@ -35,62 +35,65 @@ fn sys_brk(new_break: usize) -> isize {
 /// the heap through `:brk` when no free block fits. Returns a pointer to the
 /// usable payload or null.
 unsafe fn alloc_bytes(size: usize) -> *mut u8 {
-    let raw = size.max(16);
-    let need = (raw + MIN_ALIGN - 1) & !(MIN_ALIGN - 1);
+    // All raw pointer derefs and mutable statics require explicit unsafe in 2024 edition.
+    unsafe {
+        let raw = size.max(16);
+        let need = (raw + MIN_ALIGN - 1) & !(MIN_ALIGN - 1);
 
-    let mut prev: *mut Header = core::ptr::null_mut();
-    let mut h = FREE;
-    while !h.is_null() {
-        let hsize = (*h).size;
-        if hsize >= need {
-            if hsize - need >= HEADER + 16 {
-                let rest = (h as usize + HEADER + need) as *mut Header;
-                (*rest).size = hsize - need - HEADER;
-                (*rest).next = (*h).next;
-                (*h).size = need;
-                if prev.is_null() {
-                    FREE = rest;
+        let mut prev: *mut Header = core::ptr::null_mut();
+        let mut h = FREE;
+        while !h.is_null() {
+            let hsize = (*h).size;
+            if hsize >= need {
+                if hsize - need >= HEADER + 16 {
+                    let rest = (h as usize + HEADER + need) as *mut Header;
+                    (*rest).size = hsize - need - HEADER;
+                    (*rest).next = (*h).next;
+                    (*h).size = need;
+                    if prev.is_null() {
+                        FREE = rest;
+                    } else {
+                        (*prev).next = rest;
+                    }
                 } else {
-                    (*prev).next = rest;
+                    if prev.is_null() {
+                        FREE = (*h).next;
+                    } else {
+                        (*prev).next = (*h).next;
+                    }
                 }
-            } else {
-                if prev.is_null() {
-                    FREE = (*h).next;
-                } else {
-                    (*prev).next = (*h).next;
-                }
+                return (h as usize + HEADER) as *mut u8;
             }
-            return (h as usize + HEADER) as *mut u8;
+            prev = h;
+            h = (*h).next;
         }
-        prev = h;
-        h = (*h).next;
-    }
 
-    if BRK_CUR == 0 {
-        let q = sys_brk(0);
-        if q < 0 {
+        if BRK_CUR == 0 {
+            let q = sys_brk(0);
+            if q < 0 {
+                return core::ptr::null_mut();
+            }
+            BRK_CUR = q as usize;
+        }
+        let cur = BRK_CUR;
+        let grown = sys_brk(cur + HEADER + need);
+        if grown < 0 || grown as usize <= cur {
             return core::ptr::null_mut();
         }
-        BRK_CUR = q as usize;
+        let grown = grown as usize;
+        let h = cur as *mut Header;
+        (*h).size = need;
+        (*h).next = core::ptr::null_mut();
+        let alloc = (cur + HEADER) as *mut u8;
+        if grown - (cur + HEADER + need) >= HEADER + 16 {
+            let rest = (cur + HEADER + need) as *mut Header;
+            (*rest).size = grown - (cur + HEADER + need) - HEADER;
+            (*rest).next = FREE;
+            FREE = rest;
+        }
+        BRK_CUR = grown;
+        alloc
     }
-    let cur = BRK_CUR;
-    let grown = sys_brk(cur + HEADER + need);
-    if grown < 0 || grown as usize <= cur {
-        return core::ptr::null_mut();
-    }
-    let grown = grown as usize;
-    let h = cur as *mut Header;
-    (*h).size = need;
-    (*h).next = core::ptr::null_mut();
-    let alloc = (cur + HEADER) as *mut u8;
-    if grown - (cur + HEADER + need) >= HEADER + 16 {
-        let rest = (cur + HEADER + need) as *mut Header;
-        (*rest).size = grown - (cur + HEADER + need) - HEADER;
-        (*rest).next = FREE;
-        FREE = rest;
-    }
-    BRK_CUR = grown;
-    alloc
 }
 
 #[unsafe(no_mangle)]
@@ -194,7 +197,7 @@ pub struct OsAlloc;
 
 unsafe impl GlobalAlloc for OsAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let raw = alloc_bytes(layout.size());
+        let raw = unsafe { alloc_bytes(layout.size()) };
         if raw.is_null() {
             return core::ptr::null_mut();
         }
@@ -221,55 +224,80 @@ pub static ALLOC: OsAlloc = OsAlloc;
 // `-Zbuild-std=core,alloc` they are not exported.
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(s: *mut u8, c: i32, n: usize) -> *mut u8 {
-    let mut i = 0usize;
-    while i < n {
-        *s.add(i) = (c & 0xFF) as u8;
-        i += 1;
+pub unsafe extern "C" fn memset(s: *mut core::ffi::c_void, c: i32, n: usize) -> *mut core::ffi::c_void {
+    unsafe {
+        let s = s as *mut u8;
+        let mut i = 0usize;
+        while i < n {
+            *s.add(i) = (c & 0xFF) as u8;
+            i += 1;
+        }
+        s as *mut core::ffi::c_void
     }
-    s
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    let mut i = 0usize;
-    while i < n {
-        *dst.add(i) = *src.add(i);
-        i += 1;
-    }
-    dst
-}
-
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(dst: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if dst as usize <= src as usize || dst as usize >= src as usize + n {
-        // non-overlapping or src before dst with no overlap: forward copy
+pub unsafe extern "C" fn memcpy(
+    dst: *mut core::ffi::c_void,
+    src: *const core::ffi::c_void,
+    n: usize,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        let dst = dst as *mut u8;
+        let src = src as *const u8;
         let mut i = 0usize;
         while i < n {
             *dst.add(i) = *src.add(i);
             i += 1;
         }
-    } else {
-        // overlapping, dst inside src: copy backwards
-        let mut i = n;
-        while i > 0 {
-            i -= 1;
-            *dst.add(i) = *src.add(i);
-        }
+        dst as *mut core::ffi::c_void
     }
-    dst
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
-    let mut i = 0usize;
-    while i < n {
-        let av = *a.add(i);
-        let bv = *b.add(i);
-        if av != bv {
-            return (av as i32) - (bv as i32);
+pub unsafe extern "C" fn memmove(
+    dst: *mut core::ffi::c_void,
+    src: *const core::ffi::c_void,
+    n: usize,
+) -> *mut core::ffi::c_void {
+    unsafe {
+        let dst = dst as *mut u8;
+        let src = src as *const u8;
+        if dst as usize <= src as usize || dst as usize >= src as usize + n {
+            let mut i = 0usize;
+            while i < n {
+                *dst.add(i) = *src.add(i);
+                i += 1;
+            }
+        } else {
+            let mut i = n;
+            while i > 0 {
+                i -= 1;
+                *dst.add(i) = *src.add(i);
+            }
         }
-        i += 1;
+        dst as *mut core::ffi::c_void
     }
-    0
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn memcmp(
+    a: *const core::ffi::c_void,
+    b: *const core::ffi::c_void,
+    n: usize,
+) -> i32 {
+    unsafe {
+        let a = a as *const u8;
+        let b = b as *const u8;
+        let mut i = 0usize;
+        while i < n {
+            let av = *a.add(i);
+            let bv = *b.add(i);
+            if av != bv {
+                return (av as i32) - (bv as i32);
+            }
+            i += 1;
+        }
+        0
+    }
 }

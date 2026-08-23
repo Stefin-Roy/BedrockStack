@@ -187,7 +187,7 @@ pub extern "C" fn entry_main() -> usize {
     // `.savegame/doomsav0.dsg`) against the process CWD, which defaults to
     // `/` — the read-only unispace registry root.  Repoint the CWD at the
     // writable tmpfs (`A>`) so saves land in `/A/.savegame/`.
-    let ch = unsafe { libc::vfs::chdir(b"/A\0".as_ptr() as *const core::ffi::c_char) };
+    let ch = libc::vfs::chdir(b"/A\0".as_ptr() as *const core::ffi::c_char);
     if ch != 0 {
         let s = b"[doom] chdir /A failed\n";
         let _ = bedrock_serial(s.as_ptr(), s.len());
@@ -206,7 +206,7 @@ pub extern "C" fn entry_main() -> usize {
         let slice = core::slice::from_raw_parts_mut(base, ARGS_CAP);
         libc::process::args(slice)
     };
-    unsafe {
+    {
         let msg = b"[doom] bedrock_args len=";
         let _ = bedrock_serial(msg.as_ptr(), msg.len());
         // crude decimal

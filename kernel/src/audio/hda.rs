@@ -396,17 +396,10 @@ impl Inner {
     }
 
     fn drain_rirb(&mut self, log_first: bool) -> u32 {
-        let rirb_virt = self.rirb_virt;
         let wp = self.r16(regs::RIRBWP) & 0xff;
         let mut n = 0u32;
-        let mut first = (0u32, 0u32);
         let mut idx = (self.last_wp + 1) & 0xff;
         while idx != ((wp + 1) & 0xff) {
-            let res = unsafe { read_volatile((rirb_virt + idx as u64 * 8) as *const u32) };
-            let res_ex = unsafe { read_volatile((rirb_virt + idx as u64 * 8 + 4) as *const u32) };
-            if n == 0 {
-                first = (res, res_ex);
-            }
             n += 1;
             idx = (idx + 1) & 0xff;
         }

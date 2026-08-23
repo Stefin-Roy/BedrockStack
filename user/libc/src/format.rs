@@ -9,7 +9,7 @@
 
 use core::ffi::{
     VaList, c_char, c_double, c_int, c_long, c_longlong, c_short, c_uint, c_ulong, c_ulonglong,
-    c_ushort, c_void,
+    c_void,
 };
 use core::fmt::Write as _;
 
@@ -817,20 +817,20 @@ pub unsafe extern "C" fn vfprintf(f: *mut FILE, fmt: *const c_char, ap: VaList) 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fprintf(f: *mut FILE, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vfprintf(f, fmt, ap)
     }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn vprintf(fmt: *const c_char, ap: VaList) -> c_int {
-    vfprintf(unsafe { crate::stdio::stdout }, fmt, ap)
+    unsafe { vfprintf(crate::stdio::stdout, fmt, ap) }
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn printf(fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vprintf(fmt, ap)
     }
 }
@@ -866,7 +866,7 @@ pub unsafe extern "C" fn snprintf(
     args: ...
 ) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vsnprintf(s, n, fmt, ap)
     }
 }
@@ -891,7 +891,7 @@ pub unsafe extern "C" fn vsprintf(s: *mut c_char, fmt: *const c_char, ap: VaList
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn sprintf(s: *mut c_char, fmt: *const c_char, args: ...) -> c_int {
     unsafe {
-        let mut ap = args;
+        let ap = args;
         vsprintf(s, fmt, ap)
     }
 }
@@ -910,7 +910,7 @@ impl Sink for HeapSink {
         let need = self.len + b.len();
         if need > self.cap {
             let newcap = need.next_power_of_two().max(128);
-            let np = unsafe { crate::mem::realloc(self.ptr as *mut core::ffi::c_void, newcap) };
+            let np = crate::mem::realloc(self.ptr as *mut core::ffi::c_void, newcap);
             if np.is_null() {
                 return;
             }
