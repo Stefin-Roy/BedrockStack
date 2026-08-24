@@ -13,6 +13,23 @@ mod mbr;
 const SECTOR_SIZE: usize = 512;
 const MAX_EBR_CHAIN: u32 = 100;
 
+/// Last detailed probe/mount error for post-mortem logging (see `last_probe_error`).
+/// Stores the `&'static str` returned by `probe` before it is collapsed to
+/// `VfsError::InvalidDevice`, plus NTFS-stage detail when available.
+static LAST_MOUNT_DETAIL: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+
+pub fn last_mount_detail() -> Option<&'static str> {
+    *LAST_MOUNT_DETAIL.lock()
+}
+
+pub fn last_probe_error() -> Option<&'static str> {
+    last_mount_detail()
+}
+
+fn set_last_detail(s: Option<&'static str>) {
+    *LAST_MOUNT_DETAIL.lock() = s;
+}
+
 #[derive(Debug, Clone)]
 pub struct PartitionInfo {
     pub number: u32,
@@ -132,14 +149,32 @@ pub fn mount_partition(
     fstype: &str,
     drive: char,
 ) -> Result<(), VfsError> {
-    let table = probe(device.clone()).map_err(|_| VfsError::InvalidDevice)?;
+    let table = match probe(device.clone()) {
+        Ok(t) => {
+            set_last_detail(None);
+            t
+        }
+        Err(s) => {
+            set_last_detail(Some(s));
+            return Err(VfsError::InvalidDevice);
+        }
+    };
     let info = table
         .partitions()
         .iter()
         .find(|p| p.number == part_number && !p.is_extended)
-        .ok_or(VfsError::NotFound)?;
+        .ok_or_else(|| {
+            set_last_detail(Some("partition number not found"));
+            VfsError::NotFound
+        })?;
     let part_dev = PartitionDevice::new(device, info);
-    vfs::mount(fstype, Some(Arc::new(part_dev)), drive)
+    let res = vfs::mount(fstype, Some(Arc::new(part_dev)), drive);
+    // Do not clear on failure: keep probe detail (if any) for lib.rs to log.
+    // Success clears.
+    if res.is_ok() {
+        set_last_detail(None);
+    }
+    res
 }
 
 pub fn mount_first_partition(
@@ -147,14 +182,31 @@ pub fn mount_first_partition(
     fstype: &str,
     drive: char,
 ) -> Result<(), VfsError> {
-    let table = probe(device.clone()).map_err(|_| VfsError::InvalidDevice)?;
+    let table = match probe(device.clone()) {
+        Ok(t) => {
+            // Clear stale detail on successful probe; mount may still fail later.
+            set_last_detail(None);
+            t
+        }
+        Err(s) => {
+            set_last_detail(Some(s));
+            return Err(VfsError::InvalidDevice);
+        }
+    };
     let info = table
         .partitions()
         .iter()
         .find(|p| !p.is_extended)
-        .ok_or(VfsError::NotFound)?;
+        .ok_or_else(|| {
+            set_last_detail(Some("no non-extended partition"));
+            VfsError::NotFound
+        })?;
     let part_dev = PartitionDevice::new(device, info);
-    vfs::mount(fstype, Some(Arc::new(part_dev)), drive)
+    let res = vfs::mount(fstype, Some(Arc::new(part_dev)), drive);
+    if res.is_ok() {
+        set_last_detail(None);
+    }
+    res
 }
 
 fn read_sector(device: &dyn BlockDevice, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {

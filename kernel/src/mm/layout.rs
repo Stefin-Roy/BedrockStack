@@ -101,6 +101,13 @@ pub const FB_VADDR_FLOOR: u64 = KERNEL_VMA_BASE - 0x9000_0000;
 pub const LAPIC_VADDR_BASE: u64 = FB_VADDR_FLOOR - 0x1000_0000;
 pub const LAPIC_VADDR_FLOOR: u64 = LAPIC_VADDR_BASE - 0x1000_0000;
 
+/// IOMMU (VT-d) register window: each DRHD's 4 KiB register BAR is mapped
+/// here, directly below the LAPIC arena, still inside higher-half PML4
+/// sharing (`clone_high_half` copies 256..511). The window is 512 MiB like
+/// the other device windows and uses `NO_CACHE` UC mappings.
+pub const IOMMU_VADDR_BASE: u64 = LAPIC_VADDR_FLOOR;
+pub const IOMMU_VADDR_FLOOR: u64 = IOMMU_VADDR_BASE - 0x2000_0000;
+
 /// Capability supervisor pages: per-process 8K (2×4K) frames mapped supervisor-only
 /// (READ, no USER) at a fixed low-half VA. Must be outside `usermem`'s
 /// allocatable range (which caps at `user_ceiling` ≈ stack guard bottom), so
@@ -173,6 +180,9 @@ fn kaslr_collides(off: u64) -> bool {
         return true;
     }
     if check(LAPIC_VADDR_FLOOR..LAPIC_VADDR_BASE) {
+        return true;
+    }
+    if check(IOMMU_VADDR_FLOOR..IOMMU_VADDR_BASE) {
         return true;
     }
     false
@@ -347,10 +357,11 @@ const fn region(name: &'static str, base: u64, floor: u64) -> Region {
 }
 
 /// The live device windows, keyed by name.
-static REGIONS: Mutex<[Region; 3]> = Mutex::new([
+static REGIONS: Mutex<[Region; 4]> = Mutex::new([
     region("acpi", ACPI_VADDR_BASE, ACPI_VADDR_FLOOR),
     region("ecam", ECAM_VADDR_BASE, ECAM_VADDR_FLOOR),
     region("dma", DMA_VADDR_BASE, DMA_VADDR_FLOOR),
+    region("iommu", IOMMU_VADDR_BASE, IOMMU_VADDR_FLOOR),
 ]);
 
 /// Allocate `size` bytes downward inside the named window, page-rounding up.
@@ -425,7 +436,7 @@ pub fn to_physmap(phys: u64) -> u64 {
 /// static regions so the actual remapped image never collides.
 pub fn verify_layout() {
     let kaslr = kaslr_offset();
-    let regions: [(&str, Range<u64>); 8] = [
+    let regions: [(&str, Range<u64>); 9] = [
         ("heap", HEAP_FLOOR..HEAP_TOP),
         ("kstack", KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE),
         ("physmap", PHYS_MAP_BASE..PHYS_MAP_BASE + physmap_end()),
@@ -434,6 +445,7 @@ pub fn verify_layout() {
         ("dma", DMA_VADDR_FLOOR..DMA_VADDR_BASE),
         ("fb", FB_VADDR_FLOOR..FB_VADDR_BASE),
         ("lapic", LAPIC_VADDR_FLOOR..LAPIC_VADDR_BASE),
+        ("iommu", IOMMU_VADDR_FLOOR..IOMMU_VADDR_BASE),
     ];
     if kaslr != 0 {
         assert!(!kaslr_collides(kaslr), "KASLR offset {:#x} collides (filtered pick failed)", kaslr);

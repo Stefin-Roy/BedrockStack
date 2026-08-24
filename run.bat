@@ -57,6 +57,7 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -device usb-mouse ^
     -device usb-tablet ^
     -device usb-audio,audiodev=au ^
+    -device intel-iommu ^
     -audiodev dsound,id=au ^
     -device ich9-intel-hda ^
     -device hda-output,audiodev=au ^

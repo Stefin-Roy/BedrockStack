@@ -89,6 +89,52 @@ pub enum TriggerMode {
     Level,
 }
 
+/// VT-d DMA Remapping Reporting Structure (DMAR) — Intel VT-d, ACPI View.
+///
+/// Probed from the `DMAR` table. `None` when absent (IOMMU unavailable
+/// or firmware did not expose it, e.g. legacy QEMU without `intel-iommu`).
+#[derive(Clone, Debug)]
+pub struct DeviceScope {
+    pub device_type: u8,
+    pub enumeration_id: u8,
+    pub start_bus_number: u8,
+    /// PCI path: list of (device, function) hops from the remapping unit.
+    pub path: Vec<(u8, u8)>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Drhd {
+    pub flags: u8,
+    pub segment: u16,
+    pub register_base: u64,
+    pub include_pci_all: bool,
+    pub devices: Vec<DeviceScope>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Rmrr {
+    pub segment: u16,
+    pub base_address: u64,
+    pub limit_address: u64,
+    pub devices: Vec<DeviceScope>,
+}
+
+#[derive(Clone, Debug)]
+pub struct Atsr {
+    pub flags: u8,
+    pub segment: u16,
+    pub devices: Vec<DeviceScope>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DmarInfo {
+    pub host_address_width: u8,
+    pub flags: u8,
+    pub drhds: Vec<Drhd>,
+    pub rmrrs: Vec<Rmrr>,
+    pub atsr: Vec<Atsr>,
+}
+
 /// Platform-level ACPI information parsed from FADT.
 pub struct PlatformInfo {
     pub reset_gas: Option<Gas>,

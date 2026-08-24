@@ -1,4 +1,4 @@
-use crate::acpi::{AcpiSubsystem, InterruptModel, PciConfigRegions, PlatformInfo};
+use crate::acpi::{AcpiSubsystem, DmarInfo, InterruptModel, PciConfigRegions, PlatformInfo};
 use crate::mm::vmm::PageFlags;
 
 use super::super::acpi::AcpiProvider;
@@ -28,6 +28,10 @@ impl AcpiProvider for X86Acpi {
 
     fn cpus(&self) -> &[(u32, bool)] {
         &self.acpi.cpus
+    }
+
+    fn dmar(&self) -> Option<&DmarInfo> {
+        self.acpi.dmar.as_ref()
     }
 
     fn map_device_mmio(&self, paddr: u64, size: u64, flags: PageFlags) -> u64 {

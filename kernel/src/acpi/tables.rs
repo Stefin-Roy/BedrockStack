@@ -253,6 +253,9 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
         sig(b"MCFG"),
         sig(b"DSDT"),
         sig(b"SSDT"),
+        sig(b"DMAR"),
+        sig(b"IVRS"),
+        sig(b"IORT"),
     ];
     if !keep_sigs.contains(&sig_u32) {
         return Ok(None);

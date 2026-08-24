@@ -257,6 +257,18 @@ pub fn init() {
             .set_handler_fn(ipi_tlb_shootdown_handler)
             .disable_interrupts(true);
 
+        // IOMMU fault (vector 53) — non-halting fault logger. Each VT-d unit
+        // drains its FSTS/FRCD queue here, then EOI. Always present; no-op when
+        // IOMMU is disabled.
+        idt[53]
+            .set_handler_fn(iommu_fault_handler)
+            .disable_interrupts(true);
+        // QI completion (vector 54) — currently polled, but reserved for the
+        // invalidation completion interrupt when QI ECAP so indicates.
+        idt[54]
+            .set_handler_fn(iommu_qi_handler)
+            .disable_interrupts(true);
+
         // Register device interrupt vectors 33-48 (interrupt gates, clears IF).
         idt[33].set_handler_fn(irq_33).disable_interrupts(true);
         idt[34].set_handler_fn(irq_34).disable_interrupts(true);
@@ -339,6 +351,37 @@ extern "x86-interrupt" fn ipi_tlb_shootdown_handler(frame: InterruptStackFrame) 
         swapgs();
     }
     crate::mm::vmm::tlb_shootdown_on_this_cpu();
+    apic::apic_eoi();
+    if u {
+        swapgs();
+    }
+}
+
+pub const IOMMU_FAULT_VECTOR: u8 = 53;
+pub const IOMMU_QI_VECTOR: u8 = 54;
+
+extern "x86-interrupt" fn iommu_fault_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u {
+        swapgs();
+    }
+    #[cfg(target_arch = "x86_64")]
+    crate::iommu::fault_handler();
+    apic::apic_eoi();
+    if u {
+        swapgs();
+    }
+}
+
+extern "x86-interrupt" fn iommu_qi_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u {
+        swapgs();
+    }
+    // QI completion: currently polled, but EOI is required if hardware fires it.
+    // Drain faults as well as a belt-and-suspenders.
+    #[cfg(target_arch = "x86_64")]
+    crate::iommu::fault_handler();
     apic::apic_eoi();
     if u {
         swapgs();

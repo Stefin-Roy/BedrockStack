@@ -2,7 +2,7 @@ use alloc::vec::Vec;
 
 use crate::mm::vmm::PageFlags;
 
-use super::super::acpi::{AcpiProvider, InterruptModel, PciConfigRegions, PlatformInfo};
+use super::super::acpi::{AcpiProvider, DmarInfo, InterruptModel, PciConfigRegions, PlatformInfo};
 
 pub struct RiscvAcpi;
 
@@ -24,6 +24,10 @@ impl AcpiProvider for RiscvAcpi {
 
     fn cpus(&self) -> &[(u32, bool)] {
         &[]
+    }
+
+    fn dmar(&self) -> Option<&DmarInfo> {
+        None
     }
 
     fn map_device_mmio(&self, _paddr: u64, _size: u64, _flags: PageFlags) -> u64 {

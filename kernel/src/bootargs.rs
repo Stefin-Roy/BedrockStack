@@ -126,6 +126,9 @@ pub fn contains_word(word: &str) -> bool {
         if token.len() == w.len() + 1 && token[0] == b'-' && &token[1..] == w {
             return true;
         }
+        if token.len() == w.len() + 2 && token[0] == b'-' && token[1] == b'-' && &token[2..] == w {
+            return true;
+        }
     }
     false
 }
@@ -133,4 +136,10 @@ pub fn contains_word(word: &str) -> bool {
 /// Convenience: `nokaslr` present (also `-nokaslr`).
 pub fn is_nokaslr() -> bool {
     contains_word("nokaslr")
+}
+
+/// `noiommu` disables the VT-d IOMMU (also `-noiommu`). Without this flag
+/// the IOMMU is always on when DMAR is present (opt-out, not opt-in).
+pub fn is_noiommu() -> bool {
+    contains_word("noiommu")
 }

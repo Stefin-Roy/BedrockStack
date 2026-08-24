@@ -24,7 +24,7 @@ pub static PHYS_MEM: Schema = Schema::Struct(&[
 
 pub static FEATURES: Schema = Schema::List(&schema::SCHEMA_STR);
 
-const VERSION: &str = "bedrockos 0.7 (unispace)";
+const VERSION: &str = "Bedrock OS @ Codename: Lodax";
 
 /// Register the `/sys` system (kernel introspection objects).
 pub fn register() -> Result<(), UnispaceError> {

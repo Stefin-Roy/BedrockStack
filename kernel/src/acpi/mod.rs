@@ -7,6 +7,7 @@ use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 
 #[cfg(target_arch = "x86_64")]
 mod aml_ctx;
+mod dmar;
 mod fadt;
 mod gas;
 #[cfg(target_arch = "x86_64")]
@@ -17,8 +18,9 @@ pub mod platform;
 mod tables;
 
 pub use platform::{
-    AcpiError, Apic, Gas, InterruptModel, IoApic, PciConfigRegions, PciMcfgRegion, PlatformInfo,
-    Pm1ControlBit, Polarity, Processor, ProcessorInfo, ProcessorState, TriggerMode,
+    AcpiError, Apic, Atsr, DeviceScope, DmarInfo, Drhd, Gas, InterruptModel, IoApic,
+    PciConfigRegions, PciMcfgRegion, PlatformInfo, Pm1ControlBit, Polarity, Processor,
+    ProcessorInfo, ProcessorState, Rmrr, TriggerMode,
 };
 
 /// Resolve a legacy ISA IRQ to its GSI plus polarity/trigger via the MADT
@@ -112,6 +114,8 @@ pub struct AcpiSubsystem {
     pub cpus: Vec<(u32, bool)>,
     pub pci_config_regions: PciConfigRegions,
     pub platform_info: PlatformInfo,
+    /// DMA remapping (VT-d) info, if present.
+    pub dmar: Option<DmarInfo>,
     /// Persistent AML interpreter over the DSDT + SSDTs (x86_64). `None` when
     /// no DSDT was found or the tables could not be parsed by the `aml` crate.
     #[cfg(target_arch = "x86_64")]
@@ -198,6 +202,28 @@ impl AcpiSubsystem {
             interrupt_model
         );
 
+        let dmar = entries
+            .iter()
+            .find(|e| e.signature == sig(b"DMAR"))
+            .and_then(|e| match dmar::parse_dmar(e.vaddr, e.length) {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log::warn!("ACPI: DMAR parse failed: {:?} (ignored)", err);
+                    None
+                }
+            });
+        if let Some(ref dm) = dmar {
+            SerialPort::puts("[acpi] DMAR host_width=");
+            SerialPort::put_u64(dm.host_address_width as u64);
+            SerialPort::puts(" drhd=");
+            SerialPort::put_u64(dm.drhds.len() as u64);
+            SerialPort::puts(" rmrr=");
+            SerialPort::put_u64(dm.rmrrs.len() as u64);
+            SerialPort::puts("\n");
+        } else {
+            SerialPort::puts("[acpi] DMAR absent\n");
+        }
+
         #[cfg(target_arch = "x86_64")]
         let subsystem = Self {
             interrupt_model,
@@ -205,6 +231,7 @@ impl AcpiSubsystem {
             cpus,
             pci_config_regions,
             platform_info,
+            dmar,
             aml,
         };
         #[cfg(not(target_arch = "x86_64"))]
@@ -214,6 +241,7 @@ impl AcpiSubsystem {
             cpus,
             pci_config_regions,
             platform_info,
+            dmar,
         };
         Ok(subsystem)
     }

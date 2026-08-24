@@ -30,6 +30,8 @@ pub mod task;
 pub mod unispace;
 pub mod caps;
 #[cfg(target_arch = "x86_64")]
+pub mod iommu;
+#[cfg(target_arch = "x86_64")]
 pub mod usb;
 
 use acpi::AcpiSubsystem;
@@ -264,6 +266,28 @@ impl Kernel {
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
         self.init_acpi();
+
+        // Reserve DMAR RMRR ranges early (before the service container hands
+        // out frames). RMRR is BIOS-reserved memory that must stay identity-
+        // mapped for legacy devices (USB, graphics). Even with `noiommu` we
+        // must not reallocate it — the device may DMA there untranslated.
+        #[cfg(target_arch = "x86_64")]
+        if let Some(ref acpi) = self.acpi {
+            if let Some(ref dmar) = acpi.dmar {
+                for rmrr in &dmar.rmrrs {
+                    let start = rmrr.base_address & !0xFFF;
+                    let end = (rmrr.limit_address | 0xFFF) + 1; // exclusive
+                    if end > start {
+                        crate::drivers::serial::SerialPort::puts("[init] RMRR reserve ");
+                        crate::drivers::serial::SerialPort::put_hex(start);
+                        crate::drivers::serial::SerialPort::puts(" - ");
+                        crate::drivers::serial::SerialPort::put_hex(end);
+                        crate::drivers::serial::SerialPort::puts("\n");
+                        self.allocator.reserve_range(start, end - start);
+                    }
+                }
+            }
+        }
 
         // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
         #[cfg(target_arch = "x86_64")]
@@ -550,7 +574,47 @@ impl Kernel {
                     log::info!("Mounted NTFS demo as C> (read-only)");
                     crate::filesystems::fstypes::ntfs::selftest::run();
                 }
-                Err(e) => log::warn!("Could not mount NTFS demo on C>: {:?}", e),
+                Err(e) => {
+                    let probe = crate::filesystems::partition::last_mount_detail().unwrap_or("none");
+                    let ntfs = crate::filesystems::fstypes::ntfs::last_error().unwrap_or("none");
+                    // Discriminant helps without parsing Debug; probe/ntfs pinpoint the
+                    // collapsed IOError: "sector read error" vs "usa_fixup" vs "MFT FILE miss".
+                    log::warn!(
+                        "Could not mount NTFS demo on C>: {:?} discriminant={}({}) probe_detail={:?} ntfs_detail={:?} model={:?} sectors={}",
+                        e,
+                        e.discriminant_name(),
+                        e.discriminant_value(),
+                        probe,
+                        ntfs,
+                        dev.model_string(),
+                        dev.sector_count()
+                    );
+                    // Always mirror to raw serial for boots where the logger level
+                    // filters WARN, and so the triple is visible even without `log`.
+                    crate::drivers::serial::SerialPort::puts("[ntfs] mount C> failed: VfsError::");
+                    crate::drivers::serial::SerialPort::puts(e.discriminant_name());
+                    crate::drivers::serial::SerialPort::puts(" probe='");
+                    crate::drivers::serial::SerialPort::puts(probe);
+                    crate::drivers::serial::SerialPort::puts("' ntfs='");
+                    crate::drivers::serial::SerialPort::puts(ntfs);
+                    crate::drivers::serial::SerialPort::puts("' dev='");
+                    crate::drivers::serial::SerialPort::puts(dev.model_string());
+                    crate::drivers::serial::SerialPort::puts("'\n");
+                }
+            }
+        } else {
+            #[cfg(all(target_arch = "x86_64", feature = "selftest"))]
+            {
+                let count = block_devices.len();
+                log::warn!("NTFS demo not mounted: second block device missing (block_devices={})", count);
+                crate::drivers::serial::SerialPort::puts("[ntfs] mount C> skipped: second block device missing, block_devices=");
+                crate::drivers::serial::SerialPort::put_u64(count as u64);
+                crate::drivers::serial::SerialPort::puts("\n");
+                if count > 0 {
+                    crate::drivers::serial::SerialPort::puts("[ntfs] dev0 model='");
+                    crate::drivers::serial::SerialPort::puts(block_devices[0].model_string());
+                    crate::drivers::serial::SerialPort::puts("'\n");
+                }
             }
         }
 
@@ -593,6 +657,15 @@ impl Kernel {
         loop {
             #[cfg(target_arch = "x86_64")]
             {
+                // IOMMU fault poll (backup for the fault MSI at vector 53).
+                // The IRQ drains the FRCD queue; polling catches faults even
+                // if the MSI was not delivered (e.g., masked or coalesced).
+                // Non-halting: faults are logged and ignored.
+                #[cfg(target_arch = "x86_64")]
+                if crate::iommu::is_enabled() {
+                    crate::iommu::fault_handler();
+                }
+
                 // Reap parked dead tasks: free their user page tables, kernel
                 // stacks, and task boxes.  Runs here (idle stack, kernel CR3)
                 // so no task is ever torn down while parked on its own stack.

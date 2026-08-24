@@ -35,6 +35,8 @@ pub fn update_dma_alloc(alloc: *mut BitmapAllocator) {
     if let Some(kdma) = DMA_ALLOCATOR.get() {
         kdma.inner.lock().alloc = alloc;
     }
+    #[cfg(target_arch = "x86_64")]
+    crate::iommu::update_alloc(alloc);
 }
 
 /// Translation cache shared across the kernel.

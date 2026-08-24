@@ -14,6 +14,7 @@ ps2_trace = []
 heap_trace = []
 kernelmb2 = []
 selftest = []
+iommu_trace = []
 
 [dependencies]
 spin = "0.9"

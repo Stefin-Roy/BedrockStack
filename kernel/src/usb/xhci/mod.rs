@@ -134,6 +134,26 @@ fn init_controller(
         }
     }
 
+    // Allocate DeviceContext output buffers for each slot and program DCBAA.
+    // Without IOMMU, DMA to phys 0 was silently "working" (corrupting low mem);
+    // with VT-d, IOVA 0 is reserved and faults (seen as iova=0 write=1 from xHC).
+    // The spec (§6.1) requires DCBAA[slot] to point to a 1K (32*32) or 2K (64*32)
+    // Output Context for every enabled slot. Pre-allocating for all slots avoids
+    // on-demand allocation in the hot-plug path and eliminates the IOVA 0 fault.
+    // xHCI is assumed correct otherwise, per review note.
+    for slot in 1..=max_slots {
+        let ctx_buf = dma.alloc_page().ok_or("OOM for DeviceContext")?;
+        // Zero the context (already zeroed by alloc_page) but be explicit.
+        unsafe { core::ptr::write_bytes(ctx_buf.virt as *mut u8, 0, 4096) };
+        let off = (slot as u64) * 8;
+        unsafe {
+            core::ptr::write_volatile((dcbaa.virt + off) as *mut u64, ctx_buf.phys);
+        }
+        // Leak the DmaBuffer descriptor; pages remain allocated via bitmap and
+        // mapped via IOMMU. No free path for DeviceContexts (lifetime = controller).
+        core::mem::forget(ctx_buf);
+    }
+
     regs.write_op32(registers::OP_DCBAAP, dcbaa.phys as u32);
     if ac64 {
         regs.write_op32(registers::OP_DCBAAP + 4, (dcbaa.phys >> 32) as u32);

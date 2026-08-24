@@ -444,6 +444,7 @@ if not exist "%QEMU_PATH%" (
     -device ich9-intel-hda ^
     -device hda-output,audiodev=au ^
     -device hda-duplex,audiodev=au ^
+    -device intel-iommu ^
     -netdev user,id=net0,hostfwd=tcp::8080-:80 ^
     -device virtio-net,netdev=net0 ^
     -vga std ^
