@@ -14,6 +14,7 @@
 //! or `DmaAllocator`.
 
 use core::ops::Range;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use spin::Mutex;
 
 ///
@@ -108,6 +109,218 @@ pub const LAPIC_VADDR_FLOOR: u64 = LAPIC_VADDR_BASE - 0x1000_0000;
 /// `clone_high_half`'s PML4 256..511 copy) and supervisor-only so ring3 faults.
 pub const CAP_SLOT_VA: u64 = 0x0000_7FFF_8000_0000;
 pub const CAP_SLOT_SIZE: u64 = 8192;
+
+// ── KASLR — 4 MiB CSPRNG, actual slide ───────────────────────────────
+//
+// KASLR_OFFSET is a 4 MiB-aligned offset within [0x10000000,0x400000000]
+// from KERNEL_VMA_BASE, seeded by RDRAND+rdtsc via the early CSPRNG
+// (`crate::random::init_early` must run before `init_kaslr`). The kernel
+// image is actually remapped at `KERNEL_VMA_BASE - offset` in
+// `arch::paging::setup` (true slide, not reserve-only). Candidates that
+// would collide with any static region (heap/kstack/physmap/device windows)
+// are filtered — with 4 MiB granule and 16 GiB range ≈4096 steps, ~3400
+// survive (≈320 with old 2.5 GiB max) vs 3 at 1GiB. Old max 0xA0000000 gave
+// only 3 candidates because device windows are contiguous 2.5 GiB – the
+// enlarged range uses the large free VA between LAPIC_FLOOR and PHYS_MAP.
+pub const KASLR_ALIGN: u64 = 0x400000; // 4 MiB
+pub const KASLR_MIN_OFFSET: u64 = 0x1000_0000;
+pub const KASLR_MAX_OFFSET: u64 = 0x400000000;
+static KASLR_OFFSET: AtomicU64 = AtomicU64::new(0);
+static KASLR_INIT_DONE: AtomicBool = AtomicBool::new(false);
+
+pub fn kaslr_offset() -> u64 {
+    KASLR_OFFSET.load(Ordering::Relaxed)
+}
+pub fn set_kaslr_offset(off: u64) {
+    KASLR_OFFSET.store(off, Ordering::Relaxed)
+}
+/// True if `off` would place `[KERNEL_VMA_BASE-off, +KERNEL_IMAGE_SIZE)`
+/// over any static region. Used by picker and `verify_layout`.
+fn kaslr_collides(off: u64) -> bool {
+    if off == 0 {
+        return false;
+    }
+    if off % KASLR_ALIGN != 0 {
+        return true;
+    }
+    if off < KASLR_MIN_OFFSET || off > KASLR_MAX_OFFSET {
+        return true;
+    }
+    let base = KERNEL_VMA_BASE.wrapping_sub(off);
+    let end = base.wrapping_add(KERNEL_IMAGE_SIZE);
+    // Regions valid pre-paging: physmap_end may be 0 (DIRECT_MAP not yet live), treat as empty.
+    let phys_end = physmap_end();
+    let check = |r: Range<u64>| !(end <= r.start || r.end <= base);
+    if phys_end != 0 && check(PHYS_MAP_BASE..PHYS_MAP_BASE + phys_end) {
+        return true;
+    }
+    if check(HEAP_FLOOR..HEAP_TOP) {
+        return true;
+    }
+    if check(KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE) {
+        return true;
+    }
+    if check(ACPI_VADDR_FLOOR..ACPI_VADDR_BASE) {
+        return true;
+    }
+    if check(ECAM_VADDR_FLOOR..ECAM_VADDR_BASE) {
+        return true;
+    }
+    if check(DMA_VADDR_FLOOR..DMA_VADDR_BASE) {
+        return true;
+    }
+    if check(FB_VADDR_FLOOR..FB_VADDR_BASE) {
+        return true;
+    }
+    if check(LAPIC_VADDR_FLOOR..LAPIC_VADDR_BASE) {
+        return true;
+    }
+    false
+}
+
+#[cfg(target_arch = "x86_64")]
+fn has_rdrand_kaslr() -> bool {
+    let cp = core::arch::x86_64::__cpuid(1);
+    (cp.ecx & (1 << 30)) != 0
+}
+#[cfg(target_arch = "x86_64")]
+fn rdrand64_kaslr(out: &mut u64) -> bool {
+    let mut val: u64 = 0;
+    let mut cf: u8 = 0;
+    unsafe {
+        core::arch::asm!(
+            "rdrand {0}",
+            "setc {1}",
+            out(reg) val,
+            out(reg_byte) cf,
+            options(nomem, nostack)
+        );
+    }
+    if cf != 0 { *out = val; true } else { false }
+}
+#[cfg(target_arch = "x86_64")]
+fn rdtsc_kaslr() -> u64 {
+    let lo: u32; let hi: u32;
+    unsafe { core::arch::asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack)) };
+    (lo as u64) | ((hi as u64) << 32)
+}
+pub fn init_kaslr() {
+    if KASLR_INIT_DONE.swap(true, Ordering::SeqCst) { return; }
+    debug_assert!(crate::random::is_ready(), "KASLR: random::init_early must run before init_kaslr");
+    // Formal bootargs check: `nokaslr` (or `-nokaslr`) from Multiboot2 tag 1.
+    // When present, disable KASLR entirely (offset 0). This is the user-visible
+    // switch for debugging / deterministic boots and must be checked before any
+    // random pick so the log is unambiguous.
+    if crate::bootargs::is_nokaslr() {
+        KASLR_OFFSET.store(0, Ordering::Relaxed);
+        crate::drivers::serial::SerialPort::puts("[kaslr] disabled via nokaslr (bootargs=\"");
+        if let Some(s) = crate::bootargs::get() {
+            // Best-effort: truncate to 64 for serial.
+            let print_len = core::cmp::min(s.len(), 64);
+            crate::drivers::serial::SerialPort::puts(&s[..print_len]);
+        }
+        crate::drivers::serial::SerialPort::puts("\")\n");
+        return;
+    }
+    let offset = kaslr_pick_offset();
+    KASLR_OFFSET.store(offset, Ordering::Relaxed);
+    crate::drivers::serial::SerialPort::puts("[kaslr] offset=0x");
+    crate::drivers::serial::SerialPort::put_hex(offset);
+    crate::drivers::serial::SerialPort::puts(" base=0x");
+    let base = KERNEL_VMA_BASE.wrapping_sub(offset);
+    crate::drivers::serial::SerialPort::put_hex(base);
+    // count candidates for log: all 4MiB slots + zero slide (always valid)
+    let mut cnt: u64 = 0;
+    let mut off = KASLR_MIN_OFFSET;
+    while off <= KASLR_MAX_OFFSET {
+        if !kaslr_collides(off) { cnt += 1; }
+        off += KASLR_ALIGN;
+    }
+    if !kaslr_collides(0) {
+        cnt += 1;
+    }
+    crate::drivers::serial::SerialPort::puts(" candidates=");
+    crate::drivers::serial::SerialPort::put_u64(cnt);
+    crate::drivers::serial::SerialPort::puts("\n");
+}
+fn kaslr_pick_offset() -> u64 {
+    // Enumerate non-colliding 4 MiB slots and pick uniformly via CSPRNG.
+    // Early CSPRNG (init_early) is live before this call; if not yet seeded,
+    // fall back to standalone RDRAND/jitter (pre-paging, no heap).
+    let mut valid_cnt: usize = 0;
+    let mut off = KASLR_MIN_OFFSET;
+    while off <= KASLR_MAX_OFFSET {
+        if !kaslr_collides(off) { valid_cnt += 1; }
+        off = off.wrapping_add(KASLR_ALIGN);
+    }
+    // include 0 no-slide as valid when nothing else? It never collides.
+    let has_zero = !kaslr_collides(0);
+    let total = valid_cnt + if has_zero { 1 } else { 0 };
+    if total == 0 { return 0; }
+    let idx = {
+        // Prefer CSPRNG (early seeded)
+        if crate::random::is_seeded() {
+            (crate::random::random_u32() as usize) % total
+        } else if crate::random::is_ready() {
+            // ready but not yet seeded — still use fill (falls back to splitmix)
+            (crate::random::random_u32() as usize) % total
+        } else {
+            // Last resort: standalone RDRAND/jitter (no heap, pre-RNG)
+            let mut rng_val: u64 = 0;
+            let mut have = false;
+            #[cfg(target_arch = "x86_64")]
+            {
+                if has_rdrand_kaslr() {
+                    for _ in 0..10 { if rdrand64_kaslr(&mut rng_val) { have=true; break; } }
+                }
+                if !have {
+                    let t0 = rdtsc_kaslr();
+                    for _ in 0..64 { core::hint::spin_loop(); }
+                    let t1 = rdtsc_kaslr();
+                    rng_val = t0 ^ t1.rotate_left(17) ^ crate::drivers::serial::SerialPort::puts as *const () as u64;
+                    have = true;
+                }
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                let t0 = crate::arch::riscv64::time::read_time();
+                for _ in 0..64 { core::hint::spin_loop(); }
+                let t1 = crate::arch::riscv64::time::read_time();
+                rng_val = t0 ^ t1.rotate_left(17) ^ 0x6A09E667F3BCC908u64 ^ crate::drivers::serial::SerialPort::puts as *const () as u64;
+                have = true;
+            }
+            #[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
+            { rng_val = 0x6A09E667F3BCC908u64; have = true; }
+            if !have { return 0; }
+            (rng_val as usize) % total
+        }
+    };
+    // map idx -> offset (0 is first entry if present)
+    if has_zero {
+        if idx == 0 { return 0; }
+        let mut cur = 0usize;
+        let mut off2 = KASLR_MIN_OFFSET;
+        while off2 <= KASLR_MAX_OFFSET {
+            if !kaslr_collides(off2) {
+                cur += 1;
+                if cur == idx { return off2; }
+            }
+            off2 = off2.wrapping_add(KASLR_ALIGN);
+        }
+        0
+    } else {
+        let mut cur = 0usize;
+        let mut off2 = KASLR_MIN_OFFSET;
+        while off2 <= KASLR_MAX_OFFSET {
+            if !kaslr_collides(off2) {
+                if cur == idx { return off2; }
+                cur += 1;
+            }
+            off2 = off2.wrapping_add(KASLR_ALIGN);
+        }
+        0
+    }
+}
 
 // ── Runtime region table ───────────────────────────────────────────
 //
@@ -208,7 +421,10 @@ pub fn to_physmap(phys: u64) -> u64 {
 }
 
 /// Assert the static regions do not overlap. Called once early in `init`.
+/// Also validates the KASLR slide (`KERNEL_VMA_BASE - kaslr`) against *all*
+/// static regions so the actual remapped image never collides.
 pub fn verify_layout() {
+    let kaslr = kaslr_offset();
     let regions: [(&str, Range<u64>); 8] = [
         ("heap", HEAP_FLOOR..HEAP_TOP),
         ("kstack", KSTACK_VADDR_FLOOR..KSTACK_VADDR_BASE),
@@ -219,6 +435,22 @@ pub fn verify_layout() {
         ("fb", FB_VADDR_FLOOR..FB_VADDR_BASE),
         ("lapic", LAPIC_VADDR_FLOOR..LAPIC_VADDR_BASE),
     ];
+    if kaslr != 0 {
+        assert!(!kaslr_collides(kaslr), "KASLR offset {:#x} collides (filtered pick failed)", kaslr);
+        let kaslr_base = KERNEL_VMA_BASE.wrapping_sub(kaslr);
+        let kaslr_range = kaslr_base..kaslr_base + KERNEL_IMAGE_SIZE;
+        for (name, r) in &regions {
+            assert!(
+                kaslr_range.end <= r.start || r.end <= kaslr_range.start,
+                "KASLR [{:#x},{:#x}) overlaps {} [{:#x},{:#x})",
+                kaslr_range.start,
+                kaslr_range.end,
+                name,
+                r.start,
+                r.end
+            );
+        }
+    }
     for (i, (an, ar)) in regions.iter().enumerate() {
         for (bn, br) in &regions[i + 1..] {
             assert!(

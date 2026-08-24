@@ -10,6 +10,13 @@
 //! - INV-PA-05: No double allocation (frame allocated to at most one owner)
 
 use crate::boot::{MemoryRegion, MemoryRegionKind};
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AllocError {
+    NoFrames,
+    InvalidCount,
+}
 
 struct BitmapAllocatorInner {
     next_free: usize,
@@ -21,6 +28,10 @@ pub struct BitmapAllocator {
     alloc_end: u64,
     kernel_start: u64,
     kernel_end: u64,
+    /// Sharded scan-start hint — lockless `Relaxed` load for `alloc` fast-path.
+    /// `inner.next_free` remains authoritative (holds lock); hint merely shards
+    /// start_word so concurrent allocators don't all probe word 0. No buddy yet.
+    next_free_hint: AtomicUsize,
     inner: spin::Mutex<BitmapAllocatorInner>,
 }
 
@@ -140,16 +151,34 @@ impl BitmapAllocator {
             }
         }
 
+        // Runtime reserve: kernel image + frame 0 already handled, but enforce
+        // hard reservation here regardless of external caller. This survives
+        // release builds and protects against a malformed mmap where usable
+        // overlaps kernel.
+        let ks = kernel_start & !0xFFF;
+        let ke = (kernel_end + 0xFFF) & !0xFFF;
+        if ke > ks {
+            mark_region_used(
+                bitmap,
+                &MemoryRegion {
+                    base: ks,
+                    size: ke - ks,
+                    kind: MemoryRegionKind::Reserved,
+                },
+                total_frames,
+            );
+        }
+
         SerialPort::puts("[alloc] done\n");
+        let hint = (base / 4096) as usize;
         BitmapAllocator {
             bitmap,
             total_frames,
             alloc_end: max_addr,
-            kernel_start,
-            kernel_end,
-            inner: spin::Mutex::new(BitmapAllocatorInner {
-                next_free: (base / 4096) as usize,
-            }),
+            kernel_start: ks,
+            kernel_end: ke,
+            next_free_hint: AtomicUsize::new(hint),
+            inner: spin::Mutex::new(BitmapAllocatorInner { next_free: hint }),
         }
     }
 
@@ -172,11 +201,17 @@ impl BitmapAllocator {
     /// `alloc_contiguous()` will start probing). Read-only; `dma_trace` uses it
     /// to report allocator state on a frame-alloc failure.
     pub fn next_free(&self) -> usize {
+        self.next_free_hint.load(Ordering::Relaxed)
+    }
+
+    pub fn next_free_locked(&self) -> usize {
         self.inner.lock().next_free
     }
 
     /// Count of currently-free 4 KiB frames (bitmap scan; O(n), for `/sys`).
+    /// Takes `inner` lock to avoid torn u64 reads vs byte `set_used/set_free`.
     pub fn free_frames(&self) -> usize {
+        let _guard = self.inner.lock();
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
         let mut free = 0usize;
@@ -197,41 +232,64 @@ impl BitmapAllocator {
         free
     }
 
+    #[inline]
+    fn is_reserved_frame(&self, idx: usize) -> bool {
+        if idx == 0 {
+            return true;
+        }
+        let addr = (idx as u64) * 4096;
+        addr >= self.kernel_start && addr < self.kernel_end
+    }
+
+    #[inline]
+    fn range_overlaps_kernel(&self, start_idx: usize, count: usize) -> bool {
+        if start_idx == 0 {
+            return true;
+        }
+        let addr = (start_idx as u64) * 4096;
+        let end = addr + (count as u64) * 4096;
+        end > self.kernel_start && addr < self.kernel_end
+    }
+
     /// Allocate a physical frame.
     ///
     /// Returns physical address of allocated frame, or None if no frames available.
+    /// Runtime-enforces reservation of kernel image and frame 0 (not just debug_assert).
     pub fn alloc(&self) -> Option<u64> {
         let mut inner = self.inner.lock();
-        // INV-PA-02: linear scan, find first free frame
-        // Scan 64 bits (one u64 word) at a time for ~64× throughput.
+        // Advisory hint vs authoritative cursor: max avoids stale hint causing missed tail.
+        let start_idx = self.next_free_hint.load(Ordering::Relaxed).max(inner.next_free);
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
 
-        let start_word = inner.next_free / 64;
-        let start_bit = inner.next_free % 64;
+        let start_word = start_idx / 64;
+        let start_bit = start_idx % 64;
 
         // First pass: start_word .. total_words
         for wi in start_word..total_words {
             let w = unsafe { *bitmap_u64.add(wi) };
-            // Invert: 1 bits = free frames, 0 bits = used frames
-            let candidates = !w
-                // Skip bits before start_bit in the first word
+            let mut candidates = !w
                 & if wi == start_word && start_bit > 0 {
                     !((1u64 << start_bit) - 1)
                 } else {
                     !0u64
                 }
-                // Mask out bits beyond total_frames in the last word
                 & if wi == total_words - 1 && self.total_frames % 64 != 0 {
                     (1u64 << (self.total_frames % 64)) - 1
                 } else {
                     !0u64
                 };
-            if candidates != 0 {
+            while candidates != 0 {
                 let bit = candidates.trailing_zeros() as usize;
                 let idx = wi * 64 + bit;
+                if self.is_reserved_frame(idx) {
+                    // Hard reserve — never hand out, mask and keep scanning same word.
+                    candidates &= !(1u64 << bit);
+                    continue;
+                }
                 self.set_used(idx);
                 inner.next_free = idx + 1;
+                self.next_free_hint.store(idx + 1, Ordering::Relaxed);
                 let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
@@ -240,6 +298,12 @@ impl BitmapAllocator {
                     self.kernel_start,
                     self.kernel_end
                 );
+                if addr >= self.kernel_start && addr < self.kernel_end {
+                    // Runtime reserve enforcement (release builds)
+                    self.set_free(idx);
+                    candidates &= !(1u64 << bit);
+                    continue;
+                }
                 return Some(addr);
             }
         }
@@ -247,17 +311,22 @@ impl BitmapAllocator {
         // Wrap-around: scan from 0 to start_word
         for wi in 0..start_word {
             let w = unsafe { *bitmap_u64.add(wi) };
-            let candidates = !w
+            let mut candidates = !w
                 & if wi == total_words - 1 && self.total_frames % 64 != 0 {
                     (1u64 << (self.total_frames % 64)) - 1
                 } else {
                     !0u64
                 };
-            if candidates != 0 {
+            while candidates != 0 {
                 let bit = candidates.trailing_zeros() as usize;
                 let idx = wi * 64 + bit;
+                if self.is_reserved_frame(idx) {
+                    candidates &= !(1u64 << bit);
+                    continue;
+                }
                 self.set_used(idx);
                 inner.next_free = idx + 1;
+                self.next_free_hint.store(idx + 1, Ordering::Relaxed);
                 let addr = (idx as u64) * 4096;
                 debug_assert!(
                     addr < self.kernel_start || addr >= self.kernel_end,
@@ -266,6 +335,11 @@ impl BitmapAllocator {
                     self.kernel_start,
                     self.kernel_end
                 );
+                if addr >= self.kernel_start && addr < self.kernel_end {
+                    self.set_free(idx);
+                    candidates &= !(1u64 << bit);
+                    continue;
+                }
                 return Some(addr);
             }
         }
@@ -276,12 +350,21 @@ impl BitmapAllocator {
     ///
     /// Returns the physical address of the first frame, or `None` if
     /// insufficient contiguous frames are available.
+    /// Runtime-enforces kernel + frame 0 reservation (never returns overlapping range).
     pub fn alloc_contiguous(&self, count: usize) -> Option<u64> {
-        let mut inner = self.inner.lock();
+        // Fallible alias kept for callers that used expect; new code prefers try_alloc_contiguous
+        self.try_alloc_contiguous(count).ok()
+    }
+
+    /// Fallible contiguous allocation — returns Err(NoFrames) instead of panicking.
+    /// Used by smp::allocate_ap_stack and heap::allocate_pages.
+    pub fn try_alloc_contiguous(&self, count: usize) -> Result<u64, AllocError> {
         if count == 0 || count > self.total_frames {
-            return None;
+            return Err(AllocError::InvalidCount);
         }
-        let next_free = inner.next_free;
+        let mut inner = self.inner.lock();
+        let hint = self.next_free_hint.load(Ordering::Relaxed);
+        let next_free = hint.max(inner.next_free);
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
         let last_bits = if self.total_frames % 64 == 0 {
@@ -369,25 +452,67 @@ impl BitmapAllocator {
         };
 
         // Scan from next_free to end-of-bitmap, then wrap around from 0.
-        let run = find_run(next_free, self.total_frames).or_else(|| find_run(0, next_free));
-        if let Some(run_start) = run {
-            for j in run_start..run_start + count {
-                self.set_used(j);
+        // Runtime reserve: skip runs overlapping kernel or frame 0 by re-probing.
+        let mut lo = next_free;
+        let mut hi = self.total_frames;
+        let mut tried_wrap = false;
+        loop {
+            if let Some(run_start) = find_run(lo, hi) {
+                if self.range_overlaps_kernel(run_start, count) {
+                    // treat as occupied, skip past it and continue search in same half
+                    lo = run_start + 1;
+                    if lo + count > hi {
+                        if !tried_wrap && hi == self.total_frames {
+                            lo = 0;
+                            hi = next_free;
+                            tried_wrap = true;
+                            continue;
+                        } else {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+                for j in run_start..run_start + count {
+                    self.set_used(j);
+                }
+                inner.next_free = run_start + count;
+                self.next_free_hint.store(run_start + count, Ordering::Relaxed);
+                let addr = (run_start as u64) * 4096;
+                let end_addr = addr + (count as u64) * 4096;
+                debug_assert!(
+                    end_addr <= self.kernel_start || addr >= self.kernel_end,
+                    "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
+                    addr,
+                    end_addr,
+                    self.kernel_start,
+                    self.kernel_end
+                );
+                if end_addr > self.kernel_start && addr < self.kernel_end {
+                    // Runtime reserve enforcement
+                    for j in run_start..run_start + count {
+                        self.set_free(j);
+                    }
+                    lo = run_start + 1;
+                    continue;
+                }
+                return Ok(addr);
+            } else {
+                if !tried_wrap && hi == self.total_frames {
+                    lo = 0;
+                    hi = next_free;
+                    tried_wrap = true;
+                    continue;
+                }
+                break;
             }
-            inner.next_free = run_start + count;
-            let addr = (run_start as u64) * 4096;
-            let end_addr = addr + (count as u64) * 4096;
-            debug_assert!(
-                end_addr <= self.kernel_start || addr >= self.kernel_end,
-                "alloc_contiguous: range [{:#x}, {:#x}) overlaps kernel [{:#x}, {:#x})",
-                addr,
-                end_addr,
-                self.kernel_start,
-                self.kernel_end
-            );
-            return Some(addr);
         }
-        None
+        Err(AllocError::NoFrames)
+    }
+
+    /// Non-fallible wrapper for legacy callers; prefer try_alloc_contiguous.
+    pub fn alloc_contiguous_checked(&self, count: usize) -> Option<u64> {
+        self.try_alloc_contiguous(count).ok()
     }
 
     /// Mark a physical address range as used (reserved).
@@ -427,10 +552,30 @@ impl BitmapAllocator {
         if idx >= self.total_frames {
             return;
         }
+        // Never free reserved frames via runtime guard (warn in debug).
+        if idx == 0 || ( (idx as u64)*4096 >= self.kernel_start && (idx as u64)*4096 < self.kernel_end) {
+            debug_assert!(false, "phys_alloc::free: attempt to free reserved frame {:#x}", addr);
+            crate::drivers::serial::SerialPort::puts("[alloc] WARN: free reserved frame ");
+            crate::drivers::serial::SerialPort::put_hex(addr);
+            crate::drivers::serial::SerialPort::puts("\n");
+            return;
+        }
         // INV-PA-03: clear bit
         self.set_free(idx);
         if idx < inner.next_free {
             inner.next_free = idx;
+        }
+        // Shard hint backwards if this is earlier.
+        let cur = self.next_free_hint.load(Ordering::Relaxed);
+        if idx < cur {
+            // Best-effort CAS loop; Relaxed ok for hint.
+            let mut current = cur;
+            while idx < current {
+                match self.next_free_hint.compare_exchange_weak(current, idx, Ordering::Relaxed, Ordering::Relaxed) {
+                    Ok(_) => break,
+                    Err(v) => current = v,
+                }
+            }
         }
     }
 

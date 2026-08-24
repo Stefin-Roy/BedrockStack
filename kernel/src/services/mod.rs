@@ -12,6 +12,7 @@ pub mod pci_config;
 pub mod pci_device;
 pub mod phys_mem;
 pub mod platform;
+pub mod random;
 pub mod serial;
 pub mod timer_queue;
 pub mod universal_timer;
@@ -34,6 +35,7 @@ use msi::MsiAllocator;
 use pci_config::PciConfigSpace;
 use pci_device::PciDeviceManager;
 use platform::PlatformControl;
+use random::Random;
 use serial::SerialConsole;
 use universal_timer::UniversalTimer;
 
@@ -52,6 +54,7 @@ pub struct KernelServices {
     pub pci: &'static dyn PciDeviceManager,
     pub acpi: Option<&'static dyn AcpiProvider>,
     pub dma: &'static dyn DmaAllocator,
+    pub random: &'static dyn Random,
 }
 
 /// Build the platform-appropriate service container.

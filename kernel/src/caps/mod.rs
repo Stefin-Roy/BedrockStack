@@ -142,21 +142,29 @@ fn canonicalize_proc_alias<'a>(
 ) -> Result<Option<alloc::vec::Vec<&'a str>>, UnispaceError> {
     if components.len() >= 2 && components[0] == "proc" && components[1] != "self" {
         if let Some(target) = parse_pid(components[1]) {
-            // Caller must be ancestor (or self) of target to use alias
-            if let Some(caller) = crate::task::current_pid() {
-                if crate::task::is_ancestor(caller, target) {
-                    // Build canonical vec with [1] = "self"
-                    let mut canon = Vec::with_capacity(components.len());
-                    canon.push(components[0]);
-                    canon.push("self");
-                    canon.extend_from_slice(&components[2..]);
-                    return Ok(Some(canon));
+            #[cfg(target_arch = "x86_64")]
+            {
+                // Caller must be ancestor (or self) of target to use alias
+                if let Some(caller) = crate::task::current_pid() {
+                    if crate::task::is_ancestor(caller, target) {
+                        // Build canonical vec with [1] = "self"
+                        let mut canon = Vec::with_capacity(components.len());
+                        canon.push(components[0]);
+                        canon.push("self");
+                        canon.extend_from_slice(&components[2..]);
+                        return Ok(Some(canon));
+                    } else {
+                        // Hide existence of other tasks from non-ancestors
+                        return Err(UnispaceError::NotFound);
+                    }
                 } else {
-                    // Hide existence of other tasks from non-ancestors
-                    return Err(UnispaceError::NotFound);
+                    // No current task → kernel bypass already handled earlier; treat as no alias
+                    return Ok(None);
                 }
-            } else {
-                // No current task → kernel bypass already handled earlier; treat as no alias
+            }
+            #[cfg(not(target_arch = "x86_64"))]
+            {
+                let _ = target;
                 return Ok(None);
             }
         }
@@ -272,13 +280,20 @@ pub fn filter_listing_on(
             // Proc alias for /proc listing: /proc/<pid> visible if caller is ancestor and has proc/self R
             let is_proc_numeric_child = dir_components == ["proc"] && is_numeric_pid(&e.name);
             let ancestor_allows = if is_proc_numeric_child {
-                if let Some(pid) = parse_pid(&e.name) {
-                    if let Some(caller) = crate::task::current_pid() {
-                        crate::task::is_ancestor(caller, pid)
+                #[cfg(target_arch = "x86_64")]
+                {
+                    if let Some(pid) = parse_pid(&e.name) {
+                        if let Some(caller) = crate::task::current_pid() {
+                            crate::task::is_ancestor(caller, pid)
+                        } else {
+                            false
+                        }
                     } else {
                         false
                     }
-                } else {
+                }
+                #[cfg(not(target_arch = "x86_64"))]
+                {
                     false
                 }
             } else {
@@ -366,6 +381,7 @@ pub fn filter_listing(caps: &[Cap], dir_path: &str, names: Vec<crate::unispace::
         .into_iter()
         .filter(|e| {
             // Alias: /proc/<pid> -> /proc/self when ancestor
+            #[cfg(target_arch = "x86_64")]
             if dir_path == "proc" && is_numeric_pid(&e.name) {
                 if let Some(pid) = parse_pid(&e.name) {
                     if let Some(caller) = crate::task::current_pid() {
@@ -621,6 +637,9 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     // dev/fb + methods
     add("dev/fb", None, Perm::RW);
     for m in ["mode", "clear"] { add("dev/fb", Some(m), Perm::RW); }
+    // dev/random + dev/urandom (CSPRNG devices, no methods)
+    add("dev/random", None, Perm::RW);
+    add("dev/urandom", None, Perm::RW);
     // driver
     add("driver/debugserial", None, Perm::RW);
     add("driver/audio", None, Perm::RW);
@@ -628,9 +647,10 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     // input
     for f in ["input/devices", "input/events", "input/overflows", "input/kbd"] { add(f, None, Perm::RW); }
     for m in ["get", "flush"] { add("input/kbd", Some(m), Perm::RW); }
-    // kernel/timer
+    // kernel/timer + bootargs
     add("kernel/timer", None, Perm::RW);
     for m in ["sleep", "sleep_ms", "until", "epoch_secs"] { add("kernel/timer", Some(m), Perm::RW); }
+    add("kernel/bootargs", None, Perm::RW);
     // proc - static self subtree
     for p in ["proc/self", "proc/self/status", "proc/self/mem", "proc/self/args", "proc/self/caps", "proc/self/std", "proc/self/std/in", "proc/self/std/out", "proc/self/std/err"] {
         add(p, None, Perm::RW);

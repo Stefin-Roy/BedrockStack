@@ -68,6 +68,7 @@ static TIMER_METHODS: [MethodDesc; 4] = [
 pub fn register() -> Result<(), UnispaceError> {
     let kernel = Arc::new(SimpleDir::new());
     kernel.insert("timer", Arc::new(TimerObject));
+    kernel.insert("bootargs", Arc::new(BootargsObject));
     super::super::register("kernel", kernel)
 }
 
@@ -111,6 +112,27 @@ impl Object for TimerObject {
             _ => return Err(UnispaceError::MethodNotFound),
         }
         Ok(())
+    }
+}
+
+/// `/kernel/bootargs`: read = raw boot command line as Blob (may be empty).
+/// No methods – the value is the Multiboot2 tag 1 string or empty on UEFI.
+struct BootargsObject;
+
+impl Object for BootargsObject {
+    fn kind(&self) -> ObjectKind {
+        ObjectKind::Service
+    }
+    fn value_schema(&self) -> &'static Schema {
+        &schema::SCHEMA_BLOB
+    }
+    fn methods(&self) -> &'static [MethodDesc] {
+        &[]
+    }
+    fn read_value(&self, out: &mut Vec<u8>, _max: usize) -> Result<(), UnispaceError> {
+        let s = crate::bootargs::get().unwrap_or("");
+        let v = Value::Bytes(s.as_bytes().to_vec());
+        schema::encode_value(&v, &schema::SCHEMA_BLOB, out)
     }
 }
 

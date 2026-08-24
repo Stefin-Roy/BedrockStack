@@ -81,10 +81,11 @@ static FB_METHODS: [MethodDesc; 2] = [
 
 const READ_CHUNK: usize = 65536;
 
-/// Register the `/dev` system (device objects).  Currently only `/dev/fb`.
+/// Register the `/dev` system (device objects).  Currently `/dev/fb` + `/dev/random` + `/dev/urandom`.
 pub fn register() -> Result<(), UnispaceError> {
     let dev = Arc::new(SimpleDir::new());
     dev.insert("fb", Arc::new(FbObject));
+    super::random::install(&dev);
     super::super::register("dev", dev)
 }
 

@@ -105,6 +105,29 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
 
         match typ {
             0 => break,
+            1 if size >= 9 => {
+                // Boot command line: string at tag+8, NUL-terminated, size includes header.
+                let str_len = (size - 8) as usize;
+                let raw = unsafe { core::slice::from_raw_parts(tag.add(8), str_len) };
+                let nul = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                let trimmed = &raw[..nul];
+                if !trimmed.is_empty() {
+                    SerialPort::puts("[mb2] cmdline: ");
+                    if let Ok(s) = core::str::from_utf8(trimmed) {
+                        // Trim to 128 for log brevity, ensure not to split UTF8 mid-char (cmdline is ASCII).
+                        let print_len = core::cmp::min(s.len(), 128);
+                        SerialPort::puts(&s[..print_len]);
+                    } else {
+                        SerialPort::puts("<non-utf8 ");
+                        SerialPort::put_u64(trimmed.len() as u64);
+                        SerialPort::puts(" bytes>");
+                    }
+                    SerialPort::puts("\n");
+                } else {
+                    SerialPort::puts("[mb2] cmdline: <empty>\n");
+                }
+                unsafe { crate::bootargs::init_from_slice(trimmed) };
+            }
             6 if size >= 16 && region_count < MAX_REGIONS => {
                 let entry_size = unsafe { r32(tag, 8) } as usize;
                 let entries_base = unsafe { tag.add(16) };
@@ -199,6 +222,12 @@ pub unsafe extern "C" fn rust_entry_mb2(magic: u32, info: *const u8) -> ! {
         }
 
         tag = tag_next(tag);
+    }
+
+    // If no cmdline tag was delivered, mark bootargs as empty so
+    // `is_nokaslr()` is deterministic and `get()` returns Some("").
+    if !crate::bootargs::is_init() {
+        crate::bootargs::init_empty();
     }
 
     let memory_map: &'static [MemoryRegion] =

@@ -1,5 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
@@ -16,12 +16,12 @@ const MIN_BLOCK_SIZE: usize = HEADER_SIZE + BACKPTR_SIZE + MIN_ALLOC;
 const HEAP_INIT_PAGES: usize = 256;
 const HEAP_GROW_PAGES: usize = 16;
 
-// Heap chunks remain mapped after becoming idle.  Reclaiming them from
-// `GlobalAlloc::dealloc` requires a synchronous cross-CPU TLB shootdown, and
-// that is not a safe operation on the allocator's hot path: an online CPU may
-// be in an interrupt-disabled section and unable to acknowledge the IPI.
-// Keeping the chunk mapped is safe and lets the allocator reuse its free
-// blocks; the 512 MiB heap arena is deliberately sized for this policy.
+// Heap chunk reclaim — disabled by default.  The drain+coalesce proof (is_single_free_block
+// after drain_cached_blocks+coalesce_all, then unmap_range_collect+free_frames exact count)
+// is implemented but not yet stress-verified under SMP shootdown (`HEAP` is `Mutex` not
+// `IrqMutex` so an IRQ-time `alloc` miss can spin on `HEAP`). Keep disabled until
+// `heap_trace` drain proof and multi-core grow+reclaim stress passes QEMU.
+// See invariants-04-mm-heap.md:HEAP-007 / HEAP-013.
 const ENABLE_HEAP_CHUNK_RECLAIM: bool = false;
 
 // ── Free-list integrity guards ─────────────────────────────────────────
@@ -914,7 +914,11 @@ static HEAP: Mutex<HeapInner> = Mutex::new(HeapInner::empty());
 /// kernel heap (i.e. lives for the entire remaining boot sequence).  This
 /// pointer is set once by `init()`, but may be *updated* after a move with
 /// `set_phys_allocator()`.
-static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
+///
+/// Uses `AtomicPtr` for lock-free interior mutability – replaces the prior
+/// `Once<SyncUnsafeCell>` which relied on unsafe `Sync` impl.
+static PHYS_ALLOCATOR: AtomicPtr<BitmapAllocator> = AtomicPtr::new(core::ptr::null_mut());
+
 
 /// Update the physical allocator pointer after a move.
 ///
@@ -924,21 +928,13 @@ static mut PHYS_ALLOCATOR: *mut BitmapAllocator = core::ptr::null_mut();
 /// continue to work.
 pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
     let new_ptr = phys as *mut BitmapAllocator;
-    unsafe {
-        let old = PHYS_ALLOCATOR;
-        // Once set, the allocator must live at a stable address (`Kernel` owns it).
-        // A move without updating would leave the stashed pointer dangling;
-        // updating to the same address is idempotent (e.g. `lib.rs:run()` re-point).
-        if !old.is_null() && old != new_ptr {
-            // Log the re-point — useful if `Kernel::new` → `init` → `run` moves
-            // the allocator; staying silent would hide a use-after-move.
-            SerialPort::puts("[heap] set_phys_allocator re-point ");
-            SerialPort::put_hex(old as u64);
-            SerialPort::puts(" -> ");
-            SerialPort::put_hex(new_ptr as u64);
-            SerialPort::puts("\n");
-        }
-        PHYS_ALLOCATOR = new_ptr;
+    let old = PHYS_ALLOCATOR.swap(new_ptr, Ordering::Relaxed);
+    if !old.is_null() && old != new_ptr {
+        SerialPort::puts("[heap] set_phys_allocator re-point ");
+        SerialPort::put_hex(old as u64);
+        SerialPort::puts(" -> ");
+        SerialPort::put_hex(new_ptr as u64);
+        SerialPort::puts("\n");
     }
     crate::acpi::update_alloc(new_ptr);
     crate::services::dma::update_dma_alloc(new_ptr);
@@ -946,7 +942,7 @@ pub fn set_phys_allocator(phys: &mut BitmapAllocator) {
 
 /// Return a raw pointer to the physical allocator (may be null if uninitialised).
 pub fn phys_allocator_raw() -> *mut BitmapAllocator {
-    unsafe { PHYS_ALLOCATOR }
+    PHYS_ALLOCATOR.load(Ordering::Relaxed)
 }
 
 /// Return a mutable reference to the physical allocator.
@@ -954,7 +950,7 @@ pub fn phys_allocator_raw() -> *mut BitmapAllocator {
 /// # Panics
 /// Panics if the allocator has not been initialised yet.
 pub fn get_phys_allocator_mut() -> &'static mut BitmapAllocator {
-    let ptr = unsafe { PHYS_ALLOCATOR };
+    let ptr = PHYS_ALLOCATOR.load(Ordering::Relaxed);
     if ptr.is_null() {
         SerialPort::puts("[heap] FATAL: no physical allocator\n");
         loop {}
@@ -978,9 +974,8 @@ unsafe fn phys_allocator() -> &'static mut BitmapAllocator {
 pub unsafe fn init(root: u64, phys: &mut BitmapAllocator) {
     SerialPort::puts("[heap] init\n");
 
-    unsafe {
-        PHYS_ALLOCATOR = phys as *mut BitmapAllocator;
-    }
+    let ptr = phys as *mut BitmapAllocator;
+    PHYS_ALLOCATOR.store(ptr, Ordering::Relaxed);
 
     let mut heap = HEAP.lock();
     heap.root = root;
@@ -998,9 +993,20 @@ pub unsafe fn init(root: u64, phys: &mut BitmapAllocator) {
 fn allocate_pages(heap: &mut HeapInner, count: usize) {
     let phys = unsafe { phys_allocator() };
 
-    let Some(pa) = phys.alloc_contiguous(count) else {
-        SerialPort::puts("[heap] WARN: no contiguous frames for heap growth\n");
-        return;
+    let pa = match phys.try_alloc_contiguous(count) {
+        Ok(pa) => pa,
+        Err(crate::mm::phys_alloc::AllocError::NoFrames) => {
+            SerialPort::puts("[heap] WARN: NoFrames for heap growth count=");
+            SerialPort::put_u64(count as u64);
+            SerialPort::puts(" free=");
+            SerialPort::put_u64(phys.free_frames() as u64);
+            SerialPort::puts("\n");
+            return;
+        }
+        Err(crate::mm::phys_alloc::AllocError::InvalidCount) => {
+            SerialPort::puts("[heap] WARN: InvalidCount for heap growth\n");
+            return;
+        }
     };
 
     let size = (count as u64) * 4096;

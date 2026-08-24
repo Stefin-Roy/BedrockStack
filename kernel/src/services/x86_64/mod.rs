@@ -33,5 +33,6 @@ pub fn x86_services(
         pci: x86_pci_device::init(),
         acpi: acpi_provider,
         dma: crate::services::dma::init_dma_allocator(root, alloc),
+        random: crate::services::random::init(),
     }
 }

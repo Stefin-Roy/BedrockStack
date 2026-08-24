@@ -275,6 +275,12 @@ impl Vmm {
     /// before the collected frames are released to the allocator.
     #[cfg(target_arch = "x86_64")]
     fn reclaim_tables(&self, pending: &mut PendingFrames, first_cleared: u64) {
+        // Clone roots share higher-half subtrees; reclaim is deferred while any clone lives.
+        // The x86_64 helper keeps `keep_frames` guard — no assert here so normal process teardown
+        // (which has live clones) does not panic in debug (`panic=abort` is fatal).
+        if has_clone_roots() {
+            return;
+        }
         x86_64::reclaim_empty_tables(self.root, pending, first_cleared);
     }
 
@@ -495,14 +501,72 @@ impl Vmm {
 pub fn flush_tlb() {
     #[cfg(target_arch = "x86_64")]
     unsafe {
-        core::arch::asm!(
-            "mov rax, cr3; mov cr3, rax",
-            options(nostack, preserves_flags)
-        );
+        // Prefer INVPCID(type2 = all-context) when CR4.PCIDE is set and CPU
+        // advertises INVPCID (CPUID leaf 7 EBX[10]). Falls back to CR3 reload.
+        // Batched INVLPG is used by range paths via flush_tlb_range; full flush here keeps shootdown semantics.
+        if has_pcide() && has_invpcid() {
+            invpcid_all();
+        } else {
+            core::arch::asm!(
+                "mov rax, cr3; mov cr3, rax",
+                options(nostack, preserves_flags)
+            );
+        }
     }
     #[cfg(target_arch = "riscv64")]
     unsafe {
         core::arch::asm!("sfence.vma", options(nostack));
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_pcide() -> bool {
+    let cr4: u64;
+    unsafe { core::arch::asm!("mov {0}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags)) };
+    (cr4 & (1 << 17)) != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn has_invpcid() -> bool {
+    let max = core::arch::x86_64::__cpuid(0).eax;
+    if max < 7 {
+        return false;
+    }
+    let res = core::arch::x86_64::__cpuid_count(7, 0);
+    (res.ebx & (1 << 10)) != 0
+}
+
+#[cfg(target_arch = "x86_64")]
+#[repr(C, align(16))]
+struct InvpcidDesc {
+    pcid: u64,
+    addr: u64,
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn invpcid_all() {
+    // Type 2 = all-context invalidation (includes globals)
+    let desc = InvpcidDesc { pcid: 0, addr: 0 };
+    unsafe {
+        core::arch::asm!(
+            "invpcid {0}, [{1}]",
+            in(reg) 2u64,
+            in(reg) &desc,
+            options(nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+pub fn flush_tlb_range(start: u64, size: u64) {
+    // Batched INVLPG for range: iterate per 4K. Caller must have CR4.PCIDE check to prefer INVPCID for full flush.
+    let mut addr = start & !0xFFF;
+    let end = (start + size + 0xFFF) & !0xFFF;
+    while addr < end {
+        unsafe { core::arch::asm!("invlpg [{0}]", in(reg) addr, options(nostack, preserves_flags)) };
+        addr += 0x1000;
     }
 }
 
@@ -713,7 +777,7 @@ pub fn shootdown_tlb() {
         crate::arch::riscv64::sbi::send_ipi(1u64 << cpu);
     }
 
-    // Wait for every targeted CPU to flush and acknowledge.
+    // Wait for every targeted CPU to flush and acknowledge with 100ms timeout.
     for cpu in 0..count {
         if cpu == my {
             continue;
@@ -721,8 +785,53 @@ pub fn shootdown_tlb() {
         if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
             continue;
         }
+        // Use TSC-based deadline if calibrated, else spin count fallback (both arches).
+        #[cfg(target_arch = "x86_64")]
+        let use_tsc = crate::platform::x86_64_pc::apic::tsc_hz() != 0;
+        #[cfg(target_arch = "x86_64")]
+        let deadline_ns = if use_tsc {
+            crate::platform::x86_64_pc::apic::tsc_now_ns().wrapping_add(100_000_000)
+        } else {
+            0
+        };
+        let mut spins: u64 = 0;
         while TLB_ACK[cpu].load(Ordering::Acquire) < seq {
             core::hint::spin_loop();
+            #[cfg(target_arch = "x86_64")]
+            {
+                if use_tsc {
+                    if crate::platform::x86_64_pc::apic::tsc_now_ns() >= deadline_ns {
+                        crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout cpu=");
+                        crate::drivers::serial::SerialPort::put_u64(cpu as u64);
+                        crate::drivers::serial::SerialPort::puts(" seq=");
+                        crate::drivers::serial::SerialPort::put_u64(seq);
+                        crate::drivers::serial::SerialPort::puts("\n");
+                        crate::drivers::serial::SerialPort::puts("[vmm] hlt\n");
+                        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) } }
+                    }
+                } else {
+                    spins += 1;
+                    if spins > 100_000_000 {
+                        crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout (no TSC) cpu=");
+                        crate::drivers::serial::SerialPort::put_u64(cpu as u64);
+                        crate::drivers::serial::SerialPort::puts("\n");
+                        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) } }
+                    }
+                }
+            }
+            #[cfg(target_arch = "riscv64")]
+            {
+                spins += 1;
+                if spins > 100_000_000 {
+                    crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout cpu=");
+                    crate::drivers::serial::SerialPort::put_u64(cpu as u64);
+                    crate::drivers::serial::SerialPort::puts(" seq=");
+                    crate::drivers::serial::SerialPort::put_u64(seq);
+                    crate::drivers::serial::SerialPort::puts("\n");
+                    crate::drivers::serial::SerialPort::puts("[vmm] hlt\n");
+                    loop { unsafe { core::arch::asm!("wfi", options(nomem, nostack)) } }
+                }
+            }
         }
     }
 }

@@ -18,9 +18,11 @@ pub mod filesystems;
 pub mod input;
 #[cfg(target_arch = "x86_64")]
 pub mod kerneldump;
+pub mod bootargs;
 pub mod mm;
 pub mod pci;
 pub mod platform;
+pub mod random;
 pub mod services;
 pub mod smp;
 #[cfg(target_arch = "x86_64")]
@@ -239,6 +241,10 @@ impl Kernel {
         unsafe {
             crate::smp::early_init_bsp();
         }
+        // Early CSPRNG — RDRAND + TSC jitter before paging, no heap/RTC.
+        crate::random::init_early();
+        // Real KASLR: 4 MiB Csprng, filtered, actually slid in paging::setup.
+        crate::mm::layout::init_kaslr();
         self.switch_to_higher_half();
         crate::mm::layout::verify_layout();
 
@@ -252,6 +258,9 @@ impl Kernel {
         crate::drivers::serial::switch_to_growable();
 
         CurrentArch::init();
+
+        // Strong reseed — mixes calibrated TSC + RTC seconds.
+        crate::random::reseed_strong();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
         self.init_acpi();

@@ -30,13 +30,46 @@ use crate::mm::layout::to_physmap;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
 
+fn try_get_alloc() -> Option<*const BitmapAllocator> {
+    let ptr = crate::mm::heap::phys_allocator_raw();
+    if ptr.is_null() { None } else { Some(ptr as *const BitmapAllocator) }
+}
+
 /// 4 KiB page.
 pub const PAGE: u64 = 4096;
 
 /// Default per-process committed frame budget (256 MiB), the hard ceiling for
 /// `brk` + `mmap` combined. The physical allocator is the final arbiter — this
 /// is an additional guard so one runaway process cannot starve every driver.
+/// Effective budget is dynamic: min(256MiB, free_ram/16) in pages, where free_ram
+/// is current free frames * 4K. This throttles when RAM is scarce.
 const USER_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+const USER_BUDGET_CEILING_PAGES: u64 = USER_BUDGET_BYTES / PAGE;
+/// Minimum dynamic budget floor: 16 MiB so tiny-free systems can still make progress.
+const USER_BUDGET_FLOOR_PAGES: u64 = (16 * 1024 * 1024) / PAGE;
+
+/// Compute dynamic budget based on free RAM left. Keeps ceiling but throttles
+/// when free is low. Called with the allocator on every brk/mmap budget check.
+/// This is `O(total_frames)` (bitmap scan) — callers should compute it *before*
+/// taking `ADDR_SPACES` lock to avoid holding the lock during the scan.
+fn dynamic_budget_pages(alloc: &BitmapAllocator) -> u64 {
+    let free_pages = alloc.free_frames() as u64;
+    let frac = free_pages / 16;
+    let clamped = frac.clamp(USER_BUDGET_FLOOR_PAGES, USER_BUDGET_CEILING_PAGES);
+    // Also clamp by free/4 to not promise more than we could actually give
+    let by_free_quarter = free_pages / 4;
+    core::cmp::min(clamped, by_free_quarter.max(USER_BUDGET_FLOOR_PAGES))
+}
+
+#[allow(dead_code)]
+#[inline]
+fn effective_budget_pages(_asp: &AddressSpace, alloc: &BitmapAllocator) -> u64 {
+    // Genuinely dynamic: free/16 capped, not `min(snapshot, dyn)` which would
+    // pin a process to a low budget forever if forked under pressure. `asp.budget_pages`
+    // remains for introspection (`/proc/.../mem`) but is not a hard cap for growth —
+    // throttling is global, ceiling is `USER_BUDGET_CEILING_PAGES`.
+    dynamic_budget_pages(alloc)
+}
 
 /// errno codes returned from the syscall-facing functions (already negated).
 const EFAULT: i64 = -14;
@@ -106,6 +139,8 @@ static ADDR_SPACES: Mutex<Table> = Mutex::new(Table {
 /// immediately below), and `stack_flags` the stack's page permissions.
 ///
 /// Committed-page accounting starts at image + stack pages.
+/// Budget is dynamic (free/16 capped to 256MiB) but register initializes to
+/// ceiling; effective budget is checked per-brk/mmap via `effective_budget_pages`.
 pub fn register(
     root: u64,
     image_floor: u64,
@@ -116,13 +151,20 @@ pub fn register(
     let mut table = ADDR_SPACES.lock();
     let stack_base = stack_top - 8 * PAGE;
     let committed = (image_top - image_floor) / PAGE + 8;
+    // Per-boot fraction via free ram if allocator live: snapshot dynamic budget at register time
+    let init_budget = if let Some(alloc_ptr) = try_get_alloc() {
+        let alloc = unsafe { &*alloc_ptr };
+        dynamic_budget_pages(alloc).max(committed + 16)
+    } else {
+        USER_BUDGET_CEILING_PAGES
+    };
     let asp = AddressSpace {
         root,
         brk_floor: image_top,
         brk_cur: image_top,
         stack_top,
         committed,
-        budget_pages: USER_BUDGET_BYTES / PAGE,
+        budget_pages: init_budget.min(USER_BUDGET_CEILING_PAGES),
         regions: vec![
             Region {
                 kind: RegionKind::Image,
@@ -203,6 +245,8 @@ pub fn summarize(idx: usize) -> Option<MemSummary> {
 /// break. Growth page-rounds up and eagerly commits zeroed, read/write, NX
 /// frames; the region table is only updated after the commit succeeds.
 pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u64, i64> {
+    // Compute dynamic budget before taking ADDR_SPACES lock (free_frames is O(n) bitmap scan).
+    let eff_pages = dynamic_budget_pages(&*alloc);
     let mut table = ADDR_SPACES.lock();
     let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Err(EFAULT);
@@ -232,7 +276,7 @@ pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u6
             return Err(ENOMEM);
         }
         let npages = (new - old) / PAGE;
-        if npages > asp.budget_pages.saturating_sub(asp.committed) {
+        if npages > eff_pages.saturating_sub(asp.committed) {
             return Err(ENOMEM);
         }
         let mut vmm = Vmm::from_root(asp.root);
@@ -253,18 +297,25 @@ pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u6
             }),
         }
     } else {
-        // Shrink: release committed frames below the new break.
+        // Shrink: update bookkeeping under lock, then release frames after dropping it
+        // so the cross-CPU TLB shootdown (inside release_pages) does not run while
+        // holding ADDR_SPACES – another CPU spinning on that lock would still be
+        // able to take the IPI because the lock is spin::Mutex (IRQs enabled).
         let npages = (old - new) / PAGE;
-        let mut vmm = Vmm::from_root(asp.root);
-        release_pages(&mut vmm, alloc, new, npages);
-        asp.brk_cur = new;
-        asp.committed -= npages;
+        let root = asp.root;
         let heap_pages = (new - asp.brk_floor) / PAGE;
+        asp.brk_cur = new;
+        debug_assert!(npages <= asp.committed, "brk shrink {} > committed {}", npages, asp.committed);
+        asp.committed -= npages;
         if heap_pages == 0 {
             asp.regions.retain(|r| r.kind != RegionKind::Heap);
         } else if let Some(h) = asp.regions.iter_mut().find(|r| r.kind == RegionKind::Heap) {
             h.pages = heap_pages;
         }
+        drop(table);
+        let mut vmm = Vmm::from_root(root);
+        release_pages(&mut vmm, alloc, new, npages);
+        return Ok(new);
     }
     Ok(asp.brk_cur)
 }
@@ -281,6 +332,8 @@ pub fn mmap(
     prot: u64,
     alloc: &mut BitmapAllocator,
 ) -> Result<u64, i64> {
+    // Dynamic budget before lock (see brk).
+    let eff_pages = dynamic_budget_pages(&*alloc);
     let mut table = ADDR_SPACES.lock();
     let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Err(EFAULT);
@@ -310,7 +363,7 @@ pub fn mmap(
         addr
     };
 
-    if npages > asp.budget_pages.saturating_sub(asp.committed) {
+    if npages > eff_pages.saturating_sub(asp.committed) {
         return Err(ENOMEM);
     }
     let mut vmm = Vmm::from_root(asp.root);
@@ -328,16 +381,13 @@ pub fn mmap(
     Ok(vaddr)
 }
 
-/// `munmap(addr, len)`: release and unmap one or more whole anonymous regions.
+/// `munmap(addr, len)`: release and unmap whole or partial anonymous regions.
 ///
-/// `[addr, addr+len)` must exactly cover a run of contiguous `Anon` regions.
-/// Partial-region unmapping (and any attempt on the image, stack or heap) is
-/// rejected with `EINVAL`; the heap shrinks through `brk` instead.
+/// Accepts partial-region unmaps for `Anon` via split: a subrange inside an
+/// `Anon` punches a hole, splitting the region into head/tail remainders.
+/// Whole-region runs are still supported. Attempts on Image/Stack/Heap are
+/// rejected with `EINVAL`.
 pub fn munmap(idx: usize, addr: u64, len: u64, alloc: &mut BitmapAllocator) -> Result<(), i64> {
-    let mut table = ADDR_SPACES.lock();
-    let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
-        return Err(EFAULT);
-    };
     if len == 0 || len % PAGE != 0 || addr % PAGE != 0 {
         return Err(EINVAL);
     }
@@ -345,39 +395,93 @@ pub fn munmap(idx: usize, addr: u64, len: u64, alloc: &mut BitmapAllocator) -> R
         Some(e) => e,
         None => return Err(EINVAL),
     };
-
-    // Collect the anon regions that tile `[addr, end)` exactly.
-    let mut doomed: Vec<usize> = Vec::new();
-    let mut cursor = addr;
-    while cursor < end {
-        let mut hit = None;
+    if end <= addr {
+        return Err(EINVAL);
+    }
+    // Phase 1: validate and patch region table under lock, collecting unmap work for phase 2.
+    let (root, to_unmap) = {
+        let mut table = ADDR_SPACES.lock();
+        let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
+            return Err(EFAULT);
+        };
+        // Collect overlapping Anon regions. Reject non-Anon overlap.
+        let mut hits: Vec<usize> = Vec::new();
         for (i, r) in asp.regions.iter().enumerate() {
-            if r.kind == RegionKind::Anon && r.vaddr == cursor {
-                hit = Some(i);
-                break;
+            if r.end() <= addr || r.vaddr >= end {
+                continue;
+            }
+            if r.kind != RegionKind::Anon {
+                return Err(EINVAL);
+            }
+            hits.push(i);
+        }
+        if hits.is_empty() {
+            return Err(EINVAL);
+        }
+        hits.sort_unstable_by_key(|&i| asp.regions[i].vaddr);
+        let mut cursor = addr;
+        for &i in &hits {
+            let r = asp.regions[i];
+            let ov_start = r.vaddr.max(addr);
+            let ov_end = r.end().min(end);
+            if ov_start > cursor {
+                return Err(EINVAL);
+            }
+            if ov_start == cursor {
+                cursor = ov_end;
+            } else {
+                return Err(EINVAL);
+            }
+            if cursor >= end { break; }
+        }
+        if cursor < end {
+            return Err(EINVAL);
+        }
+        hits.sort_unstable_by(|a, b| b.cmp(a));
+        let root = asp.root;
+        let mut to_unmap: Vec<(u64, u64)> = Vec::new();
+        let mut freed = 0u64;
+        for &idx_hit in &hits {
+            let r = asp.regions[idx_hit];
+            let ov_start = r.vaddr.max(addr);
+            let ov_end = r.end().min(end);
+            let ov_pages = (ov_end - ov_start) / PAGE;
+            to_unmap.push((ov_start, ov_pages));
+            freed += ov_pages;
+            if ov_start == r.vaddr && ov_end == r.end() {
+                asp.regions.remove(idx_hit);
+            } else if ov_start == r.vaddr {
+                let tail_pages = (r.end() - ov_end) / PAGE;
+                asp.regions[idx_hit].vaddr = ov_end;
+                asp.regions[idx_hit].pages = tail_pages;
+            } else if ov_end == r.end() {
+                let head_pages = (ov_start - r.vaddr) / PAGE;
+                asp.regions[idx_hit].pages = head_pages;
+            } else {
+                let head_pages = (ov_start - r.vaddr) / PAGE;
+                let tail_pages = (r.end() - ov_end) / PAGE;
+                let gap_pages = (ov_end - ov_start) / PAGE;
+                let tail_guard = gap_pages >= 1;
+                let tail = Region {
+                    kind: RegionKind::Anon,
+                    vaddr: ov_end,
+                    pages: tail_pages,
+                    flags: r.flags,
+                    guard: tail_guard,
+                };
+                asp.regions[idx_hit].pages = head_pages;
+                asp.regions.insert(idx_hit + 1, tail);
             }
         }
-        let Some(i) = hit else { return Err(EINVAL) };
-        let reg_end = asp.regions[i].end();
-        if reg_end > end {
-            return Err(EINVAL); // partial region: use brk for the heap, not here
-        }
-        doomed.push(i);
-        cursor = reg_end;
+        debug_assert!(freed <= asp.committed, "munmap freed {} > committed {}", freed, asp.committed);
+        asp.committed -= freed;
+        (root, to_unmap)
+    };
+    // Phase 2: outside lock – shootdown + free
+    let mut vmm = Vmm::from_root(root);
+    for (vaddr, npages) in to_unmap {
+        release_pages(&mut vmm, alloc, vaddr, npages);
     }
-
-    let mut vmm = Vmm::from_root(asp.root);
-    let mut freed = 0u64;
-    for &i in &doomed {
-        let r = asp.regions[i];
-        release_pages(&mut vmm, alloc, r.vaddr, r.pages);
-        freed += r.pages;
-    }
-    doomed.sort_unstable_by(|a, b| b.cmp(a));
-    for i in doomed {
-        asp.regions.remove(i);
-    }
-    asp.committed -= freed;
     Ok(())
 }
 

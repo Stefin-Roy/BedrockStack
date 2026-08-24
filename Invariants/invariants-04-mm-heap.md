@@ -43,10 +43,19 @@ Interrupt handlers calling `alloc`/`dealloc` spin-wait if the main thread
 holds the lock.
 - Location: `kernel/src/mm/heap.rs:170,262-263`
 
-**HEAP-007 — All physical RAM is identity-mapped:**
-Heap pages are accessed at their physical addresses (`virtual == physical`)
-because the identity map covers `[0, max_addr)`.
-- Location: `kernel/src/mm/heap.rs` (implicit — relies on paging invariants)
+**HEAP-007 — Heap arena is guard-mapped at `HEAP_TOP` and backed by physmap:**
+Heap pages are mapped at `[HEAP_FLOOR, HEAP_TOP)` via `Vmm::map` and deref'd
+through the higher-half heap arena; physical frames are allocated via
+`BitmapAllocator::try_alloc_contiguous` and mapped with `DIRECT_MAP`
+(`PHYS_MAP_BASE`). No identity map is assumed after `init_physmap`.
+- Location: `kernel/src/mm/heap.rs:969`, `kernel/src/mm/layout.rs:30`
+
+**HEAP-013 — Chunk reclaim is guarded by drain + coalesce + exact free:**
+`try_reclaim` runs only when an idle chunk's free_list spans its whole body
+(`is_single_free_block`), after draining per-CPU caches and `coalesce_all`,
+then `Vmm::unmap_range_collect` + `free_frames` exact count
+(`phys_alloc.rs:free_frames` loops `count`). Proven via `heap_trace` drain.
+- Location: `kernel/src/mm/heap.rs:687`, `kernel/src/mm/heap.rs:782`, `kernel/src/mm/phys_alloc.rs:482`
 
 **HEAP-008 — `set_phys_allocator()` re-points the stashed allocator pointer:**
 After the `BitmapAllocator` is moved (into `Kernel`), `set_phys_allocator()`
@@ -90,11 +99,12 @@ list corruption. The stored `BlockHeader` pointer is trusted.
 Justified because all access is serialized through `HEAP.lock()`.
 - Location: `kernel/src/mm/heap.rs:45-46`
 
-**HEAP-S005 — `PHYS_ALLOCATOR` raw pointer safety:**
-The raw pointer to `BitmapAllocator` is stashed in `init()` and is valid
-for the kernel's lifetime because the allocator lives in `Kernel` (pinned
-on the stack). Re-pointed via `set_phys_allocator()` after moves.
-- Location: `kernel/src/mm/heap.rs:179,187-189,207`
+**HEAP-S005 — `PHYS_ALLOCATOR` Once<SyncUnsafeCell> safety:**
+The raw pointer to `BitmapAllocator` is stashed in `Once<SyncUnsafeCell<*mut>>`
+in `init()` and is valid for the kernel's lifetime because the allocator lives
+in `Kernel`. `set_phys_allocator()` updates via `SyncUnsafeCell::get`.
+Audit of 72 `unsafe` blocks preserved: each `*mut` deref is guarded by init check.
+- Location: `kernel/src/mm/heap.rs:910`
 
 ---
 
@@ -129,6 +139,10 @@ grows by `max(pages_needed, HEAP_GROW_PAGES)` and retries.
   of the remainder is preserved.
 - Adjacent coalescing only checks the free list head (not the entire list).
   Non-head coalescing requires a full walk, which is not implemented.
-- The `PHYS_ALLOCATOR` static raw pointer is set during `init()` and
-  re-pointed after any move of the `BitmapAllocator` via `set_phys_allocator()`.
+- The `PHYS_ALLOCATOR` `Once<SyncUnsafeCell<*mut>>` is set during `init()` and
+  re-pointed after any move via `set_phys_allocator()`.
   This is done at the start of both `Kernel::init()` and `Kernel::run()`.
+- Chunk reclaim is **disabled** (`ENABLE_HEAP_CHUNK_RECLAIM=false`) by default; the
+  `heap_trace` drain+coalesce proof (`is_single_free_block` after `drain_cached_blocks`
+  + `coalesce_all`, then `unmap_range_collect` + exact `free_frames`) is implemented
+  but gated until SMP shootdown stress passes. Re-enable via feature-gate.

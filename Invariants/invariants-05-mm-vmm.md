@@ -31,11 +31,14 @@ The kernel image is mapped at `KERNEL_VMA_BASE + phys_addr` for each
 without changing the linker script.
 - Location: `kernel/src/mm/vmm/mod.rs:79`, `kernel/src/arch/x86_64/paging.rs:129-134`
 
-**VMM-005 — VMM manages intermediate page-table frames:**
+**VMM-005 — VMM manages intermediate page-table frames with PendingFrames reclaim:**
 When creating page-table entries, the arch-specific code allocates frames
-from `BitmapAllocator` for intermediate tables. These frames are never freed
-(mappings are permanent).
-- Location: `kernel/src/mm/vmm/x86_64.rs`, `kernel/src/mm/vmm/riscv64.rs`
+from `BitmapAllocator` for intermediate tables. Frames that become empty after
+`unmap` are collected in `PendingFrames` and freed only after a cross-CPU TLB
+shootdown (`flush_tlb` + `shootdown_tlb`) completes. When `has_clone_roots()`
+is true (live `clone_high_half` sharing the parent's higher-half subtrees),
+empty tables are retained (VA cleared, frame not pushed) and `debug_assert!(!has_clone_roots)` guards the reclaim path.
+- Location: `kernel/src/mm/vmm/mod.rs:276`, `kernel/src/mm/vmm/x86_64.rs:299`
 
 **VMM-006 — Identity map covers `[0, ram_end)`, framebuffer extension beyond:**
 `ram_end = alloc_end().max(apic_base + PAGE_4K)` (x86_64) or
@@ -95,10 +98,12 @@ Maps a single 2 MiB huge page. Panics on alignment violation or OOM.
 - Location: `kernel/src/mm/vmm/mod.rs:135-148`
 
 **VMM-API-006 — `Vmm::unmap(alloc, vaddr, size)`:**
-Unmaps 4 KiB pages. Intermediate tables are NOT freed (leaked intentionally
-for simplicity). `unmap_4k()` unmaps a single page, returning `false` if
-not mapped.
-- Location: `kernel/src/mm/vmm/mod.rs:197-214`
+Unmaps 4 KiB pages. Intermediate tables are reclaimed via `PendingFrames`
+only after `flush_tlb` + `shootdown_tlb`; when `has_clone_roots()` the
+frames are retained (VA cleared). `unmap_4k()` unmaps a single page,
+returning `false` if not mapped. Reclaim is guarded by
+`debug_assert!(!has_clone_roots)`.
+- Location: `kernel/src/mm/vmm/mod.rs:276`, `kernel/src/mm/vmm/x86_64.rs:299`
 
 **VMM-API-007 — `Vmm::translate(vaddr)` → `Option<u64>`:**
 Walks the page table without TLB lookups. Returns the physical address or
@@ -106,9 +111,11 @@ Walks the page table without TLB lookups. Returns the physical address or
 - Location: `kernel/src/mm/vmm/mod.rs:220-225`
 
 **VMM-API-008 — `Vmm::flush_tlb()`:**
-Flushes the TLB for the whole address space (reloads CR3 on x86_64).
-Called after page-table mutation by the kernel VMM consumer.
-- Location: `kernel/src/mm/vmm/mod.rs:228-230`
+Flushes the TLB for the whole address space. On x86_64 uses `INVPCID(type2)` when
+`CR4.PCIDE` and `CPUID:7 EBX[10]` indicate INVPCID, else `INVLPG` batched for ranges
+and `mov cr3,rax` full flush as fallback. `shootdown_tlb` broadcasts via IPI 50
+and busy-waits on `TLB_SEQ`/`TLB_ACK[16]` with 100 ms timeout → `warn+hlt`.
+- Location: `kernel/src/mm/vmm/mod.rs:495`, `kernel/src/mm/vmm/x86_64.rs:trailing`
 
 **VMM-API-009 — `PageFlags` encoding:**
 `READ=1, WRITE=2, EXECUTE=4, NO_CACHE=8, USER=16, WRITE_COMBINING=32`.
@@ -123,9 +130,9 @@ requiring `IA32_PAT` MSR entry 1 to be programmed as `01h` (WC) via
 ## Design Notes
 
 - The VMM is a pure page-table manipulator — it does not manage virtual
-  address space allocation. Callers choose virtual addresses.
-- Intermediate page-table frames are never freed (no reference counting).
-  This is acceptable because mappings are generally permanent.
+   address space allocation. Callers choose virtual addresses.
+- Intermediate page-table frames are reclaimed via `PendingFrames` after a
+  shootdown; when clones exist reclaim is deferred (VMM-005).
 - ACPI and PCI subsystems maintain their own VMM states (`ACPI_STATE`,
   `PCI_VMM`) that share the same root frame and use a bump-allocated
   virtual address range below `KERNEL_VMA_BASE`.

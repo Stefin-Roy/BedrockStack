@@ -15,6 +15,7 @@ mb2_info_req_start:
     .word 1
     .word 0
     .long mb2_info_req_end - mb2_info_req_start
+    .long 1                        // MBI: Boot command line
     .long 4                        // MBI: Basic meminfo
     .long 6                        // MBI: Memory map
     .long 8                        // MBI: Framebuffer

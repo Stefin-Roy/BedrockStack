@@ -82,25 +82,55 @@ pub fn setup(
     let apic_base_msr = Msr::new(IA32_APIC_BASE_MSR);
     let apic_base = unsafe { apic_base_msr.read() } & !(PAGE_4K - 1);
 
-    // ── Kernel image at KERNEL_VMA — the primary map ────────────────
-    // Map every 4 KiB page of `[KERNEL_VMA, kernel_end)` to its physical
-    // backing frame via `phys = vaddr - KERNEL_VMA + KERNEL_LMA_BASE`.
-    // `.text` is RX, `.rela_dyn`/`.rodata` R, and `.data`/`.bss`/`.idt`/
-    // `.stack` RW+NX (see `leaf_flags`).  The currently-executing kernel
-    // (instruction stream AND the high `.stack` at the top of the image,
-    // which is < `kernel_end`) is covered by this mapping.
-    let kernel_start = layout.kernel_start & !(PAGE_4K - 1);
-    let kernel_end = (layout.kernel_end + PAGE_4K - 1) & !(PAGE_4K - 1);
+    // ── Kernel image at KERNEL_VMA - kaslr — the primary map ─────────
+    // True KASLR: image is remapped at randomized VMA `KASLR_BASE`.
+    // Phys backing stays at `KERNEL_LMA_BASE`; `paddr = vaddr - KASLR_BASE + LMA`.
+    // `.text` RX, etc. via `leaf_flags` against the randomized addresses.
+    let kaslr = crate::mm::layout::kaslr_offset();
+    let kaslr_base = KERNEL_VMA_BASE.wrapping_sub(kaslr);
+    // Adjust layout view for permission lookup.
+    let adj_layout = crate::KernelLayout {
+        kernel_start: layout.kernel_start.wrapping_sub(kaslr),
+        kernel_end: layout.kernel_end.wrapping_sub(kaslr),
+        text_start: layout.text_start.wrapping_sub(kaslr),
+        text_end: layout.text_end.wrapping_sub(kaslr),
+        rela_dyn_start: layout.rela_dyn_start.wrapping_sub(kaslr),
+        rela_dyn_end: layout.rela_dyn_end.wrapping_sub(kaslr),
+        rodata_start: layout.rodata_start.wrapping_sub(kaslr),
+        rodata_end: layout.rodata_end.wrapping_sub(kaslr),
+        #[cfg(target_arch = "x86_64")]
+        idt_start: layout.idt_start.wrapping_sub(kaslr),
+        #[cfg(target_arch = "x86_64")]
+        idt_end: layout.idt_end.wrapping_sub(kaslr),
+    };
+    let kernel_start = adj_layout.kernel_start & !(PAGE_4K - 1);
+    let kernel_end = (adj_layout.kernel_end + PAGE_4K - 1) & !(PAGE_4K - 1);
     let mut vaddr = kernel_start;
     while vaddr < kernel_end {
-        let paddr = vaddr - KERNEL_VMA_BASE + KERNEL_LMA_BASE;
+        let paddr = vaddr.wrapping_sub(kaslr_base).wrapping_add(KERNEL_LMA_BASE);
         vmm.map_4k(
             allocator,
             vaddr,
             paddr,
-            leaf_flags(vaddr, layout, fb_start, fb_end),
+            leaf_flags(vaddr, &adj_layout, fb_start, fb_end),
         );
         vaddr += PAGE_4K;
+    }
+    // Keep fixed-VMA alias for the running instruction stream after CR3 switch.
+    // New tables would otherwise unmap the current RIP (`KERNEL_VMA_BASE + off`)
+    // while we are still executing there via the boot tables. Duplicate maps
+    // to the same LMA, no extra frames — both aliases alias. Always map when
+    // slid (overlap cannot happen with 256M min offset and 256M image, but keep
+    // alias unconditionally for correctness if constants change).
+    if kaslr != 0 {
+        let orig_start = layout.kernel_start & !(PAGE_4K - 1);
+        let orig_end = (layout.kernel_end + PAGE_4K - 1) & !(PAGE_4K - 1);
+        let mut v2 = orig_start;
+        while v2 < orig_end {
+            let paddr2 = v2.wrapping_sub(KERNEL_VMA_BASE).wrapping_add(KERNEL_LMA_BASE);
+            vmm.map_4k(allocator, v2, paddr2, leaf_flags(v2, layout, fb_start, fb_end));
+            v2 += PAGE_4K;
+        }
     }
 
     // ── Minimal identity windows ────────────────────────────────────

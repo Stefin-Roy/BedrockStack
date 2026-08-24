@@ -24,5 +24,6 @@ pub fn riscv_services(
         pci: riscv_pci_device::init(),
         acpi: Some(riscv_acpi::init()),
         dma: crate::services::dma::init_dma_allocator(root, alloc),
+        random: crate::services::random::init(),
     }
 }

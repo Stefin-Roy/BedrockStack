@@ -45,6 +45,10 @@ pub extern "sysv64" fn kernel_main(
         unsafe { kernel::arch::x86_64::limiter::enable_cpu_slow_mode() };
     }
 
+    // UEFI has no Multiboot2 cmdline – mark bootargs as empty so
+    // `is_nokaslr()` is well-defined (always false here).
+    kernel::bootargs::init_empty();
+
     // Validate pointers from bootloader before dereferencing
     assert!(!memory_map_ptr.is_null(), "memory_map_ptr is null");
     assert!(!framebuffer_ptr.is_null(), "framebuffer_ptr is null");
@@ -185,6 +189,9 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
         SerialPort::puts("NULL");
     }
     SerialPort::puts("\n");
+
+    // RISC-V has no Multiboot2 – mark bootargs empty.
+    kernel::bootargs::init_empty();
 
     // Parse memory map and RSDP from DTB via the dedicated module.
     let memory_map = kernel::dtb::parse_memory(dtb_ptr);

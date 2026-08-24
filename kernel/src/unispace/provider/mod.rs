@@ -5,6 +5,7 @@ pub mod input;
 pub mod kernel;
 #[cfg(target_arch = "x86_64")]
 pub mod proc;
+pub mod random;
 pub mod sys;
 pub mod vfs;
 

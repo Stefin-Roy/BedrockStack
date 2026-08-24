@@ -746,8 +746,30 @@ pub unsafe fn init(
 
 fn allocate_ap_stack(_cpu_id: u32) -> u64 {
     const AP_STACK_PAGES: usize = 17;
-    let base = crate::mm::heap::get_phys_allocator_mut()
-        .alloc_contiguous(AP_STACK_PAGES)
-        .expect("SMP: OOM for AP stack");
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    let base = match alloc.try_alloc_contiguous(AP_STACK_PAGES) {
+        Ok(b) => b,
+        Err(crate::mm::phys_alloc::AllocError::NoFrames) => {
+            crate::drivers::serial::SerialPort::puts("[smp] FATAL: NoFrames for AP stack, cpu ");
+            crate::drivers::serial::SerialPort::put_u64(_cpu_id as u64);
+            crate::drivers::serial::SerialPort::puts(" free=");
+            crate::drivers::serial::SerialPort::put_u64(alloc.free_frames() as u64);
+            crate::drivers::serial::SerialPort::puts("\n");
+            // No useful fallback — contiguous is required for the 17-page AP stack.
+            // Propagating via try_allocate path would be cleaner; here we halt as before.
+            loop { core::hint::spin_loop(); }
+        }
+        Err(crate::mm::phys_alloc::AllocError::InvalidCount) => {
+            crate::drivers::serial::SerialPort::puts("[smp] FATAL: invalid AP stack pages\n");
+            loop { core::hint::spin_loop(); }
+        }
+    };
     base + AP_STACK_PAGES as u64 * 4096
+}
+
+pub fn try_allocate_ap_stack(_cpu_id: u32) -> Result<u64, crate::mm::phys_alloc::AllocError> {
+    const AP_STACK_PAGES: usize = 17;
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    let base = alloc.try_alloc_contiguous(AP_STACK_PAGES)?;
+    Ok(base + AP_STACK_PAGES as u64 * 4096)
 }

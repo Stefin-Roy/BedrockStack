@@ -297,6 +297,8 @@ unsafe fn new_higher_half_slot(root: u64, vaddr: u64) -> bool {
 /// rather than freed — freeing a shared table would let the clone's next walk
 /// dereference a reallocated frame.
 pub(super) fn reclaim_empty_tables(root: u64, pending: &mut super::PendingFrames, vaddr: u64) {
+    // Guarded by caller `reclaim_tables` (returns early when clones live) and `keep_frames` below.
+    // No debug_assert that panics with `panic=abort` here — clones are normal during process lifetime.
     // Level-0 (leaf) table index, Level-1 (PD), Level-2 (PDPT), Level-3 (PML4).
     #[rustfmt::skip]
     let (i_pt, i_pd, i_pdpt, i_pml4) = (
