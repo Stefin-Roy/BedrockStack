@@ -26,6 +26,13 @@ pub use self::x86_64::clone_high_half;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::destroy_root;
 #[cfg(target_arch = "x86_64")]
+pub use self::x86_64::{
+    clone_user_space_cow,
+    edit_user_leaf, edit_user_leaf_range, user_leaf_make_writable, user_leaf_make_writable_range,
+    user_leaf_repoint_writable, user_leaf_set_pkey_range, user_leaf_write_protect,
+    user_leaf_write_protect_range,
+};
+#[cfg(target_arch = "x86_64")]
 pub use self::x86_64::init_pat_wc;
 #[cfg(target_arch = "x86_64")]
 pub use self::x86_64::make_read_only;

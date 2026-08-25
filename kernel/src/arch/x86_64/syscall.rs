@@ -181,6 +181,8 @@ syscall_entry:
     sti                             # kernel GS/segments live: open the interrupt window
     mov  rdi, rsp                   # &mut SyscallFrame
     call syscall_dispatch
+.globl syscall_resume
+syscall_resume:
     cli                             # close the window before the user selectors load
     SET_DATA_SEL 0x23               # user DS/ES/FS (GS.base stays PerCpu for swapgs)
     pop  r15
@@ -211,6 +213,77 @@ syscall_entry:
     u_rfl = const USER_RFLAGS_OFF,
     u_rip = const USER_RIP_OFF,
 );
+
+// ── fork_child_resume ──────────────────────────────────────────────
+//
+// First-entry stub for a forked child. The scheduler has already installed
+// the child's kernel-stack top in PerCpu.syscall_rsp0 (set_kernel_stack_meta
+// runs before switch_to) and seeded that stack with a copy of the parent's
+// SyscallFrame whose rax is forced to 0 — the fork return value. Land on the
+// frame and fall into the shared sysret epilogue, so the child's first
+// execution is exactly "return from the fork syscall with 0".
+//
+// GS invariant: we are in kernel context (GS.base = PerCpu, KERNEL_GS_BASE =
+// the parent's user GS, inherited through the syscall entry swapgs), which is
+// precisely what syscall_resume's final swapgs/sysretq expects.
+core::arch::global_asm!(
+    r#"
+.globl fork_child_resume
+.code64
+fork_child_resume:
+    mov  rsp, gs:[{p_off}]          # child kernel-stack top
+    sub  rsp, {frame}               # -> seeded SyscallFrame base
+    jmp  syscall_resume
+"#,
+    p_off = const crate::smp::PERCPU_SYSCALL_RSP0_OFF,
+    frame = const FRAME_SIZE,
+);
+
+// ── SMAP fencing ─────────────────────────────────────────────────────
+//
+// With CR4.SMAP set, any kernel-mode *data* access to a user page faults
+// unless AC=1 (`stac`). Every dereference of task-owned user VAs in this
+// kernel happens inside `syscall_dispatch`, so a single guard opened at
+// dispatch entry fences them all: it sets AC on creation and clears it on
+// drop, so no early-return/errno path can leak an open window.
+//
+// The guard must span the whole call (not just the copies) because
+// `scan_user_path` returns slices that borrow validated user memory and are
+// consumed later by the providers. The copy helpers below deliberately do
+// NOT create their own guards — nesting would let an inner Drop clear AC
+// while an outer borrow is still live.
+//
+// Note on scope: interrupts taken mid-syscall run with AC still set. No ISR
+// touches user memory today (they work through physmap/kernel VAs); if one
+// ever does, it must open its own `UserAccess`.
+// STAC/CLAC #UD on CPUs that lack SMAP support (CPUID leaf7.EBX[20]=0) —
+// they are NOT unconditional NOPs. Both fence sites therefore consult
+// `cpufeat::smap_active()` first; when SMAP is off, AC is never touched and
+// user derefs are unrestricted, exactly as before SMAP existed.
+struct UserAccess {
+    _p: core::marker::PhantomData<*mut u8>,
+}
+
+impl UserAccess {
+    #[inline]
+    fn new() -> Self {
+        if crate::arch::x86_64::cpufeat::smap_active() {
+            // SAFETY: CPU supports SMAP (hence STAC/CLAC); only EFLAGS.AC changes.
+            unsafe { core::arch::asm!("stac", options(nomem, nostack)) };
+        }
+        UserAccess { _p: core::marker::PhantomData }
+    }
+}
+
+impl Drop for UserAccess {
+    #[inline]
+    fn drop(&mut self) {
+        if crate::arch::x86_64::cpufeat::smap_active() {
+            // SAFETY: CPU supports SMAP (hence STAC/CLAC); only EFLAGS.AC changes.
+            unsafe { core::arch::asm!("clac", options(nomem, nostack)) };
+        }
+    }
+}
 
 /// Syscall dispatcher — read/write over the unispace namespace.
 ///
@@ -247,10 +320,42 @@ syscall_entry:
 /// r10 (the old fourth argument) is now unused.
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
+    // SMAP fence for every user-VA dereference below (see `UserAccess`).
+    let _ua = UserAccess::new();
+    // PKU: the kernel works with all keys accessible so a task that disabled
+    // its own key can never lock the kernel out of a buffer it must copy.
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let out = dispatch_inner(frame);
+    // Restore the task's own key rights; they persist across sysretq, so the
+    // user resumes under its restrictions. (Handlers that diverge —
+    // `exit`, a kill — never reach this; the next context switch applies the
+    // successor's PKRU instead.)
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    frame.rax = out;
+}
+
+/// PKRU of the current task (0 when in kernel context).
+fn current_task_pkru() -> u32 {
+    let pc = crate::smp::current_per_cpu();
+    let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe { (*(ptr as *const crate::task::Task)).pkru }
+}
+
+fn dispatch_inner(frame: &mut SyscallFrame) -> u64 {
     match frame.rax {
-        0 => sys_read(frame),
-        1 => sys_write(frame),
-        _ => frame.rax = (-38i64) as u64, // ENOSYS
+        0 => {
+            sys_read(frame);
+            frame.rax
+        }
+        1 => {
+            sys_write(frame);
+            frame.rax
+        }
+        _ => (-38i64) as u64, // ENOSYS
 
     }
 }
@@ -596,4 +701,12 @@ pub fn syscall_entry_addr() -> u64 {
         static syscall_entry: u8;
     }
     core::ptr::addr_of!(syscall_entry) as u64
+}
+
+/// Runtime address of the forked-child first-entry stub (see the asm block).
+pub fn fork_child_resume_addr() -> u64 {
+    unsafe extern "C" {
+        static fork_child_resume: u8;
+    }
+    core::ptr::addr_of!(fork_child_resume) as u64
 }

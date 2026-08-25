@@ -80,6 +80,14 @@ pub struct Task {
     pub caps_arc: Option<Arc<Vec<crate::caps::Cap>>>,
     /// Number of 4K pages mapped at CAP_SLOT_VA for the supervisor mirror (0 when none).
     pub caps_pages: usize,
+    /// Base VA of this task's supervisor caps window. Randomized per process
+    /// (`mm::layout::pick_caps_va`); `CAP_SLOT_VA` is only the legacy default
+    /// used until a mirror is first installed.
+    pub caps_slot_va: u64,
+    /// PKU rights register snapshot (2 bits per key; 0 = all accessible).
+    /// Applied on context switch and restored at syscall exit — the kernel
+    /// itself always works with PKRU=0 (`pku_enter`). x86_64 only.
+    pub pkru: u32,
 }
 
 impl Task {
@@ -99,6 +107,8 @@ impl Task {
             caps_phys: 0,
             caps_arc: None,
             caps_pages: 0,
+            caps_slot_va: crate::mm::layout::CAP_SLOT_VA,
+            pkru: 0,
         }
     }
 }
@@ -262,12 +272,11 @@ pub fn alloc_kernel_stack(alloc: &mut BitmapAllocator) -> Option<(u64, usize)> {
     Some((base + KSTACK_SIZE, slot))
 }
 
-/// Allocate and map a capability supervisor window for `root` at `CAP_SLOT_VA`
-/// (supervisor-only READ, no USER). Returns the base physical frame (2 contiguous 4K).
-/// The caller fills it via `caps::serialize_to_page`.
-pub fn alloc_caps_page(root: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
+/// Allocate and map a capability supervisor window for `root` at `va`
+/// (supervisor-only READ, no USER). Returns the base physical frame
+/// (2 contiguous 4K). The caller fills it via `caps::serialize_to_page`.
+pub fn alloc_caps_page(root: u64, va: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
     let phys = alloc.alloc_contiguous(2)?;
-    let va = crate::mm::layout::CAP_SLOT_VA;
     unsafe {
         core::ptr::write_bytes(crate::mm::layout::to_physmap(phys) as *mut u8, 0, 4096);
         core::ptr::write_bytes(crate::mm::layout::to_physmap(phys + 4096) as *mut u8, 0, 4096);
@@ -278,23 +287,32 @@ pub fn alloc_caps_page(root: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
     Some(phys)
 }
 
-/// Unmap and free the capability supervisor window for `root`.
-pub fn free_caps_page(root: u64, alloc: &mut BitmapAllocator) {
-    let va = crate::mm::layout::CAP_SLOT_VA;
+/// Unmap and free the capability supervisor window at `va` for `root`.
+pub fn free_caps_page(root: u64, va: u64, alloc: &mut BitmapAllocator) {
     let mut vmm = Vmm::from_root(root);
     let mut frames: Vec<u64> = Vec::new();
-    vmm.unmap_range_collect(alloc, va, crate::mm::layout::CAP_SLOT_SIZE, &mut frames);
+    vmm.unmap_range_collect(
+        alloc,
+        va,
+        crate::mm::layout::CAP_SLOT_SIZE,
+        &mut frames,
+    );
     debug_assert!(frames.len() <= 2, "caps window should be at most 2 pages");
     for p in frames {
-        unsafe { alloc.free(p); }
+        unsafe { alloc.free(p) };
     }
 }
 
-/// Serialize caps to the supervisor mirror page and map it into `root`.
+/// Serialize caps to a supervisor mirror page and map it into `root` at `va`.
 /// Returns the physical frame (2 pages, see `alloc_caps_page`). The caller
 /// owns the authoritative set as an `Arc<Vec<Cap>>` on the Task.
-pub fn install_caps(root: u64, caps: &[crate::caps::Cap], alloc: &mut BitmapAllocator) -> Option<u64> {
-    let phys = alloc_caps_page(root, alloc)?;
+pub fn install_caps(
+    root: u64,
+    caps: &[crate::caps::Cap],
+    va: u64,
+    alloc: &mut BitmapAllocator,
+) -> Option<u64> {
+    let phys = alloc_caps_page(root, va, alloc)?;
     crate::caps::serialize_to_page(caps, phys);
     Some(phys)
 }
@@ -308,7 +326,7 @@ pub fn grant_cap_to_pid(pid: u64, cap: crate::caps::Cap) -> Result<(), crate::un
         if task.caps_arc.is_none() {
             let alloc = crate::mm::heap::get_phys_allocator_mut();
             let new_caps = Vec::new();
-            if let Some(phys) = install_caps(task.root, &new_caps, alloc) {
+            if let Some(phys) = install_caps(task.root, &new_caps, task.caps_slot_va, alloc) {
                 task.caps_phys = phys;
                 task.caps_arc = Some(Arc::new(new_caps));
             } else {
@@ -509,12 +527,13 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Stash for INIT caps — installed by `load_init_from_esp` before `enter_userspace`.
-static INIT_CAPS_STASH: Mutex<Option<(Arc<Vec<crate::caps::Cap>>, u64)>> = Mutex::new(None);
+/// `(caps, mirror phys, window va)`.
+static INIT_CAPS_STASH: Mutex<Option<(Arc<Vec<crate::caps::Cap>>, u64, u64)>> = Mutex::new(None);
 
-pub fn stash_init_caps(caps: Arc<Vec<crate::caps::Cap>>, phys: u64) {
-    *INIT_CAPS_STASH.lock() = Some((caps, phys));
+pub fn stash_init_caps(caps: Arc<Vec<crate::caps::Cap>>, phys: u64, va: u64) {
+    *INIT_CAPS_STASH.lock() = Some((caps, phys, va));
 }
-fn take_init_caps() -> Option<(Arc<Vec<crate::caps::Cap>>, u64)> {
+fn take_init_caps() -> Option<(Arc<Vec<crate::caps::Cap>>, u64, u64)> {
     INIT_CAPS_STASH.lock().take()
 }
 
@@ -565,6 +584,107 @@ pub fn spawn(mut task: Task) -> u64 {
     crate::unispace::provider::proc::attach(id);
     QUEUE.lock().push_back(leaked);
     id
+}
+
+/// Fork the current user task copy-on-write (`/proc/self:fork`).
+///
+/// The child receives a COW clone of the caller's address space (identical
+/// region bookkeeping, shared frames, writable pages downgraded in both
+/// roots), its own kernel stack seeded with a byte-identical copy of the
+/// caller's live `SyscallFrame` — with rax forced to 0, the fork return
+/// value — and a first-entry stub that falls into the syscall-return
+/// epilogue. The caller (still mid-`:fork` invoke) returns the child's pid.
+///
+/// Semantically: same user memory contents, same brk/stack layout, caps and
+/// args inherited; fds are process-global today so nothing to duplicate.
+///
+/// Errors (negated errno): `-EINVAL` from a kernel-only context, `-ENOMEM`
+/// when any allocation fails (all partial state is rolled back).
+pub fn fork_current() -> Result<u64, i64> {
+    use crate::arch::x86_64::syscall::{fork_child_resume_addr, SyscallFrame};
+
+    let pc = crate::smp::current_per_cpu();
+    let ptr = pc.current_task.load(Ordering::Relaxed);
+    if ptr.is_null() {
+        return Err(-22); // EINVAL: not a task context
+    }
+    // SAFETY: current_task points at a leaked Task for as long as it runs;
+    // only immutable fields are read here.
+    let parent = unsafe { &*(ptr as *const Task) };
+    if parent.vm == 0 {
+        return Err(-22); // EINVAL: kernel-only task has no address space to clone
+    }
+
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+
+    // Snapshot the caller's live syscall frame. It sits directly below
+    // kernel_stack_top: the entry stub builds it there immediately after the
+    // rsp0 xchg, and dispatch-time RSP only ever moves further down.
+    let pframe: SyscallFrame = unsafe {
+        *((parent.kernel_stack_top - core::mem::size_of::<SyscallFrame>() as u64)
+            as *const SyscallFrame)
+    };
+
+    // 1) COW address-space clone. The parent's supervisor caps window is
+    //    excluded from the structural clone (it is re-established privately
+    //    below at the child's own randomized base).
+    let skip_cow = if parent.caps_phys != 0 {
+        Some((parent.caps_slot_va, parent.caps_slot_va + crate::mm::layout::CAP_SLOT_SIZE))
+    } else {
+        None
+    };
+    let (vm, child_root) = crate::mm::usermem::fork_as(parent.vm, alloc, skip_cow)?;
+
+    // 2) Child kernel stack.
+    let Some((kstack_top, slot)) = alloc_kernel_stack(alloc) else {
+        crate::mm::vmm::destroy_root(child_root, alloc);
+        crate::mm::usermem::unregister(vm);
+        return Err(-12); // ENOMEM
+    };
+
+    // 3) Seed the child frame: identical user state, rax = 0.
+    let cframe = kstack_top - core::mem::size_of::<SyscallFrame>() as u64;
+    unsafe {
+        core::ptr::copy_nonoverlapping(&pframe as *const SyscallFrame, cframe as *mut SyscallFrame, 1);
+        (*(cframe as *mut SyscallFrame)).rax = 0;
+    }
+
+    // 4) Task bookkeeping. ctx.rsp is a formality — the resume stub reloads
+    //    rsp from PerCpu.syscall_rsp0 — but keep it consistent.
+    let mut task = Task::new(
+        kstack_top,
+        child_root,
+        parent.user_gs,
+        TaskContext::new(kstack_top, fork_child_resume_addr()),
+    );
+    task.kstack_slot = slot;
+    task.parent_pid = parent.id;
+    task.args = String::from(parent.args.as_str());
+    // Inherit PKU rights: the seeded frame returns through the syscall
+    // epilogue with the parent's PKRU still in the register.
+    task.pkru = parent.pkru;
+
+    // 5) Caps: share the authoritative Arc (grant paths diverge lazily via
+    //    Arc::make_mut) and give the child its own supervisor mirror page at
+    //    its own randomized window base, independent of later parent grants.
+    task.caps_slot_va = crate::mm::layout::pick_caps_va();
+    if let Some(caps) = &parent.caps_arc {
+        match install_caps(child_root, caps.as_slice(), task.caps_slot_va, alloc) {
+            Some(phys) => {
+                task.caps_arc = Some(caps.clone());
+                task.caps_phys = phys;
+                task.caps_pages = parent.caps_pages;
+            }
+            None => {
+                free_kernel_stack(slot, alloc);
+                crate::mm::vmm::destroy_root(child_root, alloc);
+                crate::mm::usermem::unregister(vm);
+                return Err(-12); // ENOMEM
+            }
+        }
+    }
+
+    Ok(spawn(task))
 }
 
 /// Cooperative yield: move the current task to the tail of the run queue and
@@ -1180,7 +1300,7 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
     if task.caps_phys != 0 {
         // If root still live, unmap the slot (destroy_root would free low-half anyway, but be explicit)
         if root != 0 && root != kernel_root() {
-            free_caps_page(root, alloc);
+            free_caps_page(root, task.caps_slot_va, alloc);
         } else {
             // kernel thread caps phys still needs free (2 pages)
             unsafe {
@@ -1290,6 +1410,8 @@ pub fn schedule() {
             let stack_top = t.kernel_stack_top;
             let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
             set_kernel_stack_meta(stack_top);
+            #[cfg(target_arch = "x86_64")]
+            crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
             crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
             *CURRENT.lock() = Some(t);
             (ctx_ptr, root)
@@ -1425,9 +1547,10 @@ pub fn enter_userspace(
     task.kstack_slot = slot;
     task.vm = vm;
     // Adopt stashed INIT caps if present (load_init_from_esp installed them on this root)
-    if let Some((caps, phys)) = take_init_caps() {
+    if let Some((caps, phys, va)) = take_init_caps() {
         task.caps_arc = Some(caps);
         task.caps_phys = phys;
+        task.caps_slot_va = va;
     }
     task.id = next_id();
     lineage_insert(task.id, task.parent_pid);
@@ -1437,6 +1560,8 @@ pub fn enter_userspace(
     let pid = t.id;
     let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
     set_kernel_stack_meta(kernel_stack_top);
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
     crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
     *CURRENT.lock() = Some(t);
 

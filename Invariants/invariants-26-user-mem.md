@@ -1,39 +1,51 @@
-﻿# Eager User Memory — Invariants
+﻿# User Memory — Invariants
 
-**Version:** 0.1.0
-**Date:** 2026-08-12
-**Source:** `kernel/src/mm/usermem.rs`, `kernel/src/task/load.rs`, `kernel/src/task/mod.rs`, `kernel/src/unispace/provider/proc.rs`, `kernel/src/arch/x86_64/syscall.rs`
+**Version:** 0.2.0
+**Date:** 2026-08-25
+**Source:** `kernel/src/mm/usermem.rs`, `kernel/src/mm/fault.rs`, `kernel/src/mm/framecnt.rs`, `kernel/src/task/load.rs`, `kernel/src/task/mod.rs`, `kernel/src/unispace/provider/proc.rs`, `kernel/src/arch/x86_64/syscall.rs`
 **Status:** Stable
 
 ---
 
 ## Design Contract
 
-User-process memory is committed **eagerly and atomically**: the backing
-frames for every mapping are allocated, zeroed and installed in the page
-table at the moment the mapping is created — never on demand. There is no
-demand paging, lazy commit, copy-on-write or swap, and the page-fault handler
-is never used to allocate. This file codifies the invariants that keep that
-contract enforceable.
+User-process memory is committed **eagerly and atomically by default**: the
+backing frames for every mapping are allocated, zeroed and installed in the
+page table at the moment the mapping is created. Two sanctioned exceptions
+exist since v0.2.0:
+
+1. **Lazy commit** — an `mmap` request that passes `prot bit 3 (0x8)`
+   registers its region *without* committing; pages materialize on first
+   touch through the demand-fill fault path, charged against the budget as
+   they appear.
+2. **Copy-on-write fork** — `/proc/self:fork` shares every leaf frame between
+   parent and child with both sides' writable leaves downgraded to read-only;
+   the first write faults into the COW resolver.
+
+The page-fault handler allocates in exactly these cases (`mm::fault`);
+every other ring-3 fault remains fatal for the task. There is still no swap.
+This file codifies the invariants that keep that contract enforceable.
 
 ## State Invariants
 
-**UM-001 — Eager commit at creation:**
+**UM-001 — Eager commit at creation (default):**
 Every user mapping — ELF PT_LOAD segments and the user stack at spawn
-(`task/load.rs` `create_process`), `brk` growth and `mmap` (`mm/usermem.rs`)
-— allocates and zeroes its backing frames synchronously via `commit_pages`
-before the mapping is made visible. No user PTE is ever installed without its
-frame.
+(`task/load.rs` `create_process`), `brk` growth and non-lazy `mmap`
+(`mm/usermem.rs`) — allocates and zeroes its backing frames synchronously via
+`commit_pages` before the mapping is made visible. Lazy regions are the only
+mappings registered without frames (see UM-010).
 - Location: `kernel/src/mm/usermem.rs` (`commit_pages`), `kernel/src/task/load.rs` (`create_process`)
 
-**UM-002 — #PF is never an allocator:**
-A ring-3 page fault traps in `page_fault_handler` and unconditionally kills
-the task (`crate::task::kill_user_fault`); the kernel never populates or
-allocates a user page in the fault path. A user fault is always a program
-bug, never a lazy-commit trigger.
-- Location: `kernel/src/arch/x86_64/idt.rs:362-396`
+**UM-002 — #PF allocates only through the resolver:**
+A ring-3 page fault first runs `mm::fault::resolve_user_fault`. It returns
+`true` (instruction retried) only for (a) a not-present fault inside a
+writable `Heap`/`Stack`/`Anon` region → zeroed demand fill, or (b) a write
+fault on a present non-writable leaf of a writable region → COW copy or
+in-place upgrade. Every other outcome kills the task via
+`crate::task::kill_user_fault`. `Image`-region holes never fill.
+- Location: `kernel/src/arch/x86_64/idt.rs` (`page_fault_handler`), `kernel/src/mm/fault.rs`
 
-**UM-003 — No overcommit, atomic commit:**
+**UM-003 — No partial eager commit, atomic bookkeeping:**
 `commit_pages` allocates frames one 4 KiB page at a time; on the first
 allocation failure it unmaps and frees everything it mapped so far (leaf
 frames and empty intermediate tables) and returns `Err`. `brk`/`mmap` update
@@ -95,6 +107,36 @@ a panic.
 a partial-region unmap, or any attempt touching the image, stack or heap
 region, returns `-EINVAL`. The heap shrinks exclusively through `brk`.
 - Location: `kernel/src/mm/usermem.rs` (`munmap`)
+
+**UM-010 — Lazy commit is opt-in and charged on fault:**
+A lazy region (`Region.lazy`, requested via `mmap` prot bit 0x8) registers
+with no frames and no committed charge. Each first-touch fault materializes
+one zeroed page via `demand_fill`, which re-checks the dynamic budget under
+the `ADDR_SPACES` lock before allocating — so overcommit at registration is
+bounded to one page per fault, and exhaustion kills rather than panics.
+Unfaulted lazy pages unmap/fork/teardown as absent leaves (no-ops).
+- Location: `kernel/src/mm/usermem.rs` (`mmap`, `demand_fill`), `kernel/src/mm/fault.rs`
+
+**UM-011 — COW frames are refcounted; shares precede schedulability:**
+Every leaf frame shared by a fork passed through `framecnt::share_frame`
+*before* the child root became schedulable (INV-FC-01). Counting convention:
+entry 0 = untracked single owner, ≥2 = shared; teardown routes every user
+leaf free through `framecnt::decref_or_free` (`release_pages`,
+`destroy_root`, commit rollback), which frees only the last reference. The
+COW resolver upgrades in place only when `is_sole_owner`; otherwise it makes
+a private copy and drops one reference. A failed fork unwinds its tables and
+shares completely (`clone_user_space_cow`).
+- Location: `kernel/src/mm/framecnt.rs`, `kernel/src/mm/vmm/x86_64.rs`
+  (`clone_user_space_cow`, `user_leaf_*`), `kernel/src/mm/usermem.rs` (`fork_as`),
+  `kernel/src/mm/fault.rs` (`cow_resolve`)
+
+**UM-012 — COW write-downgrade visibility:**
+`fork_as` downgrades writable leaves in the parent root while that root can
+only be resident on the calling CPU (BSP-only scheduler); the post-lock
+`shootdown_tlb()` covers any residual cross-CPU residency. The COW resolver's
+leaf edits invalidate locally only — valid because the faulting CPU is by
+definition where the root is active (INV-FC-02).
+- Location: `kernel/src/mm/usermem.rs` (`fork_as`), `kernel/src/mm/vmm/x86_64.rs` (`edit_user_leaf`)
 
 ---
 

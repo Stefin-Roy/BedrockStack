@@ -481,8 +481,23 @@ extern "x86-interrupt" fn page_fault_handler(
         swapgs();
     }
     if u {
-        // Ring-3 page fault (guard-page overflow, bad user pointer that got
-        // past the syscall walk, etc.): kill the task, don't brick the kernel.
+        // Ring-3 page fault. Demand paging and COW make #PF a legitimate
+        // allocation event now: try to resolve and retry the faulting
+        // instruction first. Anything unresolved (bad pointer, guard-page
+        // overflow, real permission breach, OOM) kills the task instead of
+        // bricking the kernel.
+        let cr2: u64;
+        unsafe {
+            core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+        }
+        if crate::mm::fault::resolve_user_fault(cr2, error_code) {
+            // Resolved: iretq returns to ring 3, so GS must be swapped back
+            // (entry swapgs'd to PerCpu; sysret paths restore it explicitly).
+            if u {
+                swapgs();
+            }
+            return;
+        }
         crate::task::kill_user_fault();
     }
     // ── PF recovery during a kernel dump ───────────────────────────

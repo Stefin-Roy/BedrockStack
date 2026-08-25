@@ -441,9 +441,10 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     // Install manual fullcaps for INIT (no wildcard)
     {
         let caps = alloc::sync::Arc::new(crate::caps::full_caps_for_init());
-        if let Some(phys) = crate::task::install_caps(root, &caps, alloc) {
+        let caps_va = crate::mm::layout::pick_caps_va();
+        if let Some(phys) = crate::task::install_caps(root, &caps, caps_va, alloc) {
             // Stash the Arc'd set; enter_userspace adopts it into the real Task.
-            crate::task::stash_init_caps(caps, phys);
+            crate::task::stash_init_caps(caps, phys, caps_va);
         } else {
             // INIT without its capability mirror is not a usable process and
             // would otherwise run deny-all while leaking its address space.

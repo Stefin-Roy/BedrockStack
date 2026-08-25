@@ -38,9 +38,14 @@ pub const HEAP_FLOOR: u64 = KERNEL_VMA_BASE + 0x1000_0000; //     (+256 MiB)
 pub const HEAP_GUARD_PAGES: u64 = 1;
 pub const HEAP_GUARD_BYTES: u64 = HEAP_GUARD_PAGES * 4096;
 
-/// Per-task kernel stack size (16 KiB) and the fixed window holding one stack
+/// Per-task kernel stack size (32 KiB) and the fixed window holding one stack
 /// per concurrent kernel task.
-pub const KSTACK_SIZE: u64 = 16 * 1024;
+///
+/// 16 KiB overflowed under debug builds: the unoptimized spawn path
+/// (ELF load + caps install + CSPRNG frames) alone consumes >15 KiB of
+/// call-chain depth. Debug builds get no inlining, so budget for worst-case
+/// frame sizes here rather than per-call-site.
+pub const KSTACK_SIZE: u64 = 32 * 1024;
 pub const MAX_KSTACKS: usize = 256;
 pub const KSTACK_WINDOW_SIZE: u64 = (MAX_KSTACKS as u64) * KSTACK_SIZE;
 
@@ -114,13 +119,35 @@ pub const IOMMU_VADDR_BASE: u64 = LAPIC_VADDR_FLOOR;
 pub const IOMMU_VADDR_FLOOR: u64 = IOMMU_VADDR_BASE - 0x2000_0000;
 
 /// Capability supervisor pages: per-process 8K (2×4K) frames mapped supervisor-only
-/// (READ, no USER) at a fixed low-half VA. Must be outside `usermem`'s
-/// allocatable range (which caps at `user_ceiling` ≈ stack guard bottom), so
-/// choose a VA above the user stack top (0x7FFF00000000) but below USER_BOUNDARY
-/// (0x800000000000). This VA is private per PML4 (low half, not shared via
-/// `clone_high_half`'s PML4 256..511 copy) and supervisor-only so ring3 faults.
+/// (READ, no USER). Must be outside `usermem`'s allocatable range (which caps
+/// at `user_ceiling` ≈ stack guard bottom), so the band sits above the user
+/// stack top (0x7FFF00000000, worst case after its 256 MiB downward ASLR
+/// slide) but below USER_BOUNDARY (0x800000000000). This VA is private per
+/// PML4 (low half, not shared via `clone_high_half`'s PML4 256..511 copy)
+/// and supervisor-only so ring3 faults.
+///
+/// `CAP_SLOT_VA` is only the legacy default; every process now picks its own
+/// base via [`pick_caps_va`] (per-task randomization of the supervisor
+/// window).
 pub const CAP_SLOT_VA: u64 = 0x0000_7FFF_8000_0000;
 pub const CAP_SLOT_SIZE: u64 = 8192;
+
+/// Randomized caps-window band: starts 2 MiB above the highest possible
+/// post-ASLR stack top and spans ~254 MiB (≈15 bits of entropy at 4 KiB
+/// granularity), always clear of user regions by construction.
+pub const CAP_SLOT_BAND_LO: u64 = 0x0000_7FFF_0200_0000;
+pub const CAP_SLOT_BAND_HI: u64 = 0x0000_7FFF_FE00_0000;
+
+/// Pick a fresh page-aligned caps-window base for one process. Collision
+/// with user regions is impossible by band construction: user allocations
+/// are capped below the stack guard, which tops out under `CAP_SLOT_BAND_LO`.
+pub fn pick_caps_va() -> u64 {
+    const SPAN: u64 = CAP_SLOT_BAND_HI - CAP_SLOT_BAND_LO;
+    let off = crate::random::random_u64() % (SPAN / PAGE_4K);
+    CAP_SLOT_BAND_LO + off * PAGE_4K
+}
+
+const PAGE_4K: u64 = 4096;
 
 // ── KASLR — 4 MiB CSPRNG, actual slide ───────────────────────────────
 //

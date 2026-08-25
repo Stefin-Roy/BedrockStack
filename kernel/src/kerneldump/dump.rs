@@ -171,6 +171,43 @@ fn frame_va(phys: u64) -> u64 {
     crate::mm::layout::to_physmap(phys)
 }
 
+// ── KASLR-aware kernel-relative addressing ──────────────────────────
+//
+// The image is slid by `layout::kaslr_offset()` at boot, so raw RIP/stack
+// values don't match the unslid ELF on disk. Every address that lands inside
+// the running image is annotated as `k+0xOFFSET` — offset from the *linked*
+// base (`KERNEL_VMA_BASE`), which is exactly what nm/addr2line/objdump expect.
+// The slide itself is printed in the header so a dump is self-describing.
+
+/// Runtime base of the kernel image (linked base minus the KASLR slide).
+fn kernel_image_base() -> u64 {
+    crate::mm::layout::KERNEL_VMA_BASE.wrapping_sub(crate::mm::layout::kaslr_offset())
+}
+
+/// Kernel-relative offset of `addr` (from the linked base) when `addr` lies
+/// inside the running image; `None` for anything else (physmap, stacks, user).
+fn krel(addr: u64) -> Option<u64> {
+    let base = kernel_image_base();
+    let off = addr.wrapping_sub(base);
+    if off < crate::mm::layout::KERNEL_IMAGE_SIZE {
+        Some(off)
+    } else {
+        None
+    }
+}
+
+/// `  (k+0x1234a0)` suffix, or empty when `addr` isn't inside the image.
+fn ksuffix(addr: u64) -> &'static str {
+    // Formatting into a fixed buffer would need a lock-free writer; the
+    // annotation alone is enough to recover the slide offline, so keep the
+    // stack rows clean and annotate only via the header + RIP line below.
+    if krel(addr).is_some() {
+        " (k)"
+    } else {
+        ""
+    }
+}
+
 fn probe_read_quad(cr3: u64, addr: u64) -> Option<u64> {
     let ext = (addr as i64) >> 47;
     if ext != 0 && ext != -1 {
@@ -232,7 +269,10 @@ fn dump_fault_stack(w: &mut impl Write, rsp: u64, cr3: u64) {
             let addr = base.wrapping_add(col as u64 * 8);
             match probe_read_quad(cr3, addr) {
                 Some(val) => {
-                    let _ = write!(w, "  {:#018x}", val);
+                    // `(k)` marks values inside the slid kernel image —
+                    // subtract the header's KASLR slide to get the
+                    // link-time address for nm/addr2line.
+                    let _ = write!(w, "  {:#018x}{}", val, ksuffix(val));
                     any_valid = true;
                 }
                 None => {
@@ -307,7 +347,13 @@ fn dump_code_bytes(w: &mut impl Write, rip: u64, cr3: u64) {
         let len = if len == 0 { 1 } else { len };
 
         if num_insns >= start_idx {
-            let _ = write!(w, "  {:#018x}:", addr);
+            // Show the link-time (unslid) address too so the line can be
+            // pasted straight into objdump --start-address.
+            if let Some(off) = krel(addr) {
+                let _ = write!(w, "  {:#018x} (k+{:#x}):", addr, off);
+            } else {
+                let _ = write!(w, "  {:#018x}:", addr);
+            }
 
             for j in 0..len {
                 let _ = write!(w, " {:02x}", buf[offset + j]);
@@ -904,7 +950,25 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
 
     // ── Interrupt frame ───────────────────────────────────────────
     let _ = writeln!(w, "--- Interrupt Frame ---");
-    let _ = writeln!(w, "RIP  = {:#018x}", fault_rip);
+    let kaslr = crate::mm::layout::kaslr_offset();
+    let _ = writeln!(
+        w,
+        "KASLR slide = {:#x}  (image base {:#018x}; symbolize as addr - slide)",
+        kaslr,
+        kernel_image_base()
+    );
+    match krel(fault_rip) {
+        Some(off) => {
+            let _ = writeln!(
+                w,
+                "RIP  = {:#018x}  (kernel+{:#x})",
+                fault_rip, off
+            );
+        }
+        None => {
+            let _ = writeln!(w, "RIP  = {:#018x}", fault_rip);
+        }
+    }
     let _ = writeln!(w, "CS   = {:#018x}", fault_cs);
     let _ = writeln!(w, "RFLAGS = {:#018x}", fault_rfl);
     write_rflags(&mut w, fault_rfl);

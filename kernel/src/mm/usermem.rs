@@ -101,9 +101,19 @@ pub struct Region {
     pub vaddr: u64,
     pub pages: u64,
     /// Informational permissions (introspection only; the PTE is the truth).
+    /// For lazy regions this is also the fill permission used by
+    /// `demand_fill`.
     pub flags: PageFlags,
     /// True when ≥1 unmapped page must protect this region's underside.
     pub guard: bool,
+    /// Lazy commit (mmap prot bit 0x8): registered without frames; pages
+    /// materialize on first touch via `demand_fill` at `flags`. Charged per
+    /// fault instead of up front (UM-010).
+    pub lazy: bool,
+    /// PKU protection key 0..=15 (0 = default, unrestricted). Applied to
+    /// present leaves by `pkey_protect`; lazy/COW fills re-apply it from
+    /// here when they materialize a page. Enforcement is PKRU-side.
+    pub pkey: u8,
 }
 
 impl Region {
@@ -178,6 +188,8 @@ pub fn register(
                 pages: (image_top - image_floor) / PAGE,
                 flags: PageFlags::USER | PageFlags::READ | PageFlags::WRITE,
                 guard: false,
+                lazy: false,
+                pkey: 0,
             },
             Region {
                 kind: RegionKind::Stack,
@@ -185,6 +197,8 @@ pub fn register(
                 pages: 8,
                 flags: stack_flags,
                 guard: true,
+                lazy: false,
+                pkey: 0,
             },
         ],
     };
@@ -305,6 +319,8 @@ pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u6
                 pages: (new - asp.brk_floor) / PAGE,
                 flags,
                 guard: false,
+                lazy: false,
+                pkey: 0,
             }),
         }
     } else {
@@ -331,11 +347,18 @@ pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u6
     Ok(asp.brk_cur)
 }
 
-/// `mmap(addr, len, prot)`: eagerly commit `len` zeroed anonymous pages.
+/// `mmap(addr, len, prot)`: commit `len` anonymous pages.
 ///
 /// `addr == 0` picks the first available gap above the break (page-aligned,
 /// guard page between regions, capped by the user stack's guard). A fixed
 /// `addr` must be page-aligned and free. `len` must be page-aligned and > 0.
+///
+/// `prot` bits: 1=read, 2=write, 4=exec (W^X: exec+write rejected), and
+/// **8 = lazy** (UM-010): the region registers with no backing frames and no
+/// committed charge; each page materializes zeroed on first touch through
+/// `demand_fill`, charged against the dynamic budget then. Lazy is only
+/// meaningful for writable mappings — a read-only lazy region would fault-fill
+/// nothing, so it is rejected.
 pub fn mmap(
     idx: usize,
     addr: u64,
@@ -343,6 +366,8 @@ pub fn mmap(
     prot: u64,
     alloc: &mut BitmapAllocator,
 ) -> Result<u64, i64> {
+    let lazy = prot & 0x8 != 0;
+    let prot = prot & !0x8;
     let mut table = ADDR_SPACES.lock();
     let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Err(EFAULT);
@@ -352,6 +377,9 @@ pub fn mmap(
     }
     let npages = len / PAGE;
     let flags = prot_to_flags(prot)?;
+    if lazy && !flags.contains(PageFlags::WRITE) {
+        return Err(EINVAL);
+    }
 
     let vaddr = if addr == 0 {
         match find_fit(asp, npages) {
@@ -372,22 +400,26 @@ pub fn mmap(
         addr
     };
 
-    // Budget read under ADDR_SPACES (O(1) counter) — atomic vs other checks.
-    let eff_pages = dynamic_budget_pages(&*alloc);
-    if npages > eff_pages.saturating_sub(asp.committed) {
-        return Err(ENOMEM);
+    if !lazy {
+        // Budget read under ADDR_SPACES (O(1) counter) — atomic vs other checks.
+        let eff_pages = dynamic_budget_pages(&*alloc);
+        if npages > eff_pages.saturating_sub(asp.committed) {
+            return Err(ENOMEM);
+        }
+        let mut vmm = Vmm::from_root(asp.root);
+        if commit_pages(&mut vmm, alloc, vaddr, npages, flags).is_err() {
+            return Err(ENOMEM);
+        }
+        asp.committed += npages;
     }
-    let mut vmm = Vmm::from_root(asp.root);
-    if commit_pages(&mut vmm, alloc, vaddr, npages, flags).is_err() {
-        return Err(ENOMEM);
-    }
-    asp.committed += npages;
     asp.regions.push(Region {
         kind: RegionKind::Anon,
         vaddr,
         pages: npages,
         flags,
         guard: true,
+        lazy,
+        pkey: 0,
     });
     Ok(vaddr)
 }
@@ -451,14 +483,12 @@ pub fn munmap(idx: usize, addr: u64, len: u64, alloc: &mut BitmapAllocator) -> R
         hits.sort_unstable_by(|a, b| b.cmp(a));
         let root = asp.root;
         let mut to_unmap: Vec<(u64, u64)> = Vec::new();
-        let mut freed = 0u64;
         for &idx_hit in &hits {
             let r = asp.regions[idx_hit];
             let ov_start = r.vaddr.max(addr);
             let ov_end = r.end().min(end);
             let ov_pages = (ov_end - ov_start) / PAGE;
             to_unmap.push((ov_start, ov_pages));
-            freed += ov_pages;
             if ov_start == r.vaddr && ov_end == r.end() {
                 asp.regions.remove(idx_hit);
             } else if ov_start == r.vaddr {
@@ -479,24 +509,227 @@ pub fn munmap(idx: usize, addr: u64, len: u64, alloc: &mut BitmapAllocator) -> R
                     pages: tail_pages,
                     flags: r.flags,
                     guard: tail_guard,
+                    lazy: r.lazy,
+                    pkey: r.pkey,
                 };
                 asp.regions[idx_hit].pages = head_pages;
                 asp.regions.insert(idx_hit + 1, tail);
             }
         }
-        debug_assert!(freed <= asp.committed, "munmap freed {} > committed {}", freed, asp.committed);
-        asp.committed -= freed;
+        // Committed accounting is deferred to phase 3: lazy regions register
+        // without frames, so only the leaves `release_pages` actually collects
+        // may be subtracted (an eager region yields exactly its span; a lazy
+        // one yields only the pages that ever fault-filled). Subtracting the
+        // raw span up front would underflow `committed` on a partial unmap of
+        // a sparsely-filled lazy region.
         (root, to_unmap)
     };
     // Phase 2: outside lock – shootdown + free
     let mut vmm = Vmm::from_root(root);
+    let mut actually_freed = 0u64;
     for (vaddr, npages) in to_unmap {
-        release_pages(&mut vmm, alloc, vaddr, npages);
+        let mut frames: Vec<u64> = Vec::new();
+        vmm.unmap_range_collect(alloc, vaddr, npages * PAGE, &mut frames);
+        for phys in frames {
+            crate::mm::framecnt::decref_or_free(alloc, phys);
+            actually_freed += 1;
+        }
+    }
+    // Phase 3: reconcile committed with what was really released.
+    {
+        let mut table = ADDR_SPACES.lock();
+        if let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) {
+            debug_assert!(
+                actually_freed <= asp.committed,
+                "munmap freed {} > committed {}",
+                actually_freed,
+                asp.committed
+            );
+            asp.committed -= actually_freed.min(asp.committed);
+        }
     }
     Ok(())
 }
 
+/// `fork`: clone `parent_vm` copy-on-write. Returns `(child slot, child root)`.
+///
+/// `skip_cow` excludes a VA range (the parent's supervisor caps window) from
+/// the structural clone — the caller re-establishes it privately at its own
+/// randomized base.
+///
+/// Both address spaces keep identical region bookkeeping (brk, stack top,
+/// committed accounting); physical frames become shared (`framecnt` > 1) and
+/// every writable leaf is downgraded to read-only in BOTH roots before this
+/// returns. The first write to any shared page faults into the CoW resolver,
+/// which copies or upgrades based on the refcount — so the parent's stale-W
+/// window between the PTE sweep and the shootdown below is unexploitable:
+/// the BSP-only scheduler guarantees neither task can run in it.
+///
+/// On failure the child's tables/shares are unwound by
+/// [`crate::mm::vmm::clone_user_space_cow`] and nothing is registered.
+#[cfg(target_arch = "x86_64")]
+pub fn fork_as(
+    parent_vm: usize,
+    alloc: &mut BitmapAllocator,
+    skip_cow: Option<(u64, u64)>,
+) -> Result<(usize, u64), i64> {
+    let mut table = ADDR_SPACES.lock();
+    let Some(parent) = table.slots.get(parent_vm).and_then(|s| s.as_ref()) else {
+        return Err(EFAULT);
+    };
+
+    // Fresh root: higher half shared by reference (kernel windows), low half
+    // filled by the structural COW clone below.
+    let child_root = crate::mm::vmm::clone_high_half(alloc, parent.root);
+
+    // 1) Downgrade writable leaves in the parent. Skipped pages are simply
+    //    absent leaves; the child inherits them as absent too.
+    for r in &parent.regions {
+        if r.flags.contains(PageFlags::WRITE) && r.pages > 0 {
+            crate::mm::vmm::user_leaf_write_protect_range(parent.root, r.vaddr, r.pages);
+        }
+    }
+
+    // 2) Structural low-half clone sharing every leaf (INV-FC-01).
+    if crate::mm::vmm::clone_user_space_cow(parent.root, child_root, alloc, skip_cow).is_err() {
+        // Roll the parent back to fully writable before unwinding the child:
+        // the downgrade sweep must never outlive the fork attempt (atomicity
+        // — the caller sees either a working fork or an untouched parent).
+        for r in &parent.regions {
+            if r.flags.contains(PageFlags::WRITE) && r.pages > 0 {
+                crate::mm::vmm::user_leaf_make_writable_range(parent.root, r.vaddr, r.pages);
+            }
+        }
+        drop(table);
+        crate::mm::vmm::destroy_root(child_root, alloc);
+        return Err(ENOMEM);
+    }
+
+    // 3) Child bookkeeping: verbatim snapshot of the parent's metadata.
+    let child = AddressSpace {
+        root: child_root,
+        brk_floor: parent.brk_floor,
+        brk_cur: parent.brk_cur,
+        stack_top: parent.stack_top,
+        committed: parent.committed,
+        budget_pages: parent.budget_pages,
+        regions: parent.regions.clone(),
+    };
+    let idx = match table.free.pop() {
+        Some(i) => {
+            table.slots[i] = Some(child);
+            i
+        }
+        None => {
+            table.slots.push(Some(child));
+            table.slots.len() - 1
+        }
+    };
+    drop(table);
+
+    // 4) Parent CPUs must observe the downgraded PTEs. The child root has
+    //    never been active anywhere; this CPU flushed locally inside the
+    //    write-protect sweep, so only the cross-CPU broadcast remains.
+    crate::mm::vmm::shootdown_tlb();
+
+    Ok((idx, child_root))
+}
+
 // ── Commit / release primitives ──────────────────────────────────────
+
+/// Demand-fill the absent page at `va` from its containing region's flags.
+///
+/// Only `Heap`/`Stack`/`Anon` regions fill: their pages are legitimately
+/// materializable on first touch (and mandatory for lazy commits). An absent
+/// page in an `Image` region is a hole the loader never mapped — fatal, as
+/// before. The committed counter is charged under the dynamic budget while
+/// holding `ADDR_SPACES`, exactly like `brk` growth.
+///
+/// Returns `false` (→ task killed) when: no region covers `va`, the region
+/// is not writable, the budget or allocator is exhausted, or `vm` is stale.
+pub fn demand_fill(vm: usize, va: u64) -> bool {
+    let alloc = crate::mm::heap::get_phys_allocator_mut();
+    let mut table = ADDR_SPACES.lock();
+    let Some(asp) = table.slots.get_mut(vm).and_then(|s| s.as_mut()) else {
+        return false;
+    };
+    let Some(r) = asp.regions.iter().find(|r| {
+        va >= r.vaddr && va < r.vaddr + r.pages * PAGE
+    }) else {
+        return false;
+    };
+    match r.kind {
+        RegionKind::Image => return false,
+        RegionKind::Heap | RegionKind::Stack | RegionKind::Anon => {}
+    }
+    if !r.flags.contains(PageFlags::WRITE) {
+        // Read-only regions are eagerly mapped; absence is corruption.
+        return false;
+    }
+    if asp.committed + 1 > dynamic_budget_pages(&*alloc) {
+        return false; // over budget → OOM-kill policy
+    }
+    let Some(phys) = alloc.alloc() else {
+        return false; // physical exhaustion → OOM-kill policy
+    };
+    unsafe {
+        core::ptr::write_bytes(crate::mm::layout::to_physmap(phys) as *mut u8, 0, PAGE as usize);
+    }
+    let mut vmm = Vmm::from_root(asp.root);
+    vmm.map_4k(alloc, va, phys, r.flags);
+    #[cfg(target_arch = "x86_64")]
+    if r.pkey != 0 {
+        crate::mm::vmm::user_leaf_set_pkey_range(asp.root, va, 1, r.pkey);
+    }
+    asp.committed += 1;
+    true
+}
+
+/// Snapshot `(root, region-is-writable)` for the CoW resolver. `None` when
+/// `vm` is stale or no region covers `va` (guard pages included — they are
+/// outside every span by construction).
+pub fn cow_context(vm: usize, va: u64) -> Option<(u64, bool)> {
+    let table = ADDR_SPACES.lock();
+    let asp = table.slots.get(vm)?.as_ref()?;
+    let r = asp
+        .regions
+        .iter()
+        .find(|r| va >= r.vaddr && va < r.vaddr + r.pages * PAGE)?;
+    Some((asp.root, r.flags.contains(PageFlags::WRITE)))
+}
+
+/// `pkey_mprotect(addr, len, key)`: tag a whole `Anon`/`Heap` region with a
+/// PKU protection key (0 clears). The span must match the region exactly —
+/// sub-range tagging would need region splitting for metadata consistency.
+///
+/// Present leaves are re-keyed in one batched edit (shootdown included);
+/// absent (lazy / never-COW-copied) pages pick the key up from region
+/// metadata when they materialize. Enforcement happens through PKRU rights
+/// (`/proc/self:pkey_set`, `Task.pkru`); tagging alone changes nothing until
+/// the task restricts itself.
+#[cfg(target_arch = "x86_64")]
+pub fn pkey_protect(vm: usize, addr: u64, len: u64, key: u8) -> Result<(), i64> {
+    if len == 0 || len % PAGE != 0 || addr % PAGE != 0 {
+        return Err(EINVAL);
+    }
+    let mut table = ADDR_SPACES.lock();
+    let Some(asp) = table.slots.get_mut(vm).and_then(|s| s.as_mut()) else {
+        return Err(EFAULT);
+    };
+    let Some(r) = asp.regions.iter_mut().find(|r| {
+        r.vaddr == addr && r.pages * PAGE == len
+    }) else {
+        return Err(EINVAL);
+    };
+    if !matches!(r.kind, RegionKind::Anon | RegionKind::Heap) {
+        return Err(EINVAL);
+    }
+    r.pkey = key;
+    crate::mm::vmm::user_leaf_set_pkey_range(asp.root, addr, len / PAGE, key);
+    drop(table);
+    crate::mm::vmm::shootdown_tlb();
+    Ok(())
+}
 
 /// Eagerly allocate, zero and map `npages` at `vaddr`. Non-contiguous frames
 /// are fine — mappings are 4 KiB granular throughout.
@@ -526,16 +759,17 @@ fn commit_pages(
                 // Use the phys we stashed instead of translate to avoid double-free confusion
                 vmm.unmap_range_collect(alloc, base, size, &mut frames);
                 // Free using stashed phys count, but frames already contains them;
-                // prefer frames from VMM to keep accounting consistent
+                // prefer frames from VMM to keep accounting consistent.
+                // Refcount-aware: shared (CoW) frames only drop one reference.
                 for p in frames {
-                    unsafe { alloc.free(p); }
+                    crate::mm::framecnt::decref_or_free(alloc, p);
                 }
                 // Any remaining phys in phys_vec beyond mapped len already not mapped
                 // (alloc succeeded but map failed? not here) — none.
             }
             // Free any phys that were allocated but not yet mapped (none in this path, but keep for symmetry)
             for p in phys_vec.iter().skip(mapped.len()) {
-                unsafe { alloc.free(*p); }
+                crate::mm::framecnt::decref_or_free(alloc, *p);
             }
             return Err(());
         };
@@ -561,9 +795,9 @@ fn release_pages(vmm: &mut Vmm, alloc: &mut BitmapAllocator, vaddr: u64, npages:
     let mut frames: Vec<u64> = Vec::new();
     vmm.unmap_range_collect(alloc, vaddr, npages * PAGE, &mut frames);
     for phys in frames {
-        unsafe {
-            alloc.free(phys);
-        }
+        // Refcount-aware: a frame still shared with a fork sibling only
+        // drops one reference here; untracked frames free exactly as before.
+        crate::mm::framecnt::decref_or_free(alloc, phys);
     }
 }
 

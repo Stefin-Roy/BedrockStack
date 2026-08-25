@@ -515,7 +515,7 @@ pub fn grant_to_current(path: String, method: Option<String>, perm: Perm) -> Res
             crate::caps::validate_cap(&cap)?;
             let mut new_caps = Vec::new();
             new_caps.push(cap);
-            if let Some(phys) = crate::task::install_caps(t.root, &new_caps, alloc) {
+            if let Some(phys) = crate::task::install_caps(t.root, &new_caps, t.caps_slot_va, alloc) {
                 t.caps_phys = phys;
                 t.caps_arc = Some(alloc::sync::Arc::new(new_caps));
                 return Ok(());

@@ -723,10 +723,12 @@ pub fn destroy_root(root: u64, alloc: &mut BitmapAllocator) {
 
     super::flush_tlb();
     super::shootdown_tlb();
+    // Refcount-aware release: leaf frames shared with fork siblings only
+    // drop one reference here; intermediate tables and untracked frames are
+    // released exactly as before (`framecnt` treats entry-0 frames as
+    // single-owner and frees them outright).
     for f in frames {
-        unsafe {
-            alloc.free(f);
-        }
+        crate::mm::framecnt::decref_or_free(alloc, f);
     }
     let was_last = super::unregister_clone_root(root);
     if was_last {
@@ -780,6 +782,329 @@ pub fn make_read_only(root: u64, vaddr: u64) {
             .expect("make_read_only: update_flags failed")
             .flush();
     }
+}
+
+// ── User leaf flag editing (CoW / protection support) ────────────────
+
+const PAGE_SIZE: u64 = 4096;
+const PTE_WRITABLE: u64 = 1 << 1;
+const PTE_USER: u64 = 1 << 2;
+const PTE_ACCESSED: u64 = 1 << 5;
+
+#[inline]
+unsafe fn invlg(va: u64) {
+    // SAFETY: `va` must be a currently-mapped canonical VA — guaranteed by
+    // callers, which only invalidate leaves they just walked as PRESENT.
+    unsafe { core::arch::asm!("invlpg [{va}]", va = in(reg) va, options(nostack, nomem)) };
+}
+
+/// Walk to the leaf PTE slot of a 4 KiB mapping without allocating.
+///
+/// Returns `(table_ptr, index)` for the PT-level entry. Every level must be
+/// PRESENT and non-huge — user mappings are always created with `map_4k`, so
+/// a PS leaf anywhere above the PT means the VA is not a user 4 KiB mapping
+/// and the caller must not touch it.
+///
+/// # Locking
+/// Caller must hold [`super::lock`] (the pointer is only valid under it).
+fn walk_leaf(root: u64, vaddr: u64) -> Option<(*mut u64, usize)> {
+    let i0 = ((vaddr >> 39) & 0x1FF) as usize;
+    let i1 = ((vaddr >> 30) & 0x1FF) as usize;
+    let i2 = ((vaddr >> 21) & 0x1FF) as usize;
+    let i3 = ((vaddr >> 12) & 0x1FF) as usize;
+    unsafe {
+        let pml4 = pte_deref(root);
+        let e0 = read_pte(pml4, i0);
+        if e0 & PTE_PRESENT == 0 || e0 & PTE_PS != 0 {
+            return None;
+        }
+        let pdpt = pte_deref(pte_frame(e0));
+        let e1 = read_pte(pdpt, i1);
+        if e1 & PTE_PRESENT == 0 || e1 & PTE_PS != 0 {
+            return None;
+        }
+        let pd = pte_deref(pte_frame(e1));
+        let e2 = read_pte(pd, i2);
+        if e2 & PTE_PRESENT == 0 || e2 & PTE_PS != 0 {
+            return None;
+        }
+        Some((pte_deref(pte_frame(e2)), i3))
+    }
+}
+
+/// Read-modify-write the raw leaf PTE of one 4 KiB mapping via `f`.
+///
+/// The callback receives the full entry (frame bits, PAT/AVL software bits
+/// included) and returns the replacement — preserve everything you do not
+/// mean to change. Returns `true` when a present page was found *and* the
+/// entry changed; the local TLB entry is invalidated in that case.
+///
+/// Other CPUs that may have this root active are NOT handled here: follow up
+/// with [`super::shootdown_tlb_for_root`] when the root is not exclusively
+/// running on this CPU.
+pub fn edit_user_leaf(root: u64, vaddr: u64, f: impl FnOnce(u64) -> u64) -> bool {
+    let _guard = super::lock();
+    let Some((pt, idx)) = walk_leaf(root, vaddr) else {
+        return false;
+    };
+    unsafe {
+        let old = read_pte(pt, idx);
+        let new = f(old);
+        if new == old {
+            return false;
+        }
+        write_pte(pt, idx, new);
+        invlg(vaddr & !0xFFF);
+    }
+    true
+}
+
+/// Batched [`edit_user_leaf`] over `[vaddr, vaddr + pages*PAGE)`.
+///
+/// One VMM lock hold and one local full-flush for the whole range; returns
+/// the number of entries changed. Follow with a scoped shootdown for `root`
+/// before relying on other CPUs observing the new permissions.
+pub fn edit_user_leaf_range(
+    root: u64,
+    vaddr: u64,
+    pages: u64,
+    f: impl Fn(u64) -> u64 + Copy,
+) -> usize {
+    let _guard = super::lock();
+    let mut changed = 0usize;
+    for p in 0..pages {
+        let va = vaddr + p * PAGE_SIZE;
+        let Some((pt, idx)) = walk_leaf(root, va) else {
+            continue;
+        };
+        unsafe {
+            let old = read_pte(pt, idx);
+            let new = f(old);
+            if new != old {
+                write_pte(pt, idx, new);
+                changed += 1;
+            }
+        }
+    }
+    if changed > 0 {
+        super::flush_tlb();
+    }
+    changed
+}
+
+/// Clear WRITABLE on one present 4 KiB user leaf, preserving every other bit.
+pub fn user_leaf_write_protect(root: u64, vaddr: u64) -> bool {
+    edit_user_leaf(root, vaddr, |e| {
+        if e & PTE_PRESENT == 0 {
+            e
+        } else {
+            e & !PTE_WRITABLE
+        }
+    })
+}
+
+/// Batched write-protect sweep used by fork; skips absent pages. Returns the
+/// number of entries actually downgraded.
+pub fn user_leaf_write_protect_range(root: u64, vaddr: u64, pages: u64) -> usize {
+    edit_user_leaf_range(root, vaddr, pages, |e| {
+        if e & PTE_PRESENT == 0 {
+            e
+        } else {
+            e & !PTE_WRITABLE
+        }
+    })
+}
+
+/// Restore WRITABLE (keeping ACCESSED set so the hardware doesn't refault the
+/// A-bit needlessly) on one present 4 KiB user leaf.
+pub fn user_leaf_make_writable(root: u64, vaddr: u64) -> bool {
+    edit_user_leaf(root, vaddr, |e| {
+        if e & PTE_PRESENT == 0 {
+            e
+        } else {
+            e | PTE_WRITABLE | PTE_ACCESSED
+        }
+    })
+}
+
+/// Restore WRITABLE on every present 4 KiB leaf in `[vaddr, vaddr+pages*PAGE)`.
+/// Batched sibling of [`user_leaf_make_writable`] — used by the fork failure
+/// path to roll the parent's write-downgrade sweep back in one lock hold.
+pub fn user_leaf_make_writable_range(root: u64, vaddr: u64, pages: u64) -> usize {
+    edit_user_leaf_range(root, vaddr, pages, |e| {
+        if e & PTE_PRESENT == 0 {
+            e
+        } else {
+            e | PTE_WRITABLE | PTE_ACCESSED
+        }
+    })
+}
+
+/// Point an existing present 4 KiB leaf at `new_paddr`, restoring WRITABLE.
+///
+/// Low flag bits (USER, NX, PAT/PCD/PWT, DIRTY) are preserved from the old
+/// entry; only the frame bits change. Used by the CoW resolver to install a
+/// private copy.
+pub fn user_leaf_repoint_writable(root: u64, vaddr: u64, new_paddr: u64) -> bool {
+    let np = new_paddr & !0xFFF;
+    edit_user_leaf(root, vaddr, |e| {
+        (e & 0xFFF) | np | PTE_PRESENT | PTE_WRITABLE | PTE_ACCESSED
+    })
+}
+
+/// PTE protection-key field: bits 59..62 (PKU).
+const PTE_PKEY_SHIFT: u64 = 59;
+
+/// Tag every present 4 KiB leaf in `[vaddr, vaddr+pages*PAGE)` with
+/// protection key `key` (0..=15). Absent pages are skipped — lazy fills and
+/// COW copies pick the key up from region metadata when they materialize.
+/// Returns the number of entries changed; follow with a shootdown if the
+/// root may be active on other CPUs.
+pub fn user_leaf_set_pkey_range(root: u64, vaddr: u64, pages: u64, key: u8) -> usize {
+    let k = ((key & 0xF) as u64) << PTE_PKEY_SHIFT;
+    edit_user_leaf_range(root, vaddr, pages, |e| {
+        if e & PTE_PRESENT == 0 {
+            e
+        } else {
+            (e & !(0xFu64 << PTE_PKEY_SHIFT)) | k
+        }
+    })
+}
+
+// ── Copy-on-write fork support ───────────────────────────────────────
+
+/// Copy-on-write clone of the user (low-half) page-table *structure*.
+///
+/// Rebuilds an identical low-half hierarchy under `child_root`, sharing every
+/// leaf frame by reference. Writable leaves must ALREADY be downgraded in the
+/// parent (`user_leaf_write_protect_range` before calling); child entries
+/// inherit the parent's leaf verbatim, so both sides take a write fault on
+/// first touch and `mm::fault` resolves by copy or in-place upgrade.
+///
+/// `skip` excludes a VA range from the clone entirely — used for the
+/// supervisor caps window, which the caller re-establishes privately at its
+/// own (per-task randomized) base. Leaves inside the range are neither copied
+/// nor refcounted; intermediate tables leading only into the range come over
+/// empty and are reclaimed by the usual empty-table sweeps later.
+///
+/// Every cloned leaf is registered as shared (`framecnt::share_frame`)
+/// during the walk — INV-FC-01: this happens strictly before the child root
+/// becomes schedulable. Intermediate tables are freshly allocated per child,
+/// never tracked, and carry the same flags `map_4k`'s table fan-out uses.
+///
+/// Huge (PS) leaves anywhere in the low half are rejected: user space is
+/// 4 KiB-granular by construction (`commit_pages`), so encountering one means
+/// corruption — fail rather than share something we can't refcount.
+///
+/// On mid-walk OOM everything is unwound: allocated tables are freed and
+/// every share taken so far is dropped, leaving parent and allocator exactly
+/// as before.
+///
+/// # Locking
+/// Takes [`super::lock`] for the whole walk; caller must not hold it.
+pub fn clone_user_space_cow(
+    parent_root: u64,
+    child_root: u64,
+    alloc: &mut BitmapAllocator,
+    skip: Option<(u64, u64)>,
+) -> Result<(), ()> {
+    let _guard = super::lock();
+    let mut tables: Vec<u64> = Vec::new();
+    let mut shared: Vec<u64> = Vec::new();
+    let r = unsafe {
+        cow_walk(
+            pte_deref(parent_root),
+            pte_deref(child_root),
+            0,
+            0,
+            alloc,
+            &mut tables,
+            &mut shared,
+            skip,
+        )
+    };
+    if r.is_err() {
+        // Unwind in reverse order of allocation. Table frames were never
+        // visible to any walker outside this lock; the shares are dropped
+        // with decref_or_free, which can never free here because the parent
+        // still holds its reference (every counter was ≥2 when incremented).
+        for f in tables.drain(..).rev() {
+            unsafe { alloc.free(f) };
+        }
+        for p in shared.drain(..) {
+            // `unshare`, not `decref_or_free`: the parent still holds the
+            // frame, and a bare decref would strand it at counter 1 (tracked
+            // sole-owner) instead of restoring the pre-fork untracked state.
+            crate::mm::framecnt::unshare(p);
+        }
+    }
+    r
+}
+
+/// One level of the COW structure copy: `level` 0 = PML4 … 3 = PT.
+/// `base_va` carries the already-resolved upper index bits of this subtree.
+///
+/// # Safety
+/// Both table pointers must be valid physmap derefs of present table frames;
+/// caller must hold [`super::lock`].
+unsafe fn cow_walk(
+    ptbl: *mut u64,
+    ctbl: *mut u64,
+    level: usize,
+    base_va: u64,
+    alloc: &mut BitmapAllocator,
+    tables: &mut Vec<u64>,
+    shared: &mut Vec<u64>,
+    skip: Option<(u64, u64)>,
+) -> Result<(), ()> {
+    const SHIFT: [u32; 4] = [39, 30, 21, 12];
+    unsafe {
+        for i in 0..512usize {
+            let va = base_va | ((i as u64) << SHIFT[level]);
+            if let Some((lo, hi)) = skip {
+                if level == 3 && va >= lo && va < hi {
+                    continue;
+                }
+                if level < 3 && va >= hi {
+                    // Subtree starts entirely above the skipped range.
+                    continue;
+                }
+            }
+            let e = read_pte(ptbl, i);
+            if e & PTE_PRESENT == 0 {
+                continue;
+            }
+            if level < 3 {
+                if e & PTE_PS != 0 {
+                    return Err(());
+                }
+                let Some(f) = alloc.alloc() else {
+                    return Err(());
+                };
+                core::ptr::write_bytes(pte_deref(f) as *mut u8, 0, PAGE_SIZE as usize);
+                tables.push(f);
+                write_pte(ctbl, i, f | PTE_PRESENT | PTE_WRITABLE | PTE_ACCESSED | (e & PTE_USER));
+                cow_walk(
+                    pte_deref(pte_frame(e)),
+                    pte_deref(f),
+                    level + 1,
+                    va,
+                    alloc,
+                    tables,
+                    shared,
+                    skip,
+                )?;
+            } else {
+                // Leaf: inherit verbatim (W already cleared by the caller's
+                // sweep) and register the extra owner before returning.
+                write_pte(ctbl, i, e);
+                let frame = pte_frame(e);
+                crate::mm::framecnt::share_frame(frame);
+                shared.push(frame);
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Allocate a fresh, zeroed page-table root and copy the kernel's higher-half

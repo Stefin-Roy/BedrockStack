@@ -219,13 +219,43 @@ static WAIT_INPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
+/// `write(/proc/self:pkey_mprotect, { addr, len, key })` — tag a whole
+/// anon/heap region with PKU protection key `key` (0 clears).
+static PKEY_MPROTECT_INPUT: Schema = Schema::Struct(&[
+    schema::Field {
+        name: "addr",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "len",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "key",
+        ty: &schema::SCHEMA_U64,
+    },
+]);
+
+/// `write(/proc/self:pkey_set, { key, rights })` — set this task's PKRU
+/// rights for one key: 0 = read/write, 1 = read-only (WD), 2 = no access (AD).
+static PKEY_SET_INPUT: Schema = Schema::Struct(&[
+    schema::Field {
+        name: "key",
+        ty: &schema::SCHEMA_U64,
+    },
+    schema::Field {
+        name: "rights",
+        ty: &schema::SCHEMA_U64,
+    },
+]);
+
 /// `wait` output: the consumed exit code.
 static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     name: "code",
     ty: &schema::SCHEMA_U64,
 }]);
 
-static PROC_METHODS: [MethodDesc; 8] = [
+static PROC_METHODS: [MethodDesc; 11] = [
     MethodDesc {
         name: "exit",
         input: &EXIT_INPUT,
@@ -265,6 +295,21 @@ static PROC_METHODS: [MethodDesc; 8] = [
         name: "wait",
         input: &WAIT_INPUT,
         output: &WAIT_OUTPUT,
+    },
+    MethodDesc {
+        name: "fork",
+        input: &schema::SCHEMA_UNIT,
+        output: &SPAWN_OUTPUT,
+    },
+    MethodDesc {
+        name: "pkey_mprotect",
+        input: &PKEY_MPROTECT_INPUT,
+        output: &schema::SCHEMA_UNIT,
+    },
+    MethodDesc {
+        name: "pkey_set",
+        input: &PKEY_SET_INPUT,
+        output: &schema::SCHEMA_UNIT,
     },
 ];
 
@@ -518,6 +563,38 @@ impl Object for ProcDir {
                 })?;
                 let v = Value::Struct(vec![Value::U64(code)]);
                 schema::encode_value(&v, &WAIT_OUTPUT, out)
+            }
+            8 => {
+                // fork: COW-clone the caller. The child resumes inside its
+                // own syscall return with rax=0; the parent gets {pid}.
+                let pid = crate::task::fork_current().map_err(|e| match e {
+                    -12 => UnispaceError::OutOfMemory,
+                    -22 => UnispaceError::InvalidArgument,
+                    _ => UnispaceError::Unsupported,
+                })?;
+                let v = Value::Struct(vec![Value::U64(pid)]);
+                schema::encode_value(&v, &SPAWN_OUTPUT, out)
+            }
+            9 => {
+                // pkey_mprotect: tag a whole anon/heap region with a PKU key.
+                let addr = arg_u64(&v, 0)?;
+                let len = arg_u64(&v, 1)?;
+                let key = arg_u64(&v, 2)?;
+                if key > 15 {
+                    return Err(UnispaceError::InvalidArgument);
+                }
+                mem_method(|vm, _alloc| crate::mm::usermem::pkey_protect(vm, addr, len, key as u8))?;
+                Ok(())
+            }
+            10 => {
+                // pkey_set: adjust this task's PKRU rights for one key.
+                // 0 = RW, 1 = read-only (WD), 2 = no access (AD).
+                let key = arg_u64(&v, 0)?;
+                let rights = arg_u64(&v, 1)?;
+                if key > 15 || rights > 2 {
+                    return Err(UnispaceError::InvalidArgument);
+                }
+                set_task_pkru(key as u8, rights as u8)
             }
             _ => Err(UnispaceError::MethodNotFound),
         }
@@ -997,10 +1074,12 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
     task.kstack_slot = slot;
     task.vm = vm;
     task.args = String::from(args);
+    // Randomize the child's supervisor caps window base before installing it.
+    task.caps_slot_va = crate::mm::layout::pick_caps_va();
     task.parent_pid = current_pid().unwrap_or(0);
-    // Install caps page for child before spawn (maps CAP_SLOT_VA in child's root)
+    // Install caps page for child before spawn (maps the randomized window in child's root)
     if !child_caps.is_empty() {
-        if let Some(phys) = crate::task::install_caps(root, &child_caps, alloc) {
+        if let Some(phys) = crate::task::install_caps(root, &child_caps, task.caps_slot_va, alloc) {
             task.caps_arc = Some(alloc::sync::Arc::new(child_caps));
             task.caps_phys = phys;
         } else {
@@ -1023,6 +1102,28 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
 }
 
 // ── Method input helpers (bounded; never panic on request data) ──────
+
+/// Update the current task's PKRU rights for one key and apply immediately.
+/// `rights`: 0 = RW, 1 = read-only (WD bit), 2 = no access (AD+WD bits).
+fn set_task_pkru(key: u8, rights: u8) -> Result<(), UnispaceError> {
+    let pc = crate::smp::current_per_cpu();
+    let ptr = pc.current_task.load(core::sync::atomic::Ordering::Relaxed);
+    if ptr.is_null() {
+        return Err(UnispaceError::NotFound);
+    }
+    // SAFETY: current_task points at the leaked Task running this syscall.
+    let t = unsafe { &mut *(ptr as *mut crate::task::Task) };
+    let wd = 1u32 << (2 * key as u32);
+    let ad = 1u32 << (2 * key as u32 + 1);
+    t.pkru &= !(wd | ad);
+    match rights {
+        0 => {}
+        1 => t.pkru |= wd,
+        _ => t.pkru |= wd | ad,
+    }
+    crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
+    Ok(())
+}
 
 /// Run one of the `usermem` mutations against the *current* task's address
 /// space, translating the raw errno (`-EINVAL`/`-EFAULT`/`-ENOMEM`) into a
