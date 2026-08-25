@@ -28,8 +28,13 @@ pub const KERNEL_IMAGE_BASE: u64 = KERNEL_VMA_BASE;
 
 /// Heap arena: grows downward from `HEAP_TOP`; each growth chunk is followed
 /// by an unmapped guard page; bounded below by `HEAP_FLOOR`.
-pub const HEAP_TOP: u64 = KERNEL_VMA_BASE + 0x3000_0000; // top  (+768 MiB)
-pub const HEAP_FLOOR: u64 = KERNEL_VMA_BASE + 0x1000_0000; //      (+256 MiB)
+///
+/// The window was widened 512 MiB → 896 MiB (top moved from +0x3000_0000 to
+/// +0x3800_0000): the old bound turned transient physical fragmentation into
+/// a hard arena-exhaustion panic while ~60 MiB of headroom below the kstack
+/// window (`KSTACK_VADDR_FLOOR` = +0x3FC0_0000) sat unused.
+pub const HEAP_TOP: u64 = KERNEL_VMA_BASE + 0x3800_0000; // top (+896 MiB)
+pub const HEAP_FLOOR: u64 = KERNEL_VMA_BASE + 0x1000_0000; //     (+256 MiB)
 pub const HEAP_GUARD_PAGES: u64 = 1;
 pub const HEAP_GUARD_BYTES: u64 = HEAP_GUARD_PAGES * 4096;
 

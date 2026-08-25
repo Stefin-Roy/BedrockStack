@@ -49,9 +49,15 @@ const USER_BUDGET_CEILING_PAGES: u64 = USER_BUDGET_BYTES / PAGE;
 const USER_BUDGET_FLOOR_PAGES: u64 = (16 * 1024 * 1024) / PAGE;
 
 /// Compute dynamic budget based on free RAM left. Keeps ceiling but throttles
-/// when free is low. Called with the allocator on every brk/mmap budget check.
-/// This is `O(total_frames)` (bitmap scan) — callers should compute it *before*
-/// taking `ADDR_SPACES` lock to avoid holding the lock during the scan.
+/// when free is low. Called with the allocator on every brk/mmap/register
+/// budget check.
+///
+/// The frame count comes from the allocator's O(1) atomic counter, so callers
+/// read it *under* the `ADDR_SPACES` lock — making the budget check atomic
+/// with respect to every other process's check and closing the old
+/// compute-before-lock TOCTOU where two processes could both pass and then
+/// exhaust physical RAM together (`commit_pages` still rolls back atomically,
+/// so the residual failure mode is a clean ENOMEM).
 fn dynamic_budget_pages(alloc: &BitmapAllocator) -> u64 {
     let free_pages = alloc.free_frames() as u64;
     let frac = free_pages / 16;
@@ -245,15 +251,18 @@ pub fn summarize(idx: usize) -> Option<MemSummary> {
 /// break. Growth page-rounds up and eagerly commits zeroed, read/write, NX
 /// frames; the region table is only updated after the commit succeeds.
 pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u64, i64> {
-    // Compute dynamic budget before taking ADDR_SPACES lock (free_frames is O(n) bitmap scan).
-    let eff_pages = dynamic_budget_pages(&*alloc);
     let mut table = ADDR_SPACES.lock();
     let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Err(EFAULT);
     };
 
-    let new = align_up(new_break);
-    if new == 0 || new < asp.brk_floor {
+    if new_break == 0 {
+        return Ok(asp.brk_cur);
+    }
+    let Some(new) = align_up(new_break) else {
+        return Err(EINVAL);
+    };
+    if new < asp.brk_floor {
         return Ok(asp.brk_cur);
     }
     let old = asp.brk_cur;
@@ -275,6 +284,8 @@ pub fn brk(idx: usize, new_break: u64, alloc: &mut BitmapAllocator) -> Result<u6
         if new > boundary {
             return Err(ENOMEM);
         }
+        // Budget read under ADDR_SPACES (O(1) counter) — atomic vs other checks.
+        let eff_pages = dynamic_budget_pages(&*alloc);
         let npages = (new - old) / PAGE;
         if npages > eff_pages.saturating_sub(asp.committed) {
             return Err(ENOMEM);
@@ -332,8 +343,6 @@ pub fn mmap(
     prot: u64,
     alloc: &mut BitmapAllocator,
 ) -> Result<u64, i64> {
-    // Dynamic budget before lock (see brk).
-    let eff_pages = dynamic_budget_pages(&*alloc);
     let mut table = ADDR_SPACES.lock();
     let Some(asp) = table.slots.get_mut(idx).and_then(|s| s.as_mut()) else {
         return Err(EFAULT);
@@ -363,6 +372,8 @@ pub fn mmap(
         addr
     };
 
+    // Budget read under ADDR_SPACES (O(1) counter) — atomic vs other checks.
+    let eff_pages = dynamic_budget_pages(&*alloc);
     if npages > eff_pages.saturating_sub(asp.committed) {
         return Err(ENOMEM);
     }
@@ -558,8 +569,12 @@ fn release_pages(vmm: &mut Vmm, alloc: &mut BitmapAllocator, vaddr: u64, npages:
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-const fn align_up(x: u64) -> u64 {
-    (x + (PAGE - 1)) & !(PAGE - 1)
+const fn align_up(x: u64) -> Option<u64> {
+    let y = match x.checked_add(PAGE - 1) {
+        Some(v) => v,
+        None => return None,
+    };
+    Some(y & !(PAGE - 1))
 }
 
 /// The collision span of a region: its pages plus its guard page, if any. The
@@ -583,11 +598,30 @@ fn user_ceiling(asp: &AddressSpace) -> u64 {
     0
 }
 
-/// First-fit page-aligned gap starting one guard page above the break.
-fn find_fit(asp: &AddressSpace, npages: u64) -> Option<u64> {
+/// Candidate window for the randomized first-fit pass (64 MiB of pages).
+const FIT_ASLR_SPAN_PAGES: u64 = 1 << 14;
+
+/// Random page-aligned probe point between the break and the ceiling, or
+/// `None` when the window is too small to bother.
+fn random_fit_start(asp: &AddressSpace, len: u64) -> Option<u64> {
+    let ceiling = user_ceiling(asp);
+    let lo = asp.brk_cur.checked_add(PAGE)?;
+    if ceiling <= lo.saturating_add(len) {
+        return None;
+    }
+    let span_pages = ((ceiling - lo - len) / PAGE).min(FIT_ASLR_SPAN_PAGES);
+    if span_pages == 0 {
+        return None;
+    }
+    let off = (crate::random::random_u64() % span_pages) * PAGE;
+    Some(lo + off)
+}
+
+/// First-fit gap search starting at `start` (one guard page above it).
+fn find_fit_from(asp: &AddressSpace, npages: u64, start: u64) -> Option<u64> {
     let len = npages * PAGE;
     let ceiling = user_ceiling(asp);
-    let mut cand = asp.brk_cur.checked_add(PAGE)?;
+    let mut cand = start;
 
     loop {
         if cand >= ceiling {
@@ -612,6 +646,22 @@ fn find_fit(asp: &AddressSpace, npages: u64) -> Option<u64> {
             None => return Some(cand),
         }
     }
+}
+
+/// mmap placement: randomized-start first fit with a deterministic fallback.
+///
+/// The first pass probes from a random offset above the break so consecutive
+/// allocations don't line up predictably; if that pass walks off the ceiling,
+/// the classic bottom-up scan from `brk_cur + PAGE` still finds any low gap,
+/// preserving the old packing guarantees as the worst case.
+fn find_fit(asp: &AddressSpace, npages: u64) -> Option<u64> {
+    let len_bytes = npages.checked_mul(PAGE)?;
+    if let Some(start) = random_fit_start(asp, len_bytes) {
+        if let Some(v) = find_fit_from(asp, npages, start) {
+            return Some(v);
+        }
+    }
+    find_fit_from(asp, npages, asp.brk_cur.checked_add(PAGE)?)
 }
 
 /// True when `[addr, addr+len)` (plus its own guard page below) overlaps any

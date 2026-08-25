@@ -16,12 +16,14 @@ const MIN_BLOCK_SIZE: usize = HEADER_SIZE + BACKPTR_SIZE + MIN_ALLOC;
 const HEAP_INIT_PAGES: usize = 256;
 const HEAP_GROW_PAGES: usize = 16;
 
-// Heap chunk reclaim — disabled by default.  The drain+coalesce proof (is_single_free_block
-// after drain_cached_blocks+coalesce_all, then unmap_range_collect+free_frames exact count)
-// is implemented but not yet stress-verified under SMP shootdown (`HEAP` is `Mutex` not
-// `IrqMutex` so an IRQ-time `alloc` miss can spin on `HEAP`). Keep disabled until
-// `heap_trace` drain proof and multi-core grow+reclaim stress passes QEMU.
-// See invariants-04-mm-heap.md:HEAP-007 / HEAP-013.
+// Heap chunk reclaim remains disabled until the full drain/coalesce/unmap
+// sequence is stress-verified with concurrent DMA and SMP activity.  The
+// reclaim path still has a latent free-list corruption window in practice:
+// ordinary allocation/free remains safe, while keeping chunks mapped avoids
+// returning a backing frame while a stale allocator reference can still
+// exist.  Keep the implementation available for targeted testing, but do not
+// enable it in production boots.  See invariants-04-mm-heap.md HEAP-007 /
+// HEAP-013.
 const ENABLE_HEAP_CHUNK_RECLAIM: bool = false;
 
 // ── Free-list integrity guards ─────────────────────────────────────────
@@ -34,6 +36,16 @@ const ENABLE_HEAP_CHUNK_RECLAIM: bool = false;
 const FREE_LIST_WALK_BOUND: usize = 1_000_000;
 const SORT_OUTER_BOUND: usize = 1_000_000;
 const SORT_INNER_BOUND: usize = 50_000_000;
+
+// ── heap_debug poison ──────────────────────────────────────────────────
+//
+// With the `heap_debug` feature, freed payloads are painted with 0xDD before
+// entering any free path (per-CPU cache or global list).  Post-mortem dumps
+// then show 0xDD pools around use-after-free / stale-pointer sites.  This is
+// diagnostic-only: no checks are performed (payload alignment padding makes
+// exact verification unreliable without extra per-block metadata).
+const HEAP_POISON: bool = cfg!(feature = "heap_debug");
+const HEAP_POISON_BYTE: u8 = 0xDD;
 
 macro_rules! heap_trace {
     ($($arg:tt)*) => {
@@ -72,21 +84,57 @@ impl BlockHeader {
     }
 
     fn end(&self) -> usize {
-        (self as *const Self as usize) + self.size
+        (self as *const Self as usize)
+            .checked_add(self.size)
+            .unwrap_or(usize::MAX)
+    }
+
+    fn is_valid(&self) -> bool {
+        if self.size < MIN_BLOCK_SIZE {
+            return false;
+        }
+        if self.size % BLOCK_ALIGN != 0 {
+            return false;
+        }
+        // Must be inside heap arena and not wrap.
+        let addr = self as *const Self as usize;
+        let Some(end) = addr.checked_add(self.size) else {
+            return false;
+        };
+        // Arena bounds: allow blocks that were coalesced across guard? No, guard is unmapped gap, so no block should span it, but check loose.
+        if addr < HEAP_FLOOR as usize || end > HEAP_TOP as usize {
+            // Allow blocks that are exactly at boundaries, but reject huge/overflow
+            // If block is clearly outside arena, it's corrupted.
+            // Use loose check: size must be < arena size (640M) to be plausible.
+            if self.size > 0x40000000 {
+                return false;
+            }
+        }
+        if self.size > 0x40000000 {
+            return false;
+        }
+        true
     }
 }
 
-/// One mapped heap growth region (a contiguous physical block).
+/// One mapped heap growth region.
 ///
 /// Tracks how many live allocations are served from the region so that a
 /// fully-idle chunk can be unmapped and its frames returned to the physical
 /// allocator (`try_reclaim`).
+///
+/// `scattered` chunks are backed by individually-allocated frames (growth
+/// fallback when no contiguous window exists).  They stay mapped once idle —
+/// their VA range simply returns to the free list and gets reused — because
+/// frame-by-frame teardown would need per-frame metadata this static table
+/// does not carry.  Only contiguous chunks are reclaim candidates.
 #[derive(Clone, Copy, Debug)]
 struct ChunkMeta {
     vaddr: u64,
     phys: u64,
     size: u64,
     live: usize,
+    scattered: bool,
 }
 
 impl ChunkMeta {
@@ -95,6 +143,7 @@ impl ChunkMeta {
         phys: 0,
         size: 0,
         live: 0,
+        scattered: false,
     };
 }
 
@@ -169,6 +218,14 @@ impl HeapInner {
 
     fn push_free(&mut self, block: *mut BlockHeader) {
         let block_ref = unsafe { &mut *block };
+        if !block_ref.is_valid() {
+            SerialPort::puts("[heap] WARN: dropping invalid block in push_free @0x");
+            SerialPort::put_hex(block as u64);
+            SerialPort::puts(" size=0x");
+            SerialPort::put_hex(block_ref.size as u64);
+            SerialPort::puts("\n");
+            return;
+        }
         block_ref.next = core::ptr::null_mut();
 
         // Insert in address order so the list stays sorted at all times.
@@ -184,8 +241,62 @@ impl HeapInner {
             if steps > FREE_LIST_WALK_BOUND {
                 self.free_list_fault("push_free");
             }
+            // Validate cur before trusting its size/next — drop corrupted
+            // nodes instead of aborting.  A wild free-list next (e.g. from a
+            // heap overflow that overwrote a header) would otherwise panic
+            // the kernel; leaking the corrupted block is safer than halting.
+            let cur_ref = unsafe { &*cur };
+            if !cur_ref.is_valid() {
+                SerialPort::puts("[heap] WARN: dropping invalid cur in push_free @0x");
+                SerialPort::put_hex(cur as u64);
+                SerialPort::puts(" size=0x");
+                SerialPort::put_hex(cur_ref.size as u64);
+                SerialPort::puts("\n");
+                let bad_next = cur_ref.next;
+                if prev.is_null() {
+                    self.free_list = bad_next;
+                    cur = bad_next;
+                } else {
+                    unsafe { (*prev).next = bad_next; }
+                    cur = bad_next;
+                }
+                continue;
+            }
             prev = cur;
-            cur = unsafe { (*cur).next };
+            cur = cur_ref.next;
+        }
+        if !cur.is_null() {
+            let cur_ref = unsafe { &*cur };
+            if !cur_ref.is_valid() {
+                SerialPort::puts("[heap] WARN: dropping invalid next in push_free @0x");
+                SerialPort::put_hex(cur as u64);
+                SerialPort::puts(" size=0x");
+                SerialPort::put_hex(cur_ref.size as u64);
+                SerialPort::puts("\n");
+                let succ = cur_ref.next;
+                if prev.is_null() {
+                    self.free_list = succ;
+                } else {
+                    unsafe { (*prev).next = succ; }
+                }
+                cur = succ;
+            }
+        }
+        if !prev.is_null() {
+            let prev_ref = unsafe { &*prev };
+            if !prev_ref.is_valid() {
+                SerialPort::puts("[heap] WARN: dropping invalid prev in push_free @0x");
+                SerialPort::put_hex(prev as u64);
+                SerialPort::puts(" size=0x");
+                SerialPort::put_hex(prev_ref.size as u64);
+                SerialPort::puts("\n");
+                // Unlink prev — it was already linked, now remove it.
+                // Find its predecessor to unlink.  For simplicity, fault
+                // only if this happens — it implies the list was already
+                // corrupted before this push, so a full coalesce will clean
+                // it on next reclaim.
+                self.free_list_fault("push_free: prev invalid after insertion point");
+            }
         }
 
         // Coalesce with the following neighbour (`block` immediately precedes
@@ -193,7 +304,13 @@ impl HeapInner {
         if !cur.is_null() {
             let cur_ref = unsafe { &*cur };
             if block_ref.end() == cur as usize {
-                block_ref.size += cur_ref.size;
+                let Some(new_size) = block_ref.size.checked_add(cur_ref.size) else {
+                    self.free_list_fault("push_free: size overflow coalesce next");
+                };
+                if new_size > 0x40000000 {
+                    self.free_list_fault("push_free: coalesced size huge");
+                }
+                block_ref.size = new_size;
                 block_ref.next = cur_ref.next;
             } else {
                 block_ref.next = cur;
@@ -205,7 +322,13 @@ impl HeapInner {
         if !prev.is_null() {
             let prev_ref = unsafe { &mut *prev };
             if prev_ref.end() == block as usize {
-                prev_ref.size += block_ref.size;
+                let Some(new_size) = prev_ref.size.checked_add(block_ref.size) else {
+                    self.free_list_fault("push_free: size overflow coalesce prev");
+                };
+                if new_size > 0x40000000 {
+                    self.free_list_fault("push_free: coalesced prev size huge");
+                }
+                prev_ref.size = new_size;
                 prev_ref.next = block_ref.next;
                 return;
             }
@@ -234,9 +357,12 @@ impl HeapInner {
 
     // ── Chunk tracking ────────────────────────────────────────────
 
-    /// Record a freshly mapped growth region of `size` bytes at `vaddr`
-    /// backed by contiguous physical frames starting at `phys`.
-    fn register_chunk(&mut self, vaddr: u64, phys: u64, size: u64) {
+    /// Record a freshly mapped growth region of `size` bytes at `vaddr`.
+    ///
+    /// Contiguous chunks record their physical base (`phys != 0`) and are
+    /// reclaim candidates; scattered chunks pass `scattered = true` and stay
+    /// mapped for the arena's life (see [`ChunkMeta`]).
+    fn register_chunk(&mut self, vaddr: u64, phys: u64, size: u64, scattered: bool) {
         assert!(
             self.chunk_count < MAX_CHUNKS,
             "heap: chunk table exhausted ({MAX_CHUNKS}), arena too fragmented to track"
@@ -246,6 +372,7 @@ impl HeapInner {
             phys,
             size,
             live: 0,
+            scattered,
         };
         self.chunk_count += 1;
     }
@@ -286,10 +413,11 @@ impl HeapInner {
     }
 
     /// True when the chunk at `i` is fully idle and not the base chunk that
-    /// anchors the arena (the base chunk is never reclaimed).
+    /// anchors the arena (the base chunk is never reclaimed).  Scattered
+    /// chunks are also excluded — see [`ChunkMeta`].
     fn chunk_is_reclaimable(&self, i: usize) -> bool {
         let c = &self.chunks[i];
-        c.live == 0 && c.vaddr != self.low_vaddr
+        c.live == 0 && !c.scattered && c.vaddr != self.low_vaddr
     }
 
     /// True when the free list contains a single block header at `addr` whose
@@ -532,25 +660,80 @@ impl HeapInner {
     /// blocks.  Keeps the lower-address header as the merged block.
     fn merge_sorted_free_blocks(&mut self) {
         let mut cur = self.free_list;
+        let mut prev: *mut BlockHeader = core::ptr::null_mut();
         let mut steps = 0usize;
         while !cur.is_null() {
             steps += 1;
             if steps > FREE_LIST_WALK_BOUND {
                 self.free_list_fault("merge");
             }
+            let cur_valid = unsafe { (*cur).is_valid() };
             let next = unsafe { (*cur).next };
+            if !cur_valid {
+                // Corrupted header: unlink and drop it, keep `prev` stable.
+                SerialPort::puts("[heap] WARN: dropping invalid free block @0x");
+                SerialPort::put_hex(cur as u64);
+                SerialPort::puts(" size=0x");
+                SerialPort::put_hex(unsafe { (*cur).size } as u64);
+                SerialPort::puts("\n");
+                let bad_next = next;
+                if prev.is_null() {
+                    self.free_list = bad_next;
+                    cur = bad_next;
+                } else {
+                    unsafe { (*prev).next = bad_next; }
+                    cur = bad_next;
+                }
+                continue;
+            }
             if !next.is_null() {
-                let cur_end = (cur as usize) + unsafe { (*cur).size };
+                // Validate next before trusting it
+                let next_valid = unsafe { (*next).is_valid() };
+                if !next_valid {
+                    SerialPort::puts("[heap] WARN: dropping invalid next block @0x");
+                    SerialPort::put_hex(next as u64);
+                    SerialPort::puts(" size=0x");
+                    SerialPort::put_hex(unsafe { (*next).size } as u64);
+                    SerialPort::puts("\n");
+                    unsafe { (*cur).next = (*next).next; }
+                    continue;
+                }
+                let Some(cur_end) = (cur as usize).checked_add(unsafe { (*cur).size }) else {
+                    SerialPort::puts("[heap] WARN: cur_end overflow @0x");
+                    SerialPort::put_hex(cur as u64);
+                    SerialPort::puts("\n");
+                    // Drop cur as corrupted
+                    let bad_next = next;
+                    if prev.is_null() {
+                        self.free_list = bad_next;
+                        cur = bad_next;
+                    } else {
+                        unsafe { (*prev).next = bad_next; }
+                        cur = bad_next;
+                    }
+                    continue;
+                };
                 if cur_end == next as usize {
                     // `next` is physically adjacent after `cur`: absorb it.
+                    let Some(new_size) = (unsafe { (*cur).size }).checked_add(unsafe { (*next).size }) else {
+                        SerialPort::puts("[heap] WARN: coalesce size overflow\n");
+                        unsafe { (*cur).next = (*next).next; }
+                        continue;
+                    };
+                    if new_size > 0x40000000 {
+                        SerialPort::puts("[heap] WARN: coalesced size huge, dropping\n");
+                        unsafe { (*cur).next = (*next).next; }
+                        continue;
+                    }
                     unsafe {
-                        (*cur).size += (*next).size;
+                        (*cur).size = new_size;
                         (*cur).next = (*next).next;
                     }
                     // Keep `cur` fixed; the new `cur.next` may be adjacent too.
                     continue;
                 }
             }
+            prev = cur;
             cur = unsafe { (*cur).next };
         }
     }
@@ -687,10 +870,10 @@ impl HeapInner {
     fn try_reclaim(&mut self, trigger_idx: usize, out: &mut [ReclaimRecord]) -> usize {
         let base = self.low_vaddr;
 
-        // Fast bail-out: nothing is idle, so skip the expensive coalesce.
-        let has_idle = self.chunks[..self.chunk_count]
-            .iter()
-            .any(|c| c.live == 0 && c.vaddr != base);
+        // Fast bail-out: nothing reclaimable is idle, so skip the expensive
+        // coalesce.  Uses the full reclaimable predicate (scattered chunks are
+        // never candidates — see `chunk_is_reclaimable`).
+        let has_idle = (0..self.chunk_count).any(|i| self.chunk_is_reclaimable(i));
         if !has_idle {
             return 0;
         }
@@ -727,11 +910,10 @@ impl HeapInner {
         let mut i = 0;
         let mut n = 0usize;
         while i < self.chunk_count {
-            let candidate = {
-                let c = &self.chunks[i];
-                c.live == 0 && c.vaddr != base
-            };
-            if !candidate {
+            // Full reclaimable predicate: idle, contiguous (never scattered —
+            // a scattered chunk's `phys` is 0, so reclaiming it would free
+            // frames [0, size) instead of its real backing), and not the base.
+            if !self.chunk_is_reclaimable(i) {
                 i += 1;
                 continue;
             }
@@ -979,7 +1161,10 @@ pub unsafe fn init(root: u64, phys: &mut BitmapAllocator) {
 
     let mut heap = HEAP.lock();
     heap.root = root;
-    allocate_pages(&mut heap, HEAP_INIT_PAGES);
+    assert!(
+        allocate_pages(&mut heap, HEAP_INIT_PAGES),
+        "heap: initial chunk allocation failed"
+    );
     HEAP_INITIALIZED.store(true, Ordering::SeqCst);
     SerialPort::puts("[heap] init done, pages=0x");
     SerialPort::put_hex(HEAP_INIT_PAGES as u64);
@@ -990,48 +1175,113 @@ pub unsafe fn init(root: u64, phys: &mut BitmapAllocator) {
     SerialPort::puts(")\n");
 }
 
-fn allocate_pages(heap: &mut HeapInner, count: usize) {
+/// Map `count` fresh pages into the heap arena, growing downward.
+///
+/// Physical backing strategy (in order of preference):
+///   1. **2 MiB-aligned contiguous run** (`count >= 512`) so `Vmm::map`
+///      serves the chunk with 2 MiB pages instead of degrading to
+///      512 × 4 KiB PTEs;
+///   2. **any contiguous run** (previous behaviour, 4 KiB pages);
+///   3. **scattered frames** mapped one-by-one — the arena only needs
+///      *virtual* contiguity, so a fragmented physical map no longer blocks
+///      growth.  Scattered chunks stay mapped once idle (no reclaim; their
+///      VA simply returns to the free list and gets reused — see
+///      [`ChunkMeta`]).
+///
+/// Returns `false` when growth is impossible (physical exhaustion or the
+/// arena floor was reached) — callers decide whether that is fatal.  The old
+/// code panicked on floor exhaustion even though the free list was perfectly
+/// consistent and the caller could often survive without growing.
+fn allocate_pages(heap: &mut HeapInner, count: usize) -> bool {
     let phys = unsafe { phys_allocator() };
 
-    let pa = match phys.try_alloc_contiguous(count) {
-        Ok(pa) => pa,
-        Err(crate::mm::phys_alloc::AllocError::NoFrames) => {
-            SerialPort::puts("[heap] WARN: NoFrames for heap growth count=");
-            SerialPort::put_u64(count as u64);
-            SerialPort::puts(" free=");
-            SerialPort::put_u64(phys.free_frames() as u64);
-            SerialPort::puts("\n");
-            return;
-        }
-        Err(crate::mm::phys_alloc::AllocError::InvalidCount) => {
-            SerialPort::puts("[heap] WARN: InvalidCount for heap growth\n");
-            return;
-        }
+    // Reserve VA first so a physical failure never strands address space.
+    let Some(size) = (count as u64).checked_mul(4096) else {
+        SerialPort::puts("[heap] WARN: growth size overflow\n");
+        return false;
     };
-
-    let size = (count as u64) * 4096;
-    // Guard page separates this new chunk from the one below (or the top
-    // of the arena for the first chunk).
     let low = if heap.low_vaddr == u64::MAX {
-        HEAP_TOP
-            .checked_sub(size)
-            .expect("heap: initial chunk exceeds arena")
+        match HEAP_TOP.checked_sub(size) {
+            Some(v) if v >= HEAP_FLOOR => v,
+            _ => {
+                SerialPort::puts("[heap] WARN: initial chunk exceeds arena\n");
+                return false;
+            }
+        }
     } else {
-        heap.low_vaddr
+        match heap
+            .low_vaddr
             .checked_sub(HEAP_GUARD_BYTES)
             .and_then(|v| v.checked_sub(size))
-            .expect("heap: chunk underflow below arena floor")
+        {
+            Some(v) if v >= HEAP_FLOOR => v,
+            _ => {
+                SerialPort::puts("[heap] WARN: arena floor reached at low=0x");
+                SerialPort::put_hex(heap.low_vaddr);
+                SerialPort::puts("\n");
+                return false;
+            }
+        }
     };
-    assert!(low >= HEAP_FLOOR, "heap: arena exhausted at {:#x}", low);
 
     let mut vmm = Vmm::from_root(heap.root);
-    let alloc = &mut *phys;
-    vmm.map(alloc, low, pa, size, PageFlags::READ | PageFlags::WRITE);
-    unsafe {
-        heap.add_region(low as usize, size as usize);
+
+    // Strategies 1+2: contiguous (2 MiB-aligned when it helps).
+    let contig = if count >= 512 {
+        phys.try_alloc_contiguous_aligned(count, 512)
+    } else {
+        Err(crate::mm::phys_alloc::AllocError::NoFrames)
     }
+    .or_else(|_| phys.try_alloc_contiguous(count));
+    if let Ok(pa) = contig {
+        let alloc = &mut *phys;
+        vmm.map(alloc, low, pa, size, PageFlags::READ | PageFlags::WRITE);
+        unsafe { heap.add_region(low as usize, size as usize) };
+        heap.low_vaddr = low;
+        heap.register_chunk(low, pa, size, false);
+        return true;
+    }
+
+    // Strategy 3: scattered frames — map each page individually.
+    let mut got = 0usize;
+    while got < count {
+        match phys.alloc() {
+            Some(frame) => {
+                vmm.map_4k(
+                    phys,
+                    low + (got as u64) * 4096,
+                    frame,
+                    PageFlags::READ | PageFlags::WRITE,
+                );
+                got += 1;
+            }
+            None => break,
+        }
+    }
+    if got < count {
+        SerialPort::puts("[heap] WARN: scattered growth short ");
+        SerialPort::put_u64(got as u64);
+        SerialPort::puts("/");
+        SerialPort::put_u64(count as u64);
+        SerialPort::puts("\n");
+        // Roll back page-by-page (unmap + shootdown, then free) — rare path,
+        // no buffering needed.  Frames are translated before their mapping
+        // is torn down.
+        for i in 0..got {
+            let va = low + (i as u64) * 4096;
+            let pa = vmm.translate(va);
+            vmm.unmap(phys, va, 4096);
+            if let Some(pa) = pa {
+                unsafe { phys.free(pa & !0xFFF) };
+            }
+        }
+        return false;
+    }
+
+    unsafe { heap.add_region(low as usize, size as usize) };
     heap.low_vaddr = low;
-    heap.register_chunk(low, pa, size);
+    heap.register_chunk(low, 0, size, true);
+    true
 }
 
 // ── Per-CPU free-list caches ───────────────────────────────────────
@@ -1169,19 +1419,27 @@ unsafe impl GlobalAlloc for HeapAllocator {
             return core::ptr::null_mut();
         }
 
-        // Fast path: reuse a block parked in this CPU's cache.
-        let cached = per_cpu_alloc_cached(layout);
-        if !cached.is_null() {
-            // Live accounting only drives chunk reclamation, which is compiled
-            // out when disabled.  Keeping this off the cache hit path means the
-            // per-CPU cache truly never touches the global HEAP lock.
-            if ENABLE_HEAP_CHUNK_RECLAIM {
-                HEAP.lock().mark_live(cached as u64);
+        if !ENABLE_HEAP_CHUNK_RECLAIM {
+            // With reclamation disabled, the cache can be used without taking
+            // the global heap lock.
+            let cached = per_cpu_alloc_cached(layout);
+            if !cached.is_null() {
+                return cached;
             }
-            return cached;
         }
 
+        // Reclamation removes and unmaps an idle chunk while holding HEAP and
+        // then drains every per-CPU cache.  A cache hit must therefore be
+        // removed and accounted for while HEAP is held: otherwise a reclaimer
+        // can observe live == 0 after the cache lock is released, unmap the
+        // chunk, and the allocator can return that stale cached pointer.  The
+        // lock order is HEAP -> per-CPU cache, matching drain_cached_blocks.
         let mut heap = HEAP.lock();
+        let cached = per_cpu_alloc_cached(layout);
+        if !cached.is_null() {
+            heap.mark_live(cached as u64);
+            return cached;
+        }
         let ptr = heap.alloc_inner(layout);
         let ptr = if ptr.is_null() {
             // Grow by at least the number of pages required for this
@@ -1190,7 +1448,14 @@ unsafe impl GlobalAlloc for HeapAllocator {
             // +1 page reserves room for the block header/padding so an
             // allocation that is an exact multiple of the page size (e.g. a
             // 3 MiB framebuffer shadow) still fits in the grown chunk.
-            let pages_needed = (layout.size() + 4095) / 4096 + 1;
+            let Some(pages_needed) = layout
+                .size()
+                .checked_add(4095)
+                .and_then(|size| size.checked_div(4096))
+                .and_then(|pages| pages.checked_add(1))
+            else {
+                return core::ptr::null_mut();
+            };
             allocate_pages(&mut heap, pages_needed.max(HEAP_GROW_PAGES));
             heap.alloc_inner(layout)
         } else {
@@ -1207,6 +1472,11 @@ unsafe impl GlobalAlloc for HeapAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
         if ptr.is_null() {
             return;
+        }
+        if HEAP_POISON {
+            // Paint the payload head before any free path touches it.
+            let n = _layout.size().clamp(8, 64);
+            unsafe { core::ptr::write_bytes(ptr, HEAP_POISON_BYTE, n) };
         }
         // Park the block in the current CPU's cache when there is room.  When
         // chunk reclamation is compiled out this is the entire cost of a free —

@@ -22,12 +22,26 @@ struct BitmapAllocatorInner {
     next_free: usize,
 }
 
+/// Upper bound on tracked usable regions.  The bitmap constructor asserts
+/// this holds; firmware maps (UEFI/Multiboot) stay far below it.
+pub const MAX_USABLE_REGIONS: usize = 32;
+
 pub struct BitmapAllocator {
     bitmap: *mut u8,
     total_frames: usize,
     alloc_end: u64,
     kernel_start: u64,
     kernel_end: u64,
+    /// Compact snapshot of the usable RAM spans `(base, size)` captured at
+    /// construction.  The physmap builder maps exactly these spans so MMIO /
+    /// ACPI / framebuffer holes below `alloc_end` never get writable aliases.
+    usable_regions: [(u64, u64); MAX_USABLE_REGIONS],
+    usable_len: usize,
+    /// Free-frame count maintained under `inner` (every mutation happens with
+    /// the lock held, so the value is exact between operations).  A lockless
+    /// `Relaxed` read may briefly trail a concurrent alloc/free; consumers
+    /// needing exactness take `inner` via [`Self::free_frames_exact`].
+    free_count: AtomicUsize,
     /// Sharded scan-start hint — lockless `Relaxed` load for `alloc` fast-path.
     /// `inner.next_free` remains authoritative (holds lock); hint merely shards
     /// start_word so concurrent allocators don't all probe word 0. No buddy yet.
@@ -171,23 +185,54 @@ impl BitmapAllocator {
 
         SerialPort::puts("[alloc] done\n");
         let hint = (base / 4096) as usize;
+        let mut usable_regions = [(0u64, 0u64); MAX_USABLE_REGIONS];
+        let mut usable_len = 0usize;
+        for r in memory_map {
+            if r.kind == MemoryRegionKind::Usable && r.size > 0 {
+                assert!(
+                    usable_len < MAX_USABLE_REGIONS,
+                    "too many usable memory regions (>{MAX_USABLE_REGIONS})"
+                );
+                usable_regions[usable_len] = (r.base, r.size);
+                usable_len += 1;
+            }
+        }
         BitmapAllocator {
             bitmap,
             total_frames,
             alloc_end: max_addr,
             kernel_start: ks,
             kernel_end: ke,
+            usable_regions,
+            usable_len,
+            free_count: AtomicUsize::new(0),
             next_free_hint: AtomicUsize::new(hint),
             inner: spin::Mutex::new(BitmapAllocatorInner { next_free: hint }),
         }
+        .with_seeded_free_count()
+    }
+
+    /// Seed `free_count` from a one-time full bitmap scan (boot only).
+    fn with_seeded_free_count(mut self) -> Self {
+        let guard = self.inner.lock();
+        self.free_count = AtomicUsize::new(self.count_free_locked(&guard));
+        drop(guard);
+        self
+    }
+
+    /// The usable RAM spans `(base, size)` captured from the firmware memory
+    /// map at construction.  The physmap builder maps exactly these spans —
+    /// never the holes between them.
+    pub fn usable_regions(&self) -> &[(u64, u64)] {
+        &self.usable_regions[..self.usable_len]
     }
 
     /// Highest physical address of any usable region (exclusive).
     ///
     /// This is the top of the last usable RAM chunk, NOT the end of a contiguous
-    /// block. The bitmap may cover holes between usable regions, but the page-table
-    /// mapper must map from 0 to this bound to make all allocatable frames accessible.
-    /// Holes (PCI MMIO, framebuffer, etc.) are managed by never clearing their bits.
+    /// block.  It bounds `init_physmap`'s window size; the *mapped* spans are
+    /// exactly [`BitmapAllocator::usable_regions`], so MMIO/firmware holes below
+    /// this bound get no writable alias.
     pub fn alloc_end(&self) -> u64 {
         self.alloc_end
     }
@@ -208,10 +253,24 @@ impl BitmapAllocator {
         self.inner.lock().next_free
     }
 
-    /// Count of currently-free 4 KiB frames (bitmap scan; O(n), for `/sys`).
-    /// Takes `inner` lock to avoid torn u64 reads vs byte `set_used/set_free`.
+    /// Count of currently-free 4 KiB frames — O(1) atomic read.
+    ///
+    /// Maintained under `inner` on every alloc/free/reserve path, so the value
+    /// is exact whenever no allocation is mid-flight; the lockless `Relaxed`
+    /// read here may briefly trail concurrent mutations.  Use
+    /// [`Self::free_frames_exact`] for an authoritative bitmap scan.
     pub fn free_frames(&self) -> usize {
-        let _guard = self.inner.lock();
+        self.free_count.load(Ordering::Relaxed)
+    }
+
+    /// Authoritative free-frame count via full O(n) bitmap scan under `inner`.
+    pub fn free_frames_exact(&self) -> usize {
+        let guard = self.inner.lock();
+        self.count_free_locked(&guard)
+    }
+
+    /// Full bitmap word scan; caller must hold `inner`.
+    fn count_free_locked(&self, _guard: &spin::MutexGuard<'_, BitmapAllocatorInner>) -> usize {
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
         let mut free = 0usize;
@@ -230,6 +289,12 @@ impl BitmapAllocator {
             free += mask.count_ones() as usize - w.count_ones() as usize;
         }
         free
+    }
+
+    /// Bit test without mutation; caller must hold `inner` where the bit may
+    /// race (boot-time / locked paths only).
+    fn is_used(&self, idx: usize) -> bool {
+        unsafe { (*self.bitmap_ptr().add(idx / 8) >> (idx % 8)) & 1 == 1 }
     }
 
     #[inline]
@@ -304,6 +369,7 @@ impl BitmapAllocator {
                     candidates &= !(1u64 << bit);
                     continue;
                 }
+                self.free_count.fetch_sub(1, Ordering::Relaxed);
                 return Some(addr);
             }
         }
@@ -340,6 +406,7 @@ impl BitmapAllocator {
                     candidates &= !(1u64 << bit);
                     continue;
                 }
+                self.free_count.fetch_sub(1, Ordering::Relaxed);
                 return Some(addr);
             }
         }
@@ -359,7 +426,52 @@ impl BitmapAllocator {
     /// Fallible contiguous allocation — returns Err(NoFrames) instead of panicking.
     /// Used by smp::allocate_ap_stack and heap::allocate_pages.
     pub fn try_alloc_contiguous(&self, count: usize) -> Result<u64, AllocError> {
-        if count == 0 || count > self.total_frames {
+        self.alloc_contig_core(count, 1, self.total_frames)
+    }
+
+    /// Fallible contiguous allocation whose entire span lies strictly below
+    /// `max_paddr` — the 32-bit DMA-zone query.  Devices that cannot address
+    /// above 4 GiB (e.g. HDA controllers without the 64-bit cap) allocate
+    /// through this instead of failing init.
+    pub fn try_alloc_contiguous_below(
+        &self,
+        count: usize,
+        max_paddr: u64,
+    ) -> Result<u64, AllocError> {
+        let hi_cap = ((max_paddr / 4096) as usize).min(self.total_frames);
+        if hi_cap == 0 || count > hi_cap {
+            return Err(AllocError::NoFrames);
+        }
+        self.alloc_contig_core(count, 1, hi_cap)
+    }
+
+    /// Fallible contiguous allocation with an alignment requirement expressed
+    /// in *frames* (`align_pages` must be a power of two; 1 = any frame).
+    ///
+    /// The returned base satisfies `base % (align_pages * 4096) == 0`.  Used
+    /// for huge-page-backed consumers (e.g. heap growth wanting 2 MiB chunks
+    /// → `align_pages = 512`) so `Vmm::map` can use large pages instead of
+    /// degrading to 512 × 4 KiB PTEs.
+    pub fn try_alloc_contiguous_aligned(
+        &self,
+        count: usize,
+        align_pages: usize,
+    ) -> Result<u64, AllocError> {
+        self.alloc_contig_core(count, align_pages, self.total_frames)
+    }
+
+    /// Shared contiguous-run search: `[0, hi_cap)` frame window, `align_pages`
+    /// alignment, wrap-around once.
+    fn alloc_contig_core(
+        &self,
+        count: usize,
+        align_pages: usize,
+        hi_cap: usize,
+    ) -> Result<u64, AllocError> {
+        if count == 0 || count > self.total_frames || count > hi_cap {
+            return Err(AllocError::InvalidCount);
+        }
+        if align_pages == 0 || !align_pages.is_power_of_two() {
             return Err(AllocError::InvalidCount);
         }
         let mut inner = self.inner.lock();
@@ -373,9 +485,25 @@ impl BitmapAllocator {
             self.total_frames % 64
         };
 
-        // Find a run of `count` consecutive free frames within [lo, hi).
-        // Scans 64 frames per word, skipping fully-free words in one shot
-        // instead of probing one frame at a time.
+        // Find a run of `count` consecutive free frames within [lo, hi),
+        // returning an `align_pages`-aligned start inside the run when one
+        // fits.  Scans 64 frames per word, skipping fully-free words in one
+        // shot instead of probing one frame at a time.
+        //
+        // `emit` picks the first aligned window inside a candidate run; when
+        // alignment doesn't fit *yet* the caller keeps extending the run
+        // rather than discarding it (the deficit is < align_pages frames).
+        let emit = |rs: usize, rl: usize| -> Option<usize> {
+            if rl < count {
+                return None;
+            }
+            let off = (align_pages - (rs % align_pages)) % align_pages;
+            if off + count <= rl {
+                Some(rs + off)
+            } else {
+                None
+            }
+        };
         let find_run = |lo: usize, hi: usize| -> Option<usize> {
             if lo >= hi {
                 return None;
@@ -412,8 +540,8 @@ impl BitmapAllocator {
                         run_start = wi * 64;
                     }
                     run_len += nbits;
-                    if run_len >= count {
-                        return Some(run_start);
+                    if let Some(s) = emit(run_start, run_len) {
+                        return Some(s);
                     }
                     continue;
                 }
@@ -425,8 +553,8 @@ impl BitmapAllocator {
                 if run_len > 0 {
                     let lead = (!w).trailing_zeros() as usize;
                     run_len += lead;
-                    if run_len >= count {
-                        return Some(run_start);
+                    if let Some(s) = emit(run_start, run_len) {
+                        return Some(s);
                     }
                     run_len = 0;
                     i = lead + 1;
@@ -438,8 +566,8 @@ impl BitmapAllocator {
                             i += 1;
                         }
                         let len = i - s;
-                        if len >= count {
-                            return Some(wi * 64 + s);
+                        if let Some(a) = emit(wi * 64 + s, len) {
+                            return Some(a);
                         }
                         run_len = len;
                         run_start = wi * 64 + s;
@@ -454,7 +582,10 @@ impl BitmapAllocator {
         // Scan from next_free to end-of-bitmap, then wrap around from 0.
         // Runtime reserve: skip runs overlapping kernel or frame 0 by re-probing.
         let mut lo = next_free;
-        let mut hi = self.total_frames;
+        // `hi_cap` is an exclusive frame bound.  Using total_frames here
+        // would let try_alloc_contiguous_below() return a span above its
+        // advertised DMA ceiling whenever the low zone was fragmented.
+        let mut hi = hi_cap;
         let mut tried_wrap = false;
         loop {
             if let Some(run_start) = find_run(lo, hi) {
@@ -462,7 +593,7 @@ impl BitmapAllocator {
                     // treat as occupied, skip past it and continue search in same half
                     lo = run_start + 1;
                     if lo + count > hi {
-                        if !tried_wrap && hi == self.total_frames {
+                        if !tried_wrap && hi == hi_cap {
                             lo = 0;
                             hi = next_free;
                             tried_wrap = true;
@@ -496,9 +627,10 @@ impl BitmapAllocator {
                     lo = run_start + 1;
                     continue;
                 }
+                self.free_count.fetch_sub(count, Ordering::Relaxed);
                 return Ok(addr);
             } else {
-                if !tried_wrap && hi == self.total_frames {
+                if !tried_wrap && hi == hi_cap {
                     lo = 0;
                     hi = next_free;
                     tried_wrap = true;
@@ -529,8 +661,9 @@ impl BitmapAllocator {
             ((end + 4095) / 4096).min(self.total_frames as u64) as usize
         };
         for frame in start_frame..end_frame {
-            if frame < self.total_frames {
+            if frame < self.total_frames && !self.is_used(frame) {
                 self.set_used(frame);
+                self.free_count.fetch_sub(1, Ordering::Relaxed);
             }
         }
     }
@@ -562,6 +695,7 @@ impl BitmapAllocator {
         }
         // INV-PA-03: clear bit
         self.set_free(idx);
+        self.free_count.fetch_add(1, Ordering::Relaxed);
         if idx < inner.next_free {
             inner.next_free = idx;
         }

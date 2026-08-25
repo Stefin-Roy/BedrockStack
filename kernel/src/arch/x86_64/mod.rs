@@ -1,3 +1,4 @@
+pub mod cpufeat;
 pub mod gdt;
 pub mod idt;
 #[cfg(feature = "cpu_slow")]

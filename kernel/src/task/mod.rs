@@ -1312,6 +1312,7 @@ pub fn schedule() {
                     if p.state == TaskState::Dead {
                         park_zombie(p);
                     }
+                    crate::mm::vmm::set_current_root(root);
                     unsafe {
                         switch_to(pctx, idle_ctx(), root);
                     }
@@ -1353,6 +1354,7 @@ pub fn schedule() {
             if p.state == TaskState::Dead {
                 park_zombie(p);
             }
+            crate::mm::vmm::set_current_root(next_root);
             unsafe {
                 switch_to(pctx, next_ptr, next_root);
             }
@@ -1362,12 +1364,14 @@ pub fn schedule() {
             p.state = TaskState::Ready;
             q.push_back(p);
             drop(q);
+            crate::mm::vmm::set_current_root(next_root);
             unsafe {
                 switch_to(pctx, next_ptr, next_root);
             }
         }
         None => {
             drop(q);
+            crate::mm::vmm::set_current_root(next_root);
             unsafe {
                 switch_to(idle_ctx(), next_ptr, next_root);
             }
@@ -1436,6 +1440,7 @@ pub fn enter_userspace(
     crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
     *CURRENT.lock() = Some(t);
 
+    crate::mm::vmm::set_current_root(root);
     unsafe {
         switch_to(idle_ctx(), ctx_ptr, root);
     }

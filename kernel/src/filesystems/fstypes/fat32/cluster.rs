@@ -19,6 +19,9 @@ pub(super) fn read_cluster(
     cluster: u32,
     buf: &mut [u8],
 ) -> Result<(), VfsError> {
+    if cluster < 2 || cluster as u64 >= 2u64 + sb.bpb.total_clus as u64 {
+        return Err(VfsError::InvalidInput);
+    }
     let lba = sb.bpb.cluster_to_lba(cluster);
     fat_trace!({
         crate::drivers::serial::dump_puts("[DBG:fat32] read_cluster clus=0x");
@@ -35,6 +38,9 @@ pub(super) fn write_cluster(
     cluster: u32,
     buf: &[u8],
 ) -> Result<(), VfsError> {
+    if cluster < 2 || cluster as u64 >= 2u64 + sb.bpb.total_clus as u64 {
+        return Err(VfsError::InvalidInput);
+    }
     let lba = sb.bpb.cluster_to_lba(cluster);
     write_sectors(&*sb.device, lba, sb.bpb.sec_per_clus as u32, buf)
 }

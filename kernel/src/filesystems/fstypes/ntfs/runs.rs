@@ -147,17 +147,29 @@ pub(crate) fn read_file_at(
         if run.lcn < 0 {
             buf[done..done + want].fill(0);
         } else {
-            let lba = boot.cluster_to_lba(run.lcn as u64) + in_run / boot.bytes_per_sector;
+            let lba = run
+                .lcn
+                .checked_mul(boot.sectors_per_cluster as i64)
+                .and_then(|v| v.checked_add((in_run / boot.bytes_per_sector) as i64))
+                .filter(|&v| v >= 0)
+                .map(|v| v as u64)
+                .ok_or(VfsError::IOError)?;
             let sector_off = (in_run % boot.bytes_per_sector) as usize;
             let total = sector_off + want;
             let secs = total.div_ceil(boot.bytes_per_sector as usize);
+            let secs_u64 = secs as u64;
+            if lba >= boot.total_sectors
+                || secs_u64 > boot.total_sectors.saturating_sub(lba)
+            {
+                return Err(VfsError::IOError);
+            }
             let mut tmp = vec![0u8; secs * boot.bytes_per_sector as usize];
             read_sectors(device, lba, secs as u32, &mut tmp)?;
             buf[done..done + want].copy_from_slice(&tmp[sector_off..sector_off + want]);
         }
 
         done += want;
-        pos += want as u64;
+        pos = pos.checked_add(want as u64).ok_or(VfsError::IOError)?;
     }
 
     Ok(done)

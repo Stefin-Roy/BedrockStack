@@ -275,6 +275,9 @@ pub extern "C" fn ap_entry64() -> ! {
     let pc = current_per_cpu();
     let cpu_id = pc.cpu_id;
 
+    // Match the BSP's CR4 SMEP bit (trampoline's hardcoded CR4 predates it).
+    crate::arch::x86_64::cpufeat::enable_smep();
+
     // Signal ready immediately — APs never write to .idt (fixed in Arch::init_ap),
     // so there is no race with protect_idt() on the BSP.
     crate::smp::AP_READY[cpu_id as usize]

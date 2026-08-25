@@ -690,7 +690,12 @@ pub unsafe fn init(
             continue;
         }
         let cpu_id = cpu_id_offset as u32;
-        let stack_top = allocate_ap_stack(cpu_id);
+        // Skip (don't brick) when no contiguous stack window exists — the
+        // machine boots with fewer CPUs rather than hanging forever.
+        let stack_top = match allocate_ap_stack(cpu_id) {
+            Some(top) => top,
+            None => continue,
+        };
 
         set_cpu_state(cpu_id, CpuState::Starting);
 
@@ -744,27 +749,48 @@ pub unsafe fn init(
     total
 }
 
-fn allocate_ap_stack(_cpu_id: u32) -> u64 {
+/// Allocate the 17-page contiguous AP stack for one AP.
+///
+/// Retries a few times (another CPU's `free()` may land between attempts and
+/// coalesce a window), then gives up with `None` so `init` can skip that CPU
+/// — boot continues uniprocessor-style instead of silently spinning forever.
+///
+/// Returns the stack **top** physical address (one past the last page).
+fn allocate_ap_stack(cpu_id: u32) -> Option<u64> {
+    use crate::drivers::serial::SerialPort;
     const AP_STACK_PAGES: usize = 17;
+    const AP_STACK_ATTEMPTS: usize = 3;
     let alloc = crate::mm::heap::get_phys_allocator_mut();
-    let base = match alloc.try_alloc_contiguous(AP_STACK_PAGES) {
-        Ok(b) => b,
-        Err(crate::mm::phys_alloc::AllocError::NoFrames) => {
-            crate::drivers::serial::SerialPort::puts("[smp] FATAL: NoFrames for AP stack, cpu ");
-            crate::drivers::serial::SerialPort::put_u64(_cpu_id as u64);
-            crate::drivers::serial::SerialPort::puts(" free=");
-            crate::drivers::serial::SerialPort::put_u64(alloc.free_frames() as u64);
-            crate::drivers::serial::SerialPort::puts("\n");
-            // No useful fallback — contiguous is required for the 17-page AP stack.
-            // Propagating via try_allocate path would be cleaner; here we halt as before.
-            loop { core::hint::spin_loop(); }
+    for attempt in 1..=AP_STACK_ATTEMPTS {
+        match alloc.try_alloc_contiguous(AP_STACK_PAGES) {
+            Ok(base) => return Some(base + AP_STACK_PAGES as u64 * 4096),
+            Err(crate::mm::phys_alloc::AllocError::NoFrames) => {
+                SerialPort::puts("[smp] WARN: NoFrames for AP stack cpu=");
+                SerialPort::put_u64(cpu_id as u64);
+                SerialPort::puts(" attempt=");
+                SerialPort::put_u64(attempt as u64);
+                SerialPort::puts("/");
+                SerialPort::put_u64(AP_STACK_ATTEMPTS as u64);
+                SerialPort::puts(" free=");
+                SerialPort::put_u64(alloc.free_frames() as u64);
+                SerialPort::puts("\n");
+                // Brief pause; a concurrent free may coalesce a window.
+                core::hint::spin_loop();
+            }
+            Err(crate::mm::phys_alloc::AllocError::InvalidCount) => {
+                SerialPort::puts("[smp] FATAL: invalid AP stack pages (bitmap too small)\n");
+                return None;
+            }
         }
-        Err(crate::mm::phys_alloc::AllocError::InvalidCount) => {
-            crate::drivers::serial::SerialPort::puts("[smp] FATAL: invalid AP stack pages\n");
-            loop { core::hint::spin_loop(); }
-        }
-    };
-    base + AP_STACK_PAGES as u64 * 4096
+    }
+    SerialPort::puts("[smp] WARN: skipping AP cpu=");
+    SerialPort::put_u64(cpu_id as u64);
+    SerialPort::puts(" — no contiguous ");
+    SerialPort::put_u64(AP_STACK_PAGES as u64);
+    SerialPort::puts("-frame window after ");
+    SerialPort::put_u64(AP_STACK_ATTEMPTS as u64);
+    SerialPort::puts(" attempts\n");
+    None
 }
 
 pub fn try_allocate_ap_stack(_cpu_id: u32) -> Result<u64, crate::mm::phys_alloc::AllocError> {

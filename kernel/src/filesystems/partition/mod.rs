@@ -89,9 +89,23 @@ impl BlockDevice for PartitionDevice {
         }
 
         let mut adjusted: Vec<IoRequest> = Vec::with_capacity(n);
+        let partition_end = self
+            .start_lba
+            .checked_add(self.sector_count)
+            .ok_or("partition range overflow")?;
         for r in reqs.iter() {
-            let lba = self.start_lba + r.lba;
-            if lba >= self.start_lba + self.sector_count {
+            let request_end = r
+                .lba
+                .checked_add(r.count as u64)
+                .ok_or("partition request range overflow")?;
+            if request_end > self.sector_count {
+                return Err("partition LBA out of range");
+            }
+            let lba = self
+                .start_lba
+                .checked_add(r.lba)
+                .ok_or("partition LBA overflow")?;
+            if lba >= partition_end && r.count != 0 {
                 return Err("partition LBA out of range");
             }
             let buffer = match &r.buffer {

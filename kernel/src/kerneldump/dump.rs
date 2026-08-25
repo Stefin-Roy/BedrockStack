@@ -773,6 +773,54 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let _ = writeln!(w, "  -> phys={:#x}", phys);
 }
 
+// ── Non-exception fatal dump ───────────────────────────────────────
+
+/// Fatal dump for a condition detected outside any exception frame (e.g. a
+/// TLB-shootdown timeout in normal kernel context).  Synthesizes an interrupt
+/// stack frame from the live register state so every standard dump section
+/// (registers, CRs, MSRs, stack, code bytes) still applies.
+///
+/// Vector `0xFE` is reserved for these synthetic dumps (`exception_name`
+/// renders it as "??"); the caller's context string is printed before the
+/// standard header.
+pub fn dump_fatal(context: &str) -> ! {
+    crate::drivers::serial::SerialPort::puts("\n[DUMP] fatal: ");
+    crate::drivers::serial::SerialPort::puts(context);
+    crate::drivers::serial::SerialPort::puts("\n");
+
+    let rip: u64;
+    let rsp: u64;
+    let rflags: u64;
+    let cs: u16;
+    let ss: u16;
+    // pushfq/popfq are balanced, so `nostack` stays honest; `nomem` holds
+    // because nothing here dereferences memory.
+    unsafe {
+        core::arch::asm!(
+            "lea {0}, [rip]",
+            "mov {1}, rsp",
+            "pushfq",
+            "pop {2}",
+            "mov {3:x}, cs",
+            "mov {4:x}, ss",
+            out(reg) rip,
+            lateout(reg) rsp,
+            lateout(reg) rflags,
+            lateout(reg) cs,
+            lateout(reg) ss,
+            options(nomem, nostack)
+        );
+    }
+    let frame = InterruptStackFrame::new(
+        x86_64::VirtAddr::new(rip),
+        x86_64::structures::gdt::SegmentSelector(cs),
+        x86_64::registers::rflags::RFlags::from_bits_truncate(rflags),
+        x86_64::VirtAddr::new(rsp),
+        x86_64::structures::gdt::SegmentSelector(ss),
+    );
+    dump_full_fault(&frame, 0, 0xFE)
+}
+
 // ── Main fault-dump orchestrator ───────────────────────────────────
 
 pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8) -> ! {

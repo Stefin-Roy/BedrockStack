@@ -325,6 +325,14 @@ impl BlockDevice for UsbMassStorageDevice {
                 continue;
             }
 
+            let request_end = match req.lba.checked_add(count as u64) {
+                Some(end) if end <= self.sector_count && end <= (u32::MAX as u64) + 1 => end,
+                _ => {
+                    errors += 1;
+                    continue;
+                }
+            };
+
             let bytes = (count as usize) * 512;
             let (buf_vaddr, buf_size) = match &req.buffer {
                 IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
@@ -387,6 +395,7 @@ impl BlockDevice for UsbMassStorageDevice {
                     i += chunk;
                 }
             }
+            debug_assert!(request_end >= req.lba);
             completed += 1;
         }
 

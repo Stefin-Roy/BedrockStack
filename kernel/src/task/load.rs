@@ -38,7 +38,34 @@ const PF_X: u32 = 0x1;
 const EXPECTED_MACHINE: u16 = 0x3E;
 
 /// User stack top; the stack grows down from here.
+/// Canonical user stack ceiling.  The live per-process stack top is slid
+/// down from here by [`aslr_stack_top`].
 const USER_STACK_TOP: u64 = 0x0000_7FFF_0000_0000;
+
+/// Maximum downward slide of the user stack top (256 MiB, 4 KiB granular).
+///
+/// Bounded so the stack can never climb into `CAP_SLOT_VA`
+/// (0x7FFF_8000_0000 — a full GiB above this window's bottom) and so
+/// `usermem::register`'s accounting sees a consistent ceiling.
+const USER_STACK_ASLR_WINDOW: u64 = 256 * 1024 * 1024;
+
+/// User images must stay below the lowest possible randomized stack guard.
+/// Otherwise one valid stack slide could overlap an image page that was
+/// already installed in the shared process root.
+const USER_IMAGE_MAX: u64 = USER_STACK_TOP
+    - USER_STACK_ASLR_WINDOW
+    - USER_STACK_SIZE
+    - 4096;
+const USER_BOUNDARY: u64 = 0x0000_8000_0000_0000;
+
+/// Randomized user stack top: `USER_STACK_TOP - rand[0, window)`, 4 KiB
+/// aligned.  Uses the kernel CSPRNG (non-blocking; falls back to its entropy
+/// source when unseeded), so a zero slide is possible but improbable.
+fn aslr_stack_top() -> u64 {
+    let pages = USER_STACK_ASLR_WINDOW / 4096;
+    let off = (crate::random::random_u64() % pages) * 4096;
+    USER_STACK_TOP - off
+}
 
 /// Size of the initial user stack (8 × 4 KiB). The page below it stays
 /// unmapped as the guard page.
@@ -163,15 +190,21 @@ fn parse_segments(elf: &[u8]) -> Result<Vec<Segment>, &'static str> {
         if p_memsz < p_filesz {
             return Err("Segment memsz < filesz");
         }
-        let end_in_file = (p_offset as usize)
-            .checked_add(p_filesz as usize)
+        let end_in_file = p_offset
+            .checked_add(p_filesz)
             .ok_or("segment offset overflow")?;
-        if end_in_file > elf.len() {
+        if end_in_file > elf.len() as u64 {
             return Err("Segment data out of bounds");
         }
-        p_vaddr
+        let end = p_vaddr
             .checked_add(p_memsz)
             .ok_or("segment vaddr overflow")?;
+        if p_memsz == 0 || p_vaddr < 4096 || end > USER_IMAGE_MAX || end > USER_BOUNDARY {
+            return Err("Segment outside the permitted user image range");
+        }
+        if p_flags & PF_X != 0 && p_flags & 0x2 != 0 {
+            return Err("Writable executable segment violates W^X");
+        }
 
         segs.push(Segment {
             vaddr: p_vaddr,
@@ -183,6 +216,34 @@ fn parse_segments(elf: &[u8]) -> Result<Vec<Segment>, &'static str> {
     }
     if segs.is_empty() {
         return Err("No loadable segments");
+    }
+    // A shared page may be reused by adjacent PT_LOADs, but it cannot safely
+    // represent both executable and writable content.  Reject such images
+    // instead of letting segment order silently decide the final PTE flags.
+    for (i, a) in segs.iter().enumerate() {
+        let a_start = a.vaddr & !0xFFF;
+        let a_end = a
+            .vaddr
+            .checked_add(a.memsz)
+            .and_then(|v| v.checked_add(0xFFF))
+            .ok_or("segment page range overflow")?
+            & !0xFFF;
+        for b in segs.iter().skip(i + 1) {
+            let b_start = b.vaddr & !0xFFF;
+            let b_end = b
+                .vaddr
+                .checked_add(b.memsz)
+                .and_then(|v| v.checked_add(0xFFF))
+                .ok_or("segment page range overflow")?
+                & !0xFFF;
+            if a_start < b_end
+                && b_start < a_end
+                && (a.flags & PF_X != b.flags & PF_X
+                    || a.flags & 0x2 != b.flags & 0x2)
+            {
+                return Err("Overlapping PT_LOAD pages have incompatible permissions");
+            }
+        }
     }
     Ok(segs)
 }
@@ -204,7 +265,8 @@ fn map_segment(
         .vaddr
         .checked_add(seg.memsz)
         .ok_or("segment vaddr overflow")?
-        .wrapping_add(0xFFF)
+        .checked_add(0xFFF)
+        .ok_or("segment alignment overflow")?
         & !0xFFF;
 
     let mut va = vstart;
@@ -263,19 +325,35 @@ pub fn create_process(
     let e_entry = read_u64(elf, 24);
     let segs = parse_segments(elf)?;
 
+    let entry_ok = segs.iter().any(|seg| {
+        seg.flags & PF_X != 0
+            && e_entry >= seg.vaddr
+            && e_entry < seg.vaddr.saturating_add(seg.memsz)
+    });
+    if !entry_ok {
+        return Err("ELF entry point is not inside an executable segment");
+    }
+
     // Clone the kernel higher half; the low half starts empty for the user.
     let root = clone_high_half(alloc, crate::task::kernel_root());
     let mut vmm = Vmm::from_root(root);
 
     for seg in &segs {
-        map_segment(&mut vmm, alloc, elf, seg)?;
+        if let Err(e) = map_segment(&mut vmm, alloc, elf, seg) {
+            crate::mm::vmm::destroy_root(root, alloc);
+            return Err(e);
+        }
     }
 
-    // 32 KiB user stack at the canonical ceiling, guard page below unmapped.
-    let stack_base = USER_STACK_TOP - USER_STACK_SIZE;
+    // 32 KiB user stack at the ASLR-slid top, guard page below unmapped.
+    let stack_top = aslr_stack_top();
+    let stack_base = stack_top - USER_STACK_SIZE;
     let mut va = stack_base;
-    while va < USER_STACK_TOP {
-        let phys = alloc.alloc().ok_or("OOM mapping user stack")?;
+    while va < stack_top {
+        let Some(phys) = alloc.alloc() else {
+            crate::mm::vmm::destroy_root(root, alloc);
+            return Err("OOM mapping user stack");
+        };
         vmm.map_4k(
             alloc,
             va,
@@ -309,10 +387,9 @@ pub fn create_process(
         }
     }
     let stack_flags = PageFlags::USER | PageFlags::READ | PageFlags::WRITE;
-    let vm =
-        crate::mm::usermem::register(root, image_floor, image_top, USER_STACK_TOP, stack_flags);
+    let vm = crate::mm::usermem::register(root, image_floor, image_top, stack_top, stack_flags);
 
-    Ok((root, e_entry, USER_STACK_TOP, vm))
+    Ok((root, e_entry, stack_top, vm))
 }
 
 /// Encode a `struct{name: str}` method payload and invoke it on `path`.
@@ -368,7 +445,14 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
             // Stash the Arc'd set; enter_userspace adopts it into the real Task.
             crate::task::stash_init_caps(caps, phys);
         } else {
-            log::warn!("[sched] caps page alloc failed for INIT");
+            // INIT without its capability mirror is not a usable process and
+            // would otherwise run deny-all while leaking its address space.
+            // Tear down the complete cloned root, including its root frame,
+            // before returning to the kernel idle path.
+            log::warn!("[sched] caps page alloc failed for INIT; rolling back");
+            crate::mm::vmm::destroy_root(root, alloc);
+            crate::mm::usermem::unregister(vm);
+            return;
         }
         // Ensure root still has caps page mapped (install_caps mapped it)
         // No extra step: install_caps already mapped.

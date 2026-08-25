@@ -38,8 +38,9 @@ const KERNEL_LMA_BASE: u64 = 0x600000;
 ///   - the framebuffer's physical range (write-combining — the graphics
 ///     driver derefs the physical address as its VA).
 /// Everything else in low memory is unmapped.  The private physmap
-/// (DIRECT_MAP) is built at `PHYS_MAP_BASE` covering physical
-/// `[0, alloc_end)` with the stack-guard frame excluded.
+/// (DIRECT_MAP) is built at `PHYS_MAP_BASE` covering exactly the *usable*
+/// RAM spans — MMIO/ACPI holes below `alloc_end` get no alias, and the
+/// stack-guard frame is excluded from its span.
 ///
 /// The kernel runs on the high `.stack` (the top of the kernel image, set by
 /// the boot stubs at `__stack_end`), NOT on any low stack, so driver domains
@@ -74,6 +75,9 @@ pub fn setup(
         Efer::update(|f| f.insert(EferFlags::NO_EXECUTE_ENABLE));
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
+
+    // ── Enable SMEP (BSP) — runtime-gated, no-op when unsupported ──
+    crate::arch::x86_64::cpufeat::enable_smep();
 
     let mut vmm = Vmm::new(allocator);
     let guard_page = stack_guard & !(PAGE_4K - 1);
@@ -234,50 +238,96 @@ pub fn setup(
     }
 
     // ── DIRECT_MAP (private physmap) ───────────────────────────────
-    // Map physical `[0, dm_end)` once at PHYS_MAP_BASE with READ|WRITE so the
+    // Map the *usable* RAM spans once at PHYS_MAP_BASE with READ|WRITE so the
     // VMM walkers can deref page-table frames through the physmap instead of
     // the identity map once `init_physmap` is called after activation.
     // Built here (still using the firmware identity map) because it must be
     // present in the *live* kernel root before any runtime walk.  The stack
     // guard frame is left unmapped so the physmap never exposes it.
-    let dm_end = (allocator.alloc_end() + PAGE_2M - 1) & !(PAGE_2M - 1);
-    let mut frame = 0u64;
-    while frame + PAGE_2M <= dm_end {
-        if stack_guard != 0 && frame <= guard_page && guard_page < frame + PAGE_2M {
-            // The guard falls inside this 2 MiB chunk — split it into 4 KiB
-            // pages, skipping the guard frame.
-            let mut page = frame;
-            while page < frame + PAGE_2M {
-                if page != guard_page {
-                    vmm.map_4k(
-                        allocator,
-                        PHYS_MAP_BASE + page,
-                        page,
-                        PageFlags::READ | PageFlags::WRITE,
-                    );
-                }
-                page += PAGE_4K;
-            }
-        } else {
-            vmm.map_2m(
-                allocator,
-                PHYS_MAP_BASE + frame,
-                frame,
-                PageFlags::READ | PageFlags::WRITE,
-            );
-        }
-        frame += PAGE_2M;
+    //
+    // Only `usable_regions()` spans are mapped — PCI MMIO / ACPI / framebuffer
+    // holes below `alloc_end` get NO writable alias, so a stray kernel pointer
+    // into a hole faults instead of silently scribbling on a device.
+    let mut spans: [(u64, u64); crate::mm::phys_alloc::MAX_USABLE_REGIONS] =
+        [(0, 0); crate::mm::phys_alloc::MAX_USABLE_REGIONS];
+    let mut span_count = 0usize;
+    for r in allocator.usable_regions() {
+        assert!(
+            span_count < spans.len(),
+            "physmap: more usable regions than tracked"
+        );
+        spans[span_count] = *r;
+        span_count += 1;
     }
-    while frame < dm_end {
-        if stack_guard == 0 || frame != guard_page {
-            vmm.map_4k(
-                allocator,
-                PHYS_MAP_BASE + frame,
-                frame,
-                PageFlags::READ | PageFlags::WRITE,
-            );
+
+    // 4 KiB-maps [start, end) at PHYS_MAP_BASE, skipping the stack guard.
+    fn map_span_4k(
+        vmm: &mut Vmm,
+        allocator: &mut BitmapAllocator,
+        start: u64,
+        end: u64,
+        guard_page: u64,
+        has_guard: bool,
+    ) {
+        let mut page = start;
+        while page < end {
+            if !has_guard || page != guard_page {
+                vmm.map_4k(
+                    allocator,
+                    PHYS_MAP_BASE + page,
+                    page,
+                    PageFlags::READ | PageFlags::WRITE,
+                );
+            }
+            page += PAGE_4K;
         }
-        frame += PAGE_4K;
+    }
+
+    for i in 0..span_count {
+        let (r_base, r_size) = spans[i];
+        let start = r_base & !(PAGE_4K - 1);
+        let end_raw = r_base.saturating_add(r_size);
+        if end_raw <= start {
+            continue;
+        }
+        // Round the exclusive end up to a 4 KiB boundary without overflow.
+        let Some(end) = (end_raw - 1)
+            .checked_add(PAGE_4K - 1)
+            .map(|v| v & !(PAGE_4K - 1))
+        else {
+            continue;
+        };
+
+        // Interior 2 MiB-aligned body; head/tail stay 4 KiB so region edges
+        // never spill into adjacent holes.
+        let body_start = (start + PAGE_2M - 1) & !(PAGE_2M - 1);
+        let body_end = end & !(PAGE_2M - 1);
+        let head_end = body_start.min(end);
+
+        if start < head_end {
+            map_span_4k(&mut vmm, allocator, start, head_end, guard_page, stack_guard != 0);
+        }
+
+        let mut frame = body_start.max(start);
+        while frame + PAGE_2M <= body_end {
+            if stack_guard != 0 && frame <= guard_page && guard_page < frame + PAGE_2M {
+                // Guard falls inside this chunk — split into 4 KiB pages.
+                map_span_4k(&mut vmm, allocator, frame, frame + PAGE_2M, guard_page, true);
+            } else {
+                vmm.map_2m(
+                    allocator,
+                    PHYS_MAP_BASE + frame,
+                    frame,
+                    PageFlags::READ | PageFlags::WRITE,
+                );
+            }
+            frame += PAGE_2M;
+        }
+
+        let tail_start = body_end.max(head_end);
+        if tail_start < end {
+            map_span_4k(&mut vmm, allocator, tail_start, end, guard_page, stack_guard != 0);
+        }
     }
 
     vmm

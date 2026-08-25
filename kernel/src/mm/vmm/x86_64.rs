@@ -99,59 +99,71 @@ fn table_flags_for(leaf: PageTableFlags) -> PageTableFlags {
 // ── Public API ──────────────────────────────────────────────────────
 
 pub fn map_4k(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
-    let _guard = super::lock();
-    // A brand-new higher-half PML4 slot must be fanned out to every clone.
-    let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
-    let mut mapper = mapper_at(root);
-    let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
+    // Table mutation + clone fan-out happen under the VMM lock; the (possibly
+    // long) shootdown wait runs after the guard is dropped so other CPUs can
+    // proceed with their own VMM work instead of serializing behind this map.
+    let new_slot = {
+        let _guard = super::lock();
+        let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
+        let mut mapper = mapper_at(root);
+        let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
-    let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
-    let frame = PhysFrame::<Size4KiB>::containing_address(XPhysAddr::new(paddr));
-    let x86_flags = page_flags_to_x86(flags);
+        let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
+        let frame = PhysFrame::<Size4KiB>::containing_address(XPhysAddr::new(paddr));
+        let x86_flags = page_flags_to_x86(flags);
 
-    unsafe {
-        mapper
-            .map_to_with_table_flags(
-                page,
-                frame,
-                x86_flags,
-                table_flags_for(x86_flags),
-                &mut frame_alloc,
-            )
-            .expect("x86_64 4KiB map failed")
-            .flush();
-    }
+        unsafe {
+            mapper
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    x86_flags,
+                    table_flags_for(x86_flags),
+                    &mut frame_alloc,
+                )
+                .expect("x86_64 4KiB map failed")
+                .flush();
+        }
+        if new_slot {
+            sync_clone_half(root);
+        }
+        new_slot
+    };
     if new_slot {
-        sync_clone_half(root);
         super::flush_tlb();
         super::shootdown_tlb();
     }
 }
 
 pub fn map_2m(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, flags: PageFlags) {
-    let _guard = super::lock();
-    let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
-    let mut mapper = mapper_at(root);
-    let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
+    let new_slot = {
+        let _guard = super::lock();
+        let new_slot = unsafe { new_higher_half_slot(root, vaddr) };
+        let mut mapper = mapper_at(root);
+        let mut frame_alloc = BitmapFrameAllocator { inner: alloc };
 
-    let page = Page::<Size2MiB>::containing_address(VirtAddr::new(vaddr));
-    let frame = PhysFrame::<Size2MiB>::containing_address(XPhysAddr::new(paddr));
-    let x86_flags = page_flags_to_x86(flags);
+        let page = Page::<Size2MiB>::containing_address(VirtAddr::new(vaddr));
+        let frame = PhysFrame::<Size2MiB>::containing_address(XPhysAddr::new(paddr));
+        let x86_flags = page_flags_to_x86(flags);
 
-    unsafe {
-        mapper
-            .map_to_with_table_flags(
-                page,
-                frame,
-                x86_flags,
-                table_flags_for(x86_flags),
-                &mut frame_alloc,
-            )
-            .expect("x86_64 2MiB map failed")
-            .flush();
-    }
+        unsafe {
+            mapper
+                .map_to_with_table_flags(
+                    page,
+                    frame,
+                    x86_flags,
+                    table_flags_for(x86_flags),
+                    &mut frame_alloc,
+                )
+                .expect("x86_64 2MiB map failed")
+                .flush();
+        }
+        if new_slot {
+            sync_clone_half(root);
+        }
+        new_slot
+    };
     if new_slot {
-        sync_clone_half(root);
         super::flush_tlb();
         super::shootdown_tlb();
     }
@@ -364,6 +376,93 @@ pub fn translate(root: u64, vaddr: u64) -> Option<u64> {
     mapper
         .translate_addr(VirtAddr::new(vaddr))
         .map(|p| p.as_u64())
+}
+
+// ── Last-clone empty-table sweep ──────────────────────────────────────
+
+const PTE_PS: u64 = 1 << 7;
+
+/// Recover every fully-empty intermediate table under `root`'s higher-half
+/// PML4 slots (256..=511), clearing the entries that referenced them.
+///
+/// While any clone lives, `reclaim_empty_tables` deliberately *leaks* tables
+/// that become empty (clones alias the parent's subtrees by reference, so
+/// freeing one could hand its frame to a new owner mid-walk).  This sweep
+/// runs exactly once — when the last clone unregisters — so every shared
+/// walker is gone and emptiness implies safety.  A future mapping simply
+/// re-allocates the table.
+///
+/// Returns the number of frames pushed into `pending`; the caller must run a
+/// full flush + [`super::shootdown_tlb`] before `pending.flush`.
+///
+/// # Locking
+/// Caller must hold [`super::lock`].
+pub(super) fn sweep_empty_higher_half_tables(
+    root: u64,
+    pending: &mut Vec<u64>,
+) -> usize {
+    let mut freed = 0;
+    unsafe {
+        let pml4 = pte_deref(root);
+        for i in 256..=511usize {
+            let e = read_pte(pml4, i);
+            if e & PTE_PRESENT == 0 || e & PTE_PS != 0 {
+                // Absent slot, or a 1 GiB leaf: nothing to walk.
+                continue;
+            }
+            let pdpt_frame = pte_frame(e);
+            if sweep_reclaim(pdpt_frame, 2, pending) {
+                write_pte(pml4, i, 0);
+                pending.push(pdpt_frame);
+                freed += 1;
+            }
+        }
+    }
+    freed
+}
+
+/// Recursive emptiness reclamation below one PML4 slot.
+///
+/// `level` 2 = PDPT (children are PDs, which own PT leaves),
+/// `level` 1 = PD (children are PTs — the bottom table tier).
+/// Returns `true` when the table itself became empty (caller frees it).
+///
+/// # Locking
+/// Caller must hold [`super::lock`].
+fn sweep_reclaim(tbl_frame: u64, level: u8, pending: &mut Vec<u64>) -> bool {
+    unsafe {
+        let tbl = pte_deref(tbl_frame);
+        let mut empty = true;
+        for i in 0..512usize {
+            let e = read_pte(tbl, i);
+            if e & PTE_PRESENT == 0 {
+                continue;
+            }
+            if e & PTE_PS != 0 {
+                // Huge page leaf (2 MiB here): real content, stop.
+                empty = false;
+                break;
+            }
+            let child = pte_frame(e);
+            if level <= 1 {
+                // Child is a PT — bottom tier, emptiness decided directly.
+                if table_is_empty(child) {
+                    write_pte(tbl, i, 0);
+                    pending.push(child);
+                } else {
+                    empty = false;
+                }
+            } else {
+                if sweep_reclaim(child, level - 1, pending) {
+                    write_pte(tbl, i, 0);
+                    pending.push(child);
+                } else {
+                    empty = false;
+                }
+            }
+        }
+        empty
+    }
 }
 
 /// Manual 4-level page-table walk returning `(physical, is_user, is_writable)`.
@@ -629,7 +728,32 @@ pub fn destroy_root(root: u64, alloc: &mut BitmapAllocator) {
             alloc.free(f);
         }
     }
-    super::unregister_clone_root(root);
+    let was_last = super::unregister_clone_root(root);
+    if was_last {
+        // Last clone gone: recover the parent's higher-half tables that
+        // `reclaim_empty_tables` deliberately leaked while clones shared them.
+        // Collect under the VMM lock, shootdown, then free — same pattern as
+        // the low-half walk above.
+        let parent = crate::task::kernel_root();
+        let mut pending: Vec<u64> = Vec::new();
+        {
+            let _guard = super::lock();
+            sweep_empty_higher_half_tables(parent, &mut pending);
+        }
+        if !pending.is_empty() {
+            super::flush_tlb();
+            super::shootdown_tlb();
+            for frame in pending {
+                unsafe { alloc.free(frame); }
+            }
+        }
+    }
+
+    // The root PML4 itself is owned by this task and was intentionally not
+    // reachable from the low-half walk above.  Return it after the final
+    // shootdown; otherwise every process permanently leaks one physical
+    // frame even though all of its mappings have been destroyed.
+    unsafe { alloc.free(root); }
 }
 
 /// Remove the WRITABLE flag from a single 4 KiB page, making it read-only.
@@ -642,6 +766,9 @@ pub fn destroy_root(root: u64, alloc: &mut BitmapAllocator) {
 /// (the kernel image is mapped 4 KiB-per-page).
 /// Panics if the page is not present.
 pub fn make_read_only(root: u64, vaddr: u64) {
+    // PTE mutation must hold the global VMM lock like every other mutator
+    // (this was previously unlocked — a latent race against concurrent maps).
+    let _guard = super::lock();
     let mut mapper = mapper_at(root);
     let page = Page::<Size4KiB>::containing_address(VirtAddr::new(vaddr));
     // Reconstruct flags matching what leaf_flags() would have set for
@@ -682,6 +809,11 @@ pub fn make_read_only(root: u64, vaddr: u64) {
 /// # Panics
 /// - If the allocator cannot supply a root frame (OOM).
 pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
+    // Clone creation must be serialized with map/unmap and the clone fan-out.
+    // Without this lock, a concurrent higher-half map can be copied halfway,
+    // or a destroy path can unregister/free a root while sync_clone_half is
+    // iterating the registry.
+    let _guard = super::lock();
     let new_root = alloc.alloc().expect("x86_64 VMM: OOM for cloned root");
     let new_pml4 = pte_deref(new_root);
     let parent_pml4 = pte_deref(parent_root);
@@ -693,10 +825,8 @@ pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
             write_pte(new_pml4, i, read_pte(parent_pml4, i));
         }
     }
-    // Register the clone so `reclaim_empty_tables` stops freeing intermediate
-    // tables (the clone shares the parent's higher-half subtrees) and so
-    // `sync_clone_half` keeps it sharing any slot populated later.  Do this
-    // AFTER the copy so the registry never holds a half-built root.
+    // Register only after the root is fully initialized, while the same lock
+    // excludes map fan-out and teardown.
     super::register_clone_root(new_root);
     new_root
 }
@@ -713,7 +843,9 @@ pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
 /// - If the allocator cannot supply a frame (OOM).
 pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
     let i = ((vaddr >> 39) & 0x1FF) as usize;
-    unsafe {
+    // PML4 mutation + clone fan-out under the VMM lock; shootdown after.
+    let populated = unsafe {
+        let _guard = super::lock();
         let pml4 = pte_deref(root);
         if read_pte(pml4, i) & PTE_PRESENT == 0 {
             let frame = alloc.alloc().expect("prepopulate_window: OOM for PDPT");
@@ -721,9 +853,14 @@ pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
             write_pte(pml4, i, frame | PTE_PRESENT | (1u64 << 1)); // PRESENT | WRITABLE
             // A new higher-half slot: fan it out to live clones too.
             sync_clone_half(root);
-            super::flush_tlb();
-            super::shootdown_tlb();
+            true
+        } else {
+            false
         }
+    };
+    if populated {
+        super::flush_tlb();
+        super::shootdown_tlb();
     }
 }
 
@@ -733,6 +870,7 @@ pub fn prepopulate_window(alloc: &mut BitmapAllocator, root: u64, vaddr: u64) {
 /// The caller must ensure the new page table maps the current instruction
 /// stream and stack.
 pub unsafe fn activate(root: u64) {
+    super::set_current_root(root);
     let frame = PhysFrame::containing_address(XPhysAddr::new(root));
     unsafe {
         Cr3::write(frame, Cr3Flags::empty());

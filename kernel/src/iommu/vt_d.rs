@@ -514,20 +514,53 @@ impl Domain {
     }
 
     pub fn alloc_iova(&mut self, size: u64, rmrrs: &[crate::acpi::Rmrr]) -> Option<u64> {
-        let pages = (size + 0xFFF) & !0xFFF;
-        let mut candidate = (self.next_iova + 0xFFF) & !0xFFF;
+        self.alloc_iova_with_limit(size, self.iova_limit, rmrrs)
+    }
+
+    /// Allocate an IOVA strictly below `limit` (exclusive), for 32-bit-only
+    /// devices.  Uses the same bump+RMRR-skip logic as [`Self::alloc_iova`]
+    /// but caps the window at `limit` — if the bump cursor has already
+    /// advanced past `limit` there is no low IOVA left to give out.
+    pub fn alloc_iova_below(
+        &mut self,
+        size: u64,
+        limit: u64,
+        rmrrs: &[crate::acpi::Rmrr],
+    ) -> Option<u64> {
+        if limit > self.iova_limit {
+            return None;
+        }
+        self.alloc_iova_with_limit(size, limit, rmrrs)
+    }
+
+    fn alloc_iova_with_limit(
+        &mut self,
+        size: u64,
+        limit: u64,
+        rmrrs: &[crate::acpi::Rmrr],
+    ) -> Option<u64> {
+        if size == 0 {
+            return None;
+        }
+        let pages = size.checked_add(0xFFF)? & !0xFFF;
+        let mut candidate = self.next_iova.checked_add(0xFFF)? & !0xFFF;
         let max_attempts = 64;
         let mut attempts = 0;
         while attempts < max_attempts {
-            if candidate + pages > self.iova_limit || candidate + pages < candidate {
+            if candidate + pages > limit || candidate + pages < candidate {
                 return None;
             }
             let mut overlaps = false;
             for r in rmrrs {
                 let r_start = r.base_address;
-                let r_end = r.limit_address.saturating_add(1);
-                if candidate < r_end && r_start < candidate + pages {
-                    candidate = (r_end + 0xFFF) & !0xFFF;
+                let Some(r_end) = r.limit_address.checked_add(1) else {
+                    return None;
+                };
+                let Some(candidate_end) = candidate.checked_add(pages) else {
+                    return None;
+                };
+                if candidate < r_end && r_start < candidate_end {
+                    candidate = r_end.checked_add(0xFFF).map(|v| v & !0xFFF)?;
                     overlaps = true;
                     break;
                 }
@@ -783,15 +816,41 @@ pub fn fault_handler() {
 
 /// Map a phys range to a newly allocated IOVA. Returns IOVA or None.
 pub fn map_phys_to_iova(phys: u64, size: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
+    map_phys_to_iova_inner(phys, size, alloc, None)
+}
+
+/// Map `phys` into IOVA strictly below `limit` (exclusive) — for 32-bit-only
+/// devices.  Returns `None` when no low IOVA window remains.
+pub fn map_phys_to_iova_below(
+    phys: u64,
+    size: u64,
+    alloc: &mut BitmapAllocator,
+    limit: u64,
+) -> Option<u64> {
+    map_phys_to_iova_inner(phys, size, alloc, Some(limit))
+}
+
+fn map_phys_to_iova_inner(
+    phys: u64,
+    size: u64,
+    alloc: &mut BitmapAllocator,
+    limit: Option<u64>,
+) -> Option<u64> {
+    if size == 0 || (phys & 0xFFF) != 0 {
+        return None;
+    }
     let state_mutex = IOMMU_STATE.get()?;
     let mut state = state_mutex.lock();
     let rmrrs_snapshot = state.rmrrs.clone();
-    let iova = state.domain.alloc_iova(size, &rmrrs_snapshot)?;
+    let iova = match limit {
+        Some(lim) => state.domain.alloc_iova_below(size, lim, &rmrrs_snapshot)?,
+        None => state.domain.alloc_iova(size, &rmrrs_snapshot)?,
+    };
     let allow_snp = state.domain.allow_snp;
-    let pages = (size + 0xFFF) / 4096;
+    let pages = size.checked_add(0xFFF)? / 4096;
     for p in 0..pages {
-        let i = iova + p * 4096;
-        let pa = (phys & !0xFFF) + p * 4096;
+        let i = iova.checked_add(p.checked_mul(4096)?)?;
+        let pa = phys.checked_add(p.checked_mul(4096)?)?;
         if let Err(e) = slpt::map_4k(state.domain.slpt_root_phys, alloc, i, pa, state.domain.agaw, allow_snp) {
             SerialPort::puts("[iommu] map_phys fail ");
             SerialPort::put_hex(i);

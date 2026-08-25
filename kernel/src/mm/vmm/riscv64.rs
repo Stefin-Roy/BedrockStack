@@ -162,7 +162,13 @@ pub fn map_2m(root: u64, alloc: &mut BitmapAllocator, vaddr: u64, paddr: u64, fl
     }
 }
 
-pub fn unmap_4k(root: u64, vaddr: u64, _pending: &mut super::PendingFrames) -> bool {
+/// True when every PTE in the table at `ppn` is invalid.
+fn pt_all_invalid(ppn: u64) -> bool {
+    let tbl = pt_at(ppn);
+    tbl.entries.iter().all(|e| !e.is_valid())
+}
+
+pub fn unmap_4k(root: u64, vaddr: u64, pending: &mut super::PendingFrames) -> bool {
     let _guard = super::lock();
     let root_pt = unsafe { &mut *(root as *mut PageTable) };
     let idx2 = vpn_index(vaddr, 2);
@@ -185,6 +191,23 @@ pub fn unmap_4k(root: u64, vaddr: u64, _pending: &mut super::PendingFrames) -> b
     // TLB shootdown are hoisted to the range-level caller (`Vmm::unmap` /
     // `Vmm::unmap_4k`), which runs them before any frame is freed.
     l1.entries[idx0].clear();
+
+    // Bottom-up reclamation of now-empty intermediate tables (mirrors the
+    // x86_64 `reclaim_empty_tables`): free the leaf-tier table when its last
+    // PTE went away, then cascade to the mid tier.  The root itself is never
+    // freed — every hart shares it.  Frames land in `pending`; the caller
+    // releases them only after the shootdown completes.  There is no
+    // clone-sharing hazard on riscv64 (single root, no cloned subtrees).
+    let l1_ppn = l2.entries[idx1].ppn();
+    let l2_ppn = root_pt.entries[idx2].ppn();
+    if pt_all_invalid(l1_ppn) {
+        l2.entries[idx1].clear();
+        pending.push(ppn_to_paddr(l1_ppn));
+        if pt_all_invalid(l2_ppn) {
+            root_pt.entries[idx2].clear();
+            pending.push(ppn_to_paddr(l2_ppn));
+        }
+    }
     true
 }
 
@@ -295,6 +318,7 @@ pub fn translate_user_range_ok(root: u64, ptr: u64, len: u64, need_writable: boo
 /// The caller must ensure the new page table maps the current instruction
 /// stream and stack.
 pub unsafe fn activate(root: u64) {
+    super::set_current_root(root);
     let satp = SATP_MODE_SV39 | paddr_to_ppn(root);
     unsafe {
         asm!("csrw satp, {}", in(reg) satp);

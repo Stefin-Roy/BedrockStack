@@ -284,8 +284,9 @@ impl Vmm {
         x86_64::reclaim_empty_tables(self.root, pending, first_cleared);
     }
 
-    /// No intermediate tables are reclaimed on riscv64; the collector is a
-    /// no-op there (the PendingFrames buffer stays empty on that path).
+    /// riscv64 reclaims empty intermediate tables inline inside
+    /// `riscv64::unmap_4k` (per page), so this range-path hook stays a no-op
+    /// there — the collector is drained by the per-page path instead.
     #[cfg(target_arch = "riscv64")]
     fn reclaim_tables(&self, _pending: &mut PendingFrames, _first_cleared: u64) {}
 
@@ -303,7 +304,7 @@ impl Vmm {
         let removed = self.unmap_page_collect(&mut pending, vaddr);
         if removed {
             flush_tlb();
-            shootdown_tlb();
+            shootdown_scoped(range_is_low_half(vaddr, 4096), self.root);
             crate::services::dma::invalidate_trans_cache(vaddr, 4096);
             pending.flush(alloc);
         }
@@ -317,6 +318,10 @@ impl Vmm {
     /// caller, the leaves) is released to the allocator.
     pub fn unmap(&mut self, alloc: &mut BitmapAllocator, vaddr: u64, size: u64) {
         assert_eq!(vaddr & 0xFFF, 0);
+        // The range is contiguous, so its half is decided once up front; a
+        // low-half-only range skips IPIing CPUs running other roots.
+        let low_only = range_is_low_half(vaddr, size);
+        let root = self.root;
         let mut pending = PendingFrames::new();
         let mut v = vaddr;
         let end = vaddr + size;
@@ -334,7 +339,7 @@ impl Vmm {
                         if pending.remaining() < 3 {
                             if removed_any || !pending.is_empty() {
                                 flush_tlb();
-                                shootdown_tlb();
+                                shootdown_scoped(low_only, root);
                             }
                             pending.flush(alloc);
                             removed_any = false;
@@ -342,7 +347,7 @@ impl Vmm {
                         self.reclaim_tables(&mut pending, group_first);
                         if pending.is_full() {
                             flush_tlb();
-                            shootdown_tlb();
+                            shootdown_scoped(low_only, root);
                             pending.flush(alloc);
                             removed_any = false;
                         }
@@ -356,7 +361,7 @@ impl Vmm {
                 // even if removed_any is false (orphaned intermediate tables).
                 if removed_any || !pending.is_empty() {
                     flush_tlb();
-                    shootdown_tlb();
+                    shootdown_scoped(low_only, root);
                 }
                 pending.flush(alloc);
                 removed_any = false;
@@ -365,14 +370,14 @@ impl Vmm {
         if group_first != u64::MAX {
             if pending.remaining() < 3 && !pending.is_empty() {
                 flush_tlb();
-                shootdown_tlb();
+                shootdown_scoped(low_only, root);
                 pending.flush(alloc);
             }
             self.reclaim_tables(&mut pending, group_first);
         }
         if removed_any || !pending.is_empty() {
             flush_tlb();
-            shootdown_tlb();
+            shootdown_scoped(low_only, root);
             crate::services::dma::invalidate_trans_cache(vaddr, size);
             pending.flush(alloc);
         } else {
@@ -407,6 +412,8 @@ impl Vmm {
     ) {
         assert_eq!(vaddr & 0xFFF, 0);
         assert_eq!(size & 0xFFF, 0);
+        let low_only = range_is_low_half(vaddr, size);
+        let root = self.root;
         let mut pending = PendingFrames::new();
         let mut v = vaddr;
         let end = vaddr + size;
@@ -426,7 +433,7 @@ impl Vmm {
                             if pending.remaining() < 3 {
                                 if removed_any || !pending.is_empty() {
                                     flush_tlb();
-                                    shootdown_tlb();
+                                    shootdown_scoped(low_only, root);
                                 }
                                 pending.flush(alloc);
                                 removed_any = false;
@@ -434,7 +441,7 @@ impl Vmm {
                             self.reclaim_tables(&mut pending, group_first);
                             if pending.is_full() {
                                 flush_tlb();
-                                shootdown_tlb();
+                                shootdown_scoped(low_only, root);
                                 pending.flush(alloc);
                                 removed_any = false;
                             }
@@ -447,7 +454,7 @@ impl Vmm {
             if pending.is_full() {
                 if removed_any || !pending.is_empty() {
                     flush_tlb();
-                    shootdown_tlb();
+                    shootdown_scoped(low_only, root);
                 }
                 pending.flush(alloc);
                 removed_any = false;
@@ -456,14 +463,14 @@ impl Vmm {
         if group_first != u64::MAX {
             if pending.remaining() < 3 && !pending.is_empty() {
                 flush_tlb();
-                shootdown_tlb();
+                shootdown_scoped(low_only, root);
                 pending.flush(alloc);
             }
             self.reclaim_tables(&mut pending, group_first);
         }
         if removed_any || !pending.is_empty() {
             flush_tlb();
-            shootdown_tlb();
+            shootdown_scoped(low_only, root);
             crate::services::dma::invalidate_trans_cache(vaddr, size);
             pending.flush(alloc);
         } else {
@@ -503,7 +510,8 @@ pub fn flush_tlb() {
     unsafe {
         // Prefer INVPCID(type2 = all-context) when CR4.PCIDE is set and CPU
         // advertises INVPCID (CPUID leaf 7 EBX[10]). Falls back to CR3 reload.
-        // Batched INVLPG is used by range paths via flush_tlb_range; full flush here keeps shootdown semantics.
+        // Range paths use this same full flush plus shootdown_tlb; per-page
+        // INVLPG batching lives in unmap_4k_impl's local flush.
         if has_pcide() && has_invpcid() {
             invpcid_all();
         } else {
@@ -559,17 +567,6 @@ unsafe fn invpcid_all() {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-pub fn flush_tlb_range(start: u64, size: u64) {
-    // Batched INVLPG for range: iterate per 4K. Caller must have CR4.PCIDE check to prefer INVPCID for full flush.
-    let mut addr = start & !0xFFF;
-    let end = (start + size + 0xFFF) & !0xFFF;
-    while addr < end {
-        unsafe { core::arch::asm!("invlpg [{0}]", in(reg) addr, options(nostack, preserves_flags)) };
-        addr += 0x1000;
-    }
-}
-
 // ── Cross-CPU TLB shootdown ───────────────────────────────────────────
 //
 // Every CPU in the system shares the active higher-half page tables (the boot
@@ -596,6 +593,33 @@ pub(crate) fn lock() -> spin::MutexGuard<'static, ()> {
 /// Monotonic shootdown generation.  A target CPU acknowledges the latest
 /// generation it has flushed, so overlapping shootdowns cannot be confused.
 static TLB_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Boundary between the low (per-address-space) and high (shared kernel)
+/// halves of canonical virtual address space.  Bit 47 set ⇒ higher half on
+/// x86_64; the same value works as the Sv39 sign-bit boundary on riscv64.
+const HALF_BOUNDARY: u64 = 0x0000_8000_0000_0000;
+
+/// Root each CPU currently runs on (0 = unknown / early boot).
+///
+/// Written before every CR3/satp switch (`set_current_root`); read by
+/// shootdown targeting so *low-half* (user space) flushes only IPI CPUs
+/// actually running that root.  Sound because CR3 loads are untagged (no
+/// PCID) and no page uses the GLOBAL flag — every root switch fully flushes
+/// non-global entries, so a CPU not on `root` cannot hold stale entries for
+/// it.  Higher-half mutations always broadcast (the high half is shared by
+/// every clone), so targeting only ever narrows user-space flushes.
+static CPU_ROOT: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
+
+/// Record the page-table root this CPU is about to run on.  Must be called
+/// immediately before every root switch (context switch, `activate`, idle
+/// transition).
+pub fn set_current_root(root: u64) {
+    let cpu = crate::smp::current_cpu_id() as usize;
+    if cpu < crate::smp::MAX_CPUS {
+        CPU_ROOT[cpu].store(root, Ordering::Relaxed);
+    }
+}
 
 /// Per-CPU acknowledgement: the highest shootdown generation each CPU has
 /// flushed and acknowledged.
@@ -652,6 +676,10 @@ pub fn register_clone_root(root: u64) {
 /// Release a cloned root that has been destroyed, re-arming empty-table
 /// reclamation on the parent once no clone remains.
 ///
+/// Returns `true` when this was the LAST live clone — the caller (x86_64
+/// `destroy_root`) then sweeps the parent's higher half to recover tables
+/// that were deliberately leaked while clones shared them.
+///
 /// Called by `destroy_root` after the clone's low-half frames are freed and a
 /// TLB shootdown has completed.  The dead clone's higher-half subtrees are
 /// never freed by `destroy_root` (they stay referenced by the parent), so this
@@ -659,12 +687,13 @@ pub fn register_clone_root(root: u64) {
 /// when the last clone disappears.  Must be balanced against every
 /// `register_clone_root`.
 #[cfg(target_arch = "x86_64")]
-pub fn unregister_clone_root(root: u64) {
+pub fn unregister_clone_root(root: u64) -> bool {
     let mut clones = CLONES.lock();
     if let Some(i) = clones.iter().position(|&r| r == root) {
         clones.swap_remove(i);
-        CLONE_ROOTS.fetch_sub(1, Ordering::SeqCst);
+        return CLONE_ROOTS.fetch_sub(1, Ordering::SeqCst) == 1;
     }
+    false
 }
 
 /// Snapshot of the live cloned roots, for the clone re-sync walk.
@@ -737,21 +766,95 @@ impl PendingFrames {
     }
 }
 
+/// Send the arch-specific TLB-shootdown IPI to one CPU.
+#[inline]
+fn ipi_shootdown(cpu: usize) {
+    #[cfg(target_arch = "x86_64")]
+    crate::platform::x86_64_pc::apic::send_ipi(
+        crate::smp::per_cpu_by_id(cpu as u32).apic_id,
+        crate::platform::x86_64_pc::apic::IPI_TLB_SHOOTDOWN,
+    );
+    #[cfg(target_arch = "riscv64")]
+    crate::arch::riscv64::sbi::send_ipi(1u64 << cpu);
+}
+
+/// Re-IPI rounds before a silent target is declared unresponsive.  Round 0 is
+/// the initial broadcast; rounds 1..N re-send the IPI to that CPU only (the
+/// ack may have been lost to a deep spin with interrupts briefly masked).
+const SHOOTDOWN_RETRY_ROUNDS: u32 = 3;
+
+#[cfg(target_arch = "x86_64")]
+const SHOOTDOWN_WINDOW_NS: u64 = 100_000_000;
+
+/// Spin until `cpu` acknowledges `seq`, bounded by one timeout window
+/// (TSC-derived when calibrated, else a fixed spin budget).
+/// Returns `true` on acknowledgement.
+fn shootdown_wait_window(cpu: usize, seq: u64) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let use_tsc = crate::platform::x86_64_pc::apic::tsc_hz() != 0;
+    #[cfg(target_arch = "x86_64")]
+    let deadline_ns = if use_tsc {
+        crate::platform::x86_64_pc::apic::tsc_now_ns().wrapping_add(SHOOTDOWN_WINDOW_NS)
+    } else {
+        0
+    };
+    let mut spins: u64 = 0;
+    while TLB_ACK[cpu].load(Ordering::Acquire) < seq {
+        core::hint::spin_loop();
+        #[cfg(target_arch = "x86_64")]
+        {
+            if use_tsc {
+                if crate::platform::x86_64_pc::apic::tsc_now_ns() >= deadline_ns {
+                    return false;
+                }
+            } else {
+                spins += 1;
+                if spins > 100_000_000 {
+                    return false;
+                }
+            }
+        }
+        #[cfg(target_arch = "riscv64")]
+        {
+            spins += 1;
+            if spins > 100_000_000 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Scoped-shootdown dispatch shared by the unmap paths: low-half-only
+/// mutations target just the CPUs running `root`; anything touching the
+/// shared higher half broadcasts.
+fn shootdown_scoped(low_only: bool, root: u64) {
+    // The scheduler publishes the next root before switch_to executes its
+    // CR3 load.  A concurrent shootdown in that window would otherwise see
+    // the new root in CPU_ROOT while the CPU still has the old root active,
+    // skip its IPI, and permit stale low-half entries to survive frame reuse.
+    // Keep the root-tracking metadata for diagnostics/future synchronization,
+    // but use the conservative broadcast until the switch and shootdown
+    // handshake are made atomic.
+    let _ = (low_only, root);
+    shootdown_tlb();
+}
+
 /// Broadcast a full TLB flush to every online CPU and wait for them all to
 /// complete it.
 ///
 /// The calling CPU must already have flushed its own TLB (`flush_tlb`).
-/// Holds no lock while waiting, so a remote CPU that is blocked on the VMM
-/// operation lock (spinning with interrupts enabled) can still take the IPI
-/// and acknowledge — no deadlock.
-///
-/// # Ordering
-/// Any page-table clears performed *before* this call happen-before the
-/// flush on every remote CPU (seq release / handler acquire), and every ack
-/// happens-before the caller proceeds to free the affected frames.  Frames
-/// touched by those clears must therefore only be released to the allocator
-/// after this function returns.
 pub fn shootdown_tlb() {
+    shootdown_impl(None)
+}
+
+/// True when every page in `[vaddr, vaddr+size)` lies in the low half.
+fn range_is_low_half(vaddr: u64, size: u64) -> bool {
+    let end = vaddr.saturating_add(size);
+    vaddr < HALF_BOUNDARY && end <= HALF_BOUNDARY
+}
+
+fn shootdown_impl(scope: Option<u64>) {
     let my = crate::smp::current_cpu_id() as usize;
     let seq = TLB_SEQ.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
     // The local CPU was flushed by the caller before the seq bump.
@@ -759,80 +862,67 @@ pub fn shootdown_tlb() {
 
     let count = crate::smp::cpu_count() as usize;
 
+    // Resolve the target set once so send and wait phases agree exactly.
     // Send to online CPUs only — a starting AP has no IDT to handle this IPI,
     // and reclaim cannot run before all APs are online anyway.
-    for cpu in 0..count {
+    let mut targets: u16 = 0;
+    for cpu in 0..count.min(crate::smp::MAX_CPUS) {
         if cpu == my {
             continue;
         }
         if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
             continue;
         }
-        #[cfg(target_arch = "x86_64")]
-        crate::platform::x86_64_pc::apic::send_ipi(
-            crate::smp::per_cpu_by_id(cpu as u32).apic_id,
-            crate::platform::x86_64_pc::apic::IPI_TLB_SHOOTDOWN,
-        );
-        #[cfg(target_arch = "riscv64")]
-        crate::arch::riscv64::sbi::send_ipi(1u64 << cpu);
+        if let Some(root) = scope {
+            if CPU_ROOT[cpu].load(Ordering::Relaxed) != root {
+                continue;
+            }
+        }
+        targets |= 1u16 << cpu;
+        ipi_shootdown(cpu);
     }
 
-    // Wait for every targeted CPU to flush and acknowledge with 100ms timeout.
-    for cpu in 0..count {
-        if cpu == my {
-            continue;
-        }
-        if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
-            continue;
-        }
-        // Use TSC-based deadline if calibrated, else spin count fallback (both arches).
-        #[cfg(target_arch = "x86_64")]
-        let use_tsc = crate::platform::x86_64_pc::apic::tsc_hz() != 0;
-        #[cfg(target_arch = "x86_64")]
-        let deadline_ns = if use_tsc {
-            crate::platform::x86_64_pc::apic::tsc_now_ns().wrapping_add(100_000_000)
-        } else {
-            0
-        };
-        let mut spins: u64 = 0;
-        while TLB_ACK[cpu].load(Ordering::Acquire) < seq {
-            core::hint::spin_loop();
-            #[cfg(target_arch = "x86_64")]
-            {
-                if use_tsc {
-                    if crate::platform::x86_64_pc::apic::tsc_now_ns() >= deadline_ns {
-                        crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout cpu=");
-                        crate::drivers::serial::SerialPort::put_u64(cpu as u64);
-                        crate::drivers::serial::SerialPort::puts(" seq=");
-                        crate::drivers::serial::SerialPort::put_u64(seq);
-                        crate::drivers::serial::SerialPort::puts("\n");
-                        crate::drivers::serial::SerialPort::puts("[vmm] hlt\n");
-                        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) } }
-                    }
-                } else {
-                    spins += 1;
-                    if spins > 100_000_000 {
-                        crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout (no TSC) cpu=");
-                        crate::drivers::serial::SerialPort::put_u64(cpu as u64);
-                        crate::drivers::serial::SerialPort::puts("\n");
-                        loop { unsafe { core::arch::asm!("cli; hlt", options(nomem, nostack)) } }
-                    }
+    // Wait for every targeted CPU to flush and acknowledge, re-IPIing
+    // stragglers up to SHOOTDOWN_RETRY_ROUNDS times.
+    let mut cpu = 0usize;
+    while targets != 0 {
+        if targets & 1 == 1 {
+            let mut acked = false;
+            for round in 1..SHOOTDOWN_RETRY_ROUNDS {
+                if shootdown_wait_window(cpu, seq) {
+                    acked = true;
+                    break;
                 }
+                crate::drivers::serial::SerialPort::puts("[vmm] WARN: shootdown ack timeout cpu=");
+                crate::drivers::serial::SerialPort::put_u64(cpu as u64);
+                crate::drivers::serial::SerialPort::puts(" seq=");
+                crate::drivers::serial::SerialPort::put_u64(seq);
+                crate::drivers::serial::SerialPort::puts(" — re-IPI round ");
+                crate::drivers::serial::SerialPort::put_u64(round as u64 + 1);
+                crate::drivers::serial::SerialPort::puts("/");
+                crate::drivers::serial::SerialPort::put_u64(SHOOTDOWN_RETRY_ROUNDS as u64);
+                crate::drivers::serial::SerialPort::puts("\n");
+                ipi_shootdown(cpu);
             }
-            #[cfg(target_arch = "riscv64")]
-            {
-                spins += 1;
-                if spins > 100_000_000 {
-                    crate::drivers::serial::SerialPort::puts("[vmm] WARN: TLB shootdown timeout cpu=");
-                    crate::drivers::serial::SerialPort::put_u64(cpu as u64);
-                    crate::drivers::serial::SerialPort::puts(" seq=");
-                    crate::drivers::serial::SerialPort::put_u64(seq);
-                    crate::drivers::serial::SerialPort::puts("\n");
-                    crate::drivers::serial::SerialPort::puts("[vmm] hlt\n");
-                    loop { unsafe { core::arch::asm!("wfi", options(nomem, nostack)) } }
+            if !acked && shootdown_wait_window(cpu, seq) {
+                acked = true;
+            }
+            if !acked {
+                crate::drivers::serial::SerialPort::puts("[vmm] FATAL: cpu=");
+                crate::drivers::serial::SerialPort::put_u64(cpu as u64);
+                crate::drivers::serial::SerialPort::puts(" never acknowledged shootdown seq=");
+                crate::drivers::serial::SerialPort::put_u64(seq);
+                crate::drivers::serial::SerialPort::puts(" — stale-TLB frame reuse risk\n");
+                #[cfg(target_arch = "x86_64")]
+                crate::kerneldump::dump_fatal("TLB shootdown: target CPU unresponsive");
+                #[cfg(target_arch = "riscv64")]
+                loop {
+                    unsafe { core::arch::asm!("wfi", options(nomem, nostack)) };
                 }
             }
         }
+        targets >>= 1;
+        cpu += 1;
     }
 }
 

@@ -641,21 +641,35 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
     let out_base = 0x80 + (iss as u32) * 0x20;
     let in_base = 0x80u32;
 
-    let corb = dma.alloc_page().ok_or("OOM CORB")?;
-    let rirb = dma.alloc_page().ok_or("OOM RIRB")?;
-    let out_bdl = dma.alloc_page().ok_or("OOM output BDL")?;
-    let out_buf = dma
-        .alloc_contiguous(RING_BUF_BYTES / 4096)
-        .ok_or("OOM output ring buffer")?;
-
-    if !gcap_64ok
-        && (corb.phys >= 0x1_0000_0000
+    // Buffers are allocated through the 32-bit DMA zone when the controller
+    // lacks the 64-bit cap — instead of the old detect-and-fail.
+    let (corb, rirb, out_bdl, out_buf) = if gcap_64ok {
+        let corb = dma.alloc_page().ok_or("OOM CORB")?;
+        let rirb = dma.alloc_page().ok_or("OOM RIRB")?;
+        let out_bdl = dma.alloc_page().ok_or("OOM output BDL")?;
+        let out_buf = dma
+            .alloc_contiguous(RING_BUF_BYTES / 4096)
+            .ok_or("OOM output ring buffer")?;
+        (corb, rirb, out_bdl, out_buf)
+    } else {
+        let corb = dma.alloc_below4g(1).ok_or("OOM CORB in 32-bit zone")?;
+        let rirb = dma.alloc_below4g(1).ok_or("OOM RIRB in 32-bit zone")?;
+        let out_bdl = dma
+            .alloc_below4g(1)
+            .ok_or("OOM output BDL in 32-bit zone")?;
+        let out_buf = dma
+            .alloc_below4g(RING_BUF_BYTES / 4096)
+            .ok_or("OOM output ring buffer in 32-bit zone")?;
+        // Belt and suspenders: the allocator must have honored the bound.
+        if corb.phys >= 0x1_0000_0000
             || rirb.phys >= 0x1_0000_0000
             || out_bdl.phys >= 0x1_0000_0000
-            || out_buf.phys >= 0x1_0000_0000)
-    {
-        return Err("HDA controller is 32-bit only and a DMA buffer sits above 4 GiB");
-    }
+            || out_buf.phys >= 0x1_0000_0000
+        {
+            return Err("HDA: 32-bit zone allocation returned a frame above 4 GiB");
+        }
+        (corb, rirb, out_bdl, out_buf)
+    };
 
     let audio = Box::new(HdaAudio {
         inner: Mutex::new(Inner {
