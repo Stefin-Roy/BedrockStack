@@ -529,7 +529,27 @@ fn sys_write(frame: &mut SyscallFrame) {
     let data = unsafe { core::slice::from_raw_parts(frame.rsi as *const u8, frame.rdx as usize) };
     match unispace::write_parsed(&parsed, data, &mut resp, frame.r10) {
         Ok(()) => {
-            let n = copy_validated_out(frame.rsi, frame.rdx, &resp);
+            // A method's output may legitimately exceed its input length
+            // (e.g. `:lstat` takes a short name and returns a 32-byte stat).
+            // When it does, re-validate the tail of the buffer past the
+            // input before copying so we never write to an unvalidated or
+            // unmapped page. The caller must size the buffer for both.
+            let out_len = core::cmp::max(frame.rdx, resp.len() as u64);
+            if out_len > frame.rdx {
+                if !user_range_ok(frame.rsi, out_len)
+                    || validate_user_range(root, frame.rsi, out_len, true).is_err()
+                {
+                    // Buffer too small/unwritable for the full output: report
+                    // the output size so the caller can grow and retry, but do
+                    // not fault. Copy what fits in the validated input range.
+                    let n = copy_validated_out(frame.rsi, frame.rdx, &resp);
+                    if n < resp.len() {
+                        frame.rax = (-14i64) as u64; // EFAULT: output truncated
+                        return;
+                    }
+                }
+            }
+            let n = copy_validated_out(frame.rsi, out_len, &resp);
             frame.rax = n as u64;
         }
         Err(e) => {

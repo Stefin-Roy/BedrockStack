@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use alloc::string::String;
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
 use spin::Mutex;
@@ -26,9 +26,18 @@ pub struct Fat32SuperBlock {
     /// Stable inode numbers keyed by (parent directory cluster, entry name).
     /// FAT has no inode table, so the identity is the namespace location.
     pub(crate) ino_map: Mutex<HashMap<(u32, String), u64>>,
+    /// Live inode handles keyed by (parent cluster, case-folded entry name).
+    /// Lets unlink/rmdir distinguish "open handles exist -- defer cluster
+    /// release to their Drop" from "orphaned name -- free the chain now",
+    /// closing both the stale-handle dirent-stomp and the evicted-dentry
+    /// cluster-leak holes.
+    pub(crate) handle_registry: Mutex<HashMap<(u32, String), Vec<Weak<super::inode::Fat32Inode>>>>,
     /// Shared chain metadata. Unispace resolves paths into fresh inode views,
     /// so a per-inode chain cache would be discarded after every syscall.
     pub(crate) chain_cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
+    /// In-RAM allocation bitmap (built during the initial free-cluster scan).
+    /// `None` on oversized volumes that use the FAT-scan allocator.
+    pub(crate) alloc_bitmap: Mutex<Option<super::alloc::AllocBitmap>>,
     pub(crate) next_alloc_hint: Mutex<u32>,
     pub(crate) free_clus_count: AtomicU32,
     pub(crate) volume_dirty: AtomicBool,
@@ -80,16 +89,70 @@ impl Fat32SuperBlock {
 
     /// Stable inode number for an entry.  Allocates on first sight so the same
     /// (parent, name) always maps to the same number, whichever VFS API asks.
+    /// Names are case-folded to match the case-insensitive on-disk lookup, so
+    /// `foo`/`FOO` share one inode identity.
     pub fn ino_for(&self, parent_clus: u32, name: &str) -> u64 {
+        let canon = name.to_ascii_lowercase();
         let mut map = self.ino_map.lock();
-        if let Some(&ino) = map.get(&(parent_clus, String::from(name))) {
+        if let Some(&ino) = map.get(&(parent_clus, canon.clone())) {
             return ino;
         }
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
-        map.insert((parent_clus, String::from(name)), ino);
+        map.insert((parent_clus, canon), ino);
         ino
     }
 
+    fn registry_key(parent_clus: u32, name: &str) -> (u32, String) {
+        (parent_clus, name.to_ascii_lowercase())
+    }
+
+    /// Register a live handle under its namespace location.  Prunes dead
+    /// weaks on the way to keep the vec bounded.
+    pub(crate) fn register_handle(
+        &self,
+        parent_clus: u32,
+        name: &str,
+        node: &Arc<super::inode::Fat32Inode>,
+    ) {
+        let key = Self::registry_key(parent_clus, name);
+        let weak = Arc::downgrade(node);
+        let mut reg = self.handle_registry.lock();
+        let vec = reg.entry(key).or_default();
+        vec.retain(|w| w.upgrade().is_some());
+        vec.push(weak);
+    }
+
+    /// Mark every live handle under (parent, name) as unlinked so their Drop
+    /// releases the cluster chain exactly once.  Returns the number of live
+    /// handles found.  Zero means no one owns the chain anymore and the
+    /// caller must free it itself.
+    pub(crate) fn mark_handles_unlinked(&self, parent_clus: u32, name: &str) -> usize {
+        let key = Self::registry_key(parent_clus, name);
+        let mut reg = self.handle_registry.lock();
+        if let Some(vec) = reg.remove(&key) {
+            let mut live = 0usize;
+            for w in vec {
+                if let Some(node) = w.upgrade() {
+                    node.unlinked.store(true, Ordering::Relaxed);
+                    live += 1;
+                }
+            }
+            return live;
+        }
+        0
+    }
+
+    /// Move all registered handles from one namespace location to another
+    /// (rename).  Live handles keep their deferred-free obligation.
+    pub(crate) fn move_handles(&self, old_parent: u32, old_name: &str, new_parent: u32, new_name: &str) {
+        let from = Self::registry_key(old_parent, old_name);
+        let to = Self::registry_key(new_parent, new_name);
+        let mut reg = self.handle_registry.lock();
+        let moved = reg.remove(&from).unwrap_or_default();
+        let vec = reg.entry(to).or_default();
+        vec.retain(|w| w.upgrade().is_some());
+        vec.extend(moved.into_iter().filter(|w| w.upgrade().is_some()));
+    }
     pub fn set_volume_dirty_flag(&self) -> Result<(), VfsError> {
         if self.volume_dirty.load(Ordering::Relaxed) {
             return Ok(());
@@ -118,7 +181,7 @@ impl Fat32SuperBlock {
     /// volume-dirty flag — the volume stays marked dirty while it is in use.
     pub fn sync_all(&self) -> Result<(), VfsError> {
         let mut cache = self.fat_cache.lock();
-        cache.flush(&*self.device, &self.bpb)?;
+        cache.flush(&*self.device)?;
         drop(cache);
         self.write_fsinfo()
     }
@@ -176,10 +239,12 @@ impl FileSystem for Fat32FileSystem {
         let sb = Arc::new(Fat32SuperBlock {
             device: cached,
             bpb: bpb.clone(),
-            fat_cache: Mutex::new(FatCache::new()),
+            fat_cache: Mutex::new(FatCache::new(&bpb)),
             next_ino: AtomicU64::new(2),
             ino_map: Mutex::new(HashMap::new()),
+            handle_registry: Mutex::new(HashMap::new()),
             chain_cache: Mutex::new(HashMap::new()),
+            alloc_bitmap: Mutex::new(None),
             next_alloc_hint: Mutex::new(2),
             free_clus_count: AtomicU32::new(0),
             volume_dirty: AtomicBool::new(false),
@@ -222,7 +287,7 @@ impl FileSystem for Fat32FileSystem {
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
-            write_lock: Mutex::new(()),
+            write_lock: spin::RwLock::new(()),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(Inode::new(root_ops.clone()));

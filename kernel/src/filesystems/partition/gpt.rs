@@ -35,8 +35,33 @@ struct GptEntry {
 }
 
 pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'static str> {
+    // Primary header at LBA 1; on any failure fall back to the backup header
+    // in the last sector of the device before giving up.
+    match parse_at(&device, 1) {
+        Ok(p) => Ok(p),
+        Err(primary_err) => {
+            let backup_lba = device.sector_count().checked_sub(1).ok_or(primary_err)?;
+            match parse_at(&device, backup_lba) {
+                Ok(p) => {
+                    log::warn!(
+                        "GPT: primary header rejected ({}); using backup at LBA {}",
+                        primary_err,
+                        backup_lba
+                    );
+                    Ok(p)
+                }
+                Err(_) => Err(primary_err),
+            }
+        }
+    }
+}
+
+fn parse_at(
+    device: &Arc<dyn BlockDevice>,
+    hdr_lba: u64,
+) -> Result<Vec<PartitionInfo>, &'static str> {
     let mut buf = [0u8; 512];
-    read_sector(&*device, 1, &mut buf)?;
+    read_sector(&**device, hdr_lba, &mut buf)?;
 
     let hdr = unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const GptHeader) };
 
@@ -47,6 +72,12 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
     let header_size = u32::from_le(hdr.header_size) as usize;
     if header_size < 92 || header_size > 512 {
         return Err("GPT header size out of range");
+    }
+
+    // my_lba must point back at the sector this header was read from;
+    // otherwise we might mistake a stale primary for a backup or vice versa.
+    if u64::from_le(hdr.my_lba) != hdr_lba {
+        return Err("GPT header LBA mismatch");
     }
 
     let stored_crc = u32::from_le(hdr.header_crc32);
@@ -78,8 +109,14 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
         return Err("GPT entry table out of device range");
     }
     let mut entries_buf = alloc::vec![0u8; sector_count * SECTOR_SIZE];
-    read_sectors(&*device, entry_lba, sector_count as u32, &mut entries_buf)?;
+    read_sectors(&**device, entry_lba, sector_count as u32, &mut entries_buf)?;
 
+    // Spec: partition_entries_crc32 covers the full entry array.
+    if crc32(&entries_buf[..total_bytes]) != u32::from_le(hdr.partition_entries_crc32) {
+        return Err("GPT partition entries CRC mismatch");
+    }
+
+    let dev_sectors = device.sector_count();
     let mut partitions: Vec<PartitionInfo> = Vec::new();
 
     for i in 0..num_entries as usize {
@@ -97,7 +134,13 @@ pub fn parse(device: Arc<dyn BlockDevice>) -> Result<Vec<PartitionInfo>, &'stati
 
         let start_lba = u64::from_le(entry.starting_lba);
         let end_lba = u64::from_le(entry.ending_lba);
+        if end_lba < start_lba {
+            return Err("GPT entry range invalid");
+        }
         let size_sectors = end_lba - start_lba + 1;
+        if end_lba >= dev_sectors {
+            return Err("GPT partition extends beyond device");
+        }
 
         let name_units = entry.name;
         let name_str = decode_utf16_le(&name_units);

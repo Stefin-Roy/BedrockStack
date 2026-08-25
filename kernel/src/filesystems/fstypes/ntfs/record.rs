@@ -74,11 +74,17 @@ pub(crate) fn usa_fixup(data: &mut [u8], sector_size: usize) -> Result<(), VfsEr
     }
 
     let sectors = data.len() / sector_size;
-    // Spec: usa_count == sectors+1 (USN + one saved tail per sector).
-    // Be strict so a malformed record is not silently accepted; the
-    // diagnostic distinguishes this from a torn-write USN mismatch.
-    if usa_count != sectors + 1 {
-        crate::filesystems::fstypes::ntfs::set_last_error_if_none("usa_fixup: usa_count != sectors+1");
+    // Spec: usa_count == sectors + 1 (USN + one saved tail per sector).
+    // Windows tolerates records with a larger USA array (padded layouts);
+    // require AT LEAST one saved tail per sector and a bounded array rather
+    // than exact equality, but only ever consume exactly `sectors` tails.
+    if usa_count < sectors + 1 {
+        crate::filesystems::fstypes::ntfs::set_last_error_if_none("usa_fixup: usa_count < sectors+1");
+        return Err(VfsError::IOError);
+    }
+    let tails_available = (usa_off + usa_count * 2 - (usa_off + 2)) / 2;
+    if tails_available < sectors {
+        crate::filesystems::fstypes::ntfs::set_last_error_if_none("usa_fixup: fewer tails than sectors");
         return Err(VfsError::IOError);
     }
 

@@ -20,6 +20,23 @@ static REGISTRY: Mutex<Vec<&'static dyn StorageDriver>> = Mutex::new(Vec::new())
 
 pub static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
 
+/// Append devices that are not already registered.  Deduplicate by
+/// Arc pointer equality only: two distinct physical disks may share the
+/// same model and capacity (identical USB sticks), so (model, sectors)
+/// is not a unique key.  Replug creates a fresh Arc; the stale entry
+/// remains until explicitly pruned, but lib.rs now tries every block
+/// device for the ESP mount so a stale first entry does not hide its
+/// replacement.
+pub fn register_block_devices(new_devices: Vec<Arc<dyn BlockDevice>>) {
+    let mut list = BLOCK_DEVICES.lock();
+    for d in new_devices {
+        if list.iter().any(|e| Arc::ptr_eq(e, &d)) {
+            continue;
+        }
+        list.push(d);
+    }
+}
+
 pub fn register(driver: &'static dyn StorageDriver) {
     REGISTRY.lock().push(driver);
 }

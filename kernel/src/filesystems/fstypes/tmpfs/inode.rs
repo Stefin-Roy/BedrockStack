@@ -10,6 +10,8 @@ use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
 use crate::filesystems::vfs::types::{DirEntry, FileType, Stat};
 
+use super::mount::TMPFS_BUDGET;
+
 static NEXT_INO: AtomicU64 = AtomicU64::new(2);
 const ROOT_INO: u64 = 1;
 
@@ -20,8 +22,9 @@ pub(super) enum TmpfsEntry {
     Dir {
         children: Mutex<HashMap<String, Arc<TmpfsInode>>>,
     },
+    /// Raw bytes: symlink targets are arbitrary paths and need not be UTF-8.
     Symlink {
-        target: Mutex<String>,
+        target: Mutex<Vec<u8>>,
     },
     Fifo,
 }
@@ -51,6 +54,62 @@ impl TmpfsInode {
             used,
         }
     }
+
+    /// Refuse growth that would exceed the filesystem budget.  Without this
+    /// the 64 MiB budget is only a statfs fiction and tmpfs can OOM the
+    /// kernel.
+    #[allow(dead_code)]
+    fn check_budget(&self, growth: u64) -> Result<(), VfsError> {
+        if growth == 0 {
+            return Ok(());
+        }
+        let cur = self.used.load(Ordering::Relaxed);
+        if cur.saturating_add(growth) > TMPFS_BUDGET {
+            return Err(VfsError::NoSpace);
+        }
+        Ok(())
+    }
+
+    /// Atomically reserve `growth` bytes. Fails with NoSpace if the budget
+    /// would be exceeded. Uses a CAS loop so concurrent growth cannot overshoot.
+    fn reserve_budget(&self, growth: u64) -> Result<(), VfsError> {
+        if growth == 0 {
+            return Ok(());
+        }
+        loop {
+            let cur = self.used.load(Ordering::Relaxed);
+            let new = cur.checked_add(growth).ok_or(VfsError::NoSpace)?;
+            if new > TMPFS_BUDGET {
+                return Err(VfsError::NoSpace);
+            }
+            match self.used.compare_exchange_weak(
+                cur,
+                new,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(()),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+impl Drop for TmpfsInode {
+    fn drop(&mut self) {
+        // Refund the budget for the bytes this inode still holds.  This
+        // runs when the last Arc (directory entry + any open FDs) is
+        // dropped, so open-unlinked files keep their space charged until
+        // the last close, matching POSIX tmpfs semantics.
+        let sz = match &self.entry {
+            TmpfsEntry::File { data } => data.lock().len() as u64,
+            TmpfsEntry::Symlink { target } => target.lock().len() as u64,
+            _ => 0,
+        };
+        if sz > 0 {
+            self.used.fetch_sub(sz, Ordering::Relaxed);
+        }
+    }
 }
 
 impl InodeOps for TmpfsInode {
@@ -68,13 +127,12 @@ impl InodeOps for TmpfsInode {
             }
             TmpfsEntry::Symlink { target } => {
                 let t = target.lock();
-                let bytes = t.as_bytes();
-                if offset >= bytes.len() as u64 {
+                if offset >= t.len() as u64 {
                     return Ok(0);
                 }
                 let start = offset as usize;
-                let count = core::cmp::min(buf.len(), bytes.len() - start);
-                buf[..count].copy_from_slice(&bytes[start..start + count]);
+                let count = core::cmp::min(buf.len(), t.len() - start);
+                buf[..count].copy_from_slice(&t[start..start + count]);
                 Ok(count)
             }
             _ => Err(VfsError::IsADirectory),
@@ -87,14 +145,18 @@ impl InodeOps for TmpfsInode {
                 let mut data = data.lock();
                 let old_len = data.len() as u64;
                 let end = offset as usize + buf.len();
+                if end as u64 > old_len {
+                    self.reserve_budget(end as u64 - old_len)?;
+                }
                 if end > data.len() {
                     data.resize(end, 0);
                 }
                 data[offset as usize..end].copy_from_slice(buf);
                 let new_len = data.len() as u64;
                 self.size.store(new_len, Ordering::Relaxed);
-                if new_len > old_len {
-                    self.used.fetch_add(new_len - old_len, Ordering::Relaxed);
+                // Growth already accounted by reserve_budget; only shrink needs refund.
+                if new_len < old_len {
+                    self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
                 }
                 *self.mtime.lock() = crate::services::wallclock::now_secs();
                 Ok(buf.len())
@@ -102,22 +164,37 @@ impl InodeOps for TmpfsInode {
             TmpfsEntry::Symlink { target } => {
                 let mut t = target.lock();
                 let old_len = t.len() as u64;
-                // For symlink, write replaces target string if offset==0, else append.
+                // Raw byte semantics: offset 0 replaces the whole target,
+                // otherwise write at offset with zero-fill.  No UTF-8
+                // coercion -- targets are arbitrary bytes.
                 if offset == 0 {
-                    *t = String::from_utf8_lossy(buf).into_owned();
+                    let new_len = buf.len() as u64;
+                    if new_len > old_len {
+                        self.reserve_budget(new_len - old_len)?;
+                    }
+                    *t = buf.to_vec();
+                    let new_len = t.len() as u64;
+                    self.size.store(new_len, Ordering::Relaxed);
+                    if new_len < old_len {
+                        self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
+                    }
                 } else {
-                    // Simple: extend if needed.
-                    let cur = t.clone();
-                    let mut new = cur.into_bytes();
                     let end = offset as usize + buf.len();
-                    if end > new.len() { new.resize(end, 0); }
-                    new[offset as usize..end].copy_from_slice(buf);
-                    *t = String::from_utf8_lossy(&new).into_owned();
+                    let new_len_pre = if t.len() < end { end as u64 } else { t.len() as u64 };
+                    if new_len_pre > old_len {
+                        self.reserve_budget(new_len_pre - old_len)?;
+                    }
+                    if t.len() < end {
+                        t.resize(end, 0);
+                    }
+                    t[offset as usize..end].copy_from_slice(buf);
+                    let new_len = t.len() as u64;
+                    self.size.store(new_len, Ordering::Relaxed);
+                    if new_len < old_len {
+                        self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
+                    }
                 }
-                let new_len = t.len() as u64;
-                self.size.store(new_len, Ordering::Relaxed);
                 *self.mtime.lock() = crate::services::wallclock::now_secs();
-                let _ = old_len;
                 Ok(buf.len())
             }
             _ => Err(VfsError::IsADirectory),
@@ -167,6 +244,9 @@ impl InodeOps for TmpfsInode {
         match &self.entry {
             TmpfsEntry::Dir { children } => {
                 let mut children = children.lock();
+                // Removal drops the Arc; the inode's Drop will refund the
+                // budget when the last reference (e.g. open FD) is gone,
+                // which correctly keeps space charged for open-unlinked files.
                 children.remove(name).ok_or(VfsError::NotFound)?;
                 Ok(())
             }
@@ -258,12 +338,13 @@ impl InodeOps for TmpfsInode {
             TmpfsEntry::File { data } => {
                 let mut data = data.lock();
                 let old_len = data.len() as u64;
+                if len > old_len {
+                    self.reserve_budget(len - old_len)?;
+                }
                 data.resize(len as usize, 0);
                 let new_len = data.len() as u64;
                 self.size.store(len, Ordering::Relaxed);
-                if new_len > old_len {
-                    self.used.fetch_add(new_len - old_len, Ordering::Relaxed);
-                } else if new_len < old_len {
+                if new_len < old_len {
                     self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
                 }
                 *self.mtime.lock() = crate::services::wallclock::now_secs();
@@ -271,8 +352,18 @@ impl InodeOps for TmpfsInode {
             }
             TmpfsEntry::Symlink { target } => {
                 let mut t = target.lock();
-                t.truncate(len as usize);
-                self.size.store(len, Ordering::Relaxed);
+                let old_len = t.len() as u64;
+                if len > old_len {
+                    self.reserve_budget(len - old_len)?;
+                    t.resize(len as usize, 0);
+                } else {
+                    t.truncate(len as usize);
+                }
+                let new_len = t.len() as u64;
+                self.size.store(new_len, Ordering::Relaxed);
+                if new_len < old_len {
+                    self.used.fetch_sub(old_len - new_len, Ordering::Relaxed);
+                }
                 *self.mtime.lock() = crate::services::wallclock::now_secs();
                 Ok(())
             }
@@ -304,11 +395,14 @@ impl InodeOps for TmpfsInode {
                 if children.contains_key(name) {
                     return Err(VfsError::AlreadyExists);
                 }
+                self.reserve_budget(target.len() as u64)?;
                 let ino = NEXT_INO.fetch_add(1, Ordering::Relaxed);
                 let child = Arc::new(TmpfsInode {
                     ino,
                     file_type: FileType::Symlink,
-                    entry: TmpfsEntry::Symlink { target: Mutex::new(String::from(target)) },
+                    entry: TmpfsEntry::Symlink {
+                        target: Mutex::new(target.as_bytes().to_vec()),
+                    },
                     mtime: Mutex::new(crate::services::wallclock::now_secs()),
                     mode: Mutex::new(0o777),
                     size: AtomicU64::new(target.len() as u64),
@@ -323,7 +417,11 @@ impl InodeOps for TmpfsInode {
 
     fn readlink(&self) -> Result<String, VfsError> {
         match &self.entry {
-            TmpfsEntry::Symlink { target } => Ok(target.lock().clone()),
+            TmpfsEntry::Symlink { target } => {
+                // The readlink API is String-typed; non-UTF-8 targets (which
+                // raw storage now preserves) are rendered lossily here only.
+                Ok(String::from_utf8_lossy(&target.lock()).into_owned())
+            }
             _ => Err(VfsError::InvalidInput),
         }
     }
@@ -403,6 +501,67 @@ impl InodeOps for TmpfsInode {
             }
             _ => Err(VfsError::NotADirectory),
         }
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
+    fn rename_across_dirs(
+        &self,
+        new_dir: &dyn InodeOps,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
+        let other = new_dir
+            .as_any()
+            .and_then(|a| a.downcast_ref::<TmpfsInode>())
+            .ok_or(VfsError::CrossDeviceLink)?;
+        if !Arc::ptr_eq(&self.used, &other.used) {
+            return Err(VfsError::CrossDeviceLink);
+        }
+        if self.file_type != FileType::Directory || other.file_type != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return Err(VfsError::InvalidInput);
+        }
+        // Lock both directories in deterministic order by ino to avoid deadlock.
+        if self.ino == other.ino {
+            // Same directory; VFS would have taken same_parent path, but handle anyway.
+            let children = match &self.entry {
+                TmpfsEntry::Dir { children } => children,
+                _ => return Err(VfsError::NotADirectory),
+            };
+            let mut g = children.lock();
+            let child = g.remove(old_name).ok_or(VfsError::NotFound)?;
+            g.insert(String::from(new_name), child);
+            return Ok(());
+        }
+        let (first, second, self_is_first) = if self.ino < other.ino {
+            (self, other, true)
+        } else {
+            (other, self, false)
+        };
+        let first_children = match &first.entry {
+            TmpfsEntry::Dir { children } => children,
+            _ => return Err(VfsError::NotADirectory),
+        };
+        let second_children = match &second.entry {
+            TmpfsEntry::Dir { children } => children,
+            _ => return Err(VfsError::NotADirectory),
+        };
+        let mut g1 = first_children.lock();
+        let mut g2 = second_children.lock();
+        let (src_map, dst_map) = if self_is_first {
+            (&mut *g1, &mut *g2)
+        } else {
+            (&mut *g2, &mut *g1)
+        };
+        let child = src_map.remove(old_name).ok_or(VfsError::NotFound)?;
+        // Overwrite destination if exists (same semantics as same-dir rename).
+        dst_map.insert(String::from(new_name), child);
+        Ok(())
     }
 
     fn file_type(&self) -> FileType {

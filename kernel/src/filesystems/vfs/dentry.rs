@@ -57,6 +57,17 @@ pub struct Dcache {
     map: crate::filesystems::vfs::irq::IrqMutex<HashMap<(u64, String), Weak<Dentry>>>,
 }
 
+/// Canonical cache key for `name` as a child of `dir`.  Uses the directory's
+/// filesystem semantics (case folding for FAT32/NTFS) so the dentry tree and
+/// dcache cannot hold two identities for one on-disk entry.
+pub fn canonical_child_key(dir: &Dentry, name: &str) -> String {
+    let inode_lock = dir.inode.lock();
+    match inode_lock.as_ref() {
+        Some(inode) => inode.ops.canonical_name(name),
+        None => String::from(name),
+    }
+}
+
 static DCACHE: Once<Dcache> = Once::new();
 
 pub fn dcache() -> &'static Dcache {

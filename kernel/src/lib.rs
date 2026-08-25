@@ -556,12 +556,34 @@ impl Kernel {
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");
 
-        // Mount the ESP (first partition on first block device) as B> (fat32)
+        // Mount the ESP: try every block device until one exposes a
+        // FAT32-mountable partition.  This tolerates stale entries left
+        // by a replug (old Arc + new Arc for same model) and disks whose
+        // ESP is not on the first enumerated device.
         #[cfg(target_arch = "x86_64")]
-        if let Some(dev) = block_devices.first() {
-            match crate::filesystems::partition::mount_first_partition(dev.clone(), "fat32", 'B') {
-                Ok(()) => log::info!("Mounted ESP as B> (fat32)"),
-                Err(e) => log::warn!("Could not mount ESP on B>: {:?}", e),
+        {
+            let mut esp_mounted = false;
+            let mut last_err: Option<crate::filesystems::partition::MountAttemptError> = None;
+            for dev in &block_devices {
+                match crate::filesystems::partition::mount_first_partition(dev.clone(), "fat32", 'B') {
+                    Ok(()) => {
+                        log::info!("Mounted ESP as B> (fat32) from '{}'", dev.model_string());
+                        esp_mounted = true;
+                        break;
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            if !esp_mounted {
+                if let Some(attempt) = last_err {
+                    log::warn!(
+                        "Could not mount ESP on B>: {:?} detail={}",
+                        attempt.error,
+                        attempt.detail
+                    );
+                } else {
+                    log::warn!("Could not mount ESP on B>: no block devices");
+                }
             }
         }
 
@@ -574,8 +596,9 @@ impl Kernel {
                     log::info!("Mounted NTFS demo as C> (read-only)");
                     crate::filesystems::fstypes::ntfs::selftest::run();
                 }
-                Err(e) => {
-                    let probe = crate::filesystems::partition::last_mount_detail().unwrap_or("none");
+                Err(attempt) => {
+                    let e = attempt.error;
+                    let probe = attempt.detail;
                     let ntfs = crate::filesystems::fstypes::ntfs::last_error().unwrap_or("none");
                     // Discriminant helps without parsing Debug; probe/ntfs pinpoint the
                     // collapsed IOError: "sector read error" vs "usa_fixup" vs "MFT FILE miss".
@@ -672,12 +695,11 @@ impl Kernel {
                 crate::task::reap_dead(&mut self.allocator);
 
                 // Hot-plug: poll the retained xHCI controller for port
-                // changes and register any newly attached block devices.
+                // changes and register any newly attached block devices
+                // (deduplicated by device identity).
                 let new_devices = crate::usb::xhci::poll();
                 if !new_devices.is_empty() {
-                    crate::filesystems::blockdriver::driver::BLOCK_DEVICES
-                        .lock()
-                        .extend(new_devices);
+                    crate::filesystems::blockdriver::driver::register_block_devices(new_devices);
                 }
 
                 // Run any ready task, including sleepers whose deadline has

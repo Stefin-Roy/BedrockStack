@@ -698,7 +698,7 @@ pub fn write_parsed(
                     let _ = crate::task::propagate_cap_to_parents(child_path.clone(), None, crate::caps::Perm::RW);
                     // Also grant file/dir method caps for the new child (so creator can stat etc)
                     // Propagate each method cap up the parent chain as well
-                    for method in ["stat", "truncate", "chmod", "chown", "utimens", "readlink", "create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod"] {
+                    for method in ["stat", "lstat", "readlink", "truncate", "chmod", "chown", "utimens", "create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod"] {
                         let _ = crate::task::propagate_cap_to_parents(child_path.clone(), Some(String::from(method)), crate::caps::Perm::RW);
                     }
                 }

@@ -430,10 +430,71 @@ pub extern "C" fn stat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
     }
 }
 
-/// POSIX `lstat` — same as `stat` (no symlink support in the VFS).
+/// POSIX `lstat` — like `stat` but does not follow final symlink.
 #[unsafe(no_mangle)]
 pub extern "C" fn lstat(path: *const core::ffi::c_char, buf: *mut u8) -> c_int {
-    stat(path, buf)
+    let p = unsafe { core::slice::from_raw_parts(path as *const u8, crate::string::strlen(path)) };
+    // lstat must not follow final symlink: use parent's :lstat on the basename.
+    let mut rp = [0u8; 512];
+    let Some(rpath) = resolve_into(p, &mut rp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    let Some((parent, base)) = split_path(rpath) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    let mut tp = [0u8; 512];
+    let Some(mp) = method_path(parent, b"lstat", &mut tp) else {
+        errno::set(errno::ENAMETOOLONG);
+        return -1;
+    };
+    // Encode basename as input, reuse same buffer for output (write_path overwrites input with output).
+    let mut pay = [0u8; 260];
+    let pay_len = {
+        let Some(enc) = enc_str(base, &mut pay) else {
+            errno::set(errno::ENAMETOOLONG);
+            return -1;
+        };
+        enc.len()
+    };
+    let r = unsafe { write_path(mp, &mut pay, pay_len, 0) };
+    if r < 28 {
+        if r < 0 {
+            errno::set((-r) as c_int);
+        } else {
+            errno::set(errno::EINVAL);
+        }
+        return -1;
+    }
+    if r as usize > 32 {
+        errno::set(errno::EINVAL);
+        return -1;
+    }
+    // pay[..r] now holds the encoded Stat (STAT_OUTPUT). Translate to C struct layout like stat() does.
+    // Reuse stat's decoding: copy ino/size/mode/mtime into caller's buf.
+    let kind_raw = u32::from_le_bytes(pay[16..20].try_into().unwrap());
+    let base_mode = match kind_raw {
+        1 => 0o040000,
+        2 => 0o120000,
+        3 => 0o010000,
+        4 => 0o020000,
+        5 => 0o060000,
+        6 => 0o140000,
+        _ => 0o100000,
+    };
+    let mode = base_mode | (u32::from_le_bytes(pay[28..32].try_into().unwrap_or([0; 4])) & 0o7777);
+    let ino = u64::from_le_bytes(pay[0..8].try_into().unwrap());
+    let size = u64::from_le_bytes(pay[8..16].try_into().unwrap());
+    let mtime = u64::from_le_bytes(pay[20..28].try_into().unwrap());
+    unsafe {
+        core::ptr::write_bytes(buf, 0, 32);
+        *(buf as *mut u64) = ino;
+        *((buf as *mut u64).add(1)) = size;
+        *((buf as *mut u32).add(4)) = mode;
+        *((buf as *mut u64).add(3)) = mtime;
+    }
+    0
 }
 
 /// Rust `access`-style check: `F_OK` tests existence via `:stat`.
@@ -713,7 +774,7 @@ pub extern "C" fn link(oldpath: *const core::ffi::c_char, newpath: *const core::
     if r < 0 { -1 } else { 0 }
 }
 
-/// `readlink(path, buf, bufsiz)` — read symlink target via `:readlink` or fallback to file read.
+/// `readlink(path, buf, bufsiz)` — read symlink target via parent's `:readlink` (no-follow).
 #[unsafe(no_mangle)]
 pub extern "C" fn readlink(path: *const core::ffi::c_char, buf: *mut c_char, bufsiz: usize) -> isize {
     if path.is_null() || buf.is_null() {
@@ -726,23 +787,53 @@ pub extern "C" fn readlink(path: *const core::ffi::c_char, buf: *mut c_char, buf
         errno::set(errno::ENAMETOOLONG);
         return -1;
     };
-    // Try :readlink method on the symlink itself.
+    let Some((parent, base)) = split_path(rpath) else {
+        errno::set(errno::EINVAL);
+        return -1;
+    };
+    // Try parent's :readlink on the basename (no-follow).
     let mut tp = [0u8; 512];
-    let Some(mp) = method_path(rpath, b"readlink", &mut tp) else {
+    let Some(mp) = method_path(parent, b"readlink", &mut tp) else {
         errno::set(errno::ENAMETOOLONG);
         return -1;
     };
-    let mut out = [0u8; 512];
-    let r = unsafe { write_path(mp, &mut out, 512, 0) };
+    let mut pay = [0u8; 520];
+    let pay_len = {
+        let Some(enc) = enc_str(base, &mut pay) else {
+            errno::set(errno::ENAMETOOLONG);
+            return -1;
+        };
+        enc.len()
+    };
+    let r = unsafe { write_path(mp, &mut pay, pay_len, 0) };
     if r >= 0 {
         let n = r as usize;
-        if n < 4 { return 0; }
-        let len = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
+        if n < 4 {
+            return 0;
+        }
+        let len = u32::from_le_bytes(pay[0..4].try_into().unwrap()) as usize;
         let avail = core::cmp::min(len, core::cmp::min(n - 4, bufsiz));
-        unsafe { core::ptr::copy_nonoverlapping(out[4..].as_ptr(), buf as *mut u8, avail); }
+        unsafe { core::ptr::copy_nonoverlapping(pay[4..].as_ptr(), buf as *mut u8, avail); }
         return avail as isize;
     }
-    // Fallback: read file value directly.
+    // Fallback: try file's :readlink via full path (old behavior) then plain read.
+    // FILE_METHODS readlink expects UNIT (0-length) input, not 512 bytes.
+    let mut tp2 = [0u8; 512];
+    if let Some(mp2) = method_path(rpath, b"readlink", &mut tp2) {
+        let mut out = [0u8; 512];
+        let r2 = unsafe { write_path(mp2, &mut out, 0, 0) };
+        if r2 >= 0 {
+            let n = r2 as usize;
+            if n < 4 {
+                return 0;
+            }
+            let len = u32::from_le_bytes(out[0..4].try_into().unwrap()) as usize;
+            let avail = core::cmp::min(len, core::cmp::min(n - 4, bufsiz));
+            unsafe { core::ptr::copy_nonoverlapping(out[4..].as_ptr(), buf as *mut u8, avail); }
+            return avail as isize;
+        }
+    }
+    // Final fallback: read file value directly.
     let mut tmp = [0u8; 512];
     let rr = unsafe { crate::syscall::read_path(rpath, &mut tmp, 0) };
     if rr < 0 {

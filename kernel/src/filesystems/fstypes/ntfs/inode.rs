@@ -1,3 +1,4 @@
+use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use spin::Mutex;
@@ -167,9 +168,16 @@ impl NtfsInode {
 }
 
 impl InodeOps for NtfsInode {
+    fn canonical_name(&self, name: &str) -> String {
+        // NT directory index matching is case-insensitive (eq_ignore_ascii_case).
+        name.to_ascii_lowercase()
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
         if self.unsupported {
-            return Err(VfsError::IOError);
+            // Typed errno: compressed/encrypted/reparse $DATA is a known,
+            // deliberately unsupported feature -- not an I/O failure.
+            return Err(VfsError::NotSupported);
         }
         if self.file_type != FileType::Regular {
             return Err(VfsError::IsADirectory);

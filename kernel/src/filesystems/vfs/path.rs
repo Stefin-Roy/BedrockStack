@@ -2,10 +2,14 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
-use super::dentry::{Dentry, dcache};
+use super::dentry::{Dentry, canonical_child_key, dcache};
 use super::error::VfsError;
 use super::inode::Inode;
 use super::irq::IrqMutex;
+use super::types::FileType;
+
+/// Maximum symlink expansions during one resolution (POSIX ELOOP bound).
+pub const SYMLINK_MAX: u32 = 40;
 
 static NEXT_MOUNT_ID: IrqMutex<u64> = IrqMutex::new(1);
 
@@ -39,13 +43,33 @@ pub fn split_components(path: &str) -> Vec<&str> {
         .collect()
 }
 
+/// Canonical cache key for `name` as a child of `dir`.  Uses the directory's
+/// filesystem semantics (case folding for FAT32/NTFS) so the dentry tree and
+/// dcache cannot hold two identities for one on-disk entry.
+fn child_cache_key(dir: &Dentry, name: &str) -> String {
+    canonical_child_key(dir, name)
+}
+
 /// Walk the dentry tree from `start`, resolving each component.
 /// Supports `.` (skip) and `..` (go to parent, clamped at root).
 /// Automatically crosses into mount points (dentries with non-zero `mount_id`).
+/// Follows symlinks with a bounded expansion count (ELOOP after 40).
 pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>, VfsError> {
-    let mut current = start;
+    walk_inner(start, components, 0)
+}
 
-    for &name in components {
+fn walk_inner(
+    start: Arc<Dentry>,
+    components: &[&str],
+    mut loops: u32,
+) -> Result<Arc<Dentry>, VfsError> {
+    let mut current = start;
+    let mut idx = 0usize;
+
+    while idx < components.len() {
+        let name = components[idx];
+        idx += 1;
+
         if name == "." || name.is_empty() {
             continue;
         }
@@ -62,13 +86,6 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
                 current = p;
             } else {
                 // No parent: maybe a mount root. Try covered.
-                // Look up by mount_id of current's parent mount point?
-                // We stored covered weakly in DriveMount.covered, but need to
-                // find which mount's root == current. Use lookup_by_id on
-                // current's mount_id is not correct; instead check if current
-                // is a mounted root by searching DRIVE_MAP for matching root ptr.
-                // Simpler: if get_mount_point and parent empty, try to find
-                // mount where root ptr eq current and use its covered.
                 let mut covered_parent: Option<Arc<Dentry>> = None;
                 for (_, m) in super::DRIVE_MAP.iter() {
                     if Arc::ptr_eq(&m.root, &current) {
@@ -85,55 +102,121 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
             continue;
         }
 
+        let key = child_cache_key(&current, name);
+
         // 1. Check parent's children list first
         let found = {
             let children = current.children.lock();
-            children.get(name).cloned()
+            children.get(&key).cloned()
         };
-        if let Some(child) = found {
-            current = attempt_mount_cross(child);
-            continue;
-        }
+        let child = match found {
+            Some(c) => c,
+            None => {
+                // 2. Check global dcache
+                let cur_ino = {
+                    let inode_lock = current.inode.lock();
+                    inode_lock.as_ref().map(|i| i.ino).unwrap_or(0)
+                };
+                let cached = dcache().lookup(cur_ino, &key);
+                match cached {
+                    Some(cached) => {
+                        if cached.is_negative() {
+                            return Err(VfsError::NotFound);
+                        }
+                        // Ensure it's also in the children map
+                        {
+                            let mut children = current.children.lock();
+                            if !children.contains_key(&key) {
+                                children.insert(key.clone(), cached.clone());
+                            }
+                        }
+                        cached
+                    }
+                    None => {
+                        // 3. Ask FS driver
+                        let child_ops;
+                        {
+                            let inode_lock = current.inode.lock();
+                            let inode = inode_lock.as_ref().ok_or(VfsError::NotFound)?;
+                            child_ops = inode.ops.lookup(name)?;
+                        }
 
-        // 2. Check global dcache
-        let cur_ino = {
-            let inode_lock = current.inode.lock();
-            inode_lock.as_ref().map(|i| i.ino).unwrap_or(0)
-        };
-        let cached = dcache().lookup(cur_ino, name);
-        if let Some(cached) = cached {
-            if cached.is_negative() {
-                return Err(VfsError::NotFound);
-            }
-            // Ensure it's also in the children map
-            {
-                let mut children = current.children.lock();
-                if !children.contains_key(name) {
-                    children.insert(String::from(name), cached.clone());
+                        let child_inode = Arc::new(Inode::new(child_ops));
+                        // Display name is what the caller asked for; the cache
+                        // key is canonical.
+                        let child = Dentry::new(name, Some(child_inode));
+                        *child.parent.lock() = Arc::downgrade(&current);
+                        // Children inherit their parent's mount identity so
+                        // unmount's busy-scan sees open files below the root.
+                        child.set_mount_id(current.get_mount_id());
+                        {
+                            let mut children = current.children.lock();
+                            children.insert(key.clone(), child.clone());
+                        }
+                        dcache().insert(cur_ino, key.clone(), Arc::downgrade(&child));
+                        child
+                    }
                 }
             }
-            current = attempt_mount_cross(cached);
-            continue;
-        }
-
-        // 3. Ask FS driver
-        let child_ops;
-        {
-            let inode_lock = current.inode.lock();
-            let inode = inode_lock.as_ref().ok_or(VfsError::NotFound)?;
-            child_ops = inode.ops.lookup(name)?;
-        }
-
-        let child_inode = Arc::new(Inode::new(child_ops));
-        let child = Dentry::new(name, Some(child_inode));
-        *child.parent.lock() = Arc::downgrade(&current);
-        {
-            let mut children = current.children.lock();
-            children.insert(String::from(name), child.clone());
-        }
-        dcache().insert(cur_ino, String::from(name), Arc::downgrade(&child));
+        };
 
         current = attempt_mount_cross(child);
+
+        // Follow a symlink at this position: splice its target into the
+        // remaining component stream and continue from the appropriate base.
+        loop {
+            let ft = {
+                let inode_lock = current.inode.lock();
+                match inode_lock.as_ref() {
+                    Some(i) => i.file_type,
+                    None => break,
+                }
+            };
+            if ft != FileType::Symlink {
+                break;
+            }
+            loops += 1;
+            if loops > SYMLINK_MAX {
+                return Err(VfsError::Loop);
+            }
+            let target = {
+                let inode_lock = current.inode.lock();
+                let inode = inode_lock.as_ref().ok_or(VfsError::NotFound)?;
+                inode.ops.readlink()?
+            };
+            if target.is_empty() {
+                return Err(VfsError::Loop);
+            }
+            if let Ok((letter, inner)) = split_drive_path(&target) {
+                let mount = super::DRIVE_MAP.lookup(letter)?;
+                let base = mount.root.clone();
+                let mut rest = split_components(inner);
+                rest.extend_from_slice(&components[idx..]);
+                return walk_inner(base, &rest, loops);
+            } else if target.starts_with('/') {
+                // Absolute path without drive letter: resolve from the
+                // symlink's filesystem root (same mount), not its parent.
+                let mut rest = split_components(target.trim_start_matches('/'));
+                rest.extend_from_slice(&components[idx..]);
+                let mount_id = current.get_mount_id();
+                let base = if mount_id != 0 {
+                    if let Some((_, m)) = super::DRIVE_MAP.lookup_by_id(mount_id) {
+                        m.root.clone()
+                    } else {
+                        current.parent.lock().upgrade().ok_or(VfsError::NotFound)?
+                    }
+                } else {
+                    current.parent.lock().upgrade().ok_or(VfsError::NotFound)?
+                };
+                return walk_inner(base, &rest, loops);
+            } else {
+                let mut rest = split_components(&target);
+                rest.extend_from_slice(&components[idx..]);
+                // Relative targets resolve against the link's directory.
+                let base = current.parent.lock().upgrade().ok_or(VfsError::NotFound)?;
+                return walk_inner(base, &rest, loops);
+            }
+        }
     }
 
     Ok(current)
@@ -142,6 +225,9 @@ pub fn walk_from(start: Arc<Dentry>, components: &[&str]) -> Result<Arc<Dentry>,
 /// If `dentry` is a mount point, return the root dentry of the mounted
 /// drive. Otherwise return `dentry` unchanged.
 fn attempt_mount_cross(dentry: Arc<Dentry>) -> Arc<Dentry> {
+    if !dentry.is_mount_point() {
+        return dentry;
+    }
     let mid = dentry.get_mount_id();
     if mid == 0 {
         return dentry;

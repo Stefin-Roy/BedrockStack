@@ -13,23 +13,6 @@ mod mbr;
 const SECTOR_SIZE: usize = 512;
 const MAX_EBR_CHAIN: u32 = 100;
 
-/// Last detailed probe/mount error for post-mortem logging (see `last_probe_error`).
-/// Stores the `&'static str` returned by `probe` before it is collapsed to
-/// `VfsError::InvalidDevice`, plus NTFS-stage detail when available.
-static LAST_MOUNT_DETAIL: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
-
-pub fn last_mount_detail() -> Option<&'static str> {
-    *LAST_MOUNT_DETAIL.lock()
-}
-
-pub fn last_probe_error() -> Option<&'static str> {
-    last_mount_detail()
-}
-
-fn set_last_detail(s: Option<&'static str>) {
-    *LAST_MOUNT_DETAIL.lock() = s;
-}
-
 #[derive(Debug, Clone)]
 pub struct PartitionInfo {
     pub number: u32,
@@ -43,6 +26,13 @@ pub struct PartitionInfo {
     pub guid_unique: Option<[u8; 16]>,
     pub name: Option<String>,
     pub is_extended: bool,
+}
+
+/// Mount attempt outcome carrying its own probe/mount detail string, so
+/// callers can log precisely what failed without a racy process-global slot.
+pub struct MountAttemptError {
+    pub error: VfsError,
+    pub detail: &'static str,
 }
 
 pub enum PartitionTable {
@@ -145,82 +135,133 @@ pub fn probe(device: Arc<dyn BlockDevice>) -> Result<PartitionTable, &'static st
         return Err("no valid MBR or GPT signature");
     }
 
-    let has_protective = mbr[0x1C2] == 0xEE;
+    // A protective MBR declares type 0xEE in any primary slot (hybrid disks
+    // put it elsewhere than slot 0); check all four.
+    let has_protective = (0..4).any(|i| mbr[0x1BE + i * 16 + 4] == 0xEE);
 
     if has_protective {
-        if let Ok(parts) = gpt::parse(device.clone()) {
-            return Ok(PartitionTable::Gpt(parts));
+        match gpt::parse(device.clone()) {
+            Ok(parts) => {
+                check_overlaps(&parts)?;
+                return Ok(PartitionTable::Gpt(parts));
+            }
+            // Corrupt GPT: fall through to MBR parsing, which now skips the
+            // 0xEE stubs so no bogus "partition" leaks out.
+            Err(gpt_err) => {
+                let parts = mbr::parse(device, &mbr).map_err(|_| gpt_err)?;
+                check_overlaps(&parts)?;
+                return Ok(PartitionTable::Mbr(parts));
+            }
         }
     }
 
     let parts = mbr::parse(device, &mbr)?;
+    check_overlaps(&parts)?;
     Ok(PartitionTable::Mbr(parts))
 }
 
+/// Reject tables where two real partitions claim overlapping LBAs.
+fn check_overlaps(parts: &[PartitionInfo]) -> Result<(), &'static str> {
+    let mut sorted: Vec<&PartitionInfo> = parts
+        .iter()
+        .filter(|p| !p.is_extended && p.size_sectors > 0)
+        .collect();
+    sorted.sort_by_key(|p| p.start_lba);
+    for w in sorted.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        let a_end = a
+            .start_lba
+            .checked_add(a.size_sectors)
+            .ok_or("partition range overflow")?;
+        if b.start_lba < a_end {
+            return Err("overlapping partitions");
+        }
+    }
+    Ok(())
+}
+
+/// Probe the table and mount `fstype` from the first non-extended partition
+/// that successfully mounts.  Trying every candidate in order handles disks
+/// whose ESP is not the first entry; the first success wins.
+pub fn mount_first_partition(
+    device: Arc<dyn BlockDevice>,
+    fstype: &str,
+    drive: char,
+) -> Result<(), MountAttemptError> {
+    let table = match probe(device.clone()) {
+        Ok(t) => t,
+        Err(s) => {
+            return Err(MountAttemptError {
+                error: VfsError::InvalidDevice,
+                detail: s,
+            });
+        }
+    };
+
+    let candidates: Vec<&PartitionInfo> = table
+        .partitions()
+        .iter()
+        .filter(|p| !p.is_extended && p.size_sectors > 0)
+        .collect();
+
+    if candidates.is_empty() {
+        return Err(MountAttemptError {
+            error: VfsError::NotFound,
+            detail: "no non-extended partition",
+        });
+    }
+
+    let mut last: Option<MountAttemptError> = None;
+    for info in candidates {
+        let part_dev = PartitionDevice::new(device.clone(), info);
+        match vfs::mount(fstype, Some(Arc::new(part_dev)), drive) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                // Preserve the underlying VFS error for logging; use its
+                // discriminant as the static detail so the caller can see
+                // why the filesystem rejected this partition (e.g. InvalidDevice
+                // vs NotFound) instead of a generic string.
+                let detail: &'static str = e.discriminant_name();
+                last = Some(MountAttemptError { error: e, detail });
+            }
+        }
+    }
+    Err(last.unwrap_or(MountAttemptError {
+        error: VfsError::InvalidDevice,
+        detail: "mount failed",
+    }))
+}
+
+/// Mount a specific partition number.
 pub fn mount_partition(
     device: Arc<dyn BlockDevice>,
     part_number: u32,
     fstype: &str,
     drive: char,
-) -> Result<(), VfsError> {
+) -> Result<(), MountAttemptError> {
     let table = match probe(device.clone()) {
-        Ok(t) => {
-            set_last_detail(None);
-            t
-        }
+        Ok(t) => t,
         Err(s) => {
-            set_last_detail(Some(s));
-            return Err(VfsError::InvalidDevice);
+            return Err(MountAttemptError {
+                error: VfsError::InvalidDevice,
+                detail: s,
+            });
         }
     };
     let info = table
         .partitions()
         .iter()
         .find(|p| p.number == part_number && !p.is_extended)
-        .ok_or_else(|| {
-            set_last_detail(Some("partition number not found"));
-            VfsError::NotFound
+        .ok_or(MountAttemptError {
+            error: VfsError::NotFound,
+            detail: "partition number not found",
         })?;
     let part_dev = PartitionDevice::new(device, info);
-    let res = vfs::mount(fstype, Some(Arc::new(part_dev)), drive);
-    // Do not clear on failure: keep probe detail (if any) for lib.rs to log.
-    // Success clears.
-    if res.is_ok() {
-        set_last_detail(None);
-    }
-    res
-}
-
-pub fn mount_first_partition(
-    device: Arc<dyn BlockDevice>,
-    fstype: &str,
-    drive: char,
-) -> Result<(), VfsError> {
-    let table = match probe(device.clone()) {
-        Ok(t) => {
-            // Clear stale detail on successful probe; mount may still fail later.
-            set_last_detail(None);
-            t
-        }
-        Err(s) => {
-            set_last_detail(Some(s));
-            return Err(VfsError::InvalidDevice);
-        }
-    };
-    let info = table
-        .partitions()
-        .iter()
-        .find(|p| !p.is_extended)
-        .ok_or_else(|| {
-            set_last_detail(Some("no non-extended partition"));
-            VfsError::NotFound
-        })?;
-    let part_dev = PartitionDevice::new(device, info);
-    let res = vfs::mount(fstype, Some(Arc::new(part_dev)), drive);
-    if res.is_ok() {
-        set_last_detail(None);
-    }
-    res
+    vfs::mount(fstype, Some(Arc::new(part_dev)), drive).map_err(|e| {
+        let detail: &'static str = e.discriminant_name();
+        MountAttemptError { error: e, detail }
+    })
 }
 
 fn read_sector(device: &dyn BlockDevice, lba: u64, buf: &mut [u8]) -> Result<(), &'static str> {

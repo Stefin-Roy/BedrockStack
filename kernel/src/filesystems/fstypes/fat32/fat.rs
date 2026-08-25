@@ -38,6 +38,6 @@ impl Fat32SuperBlock {
 
     pub fn flush_fat_cache(&self) -> Result<(), VfsError> {
         let mut cache = self.fat_cache.lock();
-        cache.flush(&*self.device, &self.bpb)
+        cache.flush(&*self.device)
     }
 }

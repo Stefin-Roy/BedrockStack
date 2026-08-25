@@ -18,7 +18,7 @@ pub mod path;
 pub mod superblock;
 pub mod types;
 
-use dentry::{Dentry, dcache};
+use dentry::{Dentry, canonical_child_key, dcache};
 use drive::DriveMap;
 use error::VfsError;
 use fdtable::FdTable;
@@ -31,6 +31,14 @@ use types::{DirEntry, FileType, OpenFlags, SeekFrom, Stat};
 static VFS_INIT: AtomicBool = AtomicBool::new(false);
 pub static DRIVE_MAP: DriveMap = DriveMap::new();
 pub static FD_TABLE: FdTable = FdTable::new();
+
+/// Namespace lock: held across mount/unmount and across open()'s
+/// resolve→attach sequence so an unmount cannot tear a drive down between
+/// its final busy-check and DRIVE_MAP removal while an open() is attaching
+/// to it.  A plain spin Mutex -- must NOT be an IrqMutex, since it is held
+/// across device I/O (sync/shutdown) where IRQ-disabled spinning would
+/// stall interrupt delivery.
+pub static NS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 pub struct CurrentWorkingDirectory {
     pub drive: char,
@@ -132,6 +140,7 @@ pub fn mount(
     device: Option<Arc<dyn crate::filesystems::blockdriver::traits::BlockDevice>>,
     drive: char,
 ) -> Result<(), VfsError> {
+    let _ns = NS_LOCK.lock();
     let fs = fstypes::lookup(fstype).ok_or(VfsError::NotFound)?;
     let (sb, root_ops) = fs.mount(device.clone())?;
     let root_inode = Arc::new(Inode::new(root_ops));
@@ -140,13 +149,20 @@ pub fn mount(
 
     let mid = path::next_mount_id();
     root_dentry.set_mount_id(mid);
-    let mount = DriveMount::new(mid, root_dentry, sb, device);
-    DRIVE_MAP.assign(drive, Arc::new(mount))?;
+    let mount = DriveMount::new(mid, root_dentry, sb.clone(), device);
+    if let Err(e) = DRIVE_MAP.assign(drive, Arc::new(mount)) {
+        // The superblock was fully constructed (FAT32 already set its
+        // volume-dirty bit and scanned the FAT).  Tear it down so the
+        // on-disk state does not look like an unclean shutdown.
+        let _ = sb.ops.shutdown();
+        return Err(e);
+    }
     log::info!("VFS: mounted {} on {}>", fstype, drive);
     Ok(())
 }
 
 pub fn mount_virtual(source: &str, drive: char) -> Result<(), VfsError> {
+    let _ns = NS_LOCK.lock();
     let (letter, src_dentry) = resolve_path(source)?;
     let src_inode = {
         let lock = src_dentry.inode.lock();
@@ -172,6 +188,7 @@ pub fn mount_at(
     target_path: &str,
     drive: char,
 ) -> Result<(), VfsError> {
+    let _ns = NS_LOCK.lock();
     // Resolve and verify the target mount point
     let (_, target) = resolve_path(target_path)?;
     {
@@ -199,11 +216,16 @@ pub fn mount_at(
 
     DRIVE_MAP.assign(drive, mount)?;
     target.set_mount_id(mid);
+    target.set_mount_point(true);
     log::info!("VFS: mounted {} on {}> (at {})", fstype, drive, target_path);
     Ok(())
 }
 
 pub fn unmount(drive: char) -> Result<(), VfsError> {
+    // Serialize against open()/mount()/unmount() for the whole teardown so
+    // the final busy-check and DRIVE_MAP removal are atomic with respect to
+    // new attaches.
+    let _ns = NS_LOCK.lock();
     // Check CWD not on this drive
     {
         let cwd = CWD.lock();
@@ -310,6 +332,10 @@ pub fn getcwd() -> Result<String, VfsError> {
 // ---------------------------------------------------------------------------
 
 pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
+    // Hold the namespace lock across resolve→attach so a concurrent unmount
+    // cannot complete between the busy-check and DRIVE_MAP removal while we
+    // are pinning an inode on the dying mount.
+    let _ns = NS_LOCK.lock();
     let create = flags.contains(OpenFlags::CREATE);
     let trunc = flags.contains(OpenFlags::TRUNC);
 
@@ -325,17 +351,29 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
 
     let existing = {
         let inode_lock = parent.inode.lock();
-        inode_lock
-            .as_ref()
-            .and_then(|p| p.ops.lookup(&leaf_name).ok())
+        let p = inode_lock.as_ref().ok_or(VfsError::NotFound)?;
+        match p.ops.lookup(&leaf_name) {
+            Ok(ops) => Some(ops),
+            Err(VfsError::NotFound) => None,
+            // With O_CREAT a transient lookup failure may just mean the file
+            // does not exist yet; let create() surface the real error.  Any
+            // other mode propagates device errors instead of masking them as
+            // ENOENT.
+            Err(_) if create => None,
+            Err(e) => return Err(e),
+        }
     };
+
+    // Canonical cache key for the leaf under this parent (case-folded on
+    // case-insensitive filesystems).
+    let leaf_key = canonical_child_key(&parent, &leaf_name);
 
     // O_EXCL: fail if file already exists
     if flags.contains(OpenFlags::EXCL) && existing.is_some() {
         return Err(VfsError::AlreadyExists);
     }
 
-    let inode: Arc<Inode> = match existing {
+    let mut inode: Arc<Inode> = match existing {
         Some(child_ops) => {
             let inode = Arc::new(Inode::new(child_ops));
             if trunc {
@@ -347,16 +385,17 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
             // may have been seen only via readdir, or the walk used different
             // letter-case than this path) must not fail on the fd dentry.
             let mut children = parent.children.lock();
-            match children.get(&leaf_name).cloned() {
+            match children.get(&leaf_key).cloned() {
                 Some(cd) => {
                     *cd.inode.lock() = Some(inode.clone());
                 }
                 None => {
                     let cd = Dentry::new(&leaf_name, Some(inode.clone()));
                     *cd.parent.lock() = Arc::downgrade(&parent);
+                    cd.set_mount_id(parent.get_mount_id());
                     let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
-                    dcache().insert(parent_ino, leaf_name.clone(), Arc::downgrade(&cd));
-                    children.insert(leaf_name.clone(), cd);
+                    dcache().insert(parent_ino, leaf_key.clone(), Arc::downgrade(&cd));
+                    children.insert(leaf_key.clone(), cd);
                 }
             }
             drop(children);
@@ -383,22 +422,76 @@ pub fn open(path: &str, flags: OpenFlags) -> Result<u32, VfsError> {
             let inode = Arc::new(Inode::new(child_ops));
             let child_dentry = Dentry::new(&leaf_name, Some(inode.clone()));
             *child_dentry.parent.lock() = Arc::downgrade(&parent);
+            child_dentry.set_mount_id(parent.get_mount_id());
             parent
                 .children
                 .lock()
-                .insert(leaf_name.clone(), child_dentry.clone());
+                .insert(leaf_key.clone(), child_dentry.clone());
             let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
-            dcache().insert(parent_ino, leaf_name.clone(), Arc::downgrade(&child_dentry));
+            dcache().insert(parent_ino, leaf_key.clone(), Arc::downgrade(&child_dentry));
             inode
         }
     };
 
-    let fd_dentry = parent
+    let mut fd_dentry = parent
         .children
         .lock()
-        .get(&leaf_name)
+        .get(&leaf_key)
         .cloned()
         .ok_or(VfsError::NotFound)?;
+
+    // Follow a final-component symlink (mid-path links were already followed
+    // by walk_from).  O_NOFOLLOW refuses the first hop.
+    if inode.file_type == FileType::Symlink {
+        if flags.contains(OpenFlags::NOFOLLOW) {
+            return Err(VfsError::Loop);
+        }
+        let mut loops = 0u32;
+        while inode.file_type == FileType::Symlink {
+            loops += 1;
+            if loops > path::SYMLINK_MAX {
+                return Err(VfsError::Loop);
+            }
+            let target = inode.ops.readlink()?;
+            if target.is_empty() {
+                return Err(VfsError::Loop);
+            }
+            let resolved = if let Ok((letter, inner)) = path::split_drive_path(&target) {
+                let mount = DRIVE_MAP.lookup(letter)?;
+                path::walk_from(mount.root.clone(), &path::split_components(inner))?
+            } else if target.starts_with('/') {
+                // Absolute without drive letter: from the link's filesystem root.
+                let mount_id = parent.get_mount_id();
+                let base = if mount_id != 0 {
+                    if let Some((_, m)) = DRIVE_MAP.lookup_by_id(mount_id) {
+                        m.root.clone()
+                    } else {
+                        parent.clone()
+                    }
+                } else {
+                    parent.clone()
+                };
+                path::walk_from(
+                    base,
+                    &path::split_components(target.trim_start_matches('/')),
+                )?
+            } else {
+                // Relative targets resolve against the link's directory.
+                path::walk_from(parent.clone(), &path::split_components(target.as_str()))?
+            };
+            fd_dentry = resolved;
+            let next = fd_dentry.inode.lock().clone().ok_or(VfsError::NotFound)?;
+            inode = next;
+        }
+    }
+
+    // Structural open-flag enforcement (shape rules, not access control).
+    if flags.contains(OpenFlags::DIRECTORY) && inode.file_type != FileType::Directory {
+        return Err(VfsError::NotADirectory);
+    }
+    if flags.contains(OpenFlags::NOFOLLOW) && inode.file_type == FileType::Symlink {
+        return Err(VfsError::Loop);
+    }
 
     let fd = FileDescription::new(fd_dentry, inode, flags);
     Ok(FD_TABLE.alloc(fd))
@@ -447,6 +540,10 @@ pub fn write(fd: u32, buf: &[u8]) -> Result<usize, VfsError> {
         };
         *pos = cur;
         let count = file.inode.ops.write_at(cur, buf)?;
+        // O_SYNC: durability before write() returns.
+        if file.flags.contains(OpenFlags::SYNC) {
+            file.inode.ops.flush()?;
+        }
         let new_size = cur + count as u64;
         if new_size > file.inode.size.load(Ordering::Relaxed) {
             file.inode.size.store(new_size, Ordering::Relaxed);
@@ -491,10 +588,12 @@ pub fn mkdir(path: &str) -> Result<(), VfsError> {
     let child_inode = Arc::new(Inode::new(child_ops));
     let child = Dentry::new(&name, Some(child_inode));
     *child.parent.lock() = Arc::downgrade(&parent);
-    parent.children.lock().insert(name.clone(), child.clone());
+    child.set_mount_id(parent.get_mount_id());
+    let dir_key = canonical_child_key(&parent, &name);
+    parent.children.lock().insert(dir_key.clone(), child.clone());
 
     let parent_ino = parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
-    dcache().insert(parent_ino, name, Arc::downgrade(&child));
+    dcache().insert(parent_ino, dir_key, Arc::downgrade(&child));
     Ok(())
 }
 
@@ -509,16 +608,17 @@ pub fn rmdir(path: &str) -> Result<(), VfsError> {
         .as_ref()
         .map(|i| i.ino)
         .ok_or(VfsError::NotFound)?;
+    let child_key = canonical_child_key(&parent, &name);
 
     // Signal the child inode that it will be unlinked, before dropping the
     // dentry reference (which may drop the inode if no handles are open).
-    if let Some(child) = parent.children.lock().get(&name) {
+    if let Some(child) = parent.children.lock().get(&child_key) {
         if let Some(ref inode) = *child.inode.lock() {
             inode.ops.on_unlink();
         }
     }
 
-    if let Some(child) = parent.children.lock().remove(&name) {
+    if let Some(child) = parent.children.lock().remove(&child_key) {
         child.inode.lock().take();
     }
 
@@ -527,7 +627,7 @@ pub fn rmdir(path: &str) -> Result<(), VfsError> {
     p.ops.rmdir(&name)?;
     drop(parent_inode);
 
-    dcache().evict(parent_ino, &name);
+    dcache().evict(parent_ino, &child_key);
     Ok(())
 }
 
@@ -581,9 +681,10 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
         .as_ref()
         .map(|i| i.ino)
         .ok_or(VfsError::NotFound)?;
+    let child_key = canonical_child_key(&parent, &name);
 
     // Reject unlinking directories (use rmdir instead)
-    if let Some(child) = parent.children.lock().get(&name) {
+    if let Some(child) = parent.children.lock().get(&child_key) {
         let guard = child.inode.lock();
         if let Some(inode) = guard.as_ref() {
             if inode.file_type == FileType::Directory {
@@ -601,13 +702,13 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     }
 
     // Signal the child inode before dropping the dentry reference.
-    if let Some(child) = parent.children.lock().get(&name) {
+    if let Some(child) = parent.children.lock().get(&child_key) {
         if let Some(ref inode) = *child.inode.lock() {
             inode.ops.on_unlink();
         }
     }
 
-    if let Some(child) = parent.children.lock().remove(&name) {
+    if let Some(child) = parent.children.lock().remove(&child_key) {
         child.inode.lock().take();
     }
 
@@ -616,7 +717,7 @@ pub fn unlink(path: &str) -> Result<(), VfsError> {
     p.ops.unlink(&name)?;
     drop(parent_inode);
 
-    dcache().evict(parent_ino, &name);
+    dcache().evict(parent_ino, &child_key);
     Ok(())
 }
 
@@ -660,51 +761,84 @@ pub fn rename(old_path: &str, new_path: &str) -> Result<(), VfsError> {
 
     if same_parent {
         old_ops.rename(&old_name, &new_name)?;
+        let old_key = canonical_child_key(old_parent.as_ref(), &old_name);
+        let new_key = canonical_child_key(old_parent.as_ref(), &new_name);
         let mut children = old_parent.children.lock();
-        if let Some(child) = children.remove(&old_name) {
+        if let Some(child) = children.remove(&old_key) {
             *child.name.lock() = new_name.clone();
-            children.insert(new_name.clone(), child.clone());
+            children.insert(new_key.clone(), child.clone());
             drop(children);
-            dcache().evict(old_ino, &old_name);
-            dcache().insert(old_ino, new_name, Arc::downgrade(&child));
+            dcache().evict(old_ino, &old_key);
+            dcache().insert(old_ino, new_key, Arc::downgrade(&child));
         } else {
             drop(children);
-            dcache().evict(old_ino, &old_name);
+            dcache().evict(old_ino, &old_key);
         }
     } else {
-        let child_ops = old_ops.lookup(&old_name)?;
-        if child_ops.file_type() == FileType::Directory {
-            return Err(VfsError::CrossDeviceLink);
-        }
-        let size = child_ops.size();
-        let new_child_ops = new_ops.create(&new_name)?;
-        if size > 0 {
-            const CHUNK: u64 = 65536;
-            let mut pos = 0u64;
-            while pos < size {
-                let read_size = ((size - pos) as usize).min(CHUNK as usize);
-                let mut buf = alloc::vec![0u8; read_size];
-                child_ops.read_at(pos, &mut buf)?;
-                if new_child_ops.write_at(pos, &buf).is_err() {
-                    let _ = new_ops.unlink(&new_name);
-                    return Err(VfsError::IOError);
+        // Different directories.  Try a native cross-directory rename; a
+        // filesystem that cannot (or a different mount) returns EXDEV and we
+        // propagate it -- VFS never byte-copies as a rename fallback, so a
+        // crash can never leave a duplicate behind.
+        let old_key_pre = canonical_child_key(old_parent.as_ref(), &old_name);
+
+        // Cycle guard: refuse moving a directory into itself or its own
+        // subtree.  The original check only looked at the dentry cache, so
+        // an uncached directory (e.g. never readdir'd) could be moved into
+        // its own child and create a cycle.  We now also consult the
+        // filesystem via lookup() and compare inode identities.
+        {
+            let child_dentry_opt = old_parent.children.lock().get(&old_key_pre).cloned();
+            let is_dir = if let Some(ref child) = child_dentry_opt {
+                let g = child.inode.lock();
+                g.as_ref().map(|i| i.file_type) == Some(FileType::Directory)
+            } else {
+                match old_ops.lookup(&old_name) {
+                    Ok(ops) => ops.file_type() == FileType::Directory,
+                    Err(_) => false,
                 }
-                pos += read_size as u64;
+            };
+            if is_dir {
+                let child_ino_opt = if let Some(ref child) = child_dentry_opt {
+                    child.inode.lock().as_ref().map(|i| i.ino)
+                } else {
+                    old_ops.lookup(&old_name).ok().map(|ops| ops.ino())
+                };
+                let mut anc = Some(new_parent.clone());
+                while let Some(a) = anc {
+                    if let Some(ref child) = child_dentry_opt {
+                        if Arc::ptr_eq(&a, child) {
+                            return Err(VfsError::InvalidInput);
+                        }
+                    }
+                    if let Some(child_ino) = child_ino_opt {
+                        let anc_ino = a.inode.lock().as_ref().map(|i| i.ino);
+                        if anc_ino == Some(child_ino) {
+                            return Err(VfsError::InvalidInput);
+                        }
+                    }
+                    anc = a.parent.lock().upgrade();
+                }
             }
         }
-        old_ops.unlink(&old_name).map_err(|e| {
-            let _ = new_ops.unlink(&new_name);
-            e
-        })?;
 
-        if let Some(child) = old_parent.children.lock().remove(&old_name) {
+        old_ops.rename_across_dirs(new_ops.as_ref(), &old_name, &new_name)?;
+
+        let old_key = canonical_child_key(old_parent.as_ref(), &old_name);
+        let new_key = canonical_child_key(new_parent.as_ref(), &new_name);
+        let new_ino = new_parent
+            .inode
+            .lock()
+            .as_ref()
+            .map(|i| i.ino)
+            .unwrap_or(0);
+        if let Some(child) = old_parent.children.lock().remove(&old_key) {
             *child.name.lock() = new_name.clone();
             *child.parent.lock() = Arc::downgrade(&new_parent);
-            let new_ino = new_parent.inode.lock().as_ref().map(|i| i.ino).unwrap_or(0);
-            dcache().insert(new_ino, new_name.clone(), Arc::downgrade(&child));
-            new_parent.children.lock().insert(new_name.clone(), child);
+            child.set_mount_id(new_parent.get_mount_id());
+            dcache().insert(new_ino, new_key.clone(), Arc::downgrade(&child));
+            new_parent.children.lock().insert(new_key, child);
         }
-        dcache().evict(old_ino, &old_name);
+        dcache().evict(old_ino, &old_key);
     }
 
     Ok(())
@@ -735,7 +869,15 @@ pub fn dup2(old_fd: u32, new_fd: u32) -> Result<(), VfsError> {
 }
 
 pub fn sync_all() -> Result<(), VfsError> {
+    // Dedupe by superblock identity: bind-style mounts (mount_virtual) share
+    // one SuperBlock across letters and must be flushed exactly once.
+    let mut seen: Vec<usize> = Vec::new();
     for (_letter, mount) in DRIVE_MAP.iter() {
+        let id = Arc::as_ptr(&mount.sb) as *const () as usize;
+        if seen.contains(&id) {
+            continue;
+        }
+        seen.push(id);
         mount.sb.ops.sync_fs()?;
     }
     Ok(())

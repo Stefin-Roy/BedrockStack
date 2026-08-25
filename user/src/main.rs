@@ -51,6 +51,8 @@ fn posixcheck_caps() -> &'static [libc::process::Cap<'static>] {
         libc::process::Cap { path: "A", method: Some("mkfifo"), perm: RW },
         libc::process::Cap { path: "A", method: Some("mknod"), perm: RW },
         libc::process::Cap { path: "A", method: Some("stat"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("lstat"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("readlink"), perm: RW },
         // B/EFI/BEDROCK/POSIXCHECK
         libc::process::Cap { path: "B", method: None, perm: R },
         libc::process::Cap { path: "B/EFI", method: None, perm: R },
@@ -106,6 +108,8 @@ fn doom_caps() -> &'static [libc::process::Cap<'static>] {
         libc::process::Cap { path: "A", method: Some("mkfifo"), perm: RW },
         libc::process::Cap { path: "A", method: Some("mknod"), perm: RW },
         libc::process::Cap { path: "A", method: Some("stat"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("lstat"), perm: RW },
+        libc::process::Cap { path: "A", method: Some("readlink"), perm: RW },
         libc::process::Cap { path: "B", method: None, perm: R },
         libc::process::Cap { path: "B/EFI", method: None, perm: R },
         libc::process::Cap { path: "B/EFI/BEDROCK", method: None, perm: R },

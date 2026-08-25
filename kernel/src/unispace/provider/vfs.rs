@@ -99,7 +99,7 @@ const STAT_METHOD: MethodDesc = MethodDesc {
     output: &STAT_OUTPUT,
 };
 
-static DIR_METHODS: [MethodDesc; 10] = [
+static DIR_METHODS: [MethodDesc; 12] = [
     MethodDesc {
         name: "create",
         input: &CREATE_INPUT,
@@ -146,6 +146,16 @@ static DIR_METHODS: [MethodDesc; 10] = [
         output: &schema::SCHEMA_UNIT,
     },
     STAT_METHOD,
+    MethodDesc {
+        name: "readlink",
+        input: &CREATE_INPUT,
+        output: &schema::SCHEMA_STR,
+    },
+    MethodDesc {
+        name: "lstat",
+        input: &CREATE_INPUT,
+        output: &STAT_OUTPUT,
+    },
 ];
 
 static FILE_METHODS: [MethodDesc; 6] = [
@@ -367,6 +377,18 @@ impl Object for VfsDir {
                 Ok(())
             }
             9 => stat_output(self.ops.as_ref(), out),
+            10 => {
+                let name = arg_str(&v, 0)?;
+                let ops = self.ops.lookup(name)?;
+                let target = ops.readlink()?;
+                let out_val = Value::Str(target);
+                schema::encode_value(&out_val, &schema::SCHEMA_STR, out)
+            }
+            11 => {
+                let name = arg_str(&v, 0)?;
+                let ops = self.ops.lookup(name)?;
+                stat_output(ops.as_ref(), out)
+            }
             _ => Err(UnispaceError::MethodNotFound),
         }
     }

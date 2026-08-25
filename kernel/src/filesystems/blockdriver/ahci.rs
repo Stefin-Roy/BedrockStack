@@ -162,8 +162,9 @@ struct AhciPort {
     port: u8,
     _cl_paddr: u64,
     cl_vaddr: u64,
-    _rfis_paddr: u64,
-    _rfis_vaddr: u64,
+    #[allow(dead_code)]
+    rfis_paddr: u64,
+    rfis_vaddr: u64,
     scratch_paddr: u64,
     scratch_vaddr: u64,
     max_prdt: usize,
@@ -241,6 +242,7 @@ impl AhciPort {
                 self.dump_err(tag_mask, (tfd >> 8) as u8, serr);
                 return Err("AHCI cmd error");
             }
+            self.check_sdb_error(tag_mask)?;
             return Ok(());
         }
         let serr = self.hba.pr32(self.port, port_off::SERR);
@@ -373,6 +375,40 @@ impl AhciPort {
         Ok(n)
     }
 
+    /// Build PRDT entries directly from a physical address (IoBuffer::Phys).
+    /// No virt_to_phys translation — the caller already owns a DMA-visible
+    /// physical range.
+    fn build_prdt_phys(
+        &self,
+        paddr: u64,
+        size: usize,
+        prdt_ptr: *mut PrdEntry,
+    ) -> Result<usize, &'static str> {
+        let mut rem = size as isize;
+        let mut off: isize = 0;
+        let mut n = 0usize;
+        while rem > 0 && n < self.max_prdt {
+            let pa = (paddr as isize + off) as u64;
+            let skip = (pa & 0xFFF) as usize;
+            let chunk = rem.min((4096 - skip) as isize) as usize;
+            unsafe {
+                let e = prdt_ptr.add(n);
+                let dba = pa;
+                core::ptr::addr_of_mut!((*e).dba).write_volatile(dba as u32);
+                core::ptr::addr_of_mut!((*e).dbau).write_volatile((dba >> 32) as u32);
+                core::ptr::addr_of_mut!((*e)._rsvd).write_volatile(0);
+                core::ptr::addr_of_mut!((*e).dbc).write_volatile((chunk - 1) as u32);
+            }
+            n += 1;
+            rem -= chunk as isize;
+            off += chunk as isize;
+        }
+        if rem > 0 {
+            return Err("PRDT entries exhausted");
+        }
+        Ok(n)
+    }
+
     /// Allocate `count` NCQ command slots. Returns bitmask of allocated tags.
     fn alloc_slots(&self, count: usize) -> Result<u32, &'static str> {
         loop {
@@ -424,6 +460,31 @@ impl AhciPort {
         size: usize,
         is_write: bool,
     ) -> Result<(), &'static str> {
+        self.prepare_cmd_inner(tag, lba, count, buf_vaddr, size, is_write, false)
+    }
+
+    fn prepare_cmd_phys(
+        &self,
+        tag: u8,
+        lba: u64,
+        count: u32,
+        paddr: u64,
+        size: usize,
+        is_write: bool,
+    ) -> Result<(), &'static str> {
+        self.prepare_cmd_inner(tag, lba, count, paddr, size, is_write, true)
+    }
+
+    fn prepare_cmd_inner(
+        &self,
+        tag: u8,
+        lba: u64,
+        count: u32,
+        buf_addr: u64,
+        size: usize,
+        is_write: bool,
+        is_phys: bool,
+    ) -> Result<(), &'static str> {
         let ct_va = self.slots[tag as usize].ct_vaddr;
 
         unsafe {
@@ -442,15 +503,20 @@ impl AhciPort {
         }
 
         let prdt_ptr = (ct_va + 0x80) as *mut PrdEntry;
-        let prdtl = if buf_vaddr != 0 {
-            match self.build_prdt(buf_vaddr, size, prdt_ptr) {
+        let prdtl = if buf_addr != 0 {
+            let res = if is_phys {
+                self.build_prdt_phys(buf_addr, size, prdt_ptr)
+            } else {
+                self.build_prdt(buf_addr, size, prdt_ptr)
+            };
+            match res {
                 Ok(n) => n,
                 Err(e) => {
                     use crate::drivers::serial::SerialPort;
                     SerialPort::puts("[ahci] prepare_cmd: ");
                     SerialPort::puts(e);
-                    SerialPort::puts(" vaddr=0x");
-                    SerialPort::put_hex(buf_vaddr);
+                    SerialPort::puts(if is_phys { " paddr=0x" } else { " vaddr=0x" });
+                    SerialPort::put_hex(buf_addr);
                     SerialPort::puts("\n");
                     return Err(e);
                 }
@@ -489,6 +555,13 @@ impl AhciPort {
     /// For NCQ: writes PxSACT then PxCI, waits for completion.
     /// For non-NCQ: writes only PxCI, waits for completion.
     fn submit_batch(&self, tag_mask: u32) -> Result<(), &'static str> {
+        self.kick_batch(tag_mask)?;
+        self.wait_slots(tag_mask)
+    }
+
+    /// Program the busy bits and start the commands.  Returns after the
+    /// hardware has been kicked -- NOT after the commands complete.
+    fn kick_batch(&self, tag_mask: u32) -> Result<(), &'static str> {
         // A command bit is set by software and cleared by the HBA.  Do not
         // overwrite an outstanding bit: doing so would turn a retry into a
         // permanent wait for the original command.
@@ -502,7 +575,38 @@ impl AhciPort {
             self.hba.pw32(self.port, port_off::SACT, tag_mask);
         }
         self.hba.pw32(self.port, port_off::CI, tag_mask);
-        self.wait_slots(tag_mask)
+        Ok(())
+    }
+
+    /// Sample the SDB (Set Device Bits) received FIS and surface per-command
+    /// ATA status/error that PxTFD alone can miss.  For multi-tag batches
+    /// the RFIS holds the most recent completion; checking it still catches
+    /// the last command's error and is strictly better than ignoring the
+    /// FIS entirely.  Single-tag batches are exact.
+    fn check_sdb_error(&self, tag_mask: u32) -> Result<(), &'static str> {
+        if self.rfis_vaddr == 0 {
+            return Ok(());
+        }
+        use crate::drivers::serial::SerialPort;
+        unsafe {
+            let ty = core::ptr::read_volatile((self.rfis_vaddr + 0x58) as *const u8);
+            if ty != 0xA1 {
+                return Ok(());
+            }
+            let status = core::ptr::read_volatile((self.rfis_vaddr + 0x5A) as *const u8);
+            let error = core::ptr::read_volatile((self.rfis_vaddr + 0x5B) as *const u8);
+            if status & (TFD_ERR as u8 | 0x02) != 0 || error != 0 {
+                SerialPort::puts("[ahci] SDB FIS status=0x");
+                SerialPort::put_hex(status as u64);
+                SerialPort::puts(" error=0x");
+                SerialPort::put_hex(error as u64);
+                SerialPort::puts("\n");
+                let serr = self.hba.pr32(self.port, port_off::SERR);
+                self.dump_err(tag_mask, error, serr);
+                return Err("AHCI SDB FIS error");
+            }
+        }
+        Ok(())
     }
 
     // ── Port reset ─────────────────────────────────────────────
@@ -675,6 +779,7 @@ impl BlockDevice for AhciPort {
         // Buffer virtual ranges for cache maintenance after DMA (allocation
         // and cache handling are unconditional — this is not debug-only).
         let mut buf_ranges: [(u64, u64); AHCI_MAX_SLOTS] = [(0, 0); AHCI_MAX_SLOTS];
+        let mut is_phys = [false; AHCI_MAX_SLOTS];
         for tag in 0..self.n_slots as u8 {
             if tag_mask & (1 << tag) != 0 {
                 if idx < n {
@@ -684,20 +789,29 @@ impl BlockDevice for AhciPort {
                     // SAFETY: The buffer virtual address is extracted for
                     // DMA translation. The caller guarantees the buffer
                     // lives until submit() returns (synchronous submit).
-                    let (buf_vaddr, buf_size) = match &req.buffer {
-                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::Phys(pa, sz) => (*pa, *sz),
+                    let (buf_addr, buf_size, phys) = match &req.buffer {
+                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len(), false),
+                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len(), false),
+                        IoBuffer::Phys(pa, sz) => (*pa, *sz, true),
                     };
+                    is_phys[idx] = phys;
                     if buf_size < bytes {
                         err_mask |= 1 << tag;
-                    } else if self
-                        .prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write)
-                        .is_err()
-                    {
-                        err_mask |= 1 << tag;
+                    } else {
+                        let res = if phys {
+                            self.prepare_cmd_phys(
+                                tag, req.lba, req.count, buf_addr, bytes, req.is_write,
+                            )
+                        } else {
+                            self.prepare_cmd(
+                                tag, req.lba, req.count, buf_addr, bytes, req.is_write,
+                            )
+                        };
+                        if res.is_err() {
+                            err_mask |= 1 << tag;
+                        }
                     }
-                    buf_ranges[idx] = (buf_vaddr, bytes as u64);
+                    buf_ranges[idx] = (buf_addr, bytes as u64);
                     idx += 1;
                 }
             }
@@ -709,14 +823,18 @@ impl BlockDevice for AhciPort {
             self.free_slots(tag_mask);
             return Ok(IoCompletions {
                 completed: 0,
-                errors: tag_mask,
+                errors: tag_mask.count_ones(),
             });
         }
 
         // Flush the CPU cache for write buffers before DMA submission.
-        // Without this the HBA may read stale data from RAM.
+        // Without this the HBA may read stale data from RAM.  Phys buffers
+        // are already in DMA-coherent memory, so they are skipped.
         if reqs[0].is_write {
             for i in 0..n {
+                if is_phys[i] {
+                    continue;
+                }
                 let (va, sz) = buf_ranges[i];
                 if va == 0 || sz == 0 {
                     continue;
@@ -730,14 +848,25 @@ impl BlockDevice for AhciPort {
             }
         }
 
-        let result = self.submit_batch(ok_mask);
-        match result {
+        // Hold submit_lock across wait_slots: dropping it before wait would
+        // allow a concurrent batch to be kicked while this one is in flight,
+        // and a port_reset in the error path would then clear CI/SACT for
+        // both batches, corrupting the concurrent waiter's completion.
+        let wait_result = match self.kick_batch(ok_mask) {
+            Ok(()) => self.wait_slots(ok_mask),
+            Err(e) => Err(e),
+        };
+        match wait_result {
             Ok(()) => {
                 // Invalidate the CPU cache for read buffers after DMA
                 // completes.  Without this the CPU may read stale cache
-                // lines instead of the data the HBA wrote to RAM.
+                // lines instead of the data the HBA wrote to RAM.  Phys
+                // buffers bypass the cache.
                 if !reqs[0].is_write {
                     for i in 0..n {
+                        if is_phys[i] {
+                            continue;
+                        }
                         let (va, sz) = buf_ranges[i];
                         if va == 0 || sz == 0 {
                             continue;
@@ -753,8 +882,8 @@ impl BlockDevice for AhciPort {
                 }
                 self.free_slots(tag_mask);
                 Ok(IoCompletions {
-                    completed: ok_mask,
-                    errors: err_mask,
+                    completed: ok_mask.count_ones(),
+                    errors: err_mask.count_ones(),
                 })
             }
             Err(e) => {
@@ -762,6 +891,8 @@ impl BlockDevice for AhciPort {
                 SerialPort::puts("[ahci] submit error: ");
                 SerialPort::puts(e);
                 SerialPort::puts("\n");
+                // Port reset is performed while still holding submit_lock
+                // (wait held it), so no new batch can be kicked mid-reset.
                 if self.port_reset().is_err() {
                     self.free_slots(tag_mask);
                     return Err("AHCI port reset failed");
@@ -776,16 +907,22 @@ impl BlockDevice for AhciPort {
                     let req = &reqs[i];
                     let bytes = (req.count as usize) * 512;
                     // SAFETY: Same as above — buffer lives until submit returns.
-                    let (buf_vaddr, buf_size) = match &req.buffer {
-                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len()),
-                        IoBuffer::Phys(pa, sz) => (*pa, *sz),
+                    let (buf_addr, buf_size, phys) = match &req.buffer {
+                        IoBuffer::Buf(buf) => (buf.as_ptr() as u64, buf.len(), false),
+                        IoBuffer::ConstBuf(buf) => (buf.as_ptr() as u64, buf.len(), false),
+                        IoBuffer::Phys(pa, sz) => (*pa, *sz, true),
                     };
                     if buf_size >= bytes {
-                        if self
-                            .prepare_cmd(tag, req.lba, req.count, buf_vaddr, bytes, req.is_write)
-                            .is_err()
-                        {
+                        let res = if phys {
+                            self.prepare_cmd_phys(
+                                tag, req.lba, req.count, buf_addr, bytes, req.is_write,
+                            )
+                        } else {
+                            self.prepare_cmd(
+                                tag, req.lba, req.count, buf_addr, bytes, req.is_write,
+                            )
+                        };
+                        if res.is_err() {
                             err_mask |= 1 << tag;
                             retry_ok &= !(1 << tag);
                         }
@@ -798,15 +935,15 @@ impl BlockDevice for AhciPort {
                     self.free_slots(tag_mask);
                     return Ok(IoCompletions {
                         completed: 0,
-                        errors: tag_mask,
+                        errors: tag_mask.count_ones(),
                     });
                 }
                 match self.submit_batch(retry_ok) {
                     Ok(()) => {
                         self.free_slots(tag_mask);
                         Ok(IoCompletions {
-                            completed: ok_mask,
-                            errors: err_mask,
+                            completed: retry_ok.count_ones(),
+                            errors: err_mask.count_ones(),
                         })
                     }
                     Err(e2) => {
@@ -1036,8 +1173,8 @@ fn init_one(
         port: p,
         _cl_paddr: cl_buf.phys,
         cl_vaddr: cl_buf.virt,
-        _rfis_paddr: rfis_buf.phys,
-        _rfis_vaddr: rfis_buf.virt,
+        rfis_paddr: rfis_buf.phys,
+        rfis_vaddr: rfis_buf.virt,
         scratch_paddr: sc_buf.phys,
         scratch_vaddr: sc_buf.virt,
         max_prdt,

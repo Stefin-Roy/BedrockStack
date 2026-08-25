@@ -3,7 +3,6 @@ use alloc::vec::Vec;
 use hashbrown::HashMap;
 
 use super::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
-use crate::filesystems::vfs::irq::IrqMutex;
 
 const CACHE_SIZE: usize = 4096;
 
@@ -13,7 +12,11 @@ struct CachedSector {
 
 pub struct CachedDevice {
     inner: Arc<dyn BlockDevice>,
-    cache: IrqMutex<BlockCache>,
+    // Use a plain spin Mutex, not IrqMutex: CachedDevice::submit holds
+    // the cache across inner device I/O (wait_slots) which relies on
+    // IRQ-driven completion.  An IrqMutex would disable IRQs on this CPU
+    // for the entire wait and stall the AHCI IRQ.
+    cache: spin::Mutex<BlockCache>,
 }
 
 struct BlockCache {
@@ -46,6 +49,27 @@ impl BlockCache {
             let lba = self.clock[self.clock_hand];
             self.sectors.remove(&lba);
             self.clock.swap_remove(self.clock_hand);
+        }
+    }
+
+    fn invalidate_range(&mut self, start_lba: u64, count: u32) {
+        if count == 0 {
+            return;
+        }
+        let end = start_lba.saturating_add(count as u64);
+        // hashbrown has no range API; filter by key.  The cache holds at most
+        // CACHE_SIZE entries so the scan is bounded.
+        let stale: Vec<u64> = self
+            .sectors
+            .keys()
+            .filter(|lba| **lba >= start_lba && **lba < end)
+            .copied()
+            .collect();
+        for lba in stale {
+            self.sectors.remove(&lba);
+            if let Some(pos) = self.clock.iter().position(|&x| x == lba) {
+                self.clock.swap_remove(pos);
+            }
         }
     }
 
@@ -86,45 +110,35 @@ impl BlockCache {
         Ok(())
     }
 
-    fn write(
-        &mut self,
-        device: &dyn BlockDevice,
-        lba: u64,
-        count: u32,
-        buf: &[u8],
-    ) -> Result<(), ()> {
-        // Write-through to device first
-        let req = IoRequest {
-            lba,
-            count,
-            buffer: IoBuffer::ConstBuf(buf),
-            is_write: true,
-        };
-        let c = device.submit(&[req]).map_err(|_| ())?;
-        if !c.all_ok() {
-            return Err(());
+    /// Insert a freshly written single-sector payload as a cached line
+    /// (device write already succeeded).
+    fn insert_written(&mut self, lba: u64, sector: [u8; 512]) {
+        if !self.sectors.contains_key(&lba) {
+            self.maybe_evict();
+            self.clock.push(lba);
         }
-        // Only update cache after successful write
-        if count <= 1 && buf.len() == 512 {
-            let mut sector = [0u8; 512];
-            sector.copy_from_slice(buf);
-            if !self.sectors.contains_key(&lba) {
-                self.maybe_evict();
-                self.clock.push(lba);
-            }
-            self.sectors.insert(lba, CachedSector { data: sector });
-        }
-        Ok(())
+        self.sectors.insert(lba, CachedSector { data: sector });
     }
 }
 
 impl CachedDevice {
-    fn write_io(&self, cache: &mut BlockCache, r: &IoRequest) -> Result<(), ()> {
+    /// Cache-side effect of a completed write.  Single-sector writes refresh
+    /// the cached copy; anything wider must drop overlapping lines or later
+    /// single-sector reads would serve pre-write bytes.
+    fn apply_write_to_cache(cache: &mut BlockCache, r: &IoRequest) -> Result<(), ()> {
         let buf = match &r.buffer {
             IoBuffer::ConstBuf(buf) => *buf,
+            IoBuffer::Buf(buf) => buf,
             _ => return Err(()),
         };
-        cache.write(&*self.inner, r.lba, r.count, buf)
+        if r.count <= 1 && buf.len() == 512 {
+            let mut sector = [0u8; 512];
+            sector.copy_from_slice(buf);
+            cache.insert_written(r.lba, sector);
+        } else {
+            cache.invalidate_range(r.lba, r.count);
+        }
+        Ok(())
     }
 
     fn read_io(&self, cache: &mut BlockCache, r: &IoRequest) -> Result<(), ()> {
@@ -165,7 +179,7 @@ impl CachedDevice {
     pub fn new(inner: Arc<dyn BlockDevice>) -> Arc<Self> {
         Arc::new(CachedDevice {
             inner,
-            cache: IrqMutex::new(BlockCache::new()),
+            cache: spin::Mutex::new(BlockCache::new()),
         })
     }
 }
@@ -177,12 +191,14 @@ impl BlockDevice for CachedDevice {
         let mut cache = self.cache.lock();
         let mut completed = 0u32;
         let mut errors = 0u32;
-        for r in reqs {
+        let mut i = 0usize;
+        while i < reqs.len() {
             // Physical-address buffers bypass the sector cache: the caller
             // owns a DMA-visible buffer at a fixed address, so forward the
             // request straight to the backing device (correct and avoids
             // aliasing cached sectors).
-            if let IoBuffer::Phys(pa, sz) = &r.buffer {
+            if let IoBuffer::Phys(pa, sz) = &reqs[i].buffer {
+                let r = &reqs[i];
                 let phys_req = IoRequest {
                     lba: r.lba,
                     count: r.count,
@@ -190,19 +206,57 @@ impl BlockDevice for CachedDevice {
                     is_write: r.is_write,
                 };
                 match self.inner.submit(core::slice::from_ref(&phys_req)) {
-                    Ok(c) if c.all_ok() => completed += 1,
+                    Ok(c) if c.all_ok() => {
+                        completed += 1;
+                        // A DMA write outside the cache's view still mutates
+                        // sectors we may hold cached copies of.
+                        if r.is_write {
+                            cache.invalidate_range(r.lba, r.count);
+                        }
+                    }
                     _ => errors += 1,
                 }
+                i += 1;
                 continue;
             }
-            let result = if r.is_write {
-                self.write_io(&mut cache, r)
+
+            if reqs[i].is_write {
+                // Gather the maximal run of consecutive buffered writes and
+                // issue them in ONE inner submit.  AHCI maps each request of
+                // a batch onto its own NCQ slot, so this preserves parallelism
+                // instead of serialising one wait per sector.
+                let mut j = i + 1;
+                while j < reqs.len()
+                    && reqs[j].is_write && !matches!(reqs[j].buffer, IoBuffer::Phys(..))
+                {
+                    j += 1;
+                }
+                let run = &reqs[i..j];
+                match self.inner.submit(run) {
+                    Ok(c) => {
+                        completed += c.completed;
+                        errors += c.errors;
+                        if c.all_ok() {
+                            for rr in run {
+                                let _ = Self::apply_write_to_cache(&mut cache, rr);
+                            }
+                        } else {
+                            // Partial outcome unknown per-line: drop every
+                            // overlapping line conservatively.
+                            for rr in run {
+                                cache.invalidate_range(rr.lba, rr.count);
+                            }
+                        }
+                    }
+                    Err(_) => errors += run.len() as u32,
+                }
+                i = j;
             } else {
-                self.read_io(&mut cache, r)
-            };
-            match result {
-                Ok(()) => completed += 1,
-                Err(()) => errors += 1,
+                match self.read_io(&mut cache, &reqs[i]) {
+                    Ok(()) => completed += 1,
+                    Err(()) => errors += 1,
+                }
+                i += 1;
             }
         }
         Ok(IoCompletions { completed, errors })
@@ -210,6 +264,14 @@ impl BlockDevice for CachedDevice {
 
     fn sector_count(&self) -> u64 {
         self.inner.sector_count()
+    }
+
+    fn sector_size(&self) -> usize {
+        self.inner.sector_size()
+    }
+
+    fn sync(&self) -> Result<(), &'static str> {
+        self.inner.sync()
     }
 
     fn model_string(&self) -> &str {

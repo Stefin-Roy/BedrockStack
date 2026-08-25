@@ -35,10 +35,44 @@ pub trait InodeOps: Send + Sync {
     fn mknod(&self, _name: &str, _mode: u32, _dev: u64) -> Result<Arc<dyn InodeOps>, VfsError> { Err(VfsError::NotSupported) }
     fn mkfifo(&self, _name: &str, _mode: u32) -> Result<Arc<dyn InodeOps>, VfsError> { Err(VfsError::NotSupported) }
 
+    /// Canonical form of a child name used for cache keying (dentry tree +
+    /// dcache).  Filesystems whose lookup is case-insensitive (FAT32, NTFS)
+    /// MUST override this to fold case, otherwise `foo` and `FOO` resolve to
+    /// the same dirent through two distinct cache identities.  Default:
+    /// identity (case-sensitive filesystems like tmpfs).
+    fn canonical_name(&self, name: &str) -> String {
+        String::from(name)
+    }
+
+    /// Downcast hook for same-filesystem cooperation between two directory
+    /// inodes (native cross-directory rename).  Default: None.
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        None
+    }
+
+    /// Move `old_name` from `self` into `new_dir` as `new_name` without
+    /// copying data.  Implementations must refuse when `new_dir` belongs to
+    /// a different superblock (CrossDeviceLink); VFS never falls back to a
+    /// byte-copy -- cross-mount renames are EXDEV, period.
+    fn rename_across_dirs(
+        &self,
+        _new_dir: &dyn InodeOps,
+        _old_name: &str,
+        _new_name: &str,
+    ) -> Result<(), VfsError> {
+        Err(VfsError::CrossDeviceLink)
+    }
+
     /// Called by VFS before the inode is removed from the namespace (unlink,
     /// rmdir).  The filesystem can mark the inode for deferred cleanup — the
     /// inode won't be dropped until the last open handle is closed.
     fn on_unlink(&self) {}
+
+    /// Durably flush filesystem state covering this file (O_SYNC write path).
+    /// Default: no-op for filesystems with no write-back cache.
+    fn flush(&self) -> Result<(), VfsError> {
+        Ok(())
+    }
 }
 
 pub struct InodeMeta {

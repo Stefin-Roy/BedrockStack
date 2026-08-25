@@ -26,4 +26,17 @@ pub trait BlockDevice: Send + Sync {
     fn submit(&self, reqs: &[IoRequest]) -> Result<IoCompletions, &'static str>;
     fn sector_count(&self) -> u64;
     fn model_string(&self) -> &str;
+
+    /// Logical sector size in bytes. All `IoRequest` counts are denominated
+    /// in units of this size. Defaults to 512 for legacy devices.
+    fn sector_size(&self) -> usize {
+        512
+    }
+
+    /// Flush any device-internal write cache (e.g. ATA write cache).
+    /// Returns once data is durable from this layer's perspective.
+    /// Default: no-op for devices with no internal cache.
+    fn sync(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
 }

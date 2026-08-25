@@ -18,6 +18,8 @@ pub enum VfsError {
     FileTooLarge,
     ReadOnly,
     NotSupported,
+    /// Symlink loop or symlink hit where not permitted (O_NOFOLLOW).
+    Loop,
 }
 
 impl fmt::Display for VfsError {
@@ -39,6 +41,7 @@ impl fmt::Display for VfsError {
             VfsError::FileTooLarge => write!(f, "file too large"),
             VfsError::ReadOnly => write!(f, "read-only file system"),
             VfsError::NotSupported => write!(f, "operation not supported"),
+            VfsError::Loop => write!(f, "symlink loop"),
         }
     }
 }
@@ -63,6 +66,7 @@ impl VfsError {
             VfsError::FileTooLarge => "FileTooLarge",
             VfsError::ReadOnly => "ReadOnly",
             VfsError::NotSupported => "NotSupported",
+            VfsError::Loop => "Loop",
         }
     }
 
@@ -85,6 +89,7 @@ impl VfsError {
             VfsError::FileTooLarge => 13,
             VfsError::ReadOnly => 14,
             VfsError::NotSupported => 15,
+            VfsError::Loop => 16,
         }
     }
 }

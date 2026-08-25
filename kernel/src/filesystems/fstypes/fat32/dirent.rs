@@ -9,8 +9,18 @@ pub const ATTR_VOLUME_ID: u8 = 0x08;
 pub const ATTR_DIRECTORY: u8 = 0x10;
 pub const ATTR_ARCHIVE: u8 = 0x20;
 pub const ATTR_LONG_NAME: u8 = 0x0F;
+/// NT filename-extension flags stored in the SFN entry at offset 0x0C:
+/// 0x08 = stem is all lowercase, 0x10 = extension is all lowercase.
+pub const NT_CASE_STEM_LOWER: u8 = 0x08;
+pub const NT_CASE_EXT_LOWER: u8 = 0x10;
 pub const DIR_DELETED: u8 = 0xE5;
+/// Kanji lead byte: an SFN whose first character encodes to 0xE5 collides
+/// with DIR_DELETED, so it is stored as 0x05 and restored on read.
+pub const KANJI_LEAD: u8 = 0x05;
 pub const DIR_END: u8 = 0x00;
+
+/// Maximum number of long-name slots per name (order field holds 1..=20).
+pub const MAX_LFN_ENTRIES: usize = 20;
 
 #[derive(Clone)]
 pub(crate) struct DirEntrySlot {
@@ -71,20 +81,30 @@ fn dos_datetime_to_epoch(time: u16, date: u16) -> Option<u64> {
 }
 
 pub fn decode_sfn(sfn: &[u8; MAX_SFN_LEN]) -> String {
+    decode_sfn_case(sfn, 0)
+}
+
+/// Decode an SFN honoring the NT lowercase flags (entry byte 0x0C).
+pub fn decode_sfn_case(sfn: &[u8; MAX_SFN_LEN], nt_flags: u8) -> String {
     let mut name = String::new();
     let stem_end = sfn[..8]
         .iter()
         .rposition(|&b| b != b' ')
         .map(|p| p + 1)
         .unwrap_or(0);
-    for b in &sfn[..stem_end] {
-        name.push((*b as char).to_ascii_lowercase());
+    let stem_lower = nt_flags & NT_CASE_STEM_LOWER != 0;
+    for (i, &b) in sfn[..stem_end].iter().enumerate() {
+        let b = if i == 0 && b == KANJI_LEAD { 0xE5u8 } else { b };
+        let c = (b as char).to_ascii_lowercase();
+        name.push(if stem_lower { c } else { c.to_ascii_uppercase() });
     }
     let ext_start = sfn[8..11].iter().position(|&b| b == b' ').unwrap_or(3);
     if ext_start > 0 {
         name.push('.');
-        for b in &sfn[8..8 + ext_start] {
-            name.push((*b as char).to_ascii_lowercase());
+        let ext_lower = nt_flags & NT_CASE_EXT_LOWER != 0;
+        for &b in &sfn[8..8 + ext_start] {
+            let c = (b as char).to_ascii_lowercase();
+            name.push(if ext_lower { c } else { c.to_ascii_uppercase() });
         }
     }
     name
@@ -109,6 +129,10 @@ pub fn make_sfn_bytes(stem: &str, ext: &str) -> [u8; MAX_SFN_LEN] {
             break;
         }
         sfn[i] = b.to_ascii_uppercase();
+    }
+    // 0xE5 first byte collides with DIR_DELETED; store Kanji lead as 0x05.
+    if sfn[0] == DIR_DELETED {
+        sfn[0] = KANJI_LEAD;
     }
     for (i, &b) in ext.as_bytes().iter().enumerate() {
         if i >= 3 {
@@ -142,25 +166,17 @@ pub fn sfn_from_name(
     }
 
     let mut counter = 1u32;
-    let mut suffix_buf = [0u8; 7];
-    suffix_buf[0] = b'~';
     loop {
-        let suffix_len = {
-            let mut n = counter;
-            let mut p = 6;
-            while n > 0 {
-                p -= 1;
-                suffix_buf[p] = b'0' + (n % 10) as u8;
-                n /= 10;
-            }
-            6 - p
-        };
-        let suffix_bytes = &suffix_buf[..suffix_len + 1];
+        let suffix = alloc::format!("~{}", counter);
+        let suffix_bytes = suffix.as_bytes();
         let stem_avail = 8 - suffix_bytes.len();
         let stem_trunc = &stem.as_bytes()[..stem.len().min(stem_avail)];
         let mut sfn = [b' '; MAX_SFN_LEN];
         for (i, &b) in stem_trunc.iter().enumerate() {
             sfn[i] = b.to_ascii_uppercase();
+        }
+        if sfn[0] == DIR_DELETED {
+            sfn[0] = KANJI_LEAD;
         }
         for (j, &b) in suffix_bytes.iter().enumerate() {
             sfn[stem_avail + j] = b;
@@ -175,7 +191,8 @@ pub fn sfn_from_name(
             return Some(sfn);
         }
         counter += 1;
-        if counter > 99999 {
+        // Numeric tails are ~1..~999999 per spec.
+        if counter > 999999 {
             return None;
         }
     }
@@ -200,7 +217,39 @@ pub fn needs_vfat(name: &str) -> bool {
     } else {
         0
     };
-    base_len > 8 || ext_len > 3 || name.bytes().any(|b| b > 127 || b == b' ')
+    // Characters illegal in SFNs (vfat must carry the real name): path
+    // separators, wildcards and Windows-reserved punctuation.
+    const ILLEGAL: &[u8] = br#"\/:*?"<>|;,=+[]"#;
+    let has_illegal = name.bytes().any(|b| ILLEGAL.contains(&b));
+    // Mixed case cannot survive uppercasing into an SFN.
+    let has_lower = name.bytes().any(|b| b.is_ascii_lowercase());
+    let has_upper = name.bytes().any(|b| b.is_ascii_uppercase());
+    base_len > 8
+        || ext_len > 3
+        || has_illegal
+        || (has_lower && has_upper)
+        || name.bytes().any(|b| b > 127 || b == b' ')
+}
+
+/// Number of LFN directory slots a long name needs.
+pub fn lfn_slot_count(name: &str) -> usize {
+    (name.encode_utf16().count() + 12) / 13
+}
+
+/// NT lowercase display flags for a name stored as a pure SFN (no LFN).
+pub fn nt_case_flags(name: &str) -> u8 {
+    let (stem, ext) = match name.rfind('.') {
+        Some(0) | None => (name, ""),
+        Some(d) => (&name[..d], &name[d + 1..]),
+    };
+    let mut f = 0u8;
+    if !stem.is_empty() && stem.bytes().all(|b| !b.is_ascii_uppercase()) {
+        f |= NT_CASE_STEM_LOWER;
+    }
+    if !ext.is_empty() && ext.bytes().all(|b| !b.is_ascii_uppercase()) {
+        f |= NT_CASE_EXT_LOWER;
+    }
+    f
 }
 
 pub fn decode_vfat_name(entries: &[[u8; DIR_ENTRY_SIZE]]) -> String {

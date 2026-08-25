@@ -18,9 +18,10 @@ use super::dir::{
     write_dir_entries,
 };
 use super::dirent::{
-    ATTR_ARCHIVE, ATTR_DIRECTORY, DirEntrySlot, encode_vfat_entries, file_size_from_entry,
-    first_clus_from_entry, mtime_from_entry, needs_vfat, set_file_size_in_entry,
-    set_first_clus_in_entry, set_timestamps, sfn_from_name, vfat_checksum,
+    ATTR_ARCHIVE, ATTR_DIRECTORY, DirEntrySlot, MAX_LFN_ENTRIES, encode_vfat_entries,
+    file_size_from_entry, first_clus_from_entry, lfn_slot_count, mtime_from_entry, needs_vfat,
+    nt_case_flags, set_file_size_in_entry, set_first_clus_in_entry, set_timestamps, sfn_from_name,
+    vfat_checksum,
 };
 use super::fat::EOC_MARKER;
 use super::io::read_sectors;
@@ -48,7 +49,10 @@ pub struct Fat32Inode {
     pub(crate) dir_cache: Mutex<Option<(u64, Arc<Vec<DirEntrySlot>>)>>,
     pub(crate) dir_generation: AtomicU64,
     pub(crate) dir_lock: Mutex<()>,
-    pub(crate) write_lock: Mutex<()>,
+    /// Serializes writes and truncates per inode.  Readers take the read
+    /// half so concurrent reads of one file don't serialize each other;
+    /// the FAT/cluster layers have their own sb-level locking.
+    pub(crate) write_lock: spin::RwLock<()>,
 }
 
 impl Drop for Fat32Inode {
@@ -66,6 +70,12 @@ impl Drop for Fat32Inode {
 
 impl Fat32Inode {
     fn sync_clus_and_size(&self) -> Result<(), VfsError> {
+        // A handle whose name was removed must never write metadata back:
+        // the dirent may since belong to a recreated file, and stomping its
+        // first_clus/size would corrupt the new file's data.
+        if self.unlinked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         update_entry_cluster_and_size(
             &self.sb,
             self.parent_clus,
@@ -73,6 +83,15 @@ impl Fat32Inode {
             Some(self.first_clus.load(Ordering::Relaxed)),
             Some(self.size.load(Ordering::Relaxed)),
         )
+    }
+
+    /// Dirent metadata update that silently no-ops once this handle's name
+    /// has been unlinked (see sync_clus_and_size).
+    fn update_dirent_meta(&self, clus: Option<u32>, size: Option<u32>) -> Result<(), VfsError> {
+        if self.unlinked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        update_entry_cluster_and_size(&self.sb, self.parent_clus, &self.entry_name, clus, size)
     }
 
     fn invalidate_dir_cache(&self) {
@@ -115,8 +134,14 @@ impl Fat32Inode {
 }
 
 impl InodeOps for Fat32Inode {
+    fn canonical_name(&self, name: &str) -> String {
+        // On-disk matching is eq_ignore_ascii_case everywhere; cache keys must
+        // fold identically or foo/FOO become two identities for one dirent.
+        name.to_ascii_lowercase()
+    }
+
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize, VfsError> {
-        let _write_lock = self.write_lock.lock();
+        let _read_guard = self.write_lock.read();
         if self.file_type != FileType::Regular {
             return Err(VfsError::IsADirectory);
         }
@@ -203,7 +228,7 @@ impl InodeOps for Fat32Inode {
         if offset.saturating_add(buf.len() as u64) > u32::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
-        let _write_lock = self.write_lock.lock();
+        let _write_guard = self.write_lock.write();
 
         let clus_size = self.sb.bpb.byts_per_clus as u64;
         let end_byte = offset + buf.len() as u64;
@@ -288,13 +313,7 @@ impl InodeOps for Fat32Inode {
         }
 
         if need_size_update || current_first_clus != self.first_clus.load(Ordering::Relaxed) {
-            update_entry_cluster_and_size(
-                &self.sb,
-                self.parent_clus,
-                &self.entry_name,
-                None,
-                Some(new_size),
-            )?;
+            self.update_dirent_meta(None, Some(new_size))?;
         }
 
         self.mtime.store(
@@ -332,7 +351,7 @@ impl InodeOps for Fat32Inode {
                 } else {
                     FileType::Regular
                 };
-                return Ok(Arc::new(Fat32Inode {
+                let node = Arc::new(Fat32Inode {
                     sb: self.sb.clone(),
                     first_clus: AtomicU32::new(actual_clus),
                     size: AtomicU32::new(sz),
@@ -347,8 +366,13 @@ impl InodeOps for Fat32Inode {
                     dir_cache: Mutex::new(None),
                     dir_generation: AtomicU64::new(0),
                     dir_lock: Mutex::new(()),
-                    write_lock: Mutex::new(()),
-                }) as Arc<dyn InodeOps>);
+                    write_lock: spin::RwLock::new(()),
+                });
+                if name != ".." {
+                    self.sb
+                        .register_handle(self.first_clus.load(Ordering::Relaxed), name, &node);
+                }
+                return Ok(node as Arc<dyn InodeOps>);
             }
         }
         Err(VfsError::NotFound)
@@ -375,6 +399,11 @@ impl InodeOps for Fat32Inode {
         {
             return Err(VfsError::AlreadyExists);
         }
+        // LFN order fields only encode ordinals 1..=20; longer names cannot
+        // be represented and must fail cleanly instead of writing garbage.
+        if lfn_slot_count(name) > MAX_LFN_ENTRIES {
+            return Err(VfsError::InvalidInput);
+        }
         let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots
             .iter()
             .map(|s| {
@@ -392,6 +421,10 @@ impl InodeOps for Fat32Inode {
         let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
         sfn_entry[..MAX_SFN_LEN].copy_from_slice(&sfn);
         sfn_entry[0x0B] = ATTR_ARCHIVE;
+        // Pure-SFN lowercase names keep their display form via NT flags.
+        if !needs_vfat(name) {
+            sfn_entry[0x0C] = nt_case_flags(name);
+        }
         set_first_clus_in_entry(&mut sfn_entry, 0);
         set_file_size_in_entry(&mut sfn_entry, 0);
         let mtime = set_timestamps(&mut sfn_entry).unwrap_or(0);
@@ -409,7 +442,7 @@ impl InodeOps for Fat32Inode {
         drop(_lock);
 
         let ino = self.sb.ino_for(parent, name);
-        Ok(Arc::new(Fat32Inode {
+        let node = Arc::new(Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(0),
             size: AtomicU32::new(0),
@@ -422,8 +455,11 @@ impl InodeOps for Fat32Inode {
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
-            write_lock: Mutex::new(()),
-        }) as Arc<dyn InodeOps>)
+            write_lock: spin::RwLock::new(()),
+        });
+        self.sb
+            .register_handle(self.first_clus.load(Ordering::Relaxed), name, &node);
+        Ok(node as Arc<dyn InodeOps>)
     }
 
     fn unlink(&self, name: &str) -> Result<(), VfsError> {
@@ -443,11 +479,13 @@ impl InodeOps for Fat32Inode {
             "[DBG:fat32] unlink got slots\n"
         ));
         let mut found = false;
+        let mut target_fc = 0u32;
         for slot in &*slots {
             if decode_entry_name(slot).eq_ignore_ascii_case(name) {
                 if slot.sfn_entry[0x0B] & ATTR_DIRECTORY != 0 {
                     return Err(VfsError::IsADirectory);
                 }
+                target_fc = first_clus_from_entry(&slot.sfn_entry);
                 found = true;
                 break;
             }
@@ -466,6 +504,17 @@ impl InodeOps for Fat32Inode {
         ));
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
+
+        // Hand the deferred-free obligation to live handles, or -- when no
+        // handle owns this chain (e.g. the dentry was evicted before the
+        // VFS-level on_unlink could fire) -- release it right here so it
+        // cannot leak.
+        let live = self.sb.mark_handles_unlinked(parent, name);
+        if live == 0 && target_fc >= 2 && target_fc < EOC_MARKER {
+            self.sb.invalidate_chain(target_fc);
+            self.sb.free_chain(target_fc)?;
+            self.sb.flush_fat_cache()?;
+        }
         fat_trace!(crate::drivers::serial::SerialPort::puts(
             "[DBG:fat32] unlink done\n"
         ));
@@ -489,6 +538,9 @@ impl InodeOps for Fat32Inode {
             .any(|s| decode_entry_name(s).eq_ignore_ascii_case(name))
         {
             return Err(VfsError::AlreadyExists);
+        }
+        if lfn_slot_count(name) > MAX_LFN_ENTRIES {
+            return Err(VfsError::InvalidInput);
         }
 
         fat_trace!(crate::drivers::serial::SerialPort::puts(
@@ -563,7 +615,7 @@ impl InodeOps for Fat32Inode {
         drop(_lock);
 
         let ino = self.sb.ino_for(parent, name);
-        Ok(Arc::new(Fat32Inode {
+        let node = Arc::new(Fat32Inode {
             sb: self.sb.clone(),
             first_clus: AtomicU32::new(new_clus),
             size: AtomicU32::new(0),
@@ -576,8 +628,11 @@ impl InodeOps for Fat32Inode {
             dir_cache: Mutex::new(None),
             dir_generation: AtomicU64::new(0),
             dir_lock: Mutex::new(()),
-            write_lock: Mutex::new(()),
-        }) as Arc<dyn InodeOps>)
+            write_lock: spin::RwLock::new(()),
+        });
+        self.sb
+            .register_handle(self.first_clus.load(Ordering::Relaxed), name, &node);
+        Ok(node as Arc<dyn InodeOps>)
     }
 
     fn rmdir(&self, name: &str) -> Result<(), VfsError> {
@@ -616,6 +671,15 @@ impl InodeOps for Fat32Inode {
         remove_dir_entries(&self.sb, parent, name)?;
         self.sb.flush_fat_cache()?;
         self.invalidate_dir_cache();
+
+        // Same orphan-vs-handle split as unlink: live handles free via Drop,
+        // an unowned chain must not leak the directory's clusters.
+        let live = self.sb.mark_handles_unlinked(parent, name);
+        if live == 0 && target_clus >= 2 && target_clus < EOC_MARKER {
+            self.sb.invalidate_chain(target_clus);
+            self.sb.free_chain(target_clus)?;
+            self.sb.flush_fat_cache()?;
+        }
         Ok(())
     }
 
@@ -692,6 +756,12 @@ impl InodeOps for Fat32Inode {
             .find(|s| decode_entry_name(s).eq_ignore_ascii_case(new_name))
         {
             let existing_clus = first_clus_from_entry(&existing.sfn_entry);
+            // Handles open on the overwritten file lose their chain here;
+            // mark them so their Drop does not free it a second time.
+            let _ = self.sb.mark_handles_unlinked(
+                self.first_clus.load(Ordering::Relaxed),
+                new_name,
+            );
             remove_dir_entries(&self.sb, self.first_clus.load(Ordering::Relaxed), new_name)?;
             self.sb.flush_fat_cache()?;
             if existing_clus >= 2 && existing_clus < EOC_MARKER {
@@ -717,6 +787,9 @@ impl InodeOps for Fat32Inode {
             .collect();
         let sfn = sfn_from_name(new_name, &existing_sfns).ok_or(VfsError::InvalidInput)?;
         let csum = vfat_checksum(&sfn);
+        if needs_vfat(new_name) && lfn_slot_count(new_name) > MAX_LFN_ENTRIES {
+            return Err(VfsError::InvalidInput);
+        }
         let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
         if needs_vfat(new_name) {
             new_entries.extend(encode_vfat_entries(new_name, csum));
@@ -724,6 +797,9 @@ impl InodeOps for Fat32Inode {
         let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
         sfn_entry[..MAX_SFN_LEN].copy_from_slice(&sfn);
         sfn_entry[0x0B] = attr;
+        if !needs_vfat(new_name) {
+            sfn_entry[0x0C] = nt_case_flags(new_name);
+        }
         set_first_clus_in_entry(&mut sfn_entry, fc);
         set_file_size_in_entry(&mut sfn_entry, sz);
         let _ = set_timestamps(&mut sfn_entry);
@@ -733,6 +809,9 @@ impl InodeOps for Fat32Inode {
         write_dir_entries(&self.sb, &parent, &new_entries)?;
         remove_dir_entries(&self.sb, parent, old_name)?;
         self.invalidate_dir_cache();
+        // Live handles now belong to the new name; move their deferred-free
+        // obligation so a later unlink(new_name) finds them.
+        self.sb.move_handles(parent, old_name, parent, new_name);
 
         if is_dir && fc >= 2 && fc < EOC_MARKER && fc != self.sb.bpb.root_clus {
             self.sb.flush_fat_cache()?;
@@ -760,7 +839,7 @@ impl InodeOps for Fat32Inode {
         if len > u32::MAX as u64 {
             return Err(VfsError::FileTooLarge);
         }
-        let _write_lock = self.write_lock.lock();
+        let _write_guard = self.write_lock.write();
 
         let new_size = len as u32;
         let clus_size = self.sb.bpb.byts_per_clus;
@@ -777,13 +856,7 @@ impl InodeOps for Fat32Inode {
         };
 
         if new_size == 0 && current_first != 0 {
-            update_entry_cluster_and_size(
-                &self.sb,
-                self.parent_clus,
-                &self.entry_name,
-                Some(0),
-                Some(0),
-            )?;
+            self.update_dirent_meta(Some(0), Some(0))?;
             self.sb.flush_fat_cache()?;
             self.sb.invalidate_chain(current_first);
             self.sb.free_chain(current_first)?;
@@ -795,13 +868,7 @@ impl InodeOps for Fat32Inode {
             self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
             self.sb.invalidate_chain(current_first);
-            update_entry_cluster_and_size(
-                &self.sb,
-                self.parent_clus,
-                &self.entry_name,
-                None,
-                Some(new_size),
-            )?;
+            self.update_dirent_meta(None, Some(new_size))?;
         } else if needed > have {
             if current_first == 0 {
                 let new_clus = self.sb.alloc_cluster()?;
@@ -812,13 +879,7 @@ impl InodeOps for Fat32Inode {
                 self.sb.flush_fat_cache()?;
                 self.first_clus.store(new_clus, Ordering::Relaxed);
                 self.size.store(new_size, Ordering::Relaxed);
-                update_entry_cluster_and_size(
-                    &self.sb,
-                    self.parent_clus,
-                    &self.entry_name,
-                    Some(new_clus),
-                    Some(new_size),
-                )?;
+                self.update_dirent_meta(Some(new_clus), Some(new_size))?;
                 self.mtime.store(
                     crate::services::wallclock::now_epoch_secs().unwrap_or(0),
                     Ordering::Relaxed,
@@ -829,13 +890,7 @@ impl InodeOps for Fat32Inode {
             self.sb.flush_fat_cache()?;
             self.size.store(new_size, Ordering::Relaxed);
             self.sb.invalidate_chain(current_first);
-            update_entry_cluster_and_size(
-                &self.sb,
-                self.parent_clus,
-                &self.entry_name,
-                None,
-                Some(new_size),
-            )?;
+            self.update_dirent_meta(None, Some(new_size))?;
         } else {
             self.size.store(new_size, Ordering::Relaxed);
         }
@@ -864,5 +919,148 @@ impl InodeOps for Fat32Inode {
 
     fn on_unlink(&self) {
         self.unlinked.store(true, Ordering::Relaxed);
+    }
+
+    fn flush(&self) -> Result<(), VfsError> {
+        // FAT has no per-file flush primitive; push the volume's write-back
+        // state (dirty FAT sectors + FSInfo).  Dirent/data sectors go through
+        // the block layer synchronously already.
+        self.sb.sync_all()
+    }
+
+    fn as_any(&self) -> Option<&dyn core::any::Any> {
+        Some(self)
+    }
+
+    fn rename_across_dirs(
+        &self,
+        new_dir: &dyn InodeOps,
+        old_name: &str,
+        new_name: &str,
+    ) -> Result<(), VfsError> {
+        let other = new_dir
+            .as_any()
+            .and_then(|a| a.downcast_ref::<Fat32Inode>())
+            .ok_or(VfsError::CrossDeviceLink)?;
+        if !Arc::ptr_eq(&self.sb, &other.sb) {
+            return Err(VfsError::CrossDeviceLink);
+        }
+        if self.file_type != FileType::Directory || other.file_type != FileType::Directory {
+            return Err(VfsError::NotADirectory);
+        }
+        if old_name == "." || old_name == ".." || new_name == "." || new_name == ".." {
+            return Err(VfsError::InvalidInput);
+        }
+        // Moving a directory onto itself is caught at the VFS dentry layer.
+
+        // Lock both directories in deterministic cluster order so concurrent
+        // renames cannot deadlock.  Guards are held for the entire
+        // cross-directory sequence; releasing them early would allow a
+        // concurrent rename to interleave and corrupt the dirents.
+        let src_first = self.first_clus.load(Ordering::Relaxed);
+        let dst_first = other.first_clus.load(Ordering::Relaxed);
+        let _first_guard = if src_first <= dst_first {
+            self.dir_lock.lock()
+        } else {
+            other.dir_lock.lock()
+        };
+        let _second_guard = if src_first != dst_first {
+            Some(if src_first <= dst_first {
+                other.dir_lock.lock()
+            } else {
+                self.dir_lock.lock()
+            })
+        } else {
+            None
+        };
+
+        // Locate the source entry and capture its identity.
+        let slots_src = self.get_dir_slots()?;
+        let mut target: Option<&DirEntrySlot> = None;
+        for slot in slots_src.iter() {
+            if decode_entry_name(slot).eq_ignore_ascii_case(old_name) {
+                target = Some(slot);
+                break;
+            }
+        }
+        let target = target.ok_or(VfsError::NotFound)?;
+        let attr = target.sfn_entry[0x0B];
+        let fc = first_clus_from_entry(&target.sfn_entry);
+        let sz = file_size_from_entry(&target.sfn_entry);
+        let is_dir = (attr & ATTR_DIRECTORY) != 0;
+
+        // Destination collision: overwrite semantics matching same-dir rename.
+        let slots_dst = other.get_dir_slots()?;
+        if let Some(existing) = slots_dst
+            .iter()
+            .find(|s| decode_entry_name(s).eq_ignore_ascii_case(new_name))
+        {
+            let existing_clus = first_clus_from_entry(&existing.sfn_entry);
+            let _ = self.sb.mark_handles_unlinked(dst_first, new_name);
+            remove_dir_entries(&self.sb, dst_first, new_name)?;
+            self.sb.flush_fat_cache()?;
+            if existing_clus >= 2 && existing_clus < EOC_MARKER {
+                self.sb.invalidate_chain(existing_clus);
+                self.sb.free_chain(existing_clus)?;
+            }
+            other.invalidate_dir_cache();
+        }
+
+        // Build the destination group (fresh LFN checksum for the new name).
+        let existing_sfns: HashSet<[u8; MAX_SFN_LEN]> = slots_dst
+            .iter()
+            .map(|s| {
+                let mut buf = [b' '; MAX_SFN_LEN];
+                buf.copy_from_slice(&s.sfn_entry[..MAX_SFN_LEN]);
+                buf
+            })
+            .collect();
+        let sfn = sfn_from_name(new_name, &existing_sfns).ok_or(VfsError::InvalidInput)?;
+        let csum = vfat_checksum(&sfn);
+        if needs_vfat(new_name) && lfn_slot_count(new_name) > MAX_LFN_ENTRIES {
+            return Err(VfsError::InvalidInput);
+        }
+        let mut new_entries: Vec<[u8; DIR_ENTRY_SIZE]> = Vec::new();
+        if needs_vfat(new_name) {
+            new_entries.extend(encode_vfat_entries(new_name, csum));
+        }
+        let mut sfn_entry = [0u8; DIR_ENTRY_SIZE];
+        sfn_entry[..MAX_SFN_LEN].copy_from_slice(&sfn);
+        sfn_entry[0x0B] = attr;
+        if !needs_vfat(new_name) {
+            sfn_entry[0x0C] = nt_case_flags(new_name);
+        }
+        set_first_clus_in_entry(&mut sfn_entry, fc);
+        set_file_size_in_entry(&mut sfn_entry, sz);
+        let _ = set_timestamps(&mut sfn_entry);
+        new_entries.push(sfn_entry);
+
+        // Place the new group, then drop the source group.  Between these two
+        // writes a crash can show the file in both dirs (both valid); it can
+        // never show it in neither.
+        write_dir_entries(&self.sb, &dst_first, &new_entries)?;
+        remove_dir_entries(&self.sb, src_first, old_name)?;
+        self.sb.flush_fat_cache()?;
+        self.invalidate_dir_cache();
+        other.invalidate_dir_cache();
+
+        // A moved directory's ".." must point at its new parent.
+        if is_dir && fc >= 2 && fc < EOC_MARKER && fc != self.sb.bpb.root_clus {
+            let clus_bytes = self.sb.bpb.byts_per_clus as usize;
+            let mut buf = alloc::vec![0u8; clus_bytes];
+            read_cluster(&self.sb, fc, &mut buf)?;
+            let dotdot_off = DIR_ENTRY_SIZE;
+            set_first_clus_in_entry(
+                buf.get_mut(dotdot_off..dotdot_off + DIR_ENTRY_SIZE)
+                    .ok_or(VfsError::IOError)?
+                    .try_into()
+                    .map_err(|_| VfsError::IOError)?,
+                dst_first,
+            );
+            write_cluster(&self.sb, fc, &buf)?;
+        }
+
+        self.sb.move_handles(src_first, old_name, dst_first, new_name);
+        Ok(())
     }
 }

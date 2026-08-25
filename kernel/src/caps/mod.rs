@@ -666,7 +666,7 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     // VFS top-level dir methods for A and B
     for dir in ["A", "B", "A/init", "B/EFI", "B/EFI/BEDROCK"] {
         add(dir, None, Perm::RW);
-        for m in ["create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod", "stat", "truncate", "chmod", "chown", "utimens", "readlink"] { add(dir, Some(m), Perm::RW); }
+        for m in ["create", "mkdir", "rmdir", "unlink", "rename", "symlink", "link", "mkfifo", "mknod", "stat", "lstat", "readlink", "truncate", "chmod", "chown", "utimens"] { add(dir, Some(m), Perm::RW); }
     }
     // Files under A/B for demo (manually enumerated, no wildcard)
     for f in ["A/init/test", "A/init", "B/EFI/BEDROCK/INIT", "B/EFI/BEDROCK/STARTUP.WAV", "B/EFI/BEDROCK/DOOM", "B/EFI/BEDROCK/FREEDOOM.WAD", "B/EFI/BEDROCK/POSIXCHECK"] {

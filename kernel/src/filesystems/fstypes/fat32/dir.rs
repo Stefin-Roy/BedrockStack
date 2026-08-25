@@ -7,9 +7,9 @@ use crate::filesystems::vfs::error::VfsError;
 use super::bpb::{DIR_ENTRY_SIZE, MAX_SFN_LEN};
 use super::cluster::{read_cluster, write_cluster, zero_cluster};
 use super::dirent::{
-    ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_DELETED, DIR_END, DirEntrySlot, decode_sfn,
+    ATTR_LONG_NAME, ATTR_VOLUME_ID, DIR_DELETED, DIR_END, DirEntrySlot, decode_sfn_case,
     decode_vfat_name, decode_volume_label, set_file_size_in_entry, set_first_clus_in_entry,
-    set_timestamps,
+    set_timestamps, vfat_checksum,
 };
 use super::fat::EOC_MARKER;
 
@@ -85,6 +85,18 @@ pub(super) fn read_dir_slots(
                 });
                 continue;
             }
+            // Verify the LFN checksum against the short name before trusting
+            // the chain.  A torn write (crash between LFN and SFN slots) can
+            // leave a stale chain that would alias the wrong file's long
+            // name; falling back to the SFN is always safe.
+            if !vfat_chain.is_empty() {
+                let mut sfn = [b' '; MAX_SFN_LEN];
+                sfn.copy_from_slice(&entry[..MAX_SFN_LEN]);
+                let expected = vfat_checksum(&sfn);
+                if vfat_chain.iter().any(|e| e[13] != expected) {
+                    vfat_chain.clear();
+                }
+            }
             slots.push(DirEntrySlot {
                 vfat_entries: mem::take(&mut vfat_chain),
                 sfn_entry: *entry,
@@ -117,10 +129,12 @@ pub(super) fn decode_entry_name(slot: &DirEntrySlot) -> String {
     } else if !slot.vfat_entries.is_empty() {
         decode_vfat_name(&slot.vfat_entries)
     } else {
-        decode_sfn(
+        // NT flags (byte 0x0C) restore the stored lowercase display form.
+        decode_sfn_case(
             &slot.sfn_entry[..MAX_SFN_LEN]
                 .try_into()
                 .unwrap_or([b' '; MAX_SFN_LEN]),
+            slot.sfn_entry[0x0C],
         )
     }
 }
@@ -203,20 +217,138 @@ pub(super) fn write_dir_entries(
         }
         let next = sb.read_fat_entry(cluster)?;
         if next >= EOC_MARKER {
-            let new_clus = sb.alloc_cluster()?;
-            zero_cluster(sb, new_clus)?;
-            sb.write_fat_entry(cluster, new_clus)?;
-            cluster = new_clus;
-            let mut new_buf = alloc::vec![0u8; clus_bytes];
-            for j in 0..(total - placed) {
-                new_buf[j * DIR_ENTRY_SIZE..(j + 1) * DIR_ENTRY_SIZE]
-                    .copy_from_slice(&entries[placed + j]);
-            }
-            write_cluster(sb, cluster, &new_buf)?;
+            // No cluster in the chain had room for the whole run.  Grow the
+            // directory: consume the free tail of this last cluster, then
+            // append freshly zeroed clusters for the remainder.  Any DIR_END
+            // terminator left behind would hide the appended data forever --
+            // readers stop at the first DIR_END and never follow the FAT
+            // link past it.
+            place_with_growth(sb, cluster, &mut buf, entries, placed)?;
             return Ok(());
         }
         cluster = next;
     }
+}
+
+/// Length of the entry group starting at `idx`: a maximal run of LFN slots
+/// followed by exactly one SFN slot.  Groups are the unit of placement --
+/// splitting one across clusters would break name resolution.
+fn entry_group_len(entries: &[[u8; DIR_ENTRY_SIZE]], idx: usize) -> Option<usize> {
+    let mut j = idx;
+    while j < entries.len() && entries[j][0x0B] == ATTR_LONG_NAME {
+        j += 1;
+    }
+    if j < entries.len() {
+        Some(j - idx + 1)
+    } else {
+        None
+    }
+}
+
+fn place_with_growth(
+    sb: &Fat32SuperBlock,
+    mut last_clus: u32,
+    buf: &mut [u8],
+    entries: &[[u8; DIR_ENTRY_SIZE]],
+    mut placed: usize,
+) -> Result<(), VfsError> {
+    let clus_bytes = sb.bpb.byts_per_clus as usize;
+    let entries_per_clus = clus_bytes / DIR_ENTRY_SIZE;
+
+    let mut max_group = 1usize;
+    let mut gi = 0usize;
+    while gi < entries.len() {
+        let g = entry_group_len(entries, gi).ok_or(VfsError::InvalidInput)?;
+        if g > max_group {
+            max_group = g;
+        }
+        gi += g;
+    }
+    if max_group > entries_per_clus {
+        return Err(VfsError::InvalidInput);
+    }
+
+    // Consume the trailing free tail (DIR_DELETED/DIR_END run reaching the
+    // cluster end) with whole groups.  Overwriting the DIR_END slot with a
+    // real entry keeps readers following the chain into the appended
+    // clusters below.
+    let mut free_start = None;
+    'tail_scan: for i in 0..entries_per_clus {
+        for j in i..entries_per_clus {
+            let b = buf[j * DIR_ENTRY_SIZE];
+            if b != DIR_DELETED && b != DIR_END {
+                continue 'tail_scan;
+            }
+        }
+        free_start = Some(i);
+        break;
+    }
+    if let Some(start) = free_start {
+        let avail = entries_per_clus - start;
+        let mut used = 0usize;
+        while placed < entries.len() {
+            let g = entry_group_len(entries, placed).ok_or(VfsError::InvalidInput)?;
+            if used + g > avail {
+                break;
+            }
+            for k in 0..g {
+                let dst = (start + used + k) * DIR_ENTRY_SIZE;
+                buf[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(&entries[placed + k]);
+            }
+            used += g;
+            placed += g;
+        }
+        if used > 0 {
+            // If we will append new clusters, any DIR_END remaining in this
+            // tail would terminate the scan before the FAT link is followed.
+            // Overwrite the leftover tail with DIR_DELETED so readers skip it.
+            if placed < entries.len() && used < avail {
+                for r in (start + used)..entries_per_clus {
+                    buf[r * DIR_ENTRY_SIZE] = DIR_DELETED;
+                }
+            }
+            write_cluster(sb, last_clus, buf)?;
+        } else if placed < entries.len() {
+            // No group fit in the tail but the tail still starts with
+            // DIR_END which would hide the appended clusters.  Convert the
+            // whole tail to deleted so the scan continues via FAT.
+            let mut dirty = false;
+            for r in start..entries_per_clus {
+                if buf[r * DIR_ENTRY_SIZE] == DIR_END {
+                    buf[r * DIR_ENTRY_SIZE] = DIR_DELETED;
+                    dirty = true;
+                }
+            }
+            if dirty {
+                write_cluster(sb, last_clus, buf)?;
+            }
+        }
+    }
+
+    // Append zeroed clusters until everything is placed.  Fresh clusters
+    // read as all-DIR_END, terminating the directory right after the data.
+    while placed < entries.len() {
+        let new_clus = sb.alloc_cluster()?;
+        zero_cluster(sb, new_clus)?;
+        sb.write_fat_entry(last_clus, new_clus)?;
+        let mut out = alloc::vec![0u8; clus_bytes];
+        let mut slot = 0usize;
+        while placed < entries.len() && slot < entries_per_clus {
+            let g = entry_group_len(entries, placed).ok_or(VfsError::InvalidInput)?;
+            if slot + g > entries_per_clus {
+                break;
+            }
+            for k in 0..g {
+                let dst = (slot + k) * DIR_ENTRY_SIZE;
+                out[dst..dst + DIR_ENTRY_SIZE].copy_from_slice(&entries[placed + k]);
+            }
+            slot += g;
+            placed += g;
+        }
+        write_cluster(sb, new_clus, &out)?;
+        last_clus = new_clus;
+    }
+    Ok(())
 }
 
 pub(super) fn find_and_update_entry<F>(
@@ -280,7 +412,8 @@ where
                 let sfn: &[u8; MAX_SFN_LEN] = &buf[off..off + MAX_SFN_LEN]
                     .try_into()
                     .unwrap_or([b' '; MAX_SFN_LEN]);
-                decode_sfn(sfn)
+                let nt = buf[off + 0x0C];
+                decode_sfn_case(sfn, nt)
             };
 
             if entry_name.eq_ignore_ascii_case(name) {
@@ -384,7 +517,8 @@ pub(super) fn remove_dir_entries(
                 let sfn = &buf[off..off + MAX_SFN_LEN]
                     .try_into()
                     .unwrap_or([b' '; MAX_SFN_LEN]);
-                decode_sfn(sfn)
+                let nt = buf[off + 0x0C];
+                decode_sfn_case(sfn, nt)
             };
 
             if entry_name.eq_ignore_ascii_case(name) {
