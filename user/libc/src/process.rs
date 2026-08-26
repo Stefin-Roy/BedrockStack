@@ -45,12 +45,6 @@ pub extern "C" fn getppid() -> crate::ffi::c_int {
     ppid as crate::ffi::c_int
 }
 
-pub fn sched_yield() -> isize {
-    let mut buf = [0u8; 0];
-    let r = unsafe { write_path(b"/proc/self:yield\0", &mut buf, 0, 0) };
-    errno::ret(r)
-}
-
 /// Spawn with explicit capability subset — `caps` must be subset of caller's caps.
 /// Replaces the legacy `spawn` (which is removed); every spawn now requires an explicit
 /// cap list. Encodes `struct{path:str, args:str, caps:list<{path:str,method:str,perm:u32}>}`

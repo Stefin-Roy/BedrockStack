@@ -255,6 +255,11 @@ pub fn init() {
             .set_handler_fn(ipi_timer_handler)
             .disable_interrupts(true);
 
+        // Register the resched IPI at vector 49 (interrupt gate, APIC-008).
+        idt[49]
+            .set_handler_fn(ipi_resched_handler)
+            .disable_interrupts(true);
+
         // Register the cross-CPU TLB-shootdown IPI at vector 50 (interrupt
         // gate).  Every online CPU flushes its TLB and acknowledges here, so
         // the initiator can safely release unmapped frames to the allocator.
@@ -317,6 +322,9 @@ extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
         handler();
     }
     apic::apic_eoi();
+    // Slice/deadline expiry may demand a switch; preempt only after EOI so
+    // a switched-away context never leaves an unacknowledged interrupt.
+    crate::task::try_preempt_from_irq(u);
     if u {
         swapgs();
     }
@@ -339,6 +347,26 @@ extern "x86-interrupt" fn ipi_timer_handler(frame: InterruptStackFrame) {
         handler();
     }
     apic::apic_eoi();
+    crate::task::try_preempt_from_irq(u);
+    if u {
+        swapgs();
+    }
+}
+
+/// Reschedule IPI handler (vector 49).
+///
+/// Reserved cross-CPU "please reschedule" doorbell (APIC-008). Dormant while
+/// scheduling stays BSP-only (`try_preempt_from_irq` gates on
+/// `sched_active`, which APs never raise), fully functional for per-CPU
+/// queues later.
+extern "x86-interrupt" fn ipi_resched_handler(frame: InterruptStackFrame) {
+    let u = from_user(&frame);
+    if u {
+        swapgs();
+    }
+    apic::apic_eoi();
+    crate::smp::set_need_resched();
+    crate::task::try_preempt_from_irq(u);
     if u {
         swapgs();
     }

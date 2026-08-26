@@ -17,7 +17,6 @@
 //!     task cannot exhaust the heap); their `:get` method blocks the calling
 //!     task until output is available (x86_64 only);
 //!   - `:exit`  — write `{code}` to terminate the current task (diverges);
-//!   - `:yield` — write `()` to cooperatively reschedule;
 //!   - `:kill`  — write `{pid}` to park another task for reaping;
 //!   - `:spawn` — write `{path, args}` to fork a new process from an ELF on a
 //!     mounted filesystem;
@@ -255,15 +254,10 @@ static WAIT_OUTPUT: Schema = Schema::Struct(&[schema::Field {
     ty: &schema::SCHEMA_U64,
 }]);
 
-static PROC_METHODS: [MethodDesc; 11] = [
+static PROC_METHODS: [MethodDesc; 10] = [
     MethodDesc {
         name: "exit",
         input: &EXIT_INPUT,
-        output: &schema::SCHEMA_UNIT,
-    },
-    MethodDesc {
-        name: "yield",
-        input: &schema::SCHEMA_UNIT,
         output: &schema::SCHEMA_UNIT,
     },
     MethodDesc {
@@ -516,20 +510,16 @@ impl Object for ProcDir {
                 crate::task::exit_current(code)
             }
             1 => {
-                crate::task::yield_now();
-                Ok(())
-            }
-            2 => {
                 let target = arg_u64(&v, 0)?;
                 crate::task::kill(target).map_err(|_| UnispaceError::NotFound)
             }
-            3 => {
+            2 => {
                 let path = arg_str(&v, 0)?;
                 let args = arg_str(&v, 1)?;
                 let caps = arg_caps(&v, 2)?;
                 spawn_proc(path, args, caps, out)
             }
-            4 => {
+            3 => {
                 // brk: grow/shrink/query the *current* task's break. Must run
                 // on the caller's CR3 — never self.pid's address space.
                 let new_break = arg_u64(&v, 0)?;
@@ -537,7 +527,7 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(b)]);
                 schema::encode_value(&v, &BRK_OUTPUT, out)
             }
-            5 => {
+            4 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 let prot = arg_u64(&v, 2)?;
@@ -546,13 +536,13 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(base)]);
                 schema::encode_value(&v, &MMAP_OUTPUT, out)
             }
-            6 => {
+            5 => {
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
                 mem_method(|vm, alloc| crate::mm::usermem::munmap(vm, addr, len, alloc))?;
                 Ok(())
             }
-            7 => {
+            6 => {
                 // wait: block until a *child* of the caller exits and consume
                 // its exit code.  Mirrors :kill — the path's pid is ignored;
                 // the target is named in the payload.
@@ -564,7 +554,7 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(code)]);
                 schema::encode_value(&v, &WAIT_OUTPUT, out)
             }
-            8 => {
+            7 => {
                 // fork: COW-clone the caller. The child resumes inside its
                 // own syscall return with rax=0; the parent gets {pid}.
                 let pid = crate::task::fork_current().map_err(|e| match e {
@@ -575,7 +565,7 @@ impl Object for ProcDir {
                 let v = Value::Struct(vec![Value::U64(pid)]);
                 schema::encode_value(&v, &SPAWN_OUTPUT, out)
             }
-            9 => {
+            8 => {
                 // pkey_mprotect: tag a whole anon/heap region with a PKU key.
                 let addr = arg_u64(&v, 0)?;
                 let len = arg_u64(&v, 1)?;
@@ -586,7 +576,7 @@ impl Object for ProcDir {
                 mem_method(|vm, _alloc| crate::mm::usermem::pkey_protect(vm, addr, len, key as u8))?;
                 Ok(())
             }
-            10 => {
+            9 => {
                 // pkey_set: adjust this task's PKRU rights for one key.
                 // 0 = RW, 1 = read-only (WD), 2 = no access (AD).
                 let key = arg_u64(&v, 0)?;

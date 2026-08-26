@@ -704,7 +704,7 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     for p in ["proc/self", "proc/self/status", "proc/self/mem", "proc/self/args", "proc/self/caps", "proc/self/std", "proc/self/std/in", "proc/self/std/out", "proc/self/std/err"] {
         add(p, None, Perm::RW);
     }
-    for m in ["exit", "yield", "kill", "spawn_caps", "brk", "mmap", "munmap", "wait"] {
+    for m in ["exit", "kill", "spawn_caps", "brk", "mmap", "munmap", "wait"] {
         add("proc/self", Some(m), Perm::RW);
     }
     // also allow proc/self/std/out:get etc (StdStream :get)

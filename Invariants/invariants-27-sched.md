@@ -1,15 +1,15 @@
 # Scheduler — Invariants
 
-**Version:** 0.1.0
-**Source:** `kernel/src/task/mod.rs`, `kernel/src/task/switch.rs`, `kernel/src/task/load.rs`, `kernel/src/smp/mod.rs` (PerCpu), `kernel/src/arch/x86_64/syscall.rs`, `kernel/src/services/universal_timer.rs`
-**Status:** Stable (cooperative BSP-only, FIFO)
+**Version:** 0.2.0
+**Source:** `kernel/src/task/mod.rs`, `kernel/src/task/switch.rs`, `kernel/src/task/load.rs`, `kernel/src/smp/mod.rs` (PerCpu), `kernel/src/arch/x86_64/syscall.rs`, `kernel/src/arch/x86_64/idt.rs`, `kernel/src/services/universal_timer.rs`
+**Status:** Stable (preemptive tick-sliced BSP-only, 2-class weighted round-robin)
 
 ---
 
 ## State Invariants
 
-**SCHED-001 — Cooperative BSP-only, single global FIFO:** Only the BSP runs scheduler (`ap_entry64` `arch/x86_64/trampoline.rs:311` halts). `QUEUE: Mutex<VecDeque<&'static mut Task>>` is the sole run queue; no per-CPU queues until preemptive mode lands.
-- `kernel/src/task/mod.rs:440`
+**SCHED-001 — BSP-only, single global queue, WRR:** Only the BSP runs the scheduler (`ap_entry64` `arch/x86_64/trampoline.rs:311` halts; AP ticks gate on `sched_active`). `QUEUE: IrqMutex<VecDeque<&'static mut Task>>` is the sole run queue; selection is weighted round-robin over classes, not per-CPU queues until SMP scheduling lands.
+- `kernel/src/task/mod.rs` (`QUEUE`, `schedule` pick loop)
 
 **SCHED-002 — Five lists + CURRENT + IDLE:** Live tasks are exactly one of `CURRENT: Mutex<Option<&'static mut Task>>` (`Running`), `QUEUE` (`Ready`), `SLEEPING: Mutex<Vec<(u64,&'static mut Task)>>` sorted asc deadline (`ZzZ`), `WAITERS: Mutex<Vec<(&'static mut Task,u64)>>` (`ZzZ` waiting for child pid), or `ZOMBIES: Mutex<Vec<&'static mut Task>>` (`Dead`). `RECLAIM` holds consumed zombies awaiting `reap_dead`. `IDLE` is the boot/idle anchor whose `ctx` is swapped via `idle_ctx()` (`UnsafeCell<Task>` to avoid `static mut` UB).
 - `mod.rs:440-498` (S5 UnsafeCell fix)
@@ -35,10 +35,10 @@
 **SCHED-009 — SLEEPING sorted, batch wake:** `SLEEPING` kept `deadline` asc via `binary_search` insert O(n), O(1) `earliest_sleep_deadline` peek, `wake_sleepers` drains contiguous expired prefix `drain(..n)` O(k) single shift. Never held with `QUEUE`; `SLEEPING` dropped before `QUEUE` in both `wake_sleepers` and `sleep_until`→`schedule` (deadlock avoidance).
 - `mod.rs:453-465,616-636`
 
-**SCHED-010 — `schedule()` wakes before picking:** Since 2026-08-23 `schedule()` calls `wake_sleepers()` before popping FIFO, so sleepers never starve while Ready tasks continuously yield (S1). Idle loops (`Kernel::run` / `enter_userspace`) also wake, but wake-in-schedule is primary.
+**SCHED-010 — `schedule()` wakes before picking:** Since 2026-08-23 `schedule()` calls `wake_sleepers()` before popping FIFO, so sleepers never starve (S1). Idle loops (`Kernel::run` / `enter_userspace`) also wake, but wake-in-schedule is primary.
 - `mod.rs:1261-1265`
 
-**SCHED-011 — Self-yield fast-path keeps Running:** When `next==None` and `prev==Running`, `schedule()` restores `CURRENT=Some(prev)`, `PerCpu.current_task=prev`, `TSS.rsp0=syscall_rsp0=prev.kernel_stack_top`, keeps `Running`, returns without switch or requeue. Previously requeued as `Ready` leaving `CURRENT=None` while task ran (S0).
+**SCHED-011 — Empty-queue fast-path keeps Running:** When `next==None` and `prev==Running`, `schedule()` restores `CURRENT=Some(prev)`, `PerCpu.current_task=prev`, `TSS.rsp0=syscall_rsp0=prev.kernel_stack_top`, keeps `Running`, **cancels** the slice timer and returns without switch or requeue — a lone task runs untimed so the LAPIC stays event-driven (no periodic tick). A later arrival re-arms via `preempt_kick` (`spawn`/`fork_current`) or a sleep-deadline tick (`wake_sleepers` → Ready + `need_resched`). Previously requeued as `Ready` leaving `CURRENT=None` while task ran (S0). The cooperative `yield` syscall/`:yield` proc method was removed 2026-08-26; scheduler entries are sleep, exit, wait, idle-loop dispatch, and IRQ preemption only.
 - `mod.rs:1287-1301`
 
 **SCHED-012 — Bootstrap idle halts:** `enter_userspace` loop after `schedule()` does `if earliest => wait_until(d+1) else halt()` so no 100% spin when INIT is `WAITERS` and no sleeper (S3).
@@ -52,7 +52,15 @@
 **SCHED-L001 — Never hold together:** `SLEEPING` dropped before `QUEUE` (`wake_sleepers`, `sleep_until`), `WAITERS` dropped before `QUEUE` (`wake_waiters_for`), `ZOMBIES` never acquired while holding those (`park_zombie` drops `QUEUE` first, `kill` drops before park). `reap_dead` holds `ZOMBIES` while reading `pid_live` (which scans others) — safe because nothing acquires `ZOMBIES` while holding those and `reap_dead` only runs on idle kernel CR3.
 - `mod.rs:494-498,586-592,876-907`
 
-**SCHED-L002 — ISR touch-nothing:** `universal_timer::tick` (vector 32/52) never touches scheduler locks; all `wake_sleepers`/`schedule` are idle/cooperative task context.
+**SCHED-L002 — ISR touches atomics + ring-3 preemption hook only:** `universal_timer::tick` (vector 32/52) never takes scheduler locks; it may set `need_resched` via atomics. After EOI, the vector 32/52/49 handlers call `task::try_preempt_from_irq(from_user)`, which switches tasks **only for contexts interrupted in ring 3**. Kernel-context ticks leave `need_resched` set (consumed at the next sleep/exit/wait/idle dispatch): much of the kernel (VFS caches, unispace, drivers) still holds plain spin mutexes that do not disable IRQs — switching such a holder away can deadlock an IRQ-disabling spinner, so kernel-mode preemption stays off until those locks are IrqMutex-audited. Ring-3 entry is safe because the CPU already switched to the task's kernel stack via rsp0 and no scheduler lock spans the iretq boundary. Further gates: `sched_active`, `preempt_count == 0`, non-null current, current state `Running`; EOI before any switch; interrupted frame resumes post-hook preserving swapgs/iretq pairing.
+
+**SCHED-L005 — Slice timer is a UniversalTimer entry:** The dispatched task's slice expiry is armed as a one-shot UniversalTimer entry (`arm_slice_timer`); UniversalTimer remains the single LAPIC one-shot owner, so sleep deadlines and slice expiry cannot fight over arming — the earlier fires first and `tick()` re-arms from the queue. Expiry callback sets `need_resched` (atomics only). The timer is armed **only while competition remains** in the queue after a dispatch; a lone task runs untimed (no periodic tick). Arrivals re-arm via `preempt_kick` (spawn/fork) when no timer is pending. `cancel_slice_timer` runs whenever the scheduler drops to idle or takes the empty-queue fast-path; that fast-path does not re-arm (SCHED-011).
+- `kernel/src/task/mod.rs` (`SLICE_TIMER_SEQ`, `arm_slice_timer`, `preempt_kick`), `kernel/src/services/universal_timer.rs` (`set_oneshot`/`cancel_timer_id`)
+
+**SCHED-L006 — WRR classes and slices:** `Priority::{Interactive,Batch}`; slices 4ms / 12ms; Interactive holds a 3:1 dispatch budget (`WRR_CREDIT`, reset by each Batch pick; decremented — saturating at 0 — on every Interactive pick, including the no-Batch-ready fallback). The expiry timer is granted per dispatch only under competition; preempted Running tasks requeue as `Ready` at the back of the queue.
+
+**SCHED-L007 — Resched IPI (vector 49):** Registered in `idt::init()` (APIC-008); handler EOIs, sets `need_resched`, calls `try_preempt_from_irq`. Dormant while scheduling stays BSP-only (`sched_active` false on APs), fully wired for per-CPU queues later.
+- `kernel/src/arch/x86_64/idt.rs` (`ipi_resched_handler`)
 
 **SCHED-L003 — Deadline-only, IRQ-safe locks, no periodic tick:** All scheduler locks (`QUEUE`/`CURRENT`/`SLEEPING`/`WAITERS`/`ZOMBIES`/`RECLAIM`/`KSTACK_IN_USE`/`LINEAGE`/`INIT_CAPS_STASH`) are `IrqMutex` (local-IRQ disable), so a one-shot universal_timer deadline that sets `need_resched` via atomics can never deadlock against a lock holder. The LAPIC stays **one-shot only — no periodic mode**; `need_resched` is consumed voluntarily in `schedule()`, which also increments `sched_ticks` and wraps itself in `preempt_disable/enable`. `task::init` sets `sched_active(0,true)`. `reap_dead` debug-asserts idle + kernel root. Deduplicated pid scans go through the single `with_task` helper (`process_state`/`task_vm`/`task_parent`/`pid_live`/`task_args`/`caps_snapshot`). Future SMP/preemptive mode must add per-CPU queues and switch `ADDR_SPACES` assumptions accordingly.
 - `mod.rs` (IrqMutex statics, `with_task`, `schedule`, `init`, `reap_dead`, `free_kernel_stack` assert), `smp/mod.rs:152-158,542-568`, `mm/usermem.rs` (`ADDR_SPACES` IrqMutex), `mm/vmm/mod.rs` (`current_root`)
@@ -72,9 +80,9 @@
 
 ## API Contracts
 
-**SCHED-API-001 — `spawn(Task)->u64`:** Assigns `next_id`, `lineage_insert`, `Box::leak`, `proc::attach`, `QUEUE.push_back`. `vm==0` allowed for kernel tasks (`audio_pump`).
+**SCHED-API-001 — `spawn(Task)->u64` / `spawn_with_priority(Task, Priority)->u64`:** Assigns `next_id`, `lineage_insert`, `Box::leak`, `proc::attach`, `QUEUE.push_back`. `vm==0` allowed for kernel tasks (`audio_pump`). Priority defaults to Interactive.
 
-**SCHED-API-002 — `schedule()`:** FIFO picks first `Ready` in `QUEUE`. Cases: `next+prev=Dead/ZzZ → park_zombie + switch`; `next+prev=Running → push prev Ready + switch`; `next=None+prev=Dead/ZzZ → park+switch to idle`; `next=None+prev=Running → keep Running (S0)`; `next=None+prev=None → return`.
+**SCHED-API-002 — `schedule()`:** WRR picks first Ready of the credit-selected class in `QUEUE`. Cases: `next+prev=Dead/ZzZ → park_zombie + switch`; `next+prev=Running → prev Ready push_back + switch`; `next=None+prev=Dead/ZzZ → cancel slice timer + park+switch to idle`; `next=None+prev=Running → keep Running, cancel slice timer (S0/SCHED-011)`; `next=None+prev=None → cancel slice timer + return`. A dispatch arms the expiry timer only when Ready tasks remain in the queue after the pick.
 
 **SCHED-API-003 — `sleep_until(deadline_ns)` / `sleep_current(ns)`:** Marks current `ZzZ`, binary-inserts sorted `SLEEPING`, drops lock before `schedule()`.
 

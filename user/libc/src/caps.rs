@@ -123,7 +123,6 @@ impl CapSet {
             ("proc", None, RW),
             ("proc/self", None, RW),
             ("proc/self", Some("exit"), RW),
-            ("proc/self", Some("yield"), RW),
             ("proc/self", Some("kill"), RW),
             ("proc/self", Some("spawn_caps"), RW),
             ("proc/self", Some("brk"), RW),

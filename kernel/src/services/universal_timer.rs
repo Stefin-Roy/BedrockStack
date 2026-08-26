@@ -524,3 +524,24 @@ pub fn sleep_ns(ns: u64) {
 pub fn now_ns() -> u64 {
     universal_timer().now_ns()
 }
+
+/// Arm a one-shot entry on the current CPU's base.  Used by the scheduler's
+/// slice timer so sleep deadlines and slice expiry share a single LAPIC
+/// arming owner (UniversalTimer).  `None` before `early_init`.
+pub fn set_oneshot(
+    deadline_ns: u64,
+    callback: TimerCallback,
+    context: *mut u8,
+) -> Option<TimerId> {
+    let ut = *UNIVERSAL_TIMER.get()?;
+    Some(ut.set(deadline_ns, callback, context))
+}
+
+/// Cancel a previously armed entry (any CPU's base).  `false` before
+/// `early_init` or if the entry already fired.
+pub fn cancel_timer_id(id: TimerId) -> bool {
+    match UNIVERSAL_TIMER.get() {
+        Some(&ut) => ut.cancel(id),
+        None => false,
+    }
+}

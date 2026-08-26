@@ -22,7 +22,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::vfs::irq::IrqMutex;
@@ -42,10 +42,37 @@ pub enum TaskState {
     Dead,
 }
 
+/// Scheduling class. `Interactive` runs a shorter slice but is picked up to
+/// `WEIGHT_INTERACTIVE` times per single `Batch` dispatch (weighted
+/// round-robin, see `pick_next`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Priority {
+    Interactive,
+    Batch,
+}
+
+/// Time slice granted per dispatch, in ns.
+pub const SLICE_INTERACTIVE_NS: u64 = 4_000_000;
+pub const SLICE_BATCH_NS: u64 = 12_000_000;
+/// WRR budget: Interactive is dispatched this many times per Batch round.
+const WEIGHT_INTERACTIVE: u32 = 3;
+
+impl Priority {
+    #[inline]
+    pub fn slice_ns(self) -> u64 {
+        match self {
+            Priority::Interactive => SLICE_INTERACTIVE_NS,
+            Priority::Batch => SLICE_BATCH_NS,
+        }
+    }
+}
+
 /// A schedulable unit of execution.
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
+    /// Scheduling class (WRR weight + slice length). Never mutated after spawn.
+    pub prio: Priority,
     pub kernel_stack_top: u64,
     /// Index into the fixed task-stack window (see `alloc_kernel_stack`),
     /// `usize::MAX` when the task has no kernel stack of its own (the idle
@@ -95,6 +122,7 @@ impl Task {
         Task {
             id: 0,
             state: TaskState::Ready,
+            prio: Priority::Interactive,
             kernel_stack_top,
             kstack_slot: usize::MAX,
             vm: 0,
@@ -506,7 +534,7 @@ static WAITERS: IrqMutex<Vec<(&'static mut Task, u64)>> =
 /// A sleeping task is removed from the run queue at park time and lives here
 /// until `wake_sleepers` (idle loop) moves it back to `QUEUE` as `Ready`.
 /// Never held together with `QUEUE`: `wake_sleepers` drops the sleep list
-/// before locking the queue, and `schedule`/`yield` never touch it.
+/// before locking the queue, and `schedule` never touches it.
 ///
 /// Kept sorted ascending by deadline: `earliest_sleep_deadline` is an O(1)
 /// front peek, and `wake_sleepers` drains a contiguous prefix with a single
@@ -529,7 +557,18 @@ static IDLE: IdleCell = IdleCell(core::cell::UnsafeCell::new(Task::new(0, 0, 0, 
 /// restore when parking an exiting task into idle.
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// PIDs are 64-bit, monotonically increasing, and never reused: `NEXT_ID`
+/// is only ever `fetch_add`ed — reap/GC of dead tasks never resets or recycles
+/// it — so a pid uniquely identifies at most one process for the life of the
+/// boot (SCHED-014). Exhausting 2^64 spawns cannot happen in practice; if it
+/// ever did, we abort rather than silently reuse identities.
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+fn next_id() -> u64 {
+    let prev = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    assert!(prev < u64::MAX - 1, "next_id: pid space exhausted (would reuse)");
+    prev + 1
+}
 
 /// Stash for INIT caps — installed by `load_init_from_esp` before `enter_userspace`.
 /// `(caps, mirror phys, window va)`. IrqMutex for deadline-only `need_resched`.
@@ -540,10 +579,6 @@ pub fn stash_init_caps(caps: Arc<Vec<crate::caps::Cap>>, phys: u64, va: u64) {
 }
 fn take_init_caps() -> Option<(Arc<Vec<crate::caps::Cap>>, u64, u64)> {
     INIT_CAPS_STASH.lock().take()
-}
-
-fn next_id() -> u64 {
-    NEXT_ID.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 fn idle_ctx() -> *mut TaskContext {
@@ -591,7 +626,117 @@ pub fn spawn(mut task: Task) -> u64 {
     let id = leaked.id;
     crate::unispace::provider::proc::attach(id);
     QUEUE.lock().push_back(leaked);
+    preempt_kick();
     id
+}
+
+/// Enqueue a task with an explicit scheduling class. Returns the task's id.
+pub fn spawn_with_priority(mut task: Task, prio: Priority) -> u64 {
+    task.prio = prio;
+    spawn(task)
+}
+
+// ── Slice timer (tick preemption) ──────────────────────────────────────
+//
+// The dispatched task's slice expiry is armed as a one-shot UniversalTimer
+// entry.  UniversalTimer stays the single owner of the LAPIC one-shot, so
+// sleep deadlines and slice deadlines can never fight over the arming (the
+// earlier of the two simply fires first and `tick()` re-arms from the queue).
+// The expiry callback only raises `need_resched`; the actual preemption
+// happens in `try_preempt_from_irq`, called from the timer ISR after EOI.
+
+static SLICE_TIMER_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn slice_expired(_ctx: *mut u8) {
+    crate::smp::set_need_resched();
+}
+
+#[inline]
+fn this_cpu_timer_id(seq: u64) -> crate::services::universal_timer::TimerId {
+    crate::services::universal_timer::TimerId {
+        cpu: crate::smp::current_cpu_id(),
+        seq,
+    }
+}
+
+/// Arm (replacing any previous) the slice-expiry timer for the freshly
+/// dispatched task.
+fn arm_slice_timer(slice_ns: u64) {
+    let old = SLICE_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    if old != 0 {
+        crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
+    }
+    let deadline = crate::services::universal_timer::now_ns().saturating_add(slice_ns);
+    if let Some(id) =
+        crate::services::universal_timer::set_oneshot(deadline, slice_expired, core::ptr::null_mut())
+    {
+        SLICE_TIMER_SEQ.store(id.seq, Ordering::Release);
+    }
+}
+
+/// Drop to idle: no task owns a slice anymore.
+fn cancel_slice_timer() {
+    let old = SLICE_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    if old != 0 {
+        crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
+    }
+}
+
+/// A new task became Ready: make sure a CPU-bound current gets preempted so
+/// the arrival can run. If a slice timer is already armed (competition
+/// existed), it will raise `need_resched` on expiry and nothing more is
+/// needed; otherwise arm a one-shot kick — the LAPIC stays event-driven
+/// (no periodic tick): without competition no timer runs at all (SCHED-011).
+fn preempt_kick() {
+    if !crate::smp::is_sched_active() {
+        return;
+    }
+    crate::smp::set_need_resched();
+    if SLICE_TIMER_SEQ.load(Ordering::Acquire) == 0 {
+        arm_slice_timer(SLICE_INTERACTIVE_NS);
+    }
+}
+
+/// Preemption entry from IRQ context (slice-expiry tick, any deadline tick,
+/// or the resched IPI), invoked *after* EOI.
+///
+/// `from_user` gates the switch: only contexts interrupted in **ring 3** are
+/// preempted here. Kernel-context ticks merely leave `need_resched` set,
+/// consumed at the next sleep/exit/wait/idle dispatch. Rationale: large
+/// parts of the kernel (VFS caches, unispace registries, drivers) still hold
+/// plain spin mutexes that do not disable IRQs; switching a holder away can
+/// deadlock a spinner that disables IRQs while waiting (no further ticks).
+/// Until those locks are audited to IrqMutex, kernel-mode preemption stays
+/// off. Ring-3 entry is safe: the CPU already switched to the task's kernel
+/// stack via rsp0, and the scheduler's own locks are never held across the
+/// iretq boundary.
+///
+/// Additional gates (both modes): `sched_active`, `preempt_count == 0`,
+/// non-null current, current state == `Running`. APs never schedule.
+pub fn try_preempt_from_irq(from_user: bool) {
+    if !from_user {
+        return;
+    }
+    if !crate::smp::is_sched_active() || !crate::smp::preempt_is_enabled() {
+        return;
+    }
+    let pc = crate::smp::current_per_cpu();
+    if pc.current_task.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    // Only preempt a genuinely Running current (never mid-park/exit).
+    {
+        let cur = CURRENT.lock();
+        match cur.as_deref() {
+            Some(t) if t.state == TaskState::Running => {}
+            _ => return,
+        }
+    }
+    if !crate::smp::take_need_resched() {
+        return;
+    }
+    crate::smp::inc_sched_ticks();
+    schedule();
 }
 
 /// Fork the current user task copy-on-write (`/proc/self:fork`).
@@ -693,12 +838,6 @@ pub fn fork_current() -> Result<u64, i64> {
     }
 
     Ok(spawn(task))
-}
-
-/// Cooperative yield: move the current task to the tail of the run queue and
-/// run the next ready task, if any.
-pub fn yield_now() {
-    schedule();
 }
 
 /// Park the current task until `deadline_ns` (absolute, monotonic).  The task
@@ -1312,16 +1451,23 @@ fn idle_stack_top() -> u64 {
     core::ptr::addr_of!(__kernel_end) as *const u8 as u64
 }
 
-/// Cooperative scheduler: switch to the next ready task.
+/// Weighted round-robin budget: Interactive dispatches remaining before one
+/// Batch dispatch resets it.
+static WRR_CREDIT: AtomicU32 = AtomicU32::new(WEIGHT_INTERACTIVE);
+
+/// Preemptive scheduler: switch to the next ready task.
 ///
-/// The outgoing task is requeued only if it is still `Running` (a voluntary
-/// yield). A `Dead` task (from `exit_current`) is parked and the scheduler
-/// drops to idle. No spin lock is held across `switch_to`.
+/// The outgoing task is requeued if it is still `Running` (preempted with its
+/// slice exhausted or transitioning); a `Dead` task (from `exit_current`) is
+/// parked and the scheduler drops to idle. No spin lock is held across
+/// `switch_to`.
 ///
-/// Single global FIFO, deadline-only: LAPIC stays one-shot (no periodic mode,
-/// SCHED-L002 ISR touch-nothing). `IrqMutex` (SCHED-L001) + `preempt_disable`
-/// guard the queue while a deadline wakes sleepers; `sched_ticks` counts
-/// voluntary dispatches for accounting (no quantum preemption).
+/// Single global queue, weighted round-robin: Interactive tasks are picked
+/// while their 3:1 budget allows, else Batch (`pick` below). The slice-expiry
+/// timer is armed only while competition remains in the queue; a lone task
+/// runs untimed and arrivals re-arm via `preempt_kick` (spawn/fork). Entry
+/// from IRQ context goes through `try_preempt_from_irq`
+/// (SCHED-L001 keeps tick-during-lock impossible).
 pub fn schedule() {
     debug_assert!(
         crate::smp::is_sched_active(),
@@ -1329,12 +1475,11 @@ pub fn schedule() {
     );
     crate::smp::preempt_disable();
     // Deadline-only: `need_resched` may be set by deadline expiry helpers
-    // (never a periodic LAPIC tick). Consume here; entering `schedule` *is*
-    // the yield.
+    // (never a periodic LAPIC tick). Consume here.
     let _ = crate::smp::take_need_resched();
     crate::smp::inc_sched_ticks();
     // Wake expired sleepers before picking the next task so a burst of
-    // sleepers never starves while Ready tasks continuously yield. This was
+    // sleepers never starves. This was
     // previously only in the idle loops (Kernel::run / enter_userspace) which
     // starved sleepers under load (S1).
     wake_sleepers();
@@ -1342,18 +1487,50 @@ pub fn schedule() {
     let prev = CURRENT.lock().take();
     let mut q = QUEUE.lock();
 
-    // Pop the first ready task (FIFO round-robin).
-    let mut next = None;
+    // Weighted round-robin pick: first Ready Interactive and first Ready
+    // Batch; prefer Interactive while its budget remains, else Batch. O(n)
+    // scan — the queue is small; per-CPU queues will replace this later.
+    let mut inter: Option<usize> = None;
+    let mut batch: Option<usize> = None;
     for i in 0..q.len() {
-        if q[i].state == TaskState::Ready {
-            next = q.remove(i);
-            break;
+        if q[i].state != TaskState::Ready {
+            continue;
+        }
+        match q[i].prio {
+            Priority::Interactive if inter.is_none() => inter = Some(i),
+            Priority::Batch if batch.is_none() => batch = Some(i),
+            _ => {}
         }
     }
+    let next = loop {
+        if let Some(i) = inter {
+            let c = WRR_CREDIT.load(Ordering::Relaxed);
+            if c > 0 {
+                WRR_CREDIT.store(c - 1, Ordering::Relaxed);
+                break q.remove(i);
+            }
+        }
+        if let Some(i) = batch {
+            WRR_CREDIT.store(WEIGHT_INTERACTIVE, Ordering::Relaxed);
+            break q.remove(i);
+        }
+        // Only Interactive ready (or nothing): spend it regardless of budget.
+        if let Some(i) = inter {
+            let c = WRR_CREDIT.load(Ordering::Relaxed);
+            WRR_CREDIT.store(c.saturating_sub(1), Ordering::Relaxed);
+            break q.remove(i);
+        }
+        break None;
+    };
 
     let (next_ptr, next_root) = match next {
         Some(t) => {
             t.state = TaskState::Running;
+            // Arm the expiry timer only while competition remains in the
+            // queue; a lone task runs untimed (no periodic tick, SCHED-011).
+            // A later arrival re-arms via `preempt_kick` (spawn/fork).
+            let more = q.iter().any(|t| t.state == TaskState::Ready);
+            let slice = t.prio.slice_ns();
             let root = t.root;
             let stack_top = t.kernel_stack_top;
             let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
@@ -1362,6 +1539,11 @@ pub fn schedule() {
             crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
             crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
             *CURRENT.lock() = Some(t);
+            if more {
+                arm_slice_timer(slice);
+            } else {
+                cancel_slice_timer();
+            }
             (ctx_ptr, root)
         }
         None => {
@@ -1376,6 +1558,7 @@ pub fn schedule() {
                     // left out of the queue.  `pctx` stays valid either way.
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
+                    cancel_slice_timer();
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     drop(q);
@@ -1394,7 +1577,7 @@ pub fn schedule() {
                     return;
                 }
                 Some(p) => {
-                    // Self-yield with an empty queue: keep running. Previously
+                    // Empty-queue fast-path: keep running. Previously
                     // this requeued into QUEUE and left CURRENT=None /
                     // PerCpu.current_task=null while the task continued on its
                     // stack (S0). Now restore CURRENT/PerCpu and keep Running.
@@ -1402,9 +1585,15 @@ pub fn schedule() {
                     let ptr = &mut *p as *mut Task as *mut core::ffi::c_void;
                     // Keep state Running (p was Running before take).
                     debug_assert!(p.state == TaskState::Running);
+                    // Alone on the CPU: run untimed. No slice-expiry timer is
+                    // armed, so a lone CPU-bound task is not interrupted
+                    // periodically; the next arrival re-arms via
+                    // `preempt_kick` (spawn/fork) or a sleep deadline tick
+                    // (wake_sleepers → Ready + need_resched).
                     crate::smp::current_per_cpu().current_task.store(ptr, Ordering::Relaxed);
                     *CURRENT.lock() = Some(p);
                     set_kernel_stack_meta(stack_top);
+                    cancel_slice_timer();
                     drop(q);
                     crate::smp::preempt_enable();
                     return;
@@ -1412,6 +1601,7 @@ pub fn schedule() {
                 None => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
+                    cancel_slice_timer();
                     drop(q);
                     crate::smp::preempt_enable();
                     return;
@@ -1543,8 +1733,8 @@ pub fn enter_userspace(
             _ => {
                 // Requeue sleepers whose deadline has passed.  `schedule()`
                 // already wakes, but keep this wake for the case where
-                // `schedule` found no Ready and returned without switching
-                // (self-yield fast-path now keeps Running, so wake inside
+                // `schedule` found no Ready task and returned without
+                // switching (fast-path keeps Running, so wake inside
                 // schedule covers the rest).
                 wake_sleepers();
                 schedule();
@@ -1581,7 +1771,7 @@ const SMOKE_ITERS: u32 = 5;
 extern "C" fn smoke_task_a() -> ! {
     for _ in 0..SMOKE_ITERS {
         SerialPort::puts("[task] A\n");
-        yield_now();
+        schedule();
     }
     exit_current(0)
 }
@@ -1591,7 +1781,7 @@ extern "C" fn smoke_task_a() -> ! {
 extern "C" fn smoke_task_b() -> ! {
     for _ in 0..SMOKE_ITERS {
         SerialPort::puts("[task] B\n");
-        yield_now();
+        schedule();
     }
     exit_current(1)
 }
