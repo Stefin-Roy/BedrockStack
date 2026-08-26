@@ -421,6 +421,7 @@ impl Kernel {
                     pci_config_regions: crate::acpi::PciConfigRegions { regions: a.pci_config_regions.regions.clone() },
                     platform_info: a.platform_info.clone(),
                     dmar: a.dmar.clone(),
+                    bgrt: a.bgrt.clone(),
                     table_count: a.table_count,
                     // Global snapshot is for RO introspection (cpus, mcfg, dmar);
                     // the AML interpreter stays with self.acpi (needs Mutex) and
@@ -458,6 +459,8 @@ impl Kernel {
         crate::bootanim::start(&mut self.framebuffer);
 
         // Initialise PCI subsystem (ECAM mapping + bus enumeration).
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Pci);
         if let Some(ref acpi) = self.acpi {
             crate::pci::init(
                 &acpi.pci_config_regions,
@@ -468,6 +471,8 @@ impl Kernel {
 
         // UInputL — the unified input layer.  Must exist before any driver
         // (PS/2, future USB HID) tries to register a device.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Input);
         crate::input::init();
 
         // PS/2 keyboard driver (8042 controller) — registers IRQ 1 and the
@@ -484,6 +489,8 @@ impl Kernel {
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
 
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Storage);
         #[cfg(target_arch = "x86_64")]
         let mut block_devices =
             crate::filesystems::blockdriver::driver::init_all(crate::pci::devices());
@@ -497,10 +504,14 @@ impl Kernel {
             crate::drivers::serial::SerialPort::puts(" ===\n");
         }
 
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Usb);
         #[cfg(target_arch = "x86_64")]
         let usb_block_devices = crate::usb::xhci::init_all(crate::pci::devices());
 
         // Audio subsystem — probes PCI for an Intel HD Audio controller.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Audio);
         #[cfg(target_arch = "x86_64")]
         crate::audio::init();
 
@@ -574,6 +585,8 @@ impl Kernel {
             *crate::filesystems::blockdriver::driver::BLOCK_DEVICES.lock() = block_devices.clone();
         }
 
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Vfs);
         #[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
         crate::filesystems::vfs::init().expect("VFS init failed");
 
@@ -664,6 +677,8 @@ impl Kernel {
 
         // Unispace: build the / registry, attach the providers (VFS mounts,
         // /sys), then run the boot self-test (gated behind `selftest`).
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Namespace);
         crate::unispace::init();
         match crate::unispace::provider::register_all() {
             Ok(()) => log::info!("unispace: providers registered"),
@@ -673,6 +688,8 @@ impl Kernel {
         crate::unispace::self_test();
 
         // Cooperative scheduler init (needed for the INIT launch below).
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Scheduler);
         #[cfg(target_arch = "x86_64")]
         {
             crate::task::init(self.page_table_root);
@@ -686,7 +703,10 @@ impl Kernel {
             crate::audio::spawn_pump(&mut self.allocator);
         }
 
-        // Stop the spinner: INIT's desktop paint takes over the screen now.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::set_stage(crate::bootanim::Stage::Launch);
+        // Stop the spinner: paints black in one `clear()` + `flush_full()`
+        // (single VRAM copy) before INIT's desktop paint takes over.
         #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
         crate::bootanim::stop();
 

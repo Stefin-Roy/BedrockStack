@@ -7,6 +7,7 @@ use crate::mm::vmm::{KERNEL_VMA_BASE, PageFlags, Vmm};
 
 #[cfg(target_arch = "x86_64")]
 mod aml_ctx;
+pub mod bgrt;
 mod dmar;
 mod fadt;
 mod gas;
@@ -140,6 +141,8 @@ pub struct AcpiSubsystem {
     pub platform_info: PlatformInfo,
     /// DMA remapping (VT-d) info, if present.
     pub dmar: Option<DmarInfo>,
+    /// Boot Graphics Resource Table info, if present (UEFI `BGRT`).
+    pub bgrt: Option<bgrt::BgrtInfo>,
     /// Number of SDT entries successfully parsed (for introspection).
     pub table_count: usize,
     /// Persistent AML interpreter over the DSDT + SSDTs (x86_64). `None` when
@@ -250,6 +253,31 @@ impl AcpiSubsystem {
             SerialPort::puts("[acpi] DMAR absent\n");
         }
 
+        // BGRT — boot graphics (UEFI logo). Parsed even on riscv64 if present,
+        // but the bootanim blitter is x86_64-only.
+        let bgrt = entries
+            .iter()
+            .find(|e| e.signature == sig(b"BGRT"))
+            .and_then(|e| match bgrt::parse_bgrt(e) {
+                Ok(v) => Some(v),
+                Err(err) => {
+                    log::warn!("ACPI: BGRT parse failed: {:?} (ignored)", err);
+                    SerialPort::puts("[bgrt] parse failed\n");
+                    None
+                }
+            });
+        if let Some(ref bg) = bgrt {
+            log::info!(
+                "ACPI: BGRT at addr=0x{:x} offset=({}, {})",
+                bg.image_address,
+                bg.offset_x,
+                bg.offset_y
+            );
+        } else {
+            log::info!("ACPI: BGRT absent");
+            SerialPort::puts("[bgrt] absent\n");
+        }
+
         let table_count = entries.len();
         #[cfg(target_arch = "x86_64")]
         let subsystem = Self {
@@ -259,6 +287,7 @@ impl AcpiSubsystem {
             pci_config_regions,
             platform_info,
             dmar,
+            bgrt,
             table_count,
             aml,
         };
@@ -270,6 +299,7 @@ impl AcpiSubsystem {
             pci_config_regions,
             platform_info,
             dmar,
+            bgrt,
             table_count,
         };
         Ok(subsystem)

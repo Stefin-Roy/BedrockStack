@@ -204,6 +204,62 @@ impl Framebuffer {
         }
         self.dirty = false;
     }
+
+    /// Fill the entire shadow buffer with `color` in a single pass.
+    ///
+    /// Fast path for 32 bpp uses a `u32` slice fill (one store per pixel
+    /// instead of per-row `fill_rect` branching). Other `bpp` fall back to
+    /// `fill_rect`. Always marks the whole screen dirty.
+    pub fn fill_solid(&mut self, color: Color) {
+        if self.shadow.is_null() {
+            return;
+        }
+        let bpp = self.bpp_usize();
+        if bpp == 4 {
+            let px = color.to_pixel_bytes(self.pixel_format);
+            let pixel = u32::from_le_bytes(px);
+            let count = self.total_bytes() / 4;
+            unsafe {
+                let slice = core::slice::from_raw_parts_mut(self.shadow as *mut u32, count);
+                slice.fill(pixel);
+            }
+            self.mark_dirty(0, 0, self.width, self.height);
+        } else {
+            self.fill_rect(0, 0, self.width, self.height, color);
+        }
+    }
+
+    /// Draw a glyph with explicit `fg`/`bg` colours. Mirrors `Display::draw_char`
+    /// but allows the boot animation to render text on its dark background
+    /// without the `WHITE-on-BLACK` halo.
+    pub fn draw_char_colored(
+        &mut self,
+        x: usize,
+        y: usize,
+        ch: u8,
+        fg: Color,
+        bg: Color,
+    ) -> bool {
+        let ok = unsafe {
+            draw_glyph_raw(
+                self.shadow,
+                self.stride,
+                self.bpp,
+                self.width,
+                self.height,
+                self.pixel_format,
+                x,
+                y,
+                ch,
+                fg,
+                bg,
+            )
+        };
+        if ok {
+            self.mark_dirty(x, y, 8, 16);
+        }
+        ok
+    }
 }
 
 impl Display for Framebuffer {
