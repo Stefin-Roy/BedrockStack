@@ -16,6 +16,7 @@ heap_debug = []
 kernelmb2 = []
 selftest = []
 iommu_trace = []
+lockdep = []
 
 [dependencies]
 spin = "0.9"

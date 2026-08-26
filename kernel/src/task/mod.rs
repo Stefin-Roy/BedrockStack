@@ -119,7 +119,7 @@ impl Task {
 // no longer ancestors of any live Task.
 static LINEAGE: Once<IrqMutex<HashMap<u64, u64>>> = Once::new();
 fn lineage_map() -> &'static IrqMutex<HashMap<u64, u64>> {
-    LINEAGE.call_once(|| IrqMutex::new(HashMap::new()))
+    LINEAGE.call_once(|| IrqMutex::new_keyed(LOCK_CLASS_PARK, HashMap::new()))
 }
 pub fn lineage_insert(pid: u64, parent: u64) {
     lineage_map().lock().insert(pid, parent);
@@ -216,12 +216,36 @@ fn lineage_gc() {
 /// Number of 4 KiB frames backing one kernel stack.
 const KSTACK_PAGES: usize = (KSTACK_SIZE as usize) / 4096;
 
+// ── lockdep order classes for the scheduler locks ──────────────────────
+//
+// Encodes the prose ordering rules from the lock doc-comments into machine-
+// checked keys (`lockdep` feature; see `smp::lockdep`). Strictly ascending
+// acquisition is required; equal classes are never nestable.
+//
+//   KSTACK_IN_USE (1) < QUEUE (2) < CURRENT (3) < park lists (4)
+//
+// * KSTACK_IN_USE: leaf — taken on its own by alloc/free_kernel_stack.
+// * QUEUE before CURRENT: `schedule` locks CURRENT to store/drop the
+//   dispatched task while QUEUE's guard is live (dispatch and park paths);
+//   the reverse never nests (`CURRENT.lock().take()` releases before
+//   QUEUE is acquired).
+// * Park lists (SLEEPING/WAITERS/ZOMBIES/RECLAIM/LINEAGE): per their doc
+//   comments they are never held together with each other — equal class
+//   makes any such nesting panic under lockdep instead of resting on
+//   convention. QUEUE→park-list direction (e.g. schedule parking a Dead
+//   task into ZOMBIES after dropping q) stays legal since 2 < 4.
+const LOCK_CLASS_KSTACK: u32 = 1;
+const LOCK_CLASS_QUEUE: u32 = 2;
+const LOCK_CLASS_CURRENT: u32 = 3;
+const LOCK_CLASS_PARK: u32 = 4;
+
 /// Liveness bitmap for the fixed task-stack window slots.
 /// IrqMutex: `alloc_kernel_stack`/`free_kernel_stack` may run while a deadline
 /// (universal_timer one-shot, never periodic LAPIC) wakes sleepers; IRQs
 /// disabled avoids `QUEUE`/`SLEEPING` re-entry deadlock (single global FIFO,
 /// SCHED-L001).
-static KSTACK_IN_USE: IrqMutex<[bool; MAX_KSTACKS]> = IrqMutex::new([false; MAX_KSTACKS]);
+static KSTACK_IN_USE: IrqMutex<[bool; MAX_KSTACKS]> =
+    IrqMutex::new_keyed(LOCK_CLASS_KSTACK, [false; MAX_KSTACKS]);
 
 /// Allocate the next free slot in the fixed task-stack window, mapping its
 /// four frames into the kernel root, and return `(stack_top, slot)`.
@@ -432,10 +456,11 @@ pub(crate) fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
 /// Global FIFO of runnable tasks. IrqMutex: deadline wake (one-shot universal_timer,
 /// never periodic LAPIC — SCHED-L002 ISR touch-nothing) may set `need_resched`
 /// via atomics while a task holds `QUEUE`; IRQs disabled avoids deadlock.
-static QUEUE: IrqMutex<VecDeque<&'static mut Task>> = IrqMutex::new(VecDeque::new());
+static QUEUE: IrqMutex<VecDeque<&'static mut Task>> =
+    IrqMutex::new_keyed(LOCK_CLASS_QUEUE, VecDeque::new());
 
 /// The task currently running on this CPU, or `None` when idle.
-static CURRENT: IrqMutex<Option<&'static mut Task>> = IrqMutex::new(None);
+static CURRENT: IrqMutex<Option<&'static mut Task>> = IrqMutex::new_keyed(LOCK_CLASS_CURRENT, None);
 
 /// Parked dead tasks (zombies) awaiting a parent's `:wait` or the death of
 /// their own parent.
@@ -448,7 +473,7 @@ static CURRENT: IrqMutex<Option<&'static mut Task>> = IrqMutex::new(None);
 /// its parent is gone.  `reap_dead` reads the other scheduler lists only while
 /// holding this one, and nothing acquires this lock while holding those, so
 /// there is no ordering cycle. IrqMutex for deadline-only `need_resched`.
-static ZOMBIES: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
+static ZOMBIES: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new_keyed(LOCK_CLASS_PARK, Vec::new());
 
 /// Consumed zombies awaiting idle teardown: their exit code was collected by
 /// a parent's `:wait`, and `reap_dead` frees their user page tables, kernel
@@ -460,7 +485,8 @@ static ZOMBIES: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
 /// here (and is thus invisible to every scheduler scan), so the `:wait` and
 /// `/proc` paths treat it as already reaped, and only `reap_dead` — which runs
 /// on the idle stack under the kernel root — drains this queue.
-static RECLAIM: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
+static RECLAIM: IrqMutex<Vec<&'static mut Task>> =
+    IrqMutex::new_keyed(LOCK_CLASS_PARK, Vec::new());
 
 /// Parked tasks awaiting a child's exit (`/proc/self:wait`), as `(task, pid)`
 /// keyed by the target pid.
@@ -472,7 +498,8 @@ static RECLAIM: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
 /// waiter list before locking the queue, and no `:wait` activation parks
 /// while holding it.  Only one task can wait on a given child (its parent),
 /// so there is at most one entry per target pid.
-static WAITERS: IrqMutex<Vec<(&'static mut Task, u64)>> = IrqMutex::new(Vec::new());
+static WAITERS: IrqMutex<Vec<(&'static mut Task, u64)>> =
+    IrqMutex::new_keyed(LOCK_CLASS_PARK, Vec::new());
 
 /// Parked `ZzZ` tasks awaiting their wake deadline (absolute monotonic ns).
 ///
@@ -486,7 +513,8 @@ static WAITERS: IrqMutex<Vec<(&'static mut Task, u64)>> = IrqMutex::new(Vec::new
 /// `drain`, so a burst wakeup costs O(k) (one shift) instead of O(n·k)
 /// per-element `remove` shifts.  Insertion (`sleep_until`) stays O(n), but a
 /// task sleeps far less often than the idle loop scans.
-static SLEEPING: IrqMutex<Vec<(u64, &'static mut Task)>> = IrqMutex::new(Vec::new());
+static SLEEPING: IrqMutex<Vec<(u64, &'static mut Task)>> =
+    IrqMutex::new_keyed(LOCK_CLASS_PARK, Vec::new());
 
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
 /// first `switch_to` away from it; restored when no ready task remains.
@@ -1205,9 +1233,14 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
 /// `ZOMBIES` while holding those (see `park_zombie`/`kill`/`wait`), and
 /// `reap_dead` only runs in the idle loop.
 ///
-/// TSS.rsp0 may still point at a freed stack after this; that is safe because
-/// rsp0 is only consumed on a ring-3→ring-0 transition, and no user task runs
-/// while the BSP is idling.  The next task switch re-pins rsp0.
+/// After freeing stacks, TSS.rsp0 / `syscall_rsp0` are re-pinned to the top of
+/// the kernel's static high `.stack` (the idle stack). Previously rsp0 was
+/// left pointing at the last freed task stack until the next dispatch; that
+/// was benign only because no ring-3 transition can happen while idling, but
+/// it left a window where any future code path consuming rsp0 outside a task
+/// switch (e.g. an early syscall/interrupt landing while "idle") would touch
+/// unmapped memory. Re-pinning here makes ring-0 entry always land on live
+/// memory.
 pub fn reap_dead(alloc: &mut BitmapAllocator) {
     // Single global FIFO, idle-only: must be called from idle (no CURRENT)
     // and on the kernel root (APIC MMIO for TLB shootdown). APs halt (SMP
@@ -1265,7 +1298,18 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
     for task in free {
         reap_one(task, alloc);
     }
+    // All freed kstacks are gone; make ring-0 entry land on the idle stack
+    // again instead of a just-freed one (see doc above).
+    set_kernel_stack_meta(idle_stack_top());
     lineage_gc();
+}
+
+/// Top of the kernel's static high `.stack` — the stack the BSP idles on.
+fn idle_stack_top() -> u64 {
+    unsafe extern "C" {
+        static __kernel_end: u8;
+    }
+    core::ptr::addr_of!(__kernel_end) as *const u8 as u64
 }
 
 /// Cooperative scheduler: switch to the next ready task.

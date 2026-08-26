@@ -638,6 +638,97 @@ pub fn set_bsp_hardware_id(id: u32) {
     slot_release(0);
 }
 
+// ── lockdep: per-CPU lock-order checking (`lockdep` feature) ──────────
+//
+// Every `IrqMutex` acquire pushes its order class onto this CPU's stack and
+// every release pops it. A class must be strictly greater than everything
+// already held on that CPU; a violation panics immediately with the offending
+// classes.
+//
+// Exclusivity argument: `IrqMutex::lock` disables interrupts *before* calling
+// [`acquire`] and `IrqGuard::drop` calls [`release`] before re-enabling them,
+// so only one context per CPU can touch its stack at any time. No spin lock
+// is needed — plain `UnsafeCell` indexed by `current_cpu_id()` suffices, and
+// it is safe to use before `early_init_bsp` too (the array is static BSS).
+#[cfg(feature = "lockdep")]
+pub mod lockdep {
+    use super::MAX_CPUS;
+    use core::cell::UnsafeCell;
+
+    /// Deepest legal nesting of tracked locks. The scheduler's documented
+    /// chains top out at three (KSTACK_IN_USE → CURRENT → QUEUE), but leave
+    /// generous headroom for future callers.
+    const MAX_HELD: usize = 32;
+
+    struct HeldStack {
+        depth: usize,
+        classes: [u32; MAX_HELD],
+    }
+
+    struct HeldStacks(UnsafeCell<[HeldStack; MAX_CPUS]>);
+
+    unsafe impl Sync for HeldStacks {}
+
+    // Class 0 (LOCKDEP_CLASS_NONE) never reaches here — irq.rs filters it.
+    static STACKS: HeldStacks = HeldStacks(UnsafeCell::new(
+        [const { HeldStack { depth: 0, classes: [0u32; MAX_HELD] } }; MAX_CPUS],
+    ));
+
+    fn cpu_stack() -> &'static mut HeldStack {
+        let cpu = super::try_current_per_cpu()
+            .map(|pc| pc.cpu_id as usize)
+            .unwrap_or(0);
+        assert!(cpu < MAX_CPUS, "lockdep: cpu {} out of range", cpu);
+        unsafe { &mut (*STACKS.0.get())[cpu] }
+    }
+
+    /// Called by `IrqMutex::lock` after IRQs are disabled. Panics on an
+    /// ordering violation (acquiring `class` while holding class >= `class`).
+    pub fn acquire(class: u32) {
+        if class == crate::filesystems::vfs::irq::LOCKDEP_CLASS_NONE {
+            return;
+        }
+        let s = cpu_stack();
+        for i in 0..s.depth {
+            let held = s.classes[i];
+            if held >= class {
+                panic!(
+                    "lockdep: lock-order violation: acquiring class {} while holding class {} (depth {}, position {})",
+                    class, held, s.depth, i
+                );
+            }
+        }
+        assert!(
+            s.depth < MAX_HELD,
+            "lockdep: held-lock stack overflow ({} locks nested)",
+            s.depth
+        );
+        s.classes[s.depth] = class;
+        s.depth += 1;
+    }
+
+    /// Called by `IrqGuard::drop`. Must mirror the matching `acquire`.
+    pub fn release(class: u32) {
+        if class == crate::filesystems::vfs::irq::LOCKDEP_CLASS_NONE {
+            return;
+        }
+        let s = cpu_stack();
+        assert!(s.depth > 0, "lockdep: release with empty held-lock stack");
+        s.depth -= 1;
+        assert_eq!(
+            s.classes[s.depth], class,
+            "lockdep: released class {} but top of stack is class {}",
+            class, s.classes[s.depth]
+        );
+        s.classes[s.depth] = 0;
+    }
+
+    /// Debug snapshot: current hold depth on this CPU.
+    pub fn depth() -> usize {
+        cpu_stack().depth
+    }
+}
+
 /// Find the PerCpu slot and cpu_id matching a hardware (APIC/hart) ID.
 ///
 /// The returned `&'static mut PerCpu` stays valid (it aliases the static slot
