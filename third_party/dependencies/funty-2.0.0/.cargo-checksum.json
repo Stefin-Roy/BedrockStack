@@ -1,9 +1,9 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "32592e4fc609561a1f7da60da38f684b5e54bdee0db4c31fab476b2340186326",
-        "LICENSE.txt": "f790cc576999f5998c766d3d26d7d64dc368e805a98461484f65e8d961ec6d9f",
-        "src/lib.rs": "80ed0f32d074276978813085e7288e412f9100e9a082b0e3ae044006a8fc7fad"
+        "Cargo.toml": "4f55fb79e06af264af75ed3da3e7544d5070db6e0fc3dabc30383bce02546121",
+        "LICENSE.txt": "4d25e6b7c024c7c1f1c498c90cc062e103ea2cf8236e2d63aa63a29dac23eb82",
+        "src/lib.rs": "827d38f93238410c4ec5746a4d34f10fc1c09b8c5a63fbf15530a7580d4cb16b"
     },
     "package": "e6d5a32815ae3f33302d95fdcb2ce17862f8c65363dcfd29360480ba1001fc9c"
 }

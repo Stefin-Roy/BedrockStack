@@ -37,5 +37,6 @@ pub mod vfs;
 /// Shared chunk size for buffered userspace file and stream I/O.
 ///
 /// Scratch storage using this size lives in static `.bss` buffers rather than
-/// on the fixed 32 KiB user stack.
-pub const IO_CHUNK_BYTES: usize = 64 * 1024;
+/// on the fixed 32 KiB user stack. 1 MiB balances `fread` syscall overhead
+/// for the 28 MiB `FREEDOOM.WAD` (28 vs 448 syscalls) against `.bss` cost.
+pub const IO_CHUNK_BYTES: usize = 1024 * 1024;

@@ -1,22 +1,22 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "4ddbacdfae8fa9049a0f47b8f479a5e09536687917415f5c993c9c5438cbdbcd",
-        "FAQ.md": "9eb41898523ee209a0a937f9bcb78afe45ad55ca0556f8a4d4063558098f6d1e",
-        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
-        "LICENSE-MIT": "0444c6991eead6822f7b9102e654448d51624431119546492e8b231db42c48bb",
-        "README.md": "d7f74d616a751bcca23d5d3b58a6daf556356a526c5f0b6aa0504715d176549a",
-        "build.rs": "d7dd5428c78b80bb3c99068561641ec661f0f94defbda17f85b443e358ab6396",
-        "src/aes_hash.rs": "c29c24588676f669c9c5d928100d5743325a8a7aa19dae9e899b7108c2bf5309",
-        "src/convert.rs": "85789aaa5da2a1d37d91570ba6fa14ef261ff264dac40a624a88178f41c5494b",
-        "src/fallback_hash.rs": "6061ff5c42423f9028f487e4b042449424da6a5de5fd57fdb5f2b8063124312d",
-        "src/hash_map.rs": "1df153463e3c1f818bebf09938bfe63f18dc34cfeaf3041a67e2a604135e3f84",
-        "src/hash_quality_test.rs": "61a5d8a24b1882479ef72590f9165a2cfd5af3a26e1aca3e172061798d93f35e",
-        "src/hash_set.rs": "222d4563ea3749bc63ab7ded5c4a4239a0a1515b6a64301c0e04cf095386776d",
-        "src/lib.rs": "de037bb4e0535fdf4c432f87f0e0d0e5ba9a4ba25033f97c9a76ded33574aa9e",
-        "src/operations.rs": "dae1c602718e29e5839fad52e512a8cf168c1d888cfa9cd074302db7dbabb3d4",
-        "src/random_state.rs": "3a28f818165289071339299c49d8deb93fb27bf31ab1416349132d3af5ec2ad4",
-        "src/specialize.rs": "f2fe0de5d79851ee8ef6d977f418db8d5df5469eaa18a5173fa16cd61df8312e"
+        "Cargo.toml": "60ba5547d04b9b84b034aa8c4e58308a0999387201b8b15f23688ed6ccac568b",
+        "FAQ.md": "7ab9284c8b525adc144b980df6e8a7b88b9b46fb87aeb10b265c305a389ea918",
+        "LICENSE-APACHE": "7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c",
+        "LICENSE-MIT": "e2471b89e5026831e1b3631c928e9ef6ab0a50b0b6686a567301013dfb7bd67e",
+        "README.md": "ee3fad91010f520df5baa13becd8e4cfec50d7140f9cb550fd33545f23d3bcc7",
+        "build.rs": "715e979db811fc886e81e811c61c2d82de363bc3b48b47df13254d735110c89b",
+        "src/aes_hash.rs": "0f69c14c13004c67efb6af200dced7ba8df13b6c7a1f583f2a9044c0555c8802",
+        "src/convert.rs": "1e1ef3b36957bf89db93e30d51232557756ff4606deae05d66dc3240b771c59b",
+        "src/fallback_hash.rs": "dbc55bbc2b7b6e32b256417d4292e17f28c9342c85b87cc118700088feb60b3c",
+        "src/hash_map.rs": "3293161dc54043b491bfe3cc240525e1828e928b1d86c032521ac64e6055efe8",
+        "src/hash_quality_test.rs": "8c4d7c902a1a8df7c798d4256b3c74be50771eea6aaa4d937ab575e09632d103",
+        "src/hash_set.rs": "f0559583f449f5a8cef2007bc01d0db8a72dc100f5821916f3b1cb4173a20e01",
+        "src/lib.rs": "a3f6c261a761515c33dc6ea41d103968835f1d9ae286d79f91fba72d19434d22",
+        "src/operations.rs": "635cf8c74cba75e30f13d93d29808ff4e9476b2b88d3ad9eb0693462c5bfa718",
+        "src/random_state.rs": "0eeae2881f0860c5a8e0b9738f1f1a4a9183421ccb9046fbbcf37571e940ccd9",
+        "src/specialize.rs": "46ee781ba43c1a4f468c243830b2e679b51eeaa24fa78ddcfbd72e62a6df9d86"
     },
     "package": "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
 }

@@ -1,13 +1,13 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "dd67edbeff9cee46c3ea6411098aeec7363cb4fe865006c8eca321d321332484",
-        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
-        "LICENSE-MIT": "c9a75f18b9ab2927829a208fc6aa2cf4e63b8420887ba29cdb265d6619ae82d5",
-        "src/lib.rs": "f6dfe0a321e47b5ea9f01a59711e5d3a0442949a829eb4957fa1491fbce63e5c",
-        "src/mutex.rs": "1487130ba159c9158623d58204b52531c0feaabcdea8e58c0740a29d4f33e5af",
-        "src/remutex.rs": "a0cc36a3ac9ba2a399f83667ca53670afbec0d0bae6e9c103323918594873eeb",
-        "src/rwlock.rs": "3094177475cf67c8dc34e68b3fdff2d4133ffb453860b72037477734cb87aefc"
+        "Cargo.toml": "00d950951aa18ec71627563850ebdb91222d2f5215cb6ca475f3d4f436e82c53",
+        "LICENSE-APACHE": "7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c",
+        "LICENSE-MIT": "1ad744e85fa784e84bc61758727c36e385908e740c80524e2a93c83d04a71883",
+        "src/lib.rs": "ab61a42b1066105b941b3e48c1984b9d25aed6a4973de3d4d2f938f4db4eed5e",
+        "src/mutex.rs": "7e84e00906970a32bc43c6e1deddb2167c9bf1c354d13a024280e7fe165a3351",
+        "src/remutex.rs": "b8f2c1e726dae0b3b559dbec5f4c9e92450b876ad47d33de15a0d38970b09643",
+        "src/rwlock.rs": "48189d505ee021f1fe28b46d5427c74733060ab26391c4ae8593ff8260b46594"
     },
     "package": "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
 }

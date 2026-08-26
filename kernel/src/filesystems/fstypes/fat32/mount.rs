@@ -53,28 +53,94 @@ impl Fat32SuperBlock {
         // Keep the cache lock while building. This prevents concurrent first
         // reads from walking the same large FAT chain and allocating duplicate
         // vectors.
-        let mut cache = self.chain_cache.lock();
+        let cache = self.chain_cache.lock();
         if let Some(chain) = cache.get(&first) {
             return Ok(Arc::clone(chain));
         }
+        drop(cache);
 
-        let mut chain = Vec::new();
-        let mut c = first;
-        let mut count: u32 = 0;
-        loop {
-            chain.push(c);
-            let next = self.read_fat_entry(c)?;
-            if next >= super::fat::EOC_MARKER {
-                break;
+        // Batched FAT walk: for small FATs (ESP ~242 sectors) read the whole
+        // FAT in one DMA to avoid 500+ single-sector AHCI cmds for a 28 MiB
+        // WAD (56k clusters). For large FATs (>1024 sectors) fall back to
+        // per-entry cached reads to avoid 64 MiB alloc.
+        let total_clus = self.bpb.total_clus;
+        let fat_sz = self.bpb.fat_sz32 as u64;
+        let use_bulk = fat_sz <= 1024 && total_clus <= 200_000;
+        let chain_vec = if use_bulk {
+            let fat0_lba = self.bpb.fat_sector_lba(0, 0);
+            let mut fat_data = alloc::vec![0u8; fat_sz as usize * super::bpb::SECTOR_SIZE];
+            // Chunk to 504 sectors (252 KiB) to stay within 64-entry PRDT.
+            const CHUNK: u64 = 504;
+            let mut off = 0u64;
+            while off < fat_sz {
+                let c = core::cmp::min(CHUNK, fat_sz - off);
+                let dst_off = (off as usize) * super::bpb::SECTOR_SIZE;
+                let dst_end = dst_off + (c as usize) * super::bpb::SECTOR_SIZE;
+                super::io::read_sectors(
+                    &*self.device,
+                    fat0_lba + off,
+                    c as u32,
+                    &mut fat_data[dst_off..dst_end],
+                )?;
+                off += c;
             }
-            c = next;
-            count += 1;
-            if count > self.bpb.total_clus + 2 {
-                return Err(VfsError::IOError);
+            let mut chain = Vec::new();
+            let mut c = first;
+            let mut count: u32 = 0;
+            loop {
+                chain.push(c);
+                let off = c as usize * 4;
+                if off + 4 > fat_data.len() {
+                    return Err(VfsError::IOError);
+                }
+                let next = u32::from_le_bytes([
+                    fat_data[off],
+                    fat_data[off + 1],
+                    fat_data[off + 2],
+                    fat_data[off + 3],
+                ]) & 0x0FFFFFFF;
+                if next >= super::fat::EOC_MARKER {
+                    break;
+                }
+                if next < 2 || next >= 2 + total_clus {
+                    return Err(VfsError::IOError);
+                }
+                c = next;
+                count += 1;
+                if count > total_clus + 2 {
+                    return Err(VfsError::IOError);
+                }
+                // Safety: prevent infinite loop on corrupted FAT
+                if count as usize > fat_data.len() {
+                    return Err(VfsError::IOError);
+                }
             }
+            chain
+        } else {
+            let mut chain = Vec::new();
+            let mut c = first;
+            let mut count: u32 = 0;
+            loop {
+                chain.push(c);
+                let next = self.read_fat_entry(c)?;
+                if next >= super::fat::EOC_MARKER {
+                    break;
+                }
+                c = next;
+                count += 1;
+                if count > total_clus + 2 {
+                    return Err(VfsError::IOError);
+                }
+            }
+            chain
+        };
+
+        let chain = Arc::new(chain_vec);
+        // Re-lock to insert (another thread may have inserted meanwhile).
+        let mut cache = self.chain_cache.lock();
+        if let Some(existing) = cache.get(&first) {
+            return Ok(Arc::clone(existing));
         }
-
-        let chain = Arc::new(chain);
         cache.insert(first, Arc::clone(&chain));
         Ok(chain)
     }

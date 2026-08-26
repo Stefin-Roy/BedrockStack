@@ -2,7 +2,7 @@
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
         "CHANGELOG.md": "886f8c688db0c22d24b650df0dc30a39d05d54d0e562c00d9574bf31cbf73251",
-        "Cargo.toml": "ddaa434cc54a30a33bbe0096e72479d71ba5deffa2ad9bee39419d4e50b75275",
+        "Cargo.toml": "e7a99570bcb5029d8b96a2a2124e1116f39483bbb2a4a5c33d64633567cdf658",
         "LICENSE-APACHE": "20fe7b00e904ed690e3b9fd6073784d3fc428141dbd10b81c01fd143d0797f58",
         "LICENSE-MIT": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9",
         "README.md": "8b8c45a89f9d61688fd32516ca24ea11cc6be4994757bd01bd9d02d96cd49337",

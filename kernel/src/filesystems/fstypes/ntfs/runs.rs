@@ -83,13 +83,13 @@ pub(crate) fn decode_mapping_pairs(data: &[u8], base_vcn: u64) -> Result<RunList
 
         if off_len == 0 {
             // Sparse run: advances the VCN, not the LCN.
-            vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
             let abs = base_vcn.checked_add(vcn as u64).ok_or(VfsError::IOError)?;
             runs.push(Run {
                 vcn: abs,
                 lcn: -1,
                 len: length,
             });
+            vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
         } else {
             let mut raw: u64 = 0;
             for i in 0..off_len {
@@ -99,13 +99,13 @@ pub(crate) fn decode_mapping_pairs(data: &[u8], base_vcn: u64) -> Result<RunList
             let shift = 64 - 8 * off_len;
             let delta = ((raw << shift) as i64) >> shift;
             lcn = lcn.checked_add(delta).ok_or(VfsError::IOError)?;
-            vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
             let abs = base_vcn.checked_add(vcn as u64).ok_or(VfsError::IOError)?;
             runs.push(Run {
                 vcn: abs,
                 lcn,
                 len: length,
             });
+            vcn = vcn.checked_add(length as i64).ok_or(VfsError::IOError)?;
         }
 
         pos += len_len + off_len;

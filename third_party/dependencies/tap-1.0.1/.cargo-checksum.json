@@ -1,13 +1,13 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "e1411b0ffb2a7d409e1706baf31dd4536fdf8834bcc62ca6d4bb1105733fe7cd",
-        "LICENSE.txt": "8b4e95f5cf0dc40269c99f7b787203ffe04ded245ca2427422c196efa2b2f42a",
-        "README.md": "3a5f65cba4a285afee207a17ef158bd1348345e990ce02b14973774f5119c66f",
-        "src/conv.rs": "9c975b0607d3b81cec7c7c6a9b6b732f8a4dd1beb303a07ab165471b5e0dc37c",
-        "src/lib.rs": "402e6c0456861a2632c93f062b8af47fa0d701241a39d70cd0fe6732504f76b3",
-        "src/pipe.rs": "d969c608ef598742b34fb4b84b79085bb7f28d551f596dcdc14f8d5fab110261",
-        "src/tap.rs": "a69cc67fbf2607385948b2a7e465431bc0dd0d967841c433d89c9a5082ce262c"
+        "Cargo.toml": "c0ec2bf91378ae3984928e2feaa7725886bf3bb14d88fe3148f6a26bf9a4cf3c",
+        "LICENSE.txt": "859a70b3ee333fec4ccd6ad2dcf0b5ea94f3116b7caaacaf4691898658d4ab97",
+        "README.md": "6aa0af05993b15aa9b923399dd0374c19c161695f7751c1410dedb1837d3abba",
+        "src/conv.rs": "c15f44f3654e2bbf598eec5afb9c0f9ed904d0196c4ef4873299eb0d00da9cbb",
+        "src/lib.rs": "8fefdef9dcc762aa63c07b0d99013e4346b515fdf1b645fcc912ac11470b778d",
+        "src/pipe.rs": "3cce1b879063b49d673c2282a8e3159ec89f62917ccc238982d6b40d029d2b1d",
+        "src/tap.rs": "b981bd75ffc58e8eff2324e89cd49fe1572542bc49492a1d79024e830e4ffce0"
     },
     "package": "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 }

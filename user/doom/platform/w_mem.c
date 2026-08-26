@@ -20,6 +20,8 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "m_misc.h"
 #include "w_file.h"
@@ -30,6 +32,7 @@ typedef struct
 {
     wad_file_t wad;
     FILE *fstream;
+    int fd;
 } mem_wad_file_t;
 
 extern wad_file_class_t mem_wad_file;
@@ -42,20 +45,19 @@ static void wmem_log(const char *msg)
 static wad_file_t *W_Mem_OpenFile(char *path)
 {
     mem_wad_file_t *result;
-    FILE *fstream;
+    int fd;
     long length;
     byte *buf;
-    size_t got;
+    ssize_t got;
+    size_t total = 0;
 
     wmem_log("[w_mem] open ");
     wmem_log(path);
     wmem_log("\n");
-    fstream = fopen(path, "rb");
-
-    if (fstream == NULL)
+    fd = open(path, O_RDONLY);
+    if (fd < 0)
     {
-        wmem_log("[w_mem] fopen failed errno=");
-        // crude decimal of errno
+        wmem_log("[w_mem] open failed errno=");
         {
             char tmp[32];
             int n = 0;
@@ -72,18 +74,22 @@ static wad_file_t *W_Mem_OpenFile(char *path)
         return NULL;
     }
 
-    length = M_FileLength(fstream);
-
+    length = lseek(fd, 0, SEEK_END);
     if (length <= 0)
     {
-        wmem_log("[w_mem] M_FileLength <=0\n");
-        fclose(fstream);
+        wmem_log("[w_mem] lseek/seek_end <=0\n");
+        close(fd);
+        return NULL;
+    }
+    if (lseek(fd, 0, SEEK_SET) < 0)
+    {
+        wmem_log("[w_mem] lseek set failed\n");
+        close(fd);
         return NULL;
     }
 
     {
         char tmp[64];
-        // log length
         wmem_log("[w_mem] length ");
         {
             long v = length;
@@ -97,21 +103,113 @@ static wad_file_t *W_Mem_OpenFile(char *path)
     }
 
     buf = (byte *)malloc((size_t)length);
-
     if (buf == NULL)
     {
         wmem_log("[w_mem] malloc failed\n");
-        fclose(fstream);
+        close(fd);
         return NULL;
     }
 
-    got = fread(buf, 1, (size_t)length, fstream);
-
-    if (got != (size_t)length)
+    // Chunked fd reads via 1 MiB windows: keeps each read within the
+    // 4 MiB (16×252 KiB) batched DMA window and avoids a single 28 MiB
+    // IoBuffer that can hit PRDT/EINVAL. Bypasses stdio's double copy
+    // and still collapses to ~7 NCQ batches per syscall in the kernel
+    // (252 KiB per run, 16 per submit). Falls back to loop on short.
     {
-        wmem_log("[w_mem] fread short\n");
+        const size_t CHUNK = 1024 * 1024;
+        while (total < (size_t)length)
+        {
+            size_t want = (size_t)length - total;
+            if (want > CHUNK) want = CHUNK;
+            got = read(fd, buf + total, want);
+            if (got <= 0)
+            {
+                wmem_log("[w_mem] read failed/short got=");
+                {
+                    char tmp[64];
+                    int n = 0;
+                    long v = (long)got;
+                    int neg = 0;
+                    if (v < 0) { neg = 1; v = -v; }
+                    if (neg) tmp[n++] = '-';
+                    char rev[32]; int r=0;
+                    if (v==0) tmp[n++]='0';
+                    else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log(" errno=");
+                {
+                    char tmp[32];
+                    int n=0;
+                    int e = errno;
+                    if (e<0) e=-e;
+                    if (e==0) tmp[n++]='0';
+                    else { char rev[16]; int r=0; while(e>0){ rev[r++]='0'+(e%10); e/=10; } while(r--) tmp[n++]=rev[r]; }
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log(" total=");
+                {
+                    char tmp[32];
+                    int n=0;
+                    long v = (long)total;
+                    char rev[32]; int r=0;
+                    if(v==0) tmp[n++]='0';
+                    else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log(" want=");
+                {
+                    char tmp[32];
+                    int n=0;
+                    long v = (long)want;
+                    char rev[32]; int r=0;
+                    if(v==0) tmp[n++]='0';
+                    else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log("\n");
+                free(buf);
+                close(fd);
+                return NULL;
+            }
+            total += (size_t)got;
+            // Short read before EOF – loop will retry; log progress.
+            if ((size_t)got != want) {
+                wmem_log("[w_mem] short chunk got ");
+                {
+                    char tmp[32];
+                    int n=0;
+                    long v = (long)got;
+                    char rev[32]; int r=0;
+                    if(v==0) tmp[n++]='0';
+                    else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log(" want ");
+                {
+                    char tmp[32];
+                    int n=0;
+                    long v = (long)want;
+                    char rev[32]; int r=0;
+                    if(v==0) tmp[n++]='0';
+                    else while(v>0){ rev[r++]='0'+(v%10); v/=10; } while(r--) tmp[n++]=rev[r];
+                    tmp[n]=0;
+                    wmem_log(tmp);
+                }
+                wmem_log("\n");
+            }
+        }
+    }
+    if (total != (size_t)length)
+    {
+        wmem_log("[w_mem] read short\n");
         free(buf);
-        fclose(fstream);
+        close(fd);
         return NULL;
     }
     wmem_log("[w_mem] open ok\n");
@@ -120,7 +218,8 @@ static wad_file_t *W_Mem_OpenFile(char *path)
     result->wad.file_class = &mem_wad_file;
     result->wad.mapped = buf;
     result->wad.length = (unsigned int)length;
-    result->fstream = fstream;
+    result->fstream = NULL;
+    result->fd = fd;
 
     return &result->wad;
 }
@@ -137,7 +236,10 @@ static void W_Mem_CloseFile(wad_file_t *wad)
         mem_wad->wad.mapped = NULL;
     }
 
-    fclose(mem_wad->fstream);
+    if (mem_wad->fstream)
+        fclose(mem_wad->fstream);
+    if (mem_wad->fd >= 0)
+        close(mem_wad->fd);
     Z_Free(mem_wad);
 }
 

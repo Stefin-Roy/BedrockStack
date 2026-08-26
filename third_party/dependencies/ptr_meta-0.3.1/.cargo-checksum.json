@@ -1,12 +1,12 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "723fd849d974dbe6bf19cf86cc0a0ed69836e18dfb1995c06412871b936259c6",
-        "LICENSE": "635111a955495b5d8d34b8052f69656e8e45f6437f9266329077b9aad5fbe8d3",
-        "README.md": "ecab8de808eabbbdad691cb872c5447a4833a1970b5defe85802cbd1826fb56a",
+        "Cargo.toml": "0d0aaa256d03597c8a0cffe6aea40de3eb5cfbf14edcded89e9db4a66eab4e6a",
+        "LICENSE": "631873ea9c050a54d0511dd3eb1fca1d89e6f6ea53188bcd0638fd0d2c228b8c",
+        "README.md": "159f17a2895a6c530a73f330d4d0cfed767385711f697c842c1662f553ff686b",
         "example.md": "4cbd8cfd4f770ad7a6c435e53b436b60931d96cd242b7fe8e0d771747e334d3d",
-        "src/impls.rs": "ff06b0fa5829817fce1569422d9c85f0b86947b3e687f9960128beef4437765d",
-        "src/lib.rs": "bb33b84f7f7d89396b501f6bc784a3ff5c20d490ce208a7201d2a1f4014251b1"
+        "src/impls.rs": "83687a0b7bc74e155bb4a059201c30e7acb69655ccad73e61bf5a5276f60bd4c",
+        "src/lib.rs": "75bd1218703abc71f359f590338a2c6b38ddbd091564ee2dc00d54d80808fe69"
     },
     "package": "0b9a0cf95a1196af61d4f1cbdab967179516d9a4a4312af1f31948f8f6224a79"
 }

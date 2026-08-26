@@ -126,8 +126,8 @@ pub(crate) fn iter_attrs(record: &[u8]) -> Result<Vec<Attr<'_>>, VfsError> {
             let lowest_vcn = u64_at(record, pos + 0x10).ok_or(VfsError::IOError)?;
             let highest_vcn = u64_at(record, pos + 0x18).ok_or(VfsError::IOError)?;
             let map_off = u16_at(record, pos + 0x20).ok_or(VfsError::IOError)? as usize;
-            let real_size = u64_at(record, pos + 0x2C).ok_or(VfsError::IOError)?;
-            let init_size = u64_at(record, pos + 0x34).ok_or(VfsError::IOError)?;
+            let real_size = u64_at(record, pos + 0x30).ok_or(VfsError::IOError)?;
+            let init_size = u64_at(record, pos + 0x38).ok_or(VfsError::IOError)?;
             if map_off < 0x40 || map_off >= len {
                 return Err(VfsError::IOError);
             }

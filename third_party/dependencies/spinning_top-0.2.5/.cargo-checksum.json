@@ -1,14 +1,14 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "63df13cddac109bad207bc81e193dd80281b02ff7d264f7572a15a6b42136c6b",
-        "Changelog.md": "bfd9f50e81a1d47d01f04497063c4539cd988a1970c4a9d62fea1298c7c488b4",
-        "LICENSE-APACHE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
-        "LICENSE-MIT": "984f3c74e72da2ffd0b10715e2e5e85307f30fb0ed41d08e88b37e7fac4f2d03",
-        "README.md": "40e641a02b0d4ba8a75e4ebbd926aac35a0f6dedb1d872ab747178397ff7bbba",
+        "Cargo.toml": "c3207a004f5f15ad0ae9b796093d8d1fa870f23c8418d0e46a0d6c931547b8c1",
+        "Changelog.md": "1e40d4c46ba2fdf00d7da9b3d92236405528ec6ed373ac2db328943f18a565c6",
+        "LICENSE-APACHE": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+        "LICENSE-MIT": "4d9b6ef14ee3038c2a0025009f95d7d89e0be5338e4fa57c911914203df19ed3",
+        "README.md": "a14717807ea72036b31a91de8cfc7fc20be56e2d6cef25476364a69ed00c0386",
         "img/top.png": "702df46c96d7388c25929e870b27e3db4f87c6d50710039885228e7a9045d84d",
-        "src/lib.rs": "a5c6d675070016ad07b529a4851af5951a8c4e72d14c1f779da892789ae45ca6",
-        "src/spinlock.rs": "0fcfc14061e98d44898fb145a41cfb0c2e0a51e8396ff73968ed214698e2ab39"
+        "src/lib.rs": "7134eede8c27890a3d05c232fe6390f78da639e8d9ff7b8b463a4da1259b47cd",
+        "src/spinlock.rs": "e001f99c1810b4b45c77adfaa336b546474fca33235cf0264a52511247ed6d8a"
     },
     "package": "5b9eb1a2f4c41445a3a0ff9abc5221c5fcd28e1f13cd7c0397706f9ac938ddb0"
 }

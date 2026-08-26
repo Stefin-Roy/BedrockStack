@@ -48,71 +48,197 @@ impl AllocBitmap {
 
 impl Fat32SuperBlock {
     pub fn alloc_cluster(&self) -> Result<u32, VfsError> {
+        let v = self.alloc_clusters(1)?;
+        Ok(v[0])
+    }
+
+    /// Bulk allocate `count` clusters, returning them in allocation order.
+    /// Tries to find a contiguous free run first for better sequential I/O;
+    /// falls back to gathering any free clusters. Keeps alloc_bitmap in sync
+    /// and writes EOC for each new cluster. Caller must link the chain and
+    /// flush.
+    pub fn alloc_clusters(&self, count: u32) -> Result<Vec<u32>, VfsError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
         fat_trace!(crate::drivers::serial::SerialPort::puts(
-            "[DBG:fat32] alloc_cluster\n"
+            "[DBG:fat32] alloc_clusters\n"
         ));
         let mut hint = self.next_alloc_hint.lock();
         let n = self.bpb.total_clus;
+        if n == 0 {
+            return Err(VfsError::NoSpace);
+        }
 
-        // Fast path: bitmap scan (memory only, no FAT reads).
-        // Hold bitmap only to reserve a free bit; drop it before doing FAT I/O
-        // so we don't hold `alloc_bitmap -> fat_cache` while `free_chain`
-        // holds `fat_cache -> alloc_bitmap`.
+        // Fast path: bitmap. Try to find a contiguous window of `count` free
+        // clusters first (best for sequential read/write), otherwise fall back
+        // to any free clusters.
+        let mut candidates: Vec<(u32, usize, u64)> = Vec::with_capacity(count as usize);
         {
-            let mut candidate: Option<(u32, usize, u64)> = None;
-            {
-                let mut bmp = self.alloc_bitmap.lock();
-                if let Some(b) = bmp.as_mut() {
-                    let total = n as usize;
-                    if total > 0 {
-                        let start = (*hint as usize).saturating_sub(2) % total;
-                        for off in 0..total {
-                            let i = (start + off) % total;
-                            let w = i / 64;
-                            let bit = 1u64 << (i % 64);
-                            if b.words[w] & bit != 0 {
-                                continue;
+            let mut bmp = self.alloc_bitmap.lock();
+            if let Some(b) = bmp.as_mut() {
+                let total = n as usize;
+                let start = (*hint as usize).saturating_sub(2) % total;
+                // Search for contiguous run.
+                let mut found_contig = false;
+                if (count as usize) <= total {
+                    for off in 0..total {
+                        let s = (start + off) % total;
+                        if s + count as usize > total {
+                            // Wrap test needs two checks; simplify by scanning
+                            // linearly with wrap via modulo per element.
+                            let mut ok = true;
+                            for k in 0..count as usize {
+                                let idx = (s + k) % total;
+                                let w = idx / 64;
+                                let bit = 1u64 << (idx % 64);
+                                if b.words[w] & bit != 0 {
+                                    ok = false;
+                                    break;
+                                }
                             }
-                            let clus = 2 + i as u32;
-                            b.words[w] |= bit;
-                            candidate = Some((clus, w, bit));
-                            break;
-                        }
-                        if candidate.is_none() {
-                            return Err(VfsError::NoSpace);
+                            if ok {
+                                for k in 0..count as usize {
+                                    let idx = (s + k) % total;
+                                    let w = idx / 64;
+                                    let bit = 1u64 << (idx % 64);
+                                    b.words[w] |= bit;
+                                    candidates.push((2 + idx as u32, w, bit));
+                                }
+                                found_contig = true;
+                                break;
+                            }
+                        } else {
+                            // Fast check without per-element modulo.
+                            let mut ok = true;
+                            for k in 0..count as usize {
+                                let idx = s + k;
+                                let w = idx / 64;
+                                let bit = 1u64 << (idx % 64);
+                                if b.words[w] & bit != 0 {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if ok {
+                                for k in 0..count as usize {
+                                    let idx = s + k;
+                                    let w = idx / 64;
+                                    let bit = 1u64 << (idx % 64);
+                                    b.words[w] |= bit;
+                                    candidates.push((2 + idx as u32, w, bit));
+                                }
+                                found_contig = true;
+                                break;
+                            }
                         }
                     }
                 }
+                if !found_contig {
+                    // Gather any free clusters, not necessarily contiguous.
+                    candidates.clear();
+                    for off in 0..total {
+                        if candidates.len() >= count as usize {
+                            break;
+                        }
+                        let i = (start + off) % total;
+                        let w = i / 64;
+                        let bit = 1u64 << (i % 64);
+                        if b.words[w] & bit != 0 {
+                            continue;
+                        }
+                        let clus = 2 + i as u32;
+                        b.words[w] |= bit;
+                        candidates.push((clus, w, bit));
+                    }
+                    if candidates.len() < count as usize {
+                        // Roll back partial reservation.
+                        for (_, w, bit) in &candidates {
+                            b.words[*w] &= !*bit;
+                        }
+                        return Err(VfsError::NoSpace);
+                    }
+                } else if candidates.len() != count as usize {
+                    // Should not happen; roll back.
+                    for (_, w, bit) in &candidates {
+                        b.words[*w] &= !*bit;
+                    }
+                    return Err(VfsError::IOError);
+                }
             }
-            if let Some((clus, w, bit)) = candidate {
-                match self.write_fat_entry(clus, EOC_MARKER) {
+        }
+        if !candidates.is_empty() {
+            let mut out = Vec::with_capacity(count as usize);
+            for (clus, _w, _bit) in &candidates {
+                match self.write_fat_entry(*clus, EOC_MARKER) {
                     Ok(()) => {
-                        *hint = clus + 1;
-                        self.free_clus_count.fetch_sub(1, Ordering::Relaxed);
-                        return Ok(clus);
+                        out.push(*clus);
                     }
                     Err(e) => {
-                        // Roll back the reservation so the bitmap stays in sync.
-                        if let Some(b) = self.alloc_bitmap.lock().as_mut() {
-                            b.words[w] &= !bit;
+                        // Roll back bitmap and any already-written EOCs.
+                        let mut bmp = self.alloc_bitmap.lock();
+                        if let Some(b) = bmp.as_mut() {
+                            for (_, ww, bb) in &candidates {
+                                b.words[*ww] &= !*bb;
+                            }
+                        }
+                        for c in out {
+                            let _ = self.write_fat_entry(c, FREE_CLUSTER);
                         }
                         return Err(e);
                     }
                 }
             }
+            // Advance hint past the last allocated cluster.
+            if let Some(&last) = out.last() {
+                *hint = last + 1;
+                if *hint < 2 {
+                    *hint = 2;
+                }
+            }
+            self.free_clus_count
+                .fetch_sub(count, Ordering::Relaxed);
+            return Ok(out);
         }
 
-        // Fallback: rotating linear scan over the FAT itself.
+        // Fallback: rotating linear scan over the FAT itself (no bitmap).
+        let mut out = Vec::with_capacity(count as usize);
         for i in 0..n {
+            if out.len() >= count as usize {
+                break;
+            }
             let clus = 2 + ((*hint - 2 + i) % n);
-            if self.read_fat_entry(clus)? == FREE_CLUSTER {
-                self.write_fat_entry(clus, EOC_MARKER)?;
-                *hint = clus + 1;
-                self.free_clus_count.fetch_sub(1, Ordering::Relaxed);
-                return Ok(clus);
+            let val = match self.read_fat_entry(clus) {
+                Ok(v) => v,
+                Err(e) => {
+                    for c in &out {
+                        let _ = self.write_fat_entry(*c, FREE_CLUSTER);
+                    }
+                    return Err(e);
+                }
+            };
+            if val == FREE_CLUSTER {
+                if let Err(e) = self.write_fat_entry(clus, EOC_MARKER) {
+                    for c in &out {
+                        let _ = self.write_fat_entry(*c, FREE_CLUSTER);
+                    }
+                    return Err(e);
+                }
+                out.push(clus);
             }
         }
-        Err(VfsError::NoSpace)
+        if out.len() < count as usize {
+            for c in &out {
+                let _ = self.write_fat_entry(*c, FREE_CLUSTER);
+            }
+            return Err(VfsError::NoSpace);
+        }
+        if let Some(&last) = out.last() {
+            *hint = last + 1;
+        }
+        self.free_clus_count
+            .fetch_sub(count, Ordering::Relaxed);
+        Ok(out)
     }
 
     /// Keep the allocation bitmap in sync with a freed cluster.
@@ -147,7 +273,6 @@ impl Fat32SuperBlock {
         let nsec = self.bpb.fat_sz32;
         let total_clus = self.bpb.total_clus as u64;
         let mut count = 0u32;
-        let mut buf = [0u8; SECTOR_SIZE];
         let first_valid = 2u64;
         let last_valid = first_valid + total_clus - 1;
 
@@ -161,28 +286,56 @@ impl Fat32SuperBlock {
             None
         };
 
-        for sec in 0..nsec as u64 {
-            read_sectors(&*self.device, first_lba + sec, 1, &mut buf)?;
-            let entry_base = sec * 128;
-            for i in 0..128 {
-                let entry_idx = entry_base + i;
-                if entry_idx < first_valid || entry_idx > last_valid {
-                    continue;
-                }
-                let off = (i * 4) as usize;
-                let val = u32::from_le_bytes(
-                    buf.get(off..off + 4)
-                        .ok_or(VfsError::IOError)?
-                        .try_into()
-                        .map_err(|_| VfsError::IOError)?,
-                );
-                if val & 0x0FFFFFFF == FREE_CLUSTER {
-                    count += 1;
-                } else if let Some(b) = bitmap.as_mut() {
-                    let ci = entry_idx as usize - 2;
-                    b.words[ci / 64] |= 1u64 << (ci % 64);
+        // Batched DMA: the FAT is contiguous on disk, so read it in
+        // 252 KiB chunks (504 sectors) instead of 242+ single-sector AHCI
+        // commands.  The bypass-cache path in CachedDevice::read_io lets the
+        // AHCI PRDT DMA straight into the caller's buffer, collapsing ~242 IRQs
+        // + PRDT builds into one.  Chunking keeps us under the 252 KiB / 64-entry
+        // PRDT limit even for large volumes (16M clusters => ~125k FAT sectors).
+        // Streaming per-chunk keeps peak allocation at 258 KiB instead of the
+        // whole FAT (62 MiB for 16M clusters).
+        const MAX_SECTORS_PER_IO: u64 = 504; // 252*1024 / 512
+        if nsec == 0 {
+            *self.alloc_bitmap.lock() = bitmap;
+            return Ok(count);
+        }
+        let mut chunk_buf = alloc::vec![0u8; MAX_SECTORS_PER_IO as usize * SECTOR_SIZE];
+        let mut done: u64 = 0;
+        while done < nsec as u64 {
+            let chunk = core::cmp::min(MAX_SECTORS_PER_IO, nsec as u64 - done);
+            let len = (chunk as usize) * SECTOR_SIZE;
+            read_sectors(
+                &*self.device,
+                first_lba + done,
+                chunk as u32,
+                &mut chunk_buf[..len],
+            )?;
+            for sec_off in 0..chunk {
+                let sec = done + sec_off;
+                let entry_base = sec * 128;
+                let base = (sec_off as usize) * SECTOR_SIZE;
+                for i in 0..128 {
+                    let entry_idx = entry_base + i;
+                    if entry_idx < first_valid || entry_idx > last_valid {
+                        continue;
+                    }
+                    let off = base + (i * 4) as usize;
+                    let val = u32::from_le_bytes(
+                        chunk_buf
+                            .get(off..off + 4)
+                            .ok_or(VfsError::IOError)?
+                            .try_into()
+                            .map_err(|_| VfsError::IOError)?,
+                    );
+                    if val & 0x0FFFFFFF == FREE_CLUSTER {
+                        count += 1;
+                    } else if let Some(b) = bitmap.as_mut() {
+                        let ci = entry_idx as usize - 2;
+                        b.words[ci / 64] |= 1u64 << (ci % 64);
+                    }
                 }
             }
+            done += chunk;
         }
 
         *self.alloc_bitmap.lock() = bitmap;

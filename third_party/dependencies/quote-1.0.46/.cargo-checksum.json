@@ -1,18 +1,18 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "317b213af73aaf00108f9003cc69798538660e5e509a439d3482746612333912",
-        "LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
-        "LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
-        "README.md": "9d6af721967088b8263c0544c0c3c459206998252dd5632a3bdf87cb27ec92be",
-        "build.rs": "cd6808c02e476b09a520105e2c6f6d325cccb1ecd542cbbcc836a0ae6f6fb0f1",
-        "src/ext.rs": "dabcf1dbf9a81c2dccbfb85f81a08120f5a15be40616d51434ed4ebdfe0c7283",
-        "src/format.rs": "662db1f14106d79aacab400a3176a75989a4437ecaaa85ab88cd9a40b750cc5b",
-        "src/ident_fragment.rs": "eed1a7407182c00ddfdc98741eaa6e234a6d2c01755e95f943b27926b8c92243",
-        "src/lib.rs": "c88f6fba84db5e107885d22ba27a105652b7e266cae4cfeb4827fbb6b3179757",
-        "src/runtime.rs": "fdb7986b31141627408b51381607f66ef4b69dd81b080c2f6489da267e96b2ba",
-        "src/spanned.rs": "713678bf5cb3b4bf2f119dcf64d188a63dc59455a724c3d2567ceab83b734d73",
-        "src/to_tokens.rs": "1b07b676afce2f666bac6f454758d066758033fc85e9cd9d2d12d58ad2eb36e1"
+        "Cargo.toml": "5adb6a3bcfdd3495a5381cfe8efc90ace91552227c980c3dc242a61bdc8080bc",
+        "LICENSE-APACHE": "20fe7b00e904ed690e3b9fd6073784d3fc428141dbd10b81c01fd143d0797f58",
+        "LICENSE-MIT": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9",
+        "README.md": "2366c3b36e31b083916506db43a55a6e0a936b22a50bff9f3e7a1c78b90be503",
+        "build.rs": "8df3f12d6b13417d812f652db98a2a4d89b45ffeb080b6867c2cd1f65f9ba00e",
+        "src/ext.rs": "ade3d302d0fd6fd47471a0a6d021fcaae428f4970e8a54db2fc10679d1f31399",
+        "src/format.rs": "c2fca152eea03b0c0a8761f3de5e3e9b5194c038bb7d8438f3e9818c8c4264c9",
+        "src/ident_fragment.rs": "469df0f91b526c4fd0f6aa95509e16c43857c84e25f5a2a3ffa32df2a986f735",
+        "src/lib.rs": "8bfd33cbdee5dcd4ba7896f9035d75ae79f4edd9d5c12959615699a2029f743d",
+        "src/runtime.rs": "ea8dff523736b11089217d5245e1aea8854f6771244971e8e25db27a991aa22d",
+        "src/spanned.rs": "b7996d11cc2e797e39f085fe8abb83a6aad4b60008198e73a9aa4fdc745e5df0",
+        "src/to_tokens.rs": "7b77d829746501f167adf98f6bed82b09eac84e242f951bef16d9ac694b7a0bd"
     },
     "package": "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 }

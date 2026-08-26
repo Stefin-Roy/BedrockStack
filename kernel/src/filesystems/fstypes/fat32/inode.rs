@@ -170,6 +170,34 @@ impl InodeOps for Fat32Inode {
         let mut done = 0usize;
         let mut clus_off = (offset % clus_size) as usize;
 
+        // For large sequential reads (28 MiB WAD) we batch multiple whole-run
+        // DMAs into one AHCI NCQ submit (up to 16 slots) to collapse 100+ waits
+        // into ~7. Misaligned head/tail still uses single run_buf path.
+        let mut batch: alloc::vec::Vec<(u64, u32, usize, usize)> = alloc::vec::Vec::new();
+        // Helper to flush pending whole-run batch via the central io:: batch primitive.
+        // Keeps all AHCI submit logic in one place (io.rs) and avoids duplicating
+        // IoRequest/unsafe reborrow in every caller.
+        let flush_batch = |batch: &mut alloc::vec::Vec<(u64, u32, usize, usize)>,
+                           device: &dyn crate::filesystems::blockdriver::traits::BlockDevice,
+                           buf_ptr: *mut u8|
+         -> Result<(), VfsError> {
+            if batch.is_empty() {
+                return Ok(());
+            }
+            let mut reqs: alloc::vec::Vec<(&mut [u8], u64, u32)> =
+                alloc::vec::Vec::with_capacity(batch.len());
+            for (lba, count, off, len) in batch.iter() {
+                let slice = unsafe { core::slice::from_raw_parts_mut(buf_ptr.add(*off), *len) };
+                reqs.push((slice, *lba, *count));
+            }
+            super::io::read_sectors_batch(device, &mut reqs)?;
+            batch.clear();
+            Ok(())
+        };
+
+        let buf_ptr = buf.as_mut_ptr();
+        // Safety: buf_ptr lives for the whole read_at call; batch slices are
+        // disjoint and derived from it, so no aliasing.
         while done < total && ci < chain.len() {
             // Grow a contiguous run while clusters are physically adjacent.
             let run_start = ci;
@@ -188,15 +216,38 @@ impl InodeOps for Fat32Inode {
             let run_lba = self.sb.bpb.cluster_to_lba(chain[run_start]);
 
             if clus_off == 0 && want == run_bytes {
-                // Whole-run, sector-aligned: DMA straight into the caller's
-                // buffer, no intermediate copy.
-                read_sectors(
-                    &*self.sb.device,
-                    run_lba,
-                    (want / 512) as u32,
-                    &mut buf[done..done + want],
-                )?;
+                // Whole-run, sector-aligned: queue for batched DMA.
+                batch.push((run_lba, (want / 512) as u32, done, want));
+                done += want;
+                ci += run_len;
+                // Flush when batch full or next run would be misaligned/partial.
+                let next_will_be_partial = {
+                    if done >= total || ci >= chain.len() {
+                        true
+                    } else {
+                        // Peek next run's want to see if it would be whole.
+                        let next_clus_off = 0usize;
+                        let next_clusters_needed =
+                            (total - done + next_clus_off + clus_bytes - 1) / clus_bytes;
+                        let mut next_len = 1usize;
+                        while ci + next_len < chain.len()
+                            && chain[ci + next_len] == chain[ci + next_len - 1] + 1
+                        {
+                            next_len += 1;
+                        }
+                        next_len = next_len.min(next_clusters_needed.max(1));
+                        next_len = next_len.min((MAX_RUN_BYTES / clus_bytes).max(1));
+                        let next_bytes = next_len * clus_bytes;
+                        let next_want = (total - done).min(next_bytes);
+                        !(next_want == next_bytes)
+                    }
+                };
+                if batch.len() >= 16 || next_will_be_partial || done >= total {
+                    flush_batch(&mut batch, &*self.sb.device, buf_ptr)?;
+                }
             } else {
+                // Misaligned head or partial tail: flush pending whole batch first.
+                flush_batch(&mut batch, &*self.sb.device, buf_ptr)?;
                 // Misaligned start or a partial tail run: read whole sectors
                 // into a run-sized buffer, then copy the requested window.
                 let mut run_buf = alloc::vec![0u8; run_bytes];
@@ -207,14 +258,16 @@ impl InodeOps for Fat32Inode {
                     &mut run_buf,
                 )?;
                 buf[done..done + want].copy_from_slice(&run_buf[clus_off..clus_off + want]);
+                done += want;
+                if done >= total {
+                    break;
+                }
+                ci += run_len;
+                clus_off = 0;
             }
-            done += want;
-            if done >= total {
-                break;
-            }
-            ci += run_len;
-            clus_off = 0;
         }
+        // Flush any remaining whole-run batch.
+        flush_batch(&mut batch, &*self.sb.device, buf_ptr)?;
         Ok(done)
     }
 
@@ -247,60 +300,183 @@ impl InodeOps for Fat32Inode {
                 chain.len() as u32
             };
             if have < needed_clus {
+                let need_new = needed_clus - have;
                 if current_first_clus == 0 {
-                    current_first_clus = self.sb.alloc_cluster()?;
-                    zero_cluster(&self.sb, current_first_clus)?;
-                    if needed_clus > 1 {
-                        self.sb.extend_chain(current_first_clus, needed_clus - 1)?;
+                    // Bulk allocate all clusters at once for contiguous runs.
+                    let clusters = self.sb.alloc_clusters(need_new)?;
+                    // Link the new chain internally (first already EOC, link rest).
+                    for w in clusters.windows(2) {
+                        self.sb.write_fat_entry(w[0], w[1])?;
+                    }
+                    current_first_clus = clusters[0];
+                    // Zero new clusters, but skip those fully overwritten by this write
+                    // (they will be DMA'd directly without prior zero). A cluster is
+                    // fully overwritten iff its file byte range lies entirely inside
+                    // [offset, offset+len).
+                    let write_start = offset;
+                    let write_end = offset + buf.len() as u64;
+                    for (i, &c) in clusters.iter().enumerate() {
+                        let global_idx = i;
+                        let cs = global_idx as u64 * clus_size;
+                        let ce = cs + clus_size;
+                        if cs >= write_start && ce <= write_end {
+                            continue;
+                        }
+                        if cs < write_end && ce > write_start {
+                            continue;
+                        }
+                        zero_cluster(&self.sb, c)?;
                     }
                     self.first_clus.store(current_first_clus, Ordering::Relaxed);
                     self.sb.invalidate_chain(current_first_clus);
                     self.sync_clus_and_size()?;
                 } else {
-                    self.sb
-                        .extend_chain(current_first_clus, needed_clus - have)?;
+                    // Extend existing chain with bulk allocation.
+                    let clusters = self.sb.alloc_clusters(need_new)?;
+                    for w in clusters.windows(2) {
+                        self.sb.write_fat_entry(w[0], w[1])?;
+                    }
+                    // Link tail to new head.
+                    let tail = {
+                        let chain = self.ensure_chain_cache()?;
+                        chain[have as usize - 1]
+                    };
+                    self.sb.write_fat_entry(tail, clusters[0])?;
+                    let write_start = offset;
+                    let write_end = offset + buf.len() as u64;
+                    for (i, &c) in clusters.iter().enumerate() {
+                        let global_idx = have as usize + i;
+                        let cs = global_idx as u64 * clus_size;
+                        let ce = cs + clus_size;
+                        if cs >= write_start && ce <= write_end {
+                            continue;
+                        }
+                        // Partial overlap -> RMW will handle, skip zero.
+                        if cs < write_end && ce > write_start {
+                            continue;
+                        }
+                        zero_cluster(&self.sb, c)?;
+                    }
                     self.sb.invalidate_chain(current_first_clus);
                 }
             }
         }
 
-        let start_idx = (offset / clus_size) as u32;
+        let start_idx = (offset / clus_size) as usize;
         let chain = self.ensure_chain_cache()?;
-        let mut ci = start_idx as usize;
-        let mut current = if ci < chain.len() {
-            chain[ci]
-        } else {
+        if start_idx >= chain.len() && !buf.is_empty() {
             return Err(VfsError::IOError);
-        };
+        }
 
         let clus_bytes = clus_size as usize;
-        let mut cluster_buf = alloc::vec![0u8; clus_bytes];
+        let sec_per_clus = self.sb.bpb.sec_per_clus as u32;
         let mut done = 0usize;
+        let mut ci = start_idx;
         let mut clus_off = (offset % clus_size) as usize;
 
-        while done < buf.len() {
-            let need_rmw =
-                clus_off != 0 || buf.len() - done < clus_bytes || (done > 0 && clus_off == 0);
-            if need_rmw {
-                read_cluster(&self.sb, current, &mut cluster_buf)?;
-            } else {
-                cluster_buf = alloc::vec![0u8; clus_bytes];
+        // Batched write: coalesce contiguous whole-run writes into one AHCI NCQ submit
+        // (up to 16 slots) just like read. Head/tail partials flush pending batch first.
+        let mut write_batch: alloc::vec::Vec<(&[u8], u64, u32)> = alloc::vec::Vec::new();
+        let flush_write_batch = |batch: &mut alloc::vec::Vec<(&[u8], u64, u32)>,
+                                 device: &dyn crate::filesystems::blockdriver::traits::BlockDevice|
+         -> Result<(), VfsError> {
+            if batch.is_empty() {
+                return Ok(());
             }
-            let avail = clus_bytes - clus_off;
-            let want = (buf.len() - done).min(avail);
-            cluster_buf[clus_off..clus_off + want].copy_from_slice(&buf[done..done + want]);
-            write_cluster(&self.sb, current, &cluster_buf)?;
-            done += want;
-            if done >= buf.len() {
+            super::io::write_sectors_batch(device, batch)?;
+            batch.clear();
+            Ok(())
+        };
+
+        while done < buf.len() && ci < chain.len() {
+            // Find contiguous physical run length from ci.
+            let run_start = ci;
+            let mut run_len = 1usize;
+            while run_start + run_len < chain.len()
+                && chain[run_start + run_len] == chain[run_start + run_len - 1] + 1
+                && run_start + run_len <= start_idx + (offset as usize + buf.len() + clus_bytes - 1) / clus_bytes
+            {
+                run_len += 1;
+            }
+            // Bound run_len to remaining clusters needed.
+            let clusters_needed = (buf.len() - done + clus_off + clus_bytes - 1) / clus_bytes;
+            run_len = run_len.min(clusters_needed);
+
+            // Head partial cluster (unaligned start).
+            if clus_off != 0 {
+                flush_write_batch(&mut write_batch, &*self.sb.device)?;
+                let cur = chain[ci];
+                let mut cbuf = alloc::vec![0u8; clus_bytes];
+                read_cluster(&self.sb, cur, &mut cbuf)?;
+                let want = (buf.len() - done).min(clus_bytes - clus_off);
+                cbuf[clus_off..clus_off + want].copy_from_slice(&buf[done..done + want]);
+                write_cluster(&self.sb, cur, &cbuf)?;
+                done += want;
+                ci += 1;
+                clus_off = 0;
+                if done >= buf.len() {
+                    break;
+                }
+                continue;
+            }
+
+            // Now aligned at run_start. Check how many whole clusters we can batch.
+            let remaining = buf.len() - done;
+            let max_whole = remaining / clus_bytes;
+            // Whole clusters contiguous in this run.
+            let whole_in_run = run_len.min(max_whole);
+            if whole_in_run > 0 {
+                // Queue for batched DMA instead of single write_sectors.
+                let lba = self.sb.bpb.cluster_to_lba(chain[run_start]);
+                let secs = whole_in_run as u32 * sec_per_clus;
+                let slice = &buf[done..done + whole_in_run * clus_bytes];
+                write_batch.push((slice, lba, secs));
+                done += whole_in_run * clus_bytes;
+                ci += whole_in_run;
+                // Flush when batch full or next will be partial/tail.
+                let next_will_be_partial = {
+                    if done >= buf.len() || ci >= chain.len() {
+                        true
+                    } else {
+                        let rem = buf.len() - done;
+                        rem < clus_bytes
+                    }
+                };
+                if write_batch.len() >= 16 || next_will_be_partial || done >= buf.len() {
+                    flush_write_batch(&mut write_batch, &*self.sb.device)?;
+                }
+                if done >= buf.len() {
+                    break;
+                }
+                continue;
+            }
+
+            // Tail partial (remaining < clus_bytes, aligned start but not whole).
+            if remaining > 0 && remaining < clus_bytes {
+                flush_write_batch(&mut write_batch, &*self.sb.device)?;
+                let cur = chain[ci];
+                let mut cbuf = alloc::vec![0u8; clus_bytes];
+                // Only need RMW if cluster already has data (extending vs overwriting).
+                // For clusters within existing file size, preserve tail bytes.
+                // For newly allocated tail beyond old size, the cluster was zeroed, so no need to read.
+                let file_size = self.size.load(Ordering::Relaxed) as u64;
+                let cluster_file_end = (ci as u64 + 1) * clus_bytes as u64;
+                if (ci as u64 * clus_bytes as u64) < file_size || cluster_file_end <= offset + remaining as u64 {
+                    // Overwriting existing data or zeroed new cluster with partial write -> RMW to preserve unwritten tail.
+                    if (ci as u64 * clus_bytes as u64) < file_size {
+                        read_cluster(&self.sb, cur, &mut cbuf)?;
+                    } else {
+                        // New cluster beyond file size and not fully overwritten: already zeroed, keep zeros.
+                    }
+                }
+                let want = remaining.min(clus_bytes);
+                cbuf[0..want].copy_from_slice(&buf[done..done + want]);
+                write_cluster(&self.sb, cur, &cbuf)?;
                 break;
             }
-            ci += 1;
-            if ci >= chain.len() {
-                break;
-            }
-            current = chain[ci];
-            clus_off = 0;
         }
+        // Flush any remaining whole-run batch.
+        flush_write_batch(&mut write_batch, &*self.sb.device)?;
 
         self.sb.flush_fat_cache()?;
 

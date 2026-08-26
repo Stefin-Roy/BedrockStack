@@ -1,18 +1,18 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "CHANGELOG.md": "fad22616c26e6e7201bdd42e5146a77143acaf2f33fa890418f4c7fcfcba4d05",
-        "Cargo.toml": "6b1bada35d5be994ec0de09d30ed374cfa14714f31d62988f0ccdf8f64809d0c",
-        "LICENSE-APACHE": "0d542e0c8804e39aa7f37eb00da5a762149dc682d7829451287e11b938e94594",
-        "LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
-        "README.md": "f7395ee7cfe747025b5f4b0f6a1638e31a616783e376dc9372bc8af6dbad8d11",
-        "build.rs": "8de9d55780370383bbb0c5e816d03e343796fafe4e9ce9f3f8905a441823dae7",
-        "src/ast.rs": "fb4217d6e5592d92121b46f6bfa8a6a3f539dfcaa807c765700c4eb47da05e1d",
-        "src/error.rs": "6fb61831e03b7306ddf068695fb5a5319eed74bd8b9699cc6bc7a9b53b11e23d",
-        "src/iter.rs": "ad33766ad550b4071b0678d5dd60f605cd73709b79e7430a97481b9f13a57f25",
-        "src/lib.rs": "c7767d0ac38c311a93ab59d21c24ef370e9a6ab7bf385d622813647c6b2fc335",
-        "src/to_tokens.rs": "ecb46b57c86ae6570b86c6055abd2ec4d43277bfc8751bc7765f0c361791ff8b",
-        "src/utils.rs": "a17620d113a338a4a7ecdd23d90fa91b1ad7d4e9257e49ef3526f0d1d0b25d64"
+        "CHANGELOG.md": "af9b18b3c633adbf99b82f705546f16ec35ae6e6c0214ad863f41159b2f251e1",
+        "Cargo.toml": "d6fa21798a13fdcc9b010a4401949a7c14d3cdaa9a654a5a3bae595402866a4d",
+        "LICENSE-APACHE": "eb3d7b5485466acbd81f2b496f595ab637d2792e268206b27d99e793bdb67549",
+        "LICENSE-MIT": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9",
+        "README.md": "a00e40f1c8327d75724c16495394579675fd122ce238acc35c3e2d7c40ed1731",
+        "build.rs": "66a88cc5e0118105d2f445405dbcde6b669dbe8c5c29761b0054ca7e4582da3f",
+        "src/ast.rs": "713782933e9d73fed1f07511937ab3173b672cadb531558b64fce5bb23b97371",
+        "src/error.rs": "fb600ef99dc7e2ed89b7ebc306965f0b8054447986427546691a6d79ab485d7e",
+        "src/iter.rs": "bbaa07bc3b7f142ccd597ab76b029d49f20c6f7af99d611924e422365d3e08a3",
+        "src/lib.rs": "33482c7370650bf5afe1327dcd2331f79af9aeae31fa92f6eb31315ea780e760",
+        "src/to_tokens.rs": "7780c2349ae3a27a95571cea43f3ebed2de57a2e4ee5c019ccad54d21d5cc7c9",
+        "src/utils.rs": "843f4b67e6acc4773979a60768df90bfdde1524192851885a7b3b757ca9e688b"
     },
     "package": "413d67b29ef1021b4d60f4aa1e925ca031751e213832b4b1d588fae623c05c60"
 }

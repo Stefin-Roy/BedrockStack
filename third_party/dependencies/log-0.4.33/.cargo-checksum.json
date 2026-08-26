@@ -1,21 +1,21 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "CHANGELOG.md": "5f743a67299d8b20db21c7a6d09a2070d5a34792d2c729982950b0e5221cf732",
-        "Cargo.toml": "30526edc6bcb57820b7500b686f98bd63fe768645914a0646504527c1b727225",
-        "LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
-        "LICENSE-MIT": "6485b8ed310d3f0340bf1ad1f47645069ce4069dcc6bb46c7d5c6faf41de1fdb",
-        "README.md": "cd8854c3c57dfde940b5a32d1fdf7a2a3892cab9059fcbf5ca9fe846193c413a",
-        "src/__private_api.rs": "04032f3a3c18103d8e361e21bb9e6933cb9f8231c88cec8b88424b563b5b27ac",
-        "src/kv/error.rs": "6dae12424164c33b93915f5e70bd6d99d616c969c8bfb543806721dd9b423981",
-        "src/kv/key.rs": "db3b3ba027a65849d995c96828e92dca7aabbd2fc0bda529eea61fe3bdaa7ce3",
-        "src/kv/mod.rs": "a62c4dbfbcf28fc755c3662ea4a1e79268edc15311d5ca97b7f0325cc2dfb43f",
-        "src/kv/source.rs": "0f7c3a89c8998fe3805ae35f3e87778bca30a444da9f67964e674028f7864625",
-        "src/kv/value.rs": "aa2a1cfaa33ead7a29fbe3ed06aa3b061013de471e3abde3f1389cd7b78b9622",
-        "src/lib.rs": "7b605f1702b0a97c5ba5371aba62d6297cad21c00f1097040d201eb7cc28fa7e",
-        "src/macros.rs": "6917080cd9c4a2ca8128024f562a2bfdbbcd43616e41ef125289a30c6a9a4be2",
-        "src/serde.rs": "ead8df70c3ca3fafeed062f7a42d9b6f87bc7826055d71d8c4b77a0a25b57634",
-        "triagebot.toml": "a135e10c777cd13459559bdf74fb704c1379af7c9b0f70bc49fa6f5a837daa81"
+        "CHANGELOG.md": "8059ef7dd6c0a2cecbbf6d32295a6b15ddc70dd159081e362e28f86b58134cd2",
+        "Cargo.toml": "70a6cf2815c8d31ef4f840812ead9829e92319b66677cb875481b6f28f238bd1",
+        "LICENSE-APACHE": "7cfd738c53d61c79f07e348f622bf7707c9084237054d37fbe07788a75f5881c",
+        "LICENSE-MIT": "705aaaaecefa087c187bd2eacdb01b8ac1c5ee95b1d5d04d8d7efe0363207df8",
+        "README.md": "969cddfbc81c64cab8c5e92e6fab4f9b2d2c97fe0d17d6180a1c5c8856a96bae",
+        "src/__private_api.rs": "fc0690db4ebe6bf5ba2eb7aad34903f7851be5769a831e1683a9b4022278eb2a",
+        "src/kv/error.rs": "7a2f65e56d60214b92a06ce783df56465702a84c6cc37d57935aa35173278306",
+        "src/kv/key.rs": "888ac085a9e3cbe02dacf4d6bd8f4cdabe8ab20f2919f286a84811f3665e701f",
+        "src/kv/mod.rs": "80e394e7a4637ae0ec0667d71f71884dc8e29ae0236e57bd7e6ba0ebd50bd141",
+        "src/kv/source.rs": "a5993071cf343ceea490d8efb9fd6b6c8fa6c171001b231031cc4056f9218a8a",
+        "src/kv/value.rs": "2f27a7394f8be744d111d949f3dd16dd9a2add6499c4e4b4fc6fda1e9b5bc55d",
+        "src/lib.rs": "fb7391e90f73926d7af9fbfbc24f72acd3d153cbc80079905d85b316d036083c",
+        "src/macros.rs": "ecbcd493fdd435f7c2e2fa1ebe1b33573c1f80bc0d2014e37828d61a4c8cbb1e",
+        "src/serde.rs": "a81e7807b8857c72d3f5fb121f97e246559d9ea41471aaeb223647cf75e200a2",
+        "triagebot.toml": "2d1d46d069bc4e3739069676707ca2801e0e0ba58a784a264392362ff9ac4a77"
     },
     "package": "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 }

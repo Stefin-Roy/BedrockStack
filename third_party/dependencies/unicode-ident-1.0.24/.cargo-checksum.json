@@ -1,13 +1,13 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "Cargo.toml": "0bb9c0e006a21355cb85c7df72e78dd8ba6fffbb7dc3f1e7a4c19af53cd354da",
-        "LICENSE-APACHE": "62c7a1e35f56406896d7aa7ca52d0cc0d272ac022b5d2796e7d6905db8a3636a",
-        "LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
-        "LICENSE-UNICODE": "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1",
-        "README.md": "2fd3a0c6c9abd2c042fb319221f9ef2c95728a6e3725b0f067e4d315c5dbfe5a",
-        "src/lib.rs": "078912e7c64ba3ea1081b88c2610deba31eeb057c28f9d78e929db4856b7774f",
-        "src/tables.rs": "369c476ba91a39fce55563b692a3f598daf7f026cfe0a3796cfed1102fb3b190"
+        "Cargo.toml": "641eab709ad89f5050704876f04e1315c671552eef41e54d1159453eb7676484",
+        "LICENSE-APACHE": "20fe7b00e904ed690e3b9fd6073784d3fc428141dbd10b81c01fd143d0797f58",
+        "LICENSE-MIT": "36516aefdc84c5d5a1e7485425913a22dbda69eb1930c5e84d6ae4972b5194b9",
+        "LICENSE-UNICODE": "b87a64a8309bd6912a78d2f363fb3d33f2144cb167b7082a856c0edd3c9a24d2",
+        "README.md": "5f366988ac8041f86d1479841043dc7b8b6b6e4db63ae9cbe115a44416419937",
+        "src/lib.rs": "715e57bb13ceb2f0084e01193cc9c73865da7ae081941f8786673ec535e85b6f",
+        "src/tables.rs": "0c21c8b1ff9f144398c2dec2eee08abcadbb484c86d35d5fb604ff3c615b2b92"
     },
     "package": "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 }

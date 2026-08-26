@@ -645,7 +645,7 @@ fn serial_puts(s: &[u8]) {
     let n = s.len().min(buf.len());
     buf[..n].copy_from_slice(&s[..n]);
     unsafe {
-        let mut r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
+        let r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
         if r < 0 {
             let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
         }
@@ -660,7 +660,7 @@ fn serial_write(s: &[u8]) {
         let n = (s.len() - off).min(buf.len());
         buf[..n].copy_from_slice(&s[off..off + n]);
         unsafe {
-            let mut r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
+            let r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
             if r < 0 {
                 let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
             }

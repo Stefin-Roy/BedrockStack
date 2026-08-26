@@ -70,22 +70,55 @@ impl FatCache {
     }
 
     pub fn flush(&mut self, device: &dyn BlockDevice) -> Result<(), VfsError> {
+        if self.dirty.is_empty() {
+            return Ok(());
+        }
         let is_mirrored = self.mirrored;
-        for &lba in self.dirty.iter() {
-            let data = self.sectors.get(&lba).ok_or(VfsError::IOError)?;
-            write_sectors(device, lba, 1, data)?;
-            if is_mirrored {
-                for fat_num in 1..self.num_fats {
-                    let local_idx = (lba - self.fat0_lba) % self.fat_sz as u64;
-                    write_sectors(
-                        device,
-                        self.fat0_lba + (fat_num as u64) * self.fat_sz as u64 + local_idx,
-                        1,
-                        data,
-                    )?;
+        // Coalesce dirty sectors into maximal contiguous runs to collapse many
+        // single-sector AHCI cmds into a few multi-sector DMAs. For a 124 MiB
+        // ESP (~242 FAT sectors) a 5 MiB file needs ~1280 FAT entries = 10
+        // sectors, previously 10×1-sector writes + 10×mirrors → 20 cmds.
+        // Batched: 1 run → 2 cmds (primary+mirror) for mirrored volumes.
+        let mut dirty_lbas: Vec<u64> = self.dirty.iter().copied().collect();
+        dirty_lbas.sort_unstable();
+        let mut run_start = dirty_lbas[0];
+        let mut run_len: u32 = 1;
+        const PRDT_MAX_SECTORS: u32 = 504; // 252 KiB / 512, keep within 64-entry PRDT
+        let flush_run = |start: u64, len: u32| -> Result<(), VfsError> {
+            // Gather and write in PRDT-sized chunks.
+            let mut off: u32 = 0;
+            while off < len {
+                let chunk = core::cmp::min(PRDT_MAX_SECTORS, len - off);
+                let chunk_start = start + off as u64;
+                let mut buf = alloc::vec![0u8; chunk as usize * SECTOR_SIZE];
+                for i in 0..chunk {
+                    let lba = chunk_start + i as u64;
+                    let data = self.sectors.get(&lba).ok_or(VfsError::IOError)?;
+                    buf[i as usize * SECTOR_SIZE..(i as usize + 1) * SECTOR_SIZE].copy_from_slice(data);
                 }
+                write_sectors(device, chunk_start, chunk, &buf)?;
+                if is_mirrored {
+                    for fat_num in 1..self.num_fats {
+                        let local_idx = (chunk_start - self.fat0_lba) % self.fat_sz as u64;
+                        let mirror_start =
+                            self.fat0_lba + (fat_num as u64) * self.fat_sz as u64 + local_idx;
+                        write_sectors(device, mirror_start, chunk, &buf)?;
+                    }
+                }
+                off += chunk;
+            }
+            Ok(())
+        };
+        for &lba in dirty_lbas.iter().skip(1) {
+            if lba == run_start + run_len as u64 {
+                run_len += 1;
+            } else {
+                flush_run(run_start, run_len)?;
+                run_start = lba;
+                run_len = 1;
             }
         }
+        flush_run(run_start, run_len)?;
         self.dirty.clear();
         Ok(())
     }

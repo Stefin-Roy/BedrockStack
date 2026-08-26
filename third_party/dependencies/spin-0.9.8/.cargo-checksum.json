@@ -1,21 +1,21 @@
 {
     "$comment": "This file only protects against accidental modifications. It is not a security mechanism and does not protect against malicious changes.",
     "files": {
-        "CHANGELOG.md": "34b35704b01c68214b27cb20f0c4325b3ce6e40ce8fd5aa3d2b884697a27307b",
-        "Cargo.toml": "d2a17df2fa85736364744ea8279c6aed7276cabcc63bca2d25667198504e4be7",
-        "LICENSE": "6ac8711fb340c62ce0a4ecd463342d3fa0e8e70de697c863a2e1c0c53006003c",
-        "README.md": "78f0456ba0f3fa490d2bf38d79c42b293d551a9951da5bef0e1e5043143abf78",
-        "script/doc-upload.cfg": "7383ee022197c1dade9a2e6888261def4a80df08ecb72b1b4db47d1e8a6ff8e0",
-        "src/barrier.rs": "f8569a601d870a713344747eb355e6d840db510a599709173ebd0ccba5fc4028",
-        "src/lazy.rs": "45cf9174ee607e8a9acfa652b95c9b0ac71d98e89e73b9850041c79c5f3a726e",
-        "src/lib.rs": "85fa19874da6518e7ccd0d8bd3a0549fba52afd820789797e0221af1ac62196a",
-        "src/mutex.rs": "530039838850a0e71f4af42b9a7cffa0f922874e8f00001d36d67876842ed68f",
-        "src/mutex/fair.rs": "74cf2a0b8ab8e7a95564d97e8a66fc5d3d2641dd655de56a94ae4a93458f82c3",
-        "src/mutex/spin.rs": "a11e42d58e87a195e5e2110b46bda766f5a62a0c0b75a2b163f1ce37745bf337",
-        "src/mutex/ticket.rs": "1711bb02de48cf92f950b8f31946d5003225542ab6521333be1f525b76710f26",
-        "src/once.rs": "e4289220d505b7a15e8f9fb3f0d032ee57df6a5ee1d50123d4187e1afc6fb98b",
-        "src/relax.rs": "919c345bf55c3b2f9a7d9cd4aec2b2b3db68b6dc40ee2e4de4f6f32027abc290",
-        "src/rwlock.rs": "ba3b3dd20cdcd97691f042bcdd6d352e52601db7dc0cc7053c01a5873754b196"
+        "CHANGELOG.md": "6ecf85ce1fb653b368009e8835b35c2bbf27dea4b47b1cbb81b190111500731c",
+        "Cargo.toml": "0f886ad11a8ea5bf5e9f7ab32916aa35a4c127505f21c69b0fac1627704a1b3a",
+        "LICENSE": "5e7ac0ad7a72f8cb5772354d32b09ada8d9894212fda6ee13e1dd0eadc2e37e0",
+        "README.md": "536b2efad86cbeea59bb18a238d236ace8b773e6ff25eeb016b002d01c176c8d",
+        "script/doc-upload.cfg": "c8fb55db680fcd91cd1df161c7a7b2852110acff8643860481bcb062add1e45c",
+        "src/barrier.rs": "8185ec7690c9731712daeecd3d76862a49cd83e41d98340a0b9eac3ca0461c2d",
+        "src/lazy.rs": "1f109022bc4d4d5cd0db008c7ffa460843ab4a3b1800d2de456605d82a01c6d4",
+        "src/lib.rs": "31c28f2c7a8b67fa7609a83c64433cba923991a8be9424ee82b6ee9c4b0d31d6",
+        "src/mutex.rs": "3d03f6d584461d83bee3c96482903520ae9ea284e259f50d9a10652529151247",
+        "src/mutex/fair.rs": "e2423701dba2ba730e1677600efbfc8b31cc9a5ab40aae304709a19f7b636df3",
+        "src/mutex/spin.rs": "ea54769e5084fc982f396f6a9bd058f83bef2b7cf7d17fa6c6060d1f39ad036a",
+        "src/mutex/ticket.rs": "2f6b21eec4756c2dc3febcd85f7c77699de8625f1d625e502353e12d8e00c7fa",
+        "src/once.rs": "8e77bb2785dd9c19b1b307f560429b854a7a076d5e6bee2caa32ba9f326e08d2",
+        "src/relax.rs": "775d77d50eb78facf43ffc8e82036188506e634eedbc6d051abf5d525290780e",
+        "src/rwlock.rs": "3523c68a03d1d6ea076367191996ffccb11ed040ed0f547335c81277b2964283"
     },
     "package": "6980e8d7511241f8acf4aebddbb1ff938df5eebe98691418c4468d0b72a96a67"
 }
