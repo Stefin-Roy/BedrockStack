@@ -289,6 +289,16 @@ impl Kernel {
             }
         }
 
+        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
+        // NX) VM-backed allocation via direct kernel-heap alloc. Early so the
+        // boot animation can show the BGRT logo before the rest of the boot.
+        self.init_framebuffer_shadow();
+
+        // Early boot animation: static BGRT/hex + "BedrockOS" (no track/pulse).
+        // The track is added by `enable_bar()` after IRQs are live.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::early_show(&mut self.framebuffer);
+
         // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();
@@ -307,11 +317,6 @@ impl Kernel {
         crate::services::set_global(svc_static);
         self.services = Some(svc_static);
 
-        // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
-        // NX) VM-backed allocation via direct kernel-heap alloc. Nothing
-        // dereferences the display until `run()`.
-        self.init_framebuffer_shadow();
-
         // Initialise SMP — discover and start Application Processors.
         let ncpus =
             unsafe { crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc()) };
@@ -320,6 +325,11 @@ impl Kernel {
 
         // Enable interrupts after arch init, page tables, and SMP are live.
         self.svc().platform.enable_interrupts();
+
+        // Now that the LAPIC timer IRQ can fire, add the indeterminate track
+        // and arm the 30 fps sweep over the early static image.
+        #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
+        crate::bootanim::enable_bar();
     }
 
     /// Phase D: allocate the framebuffer shadow buffer on the kernel heap and bind it.

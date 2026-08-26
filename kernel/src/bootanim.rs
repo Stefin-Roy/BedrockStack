@@ -1,12 +1,17 @@
 //! Boot animation: hex logo + indeterminate pulse + stage text.
 //!
 //! Tier 2 design (30 fps, x86_64 only):
-//!   - Dark background `#0F111A`, hex logo with accent border, `BEDROCK OS`.
+//!   - Dark background `#0F111A`, hex logo with accent border, `BedrockOS`.
 //!   - Indeterminate pulse track (mono-directional sweep) with stage text
 //!     below it (`Initializing...` -> `Launching system...`).
 //!   - Stage text driven by `set_stage()` atomics — the ISR never blocks.
 //!   - `stop()` paints black efficiently with a single `clear()` +
 //!     `flush_full()` (one memset + one VRAM copy, no per-pixel loops).
+//!
+//! Early path: `early_show()` paints the static BGRT/hex + `BedrockOS` without
+//! the track/pulse immediately after ACPI BGRT is ready (no timer, no IRQ).
+//! `enable_bar()` adds the track/stage and arms the 30 fps sweep after
+//! interrupts are live.
 //!
 //! ISR safety: `sweep_tick` runs in LAPIC-timer ISR context with the timer
 //! base's queue lock held (`universal_timer::UniversalTimerImpl::tick`). It
@@ -77,15 +82,72 @@ pub enum Stage {
 }
 
 /// Draw the static boot screen and arm the 30 fps sweep.
+///
+/// Kept for compatibility: draws the full screen (with track) and arms.
 pub fn start(fb: &mut Framebuffer) {
     if fb.width() == 0 || fb.height() == 0 || fb.bpp() == 0 {
         return;
     }
+    // If early_show was already called, just arm the bar.
+    let already_shown = FB_PTR.load(Ordering::Relaxed) != 0;
+    if already_shown {
+        enable_bar();
+        return;
+    }
     FRAME.store(0, Ordering::Relaxed);
     STAGE.store(0, Ordering::Relaxed);
-    draw_static(fb);
+    draw_static(fb, true);
     let ctx = fb as *mut Framebuffer as *mut u8;
     FB_PTR.store(ctx as u64, Ordering::Relaxed);
+    let id = universal_timer::universal_timer().set_periodic(SWEEP_PERIOD_NS, sweep_tick, ctx);
+    *TIMER_ID.lock() = Some(id);
+}
+
+/// Draw the early static screen (BGRT/hex + `BedrockOS`) without the
+/// indeterminate track. Called immediately after BGRT parse + shadow
+/// allocation, before interrupts are enabled. No timer is armed.
+pub fn early_show(fb: &mut Framebuffer) {
+    if fb.width() == 0 || fb.height() == 0 || fb.bpp() == 0 {
+        return;
+    }
+    // If already shown (e.g., via start), keep the later full draw.
+    if FB_PTR.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    FRAME.store(0, Ordering::Relaxed);
+    STAGE.store(0, Ordering::Relaxed);
+    draw_static(fb, false);
+    let ctx = fb as *mut Framebuffer as *mut u8;
+    FB_PTR.store(ctx as u64, Ordering::Relaxed);
+}
+
+/// Add the indeterminate track/stage and arm the 30 fps sweep.
+/// No-op if already armed or if `early_show` was never called.
+pub fn enable_bar() {
+    if TIMER_ID.lock().is_some() {
+        return;
+    }
+    let ptr_val = FB_PTR.load(Ordering::Relaxed);
+    if ptr_val == 0 {
+        return;
+    }
+    let fb = unsafe { &mut *(ptr_val as *mut Framebuffer) };
+    if fb.width() == 0 || fb.height() == 0 || fb.bpp() == 0 || fb.shadow_ptr().is_null() {
+        return;
+    }
+    // Paint the track + initial stage text on top of the early static image,
+    // then flush the delta before arming so the first pulse frame is coherent.
+    let w = fb.width();
+    let h = fb.height();
+    let hex_y = hex_center_y(h);
+    let bedrock_y = bedrock_y(hex_y);
+    draw_track(fb, w, h, bedrock_y);
+    let s = STAGE.load(Ordering::Relaxed);
+    draw_stage_text(fb, w, h, bedrock_y, s);
+    fb.flush();
+
+    // Arm the sweep. Use the stored FB_PTR as context (same as start).
+    let ctx = ptr_val as *mut u8;
     let id = universal_timer::universal_timer().set_periodic(SWEEP_PERIOD_NS, sweep_tick, ctx);
     *TIMER_ID.lock() = Some(id);
 }
@@ -129,7 +191,7 @@ pub fn set_stage_raw(idx: u8) {
 
 // ── static drawing ─────────────────────────────────────────────────────
 
-fn draw_static(fb: &mut Framebuffer) {
+fn draw_static(fb: &mut Framebuffer, with_track: bool) {
     let (w, h) = (fb.width(), fb.height());
 
     fb.fill_solid(BG);
@@ -144,12 +206,13 @@ fn draw_static(fb: &mut Framebuffer) {
     }
 
     let bedrock_y = bedrock_y(hex_y);
-    draw_centered_colored(fb, w, bedrock_y, "BEDROCK OS", FG_TEXT, BG);
+    draw_centered_colored(fb, w, bedrock_y, "BedrockOS", FG_TEXT, BG);
 
-    draw_track(fb, w, h, bedrock_y);
-
-    let s = STAGE.load(Ordering::Relaxed);
-    draw_stage_text(fb, w, h, bedrock_y, s);
+    if with_track {
+        draw_track(fb, w, h, bedrock_y);
+        let s = STAGE.load(Ordering::Relaxed);
+        draw_stage_text(fb, w, h, bedrock_y, s);
+    }
 
     fb.flush_full();
 }

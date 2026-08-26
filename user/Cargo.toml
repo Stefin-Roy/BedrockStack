@@ -3,5 +3,8 @@ name = "user"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+selftest = []
+
 [dependencies]
 libc = { path = "libc" }
