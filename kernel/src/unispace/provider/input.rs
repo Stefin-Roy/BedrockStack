@@ -170,14 +170,31 @@ static KBD_METHODS: [MethodDesc; 2] = [
 
 // ── Registration ──────────────────────────────────────────────────────
 
-/// Register the `/input` system.
+/// Register the `/input` system and its `/dev/input` alias.
+///
+/// Device probing belongs under `/dev`; keep `/input` for compatibility and
+/// mirror the same devices/events at `/dev/input/{devices,events,overflows,kbd}`.
+/// Kbd state is shared via the same `Arc` so `/input/kbd:get` and
+/// `/dev/input/kbd:get` drain the same queue.
 pub fn register() -> Result<(), UnispaceError> {
+    let kbd = Arc::new(KbdObject::new());
+    let kbd_alias = kbd.clone();
     let input = Arc::new(SimpleDir::new());
     input.insert("devices", Arc::new(DevicesObject));
     input.insert("events", Arc::new(EventsObject));
     input.insert("overflows", Arc::new(OverflowsObject));
-    input.insert("kbd", Arc::new(KbdObject::new()));
-    super::super::register("input", input)
+    input.insert("kbd", kbd);
+    super::super::register("input", input.clone())?;
+    // Alias under /dev/input — `/dev` is guaranteed to exist because
+    // `provider::dev::register` runs before `provider::input::register`
+    // in `register_all`. Fail loudly if the walk cannot insert.
+    let dev_alias = Arc::new(SimpleDir::new());
+    dev_alias.insert("devices", Arc::new(DevicesObject));
+    dev_alias.insert("events", Arc::new(EventsObject));
+    dev_alias.insert("overflows", Arc::new(OverflowsObject));
+    dev_alias.insert("kbd", kbd_alias);
+    super::super::connect("/dev/input", dev_alias)?;
+    Ok(())
 }
 
 // ── `/input/devices` ──────────────────────────────────────────────────

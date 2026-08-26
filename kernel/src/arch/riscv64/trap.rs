@@ -1,8 +1,15 @@
 use core::arch::asm;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
 use crate::arch::riscv64::sbi;
 use crate::arch::riscv64::time;
 use crate::platform::riscv_virt::plic;
+
+static PF_COUNT: AtomicU64 = AtomicU64::new(0);
+pub fn pf_count() -> u64 {
+    PF_COUNT.load(Ordering::Relaxed)
+}
 
 const SCAUSE_INTERRUPT: u64 = 1 << 63;
 
@@ -147,6 +154,7 @@ extern "C" fn __trap_handler(frame: &TrapFrame) {
         let exception = scause;
         match exception {
             12 | 13 | 15 => {
+                PF_COUNT.fetch_add(1, Ordering::Relaxed);
                 panic!(
                     "page fault: scause={:#x}, sepc={:#x}, stval={:#x}",
                     scause, frame.sepc, stval

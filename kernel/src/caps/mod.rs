@@ -620,14 +620,26 @@ pub fn check_path(caps: Option<&[Cap]>, components: &[&str], method: Option<&str
 /// This satisfies spec "INIT MUST NOT have a wildcard ALL AUTH cap, it MUST be manually
 /// granted capability to everything".
 pub fn full_caps_for_init() -> Vec<Cap> {
-    let mut caps = Vec::new();
+    let mut caps: Vec<Cap> = Vec::new();
     let mut add = |path: &str, method: Option<&str>, perm: Perm| {
+        // Deduplicate covering perms and alias double-inserts to avoid window waste.
+        for c in caps.iter_mut() {
+            if c.path == path && c.method.as_deref() == method {
+                if c.perm.covers(perm) {
+                    return;
+                }
+                if perm.covers(c.perm) {
+                    c.perm = perm;
+                    return;
+                }
+            }
+        }
         caps.push(Cap { path: String::from(path), method: method.map(|s| String::from(s)), perm });
     };
     // Root
     add("", None, Perm::RW);
-    // Top-level dirs
-    for d in ["A", "B", "sys", "dev", "driver", "input", "kernel", "proc"] {
+    // Top-level dirs (drivers is new canonical, driver kept as legacy alias)
+    for d in ["A", "B", "sys", "dev", "drivers", "driver", "input", "kernel", "proc"] {
         add(d, None, Perm::RW);
     }
     // sys leaves
@@ -640,13 +652,50 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     // dev/random + dev/urandom (CSPRNG devices, no methods)
     add("dev/random", None, Perm::RW);
     add("dev/urandom", None, Perm::RW);
-    // driver
-    add("driver/debugserial", None, Perm::RW);
-    add("driver/audio", None, Perm::RW);
-    for m in ["play_tone", "play_pcm"] { add("driver/audio", Some(m), Perm::RW); }
-    // input
+    // intermediate dirs for new hierarchy (ancestor R needed)
+    for d in ["sys/mm", "sys/arch", "sys/pci", "sys/platform", "sys/smp", "sys/sched", "sys/acpi", "sys/fs", "sys/input", "kernel/mm", "kernel/mm/heap", "kernel/mm/vmm", "kernel/smp", "kernel/sched", "kernel/acpi", "kernel/dump", "kernel/arch", "kernel/platform", "dev/pci", "dev/block", "dev/usb", "dev/input"] {
+        add(d, None, Perm::RW);
+    }
+    // riscv physmap uses sys/arch/satp via arch provider; ensure ancestor still covered
+    add("sys/arch/satp", None, Perm::RW);
+    // drivers (canonical) + legacy driver alias
+    for prefix in ["drivers", "driver"] {
+        add(&alloc::format!("{}/debugserial", prefix), None, Perm::RW);
+        add(&alloc::format!("{}/audio", prefix), None, Perm::RW);
+        for m in ["play_tone", "play_pcm"] { add(&alloc::format!("{}/audio", prefix), Some(m), Perm::RW); }
+        // drivers extended
+        add(&alloc::format!("{}/ps2", prefix), None, Perm::RW);
+        add(&alloc::format!("{}/usb", prefix), None, Perm::RW);
+    }
+    // dev probing aliases (pci, block, usb) — include flat sibling aliases for tooling
+    for p in ["dev/pci", "dev/pci/count", "dev/pci_count", "dev/block", "dev/block/count", "dev/block_count", "dev/usb", "dev/usb/count", "dev/input", "dev/input/devices", "dev/input/events", "dev/input/overflows", "dev/input/kbd"] {
+        add(p, None, Perm::RW);
+    }
+    for m in ["get", "flush"] { add("dev/input/kbd", Some(m), Perm::RW); }
+    // input (legacy) + dev/input alias already above
     for f in ["input/devices", "input/events", "input/overflows", "input/kbd"] { add(f, None, Perm::RW); }
     for m in ["get", "flush"] { add("input/kbd", Some(m), Perm::RW); }
+    // sys extended RO
+    for p in ["sys/mm/layout", "sys/mm/physmap", "sys/arch/cpufeat", "sys/arch/paging", "sys/arch/lapic", "sys/arch/satp", "sys/pci/ecam", "sys/platform/apic", "sys/platform/ioapic", "sys/platform/pit", "sys/platform/interrupts", "sys/smp/count", "sys/sched/counts", "sys/acpi/cpus", "sys/acpi/mcfg", "sys/acpi/dmar", "sys/acpi/tables", "sys/fs/mounts", "sys/input/ps2"] {
+        add(p, None, Perm::RW);
+    }
+    // kernel mm — include both hierarchical and flat alias for heap/vmm children
+    for p in ["kernel/mm/heap", "kernel/mm/heap/chunks", "kernel/mm/heap_chunks", "kernel/mm/phys", "kernel/mm/vmm", "kernel/mm/vmm/clones", "kernel/mm/vmm_clones", "kernel/mm/vmm/cpu_roots", "kernel/mm/vmm_cpu_roots", "kernel/mm/fault"] {
+        add(p, None, Perm::RW);
+    }
+    for m in ["translate"] { add("kernel/mm/vmm", Some(m), Perm::RW); }
+    // kernel arch
+    for p in ["kernel/arch/syscall", "kernel/arch/gdt"] { add(p, None, Perm::RW); }
+    // kernel smp/sched
+    for p in ["kernel/smp/cpus", "kernel/smp/states", "kernel/smp/ap_ready", "kernel/sched/snapshot", "kernel/sched/queue", "kernel/sched/lineage", "kernel/sched/kstacks"] {
+        add(p, None, Perm::RW);
+    }
+    // kernel acpi
+    for p in ["kernel/acpi/platform"] { add(p, None, Perm::RW); }
+    // kernel dump
+    for p in ["kernel/dump/in_progress", "kernel/dump/last"] { add(p, None, Perm::RW); }
+    // kernel platform
+    for p in ["kernel/platform/apic"] { add(p, None, Perm::RW); }
     // kernel/timer + bootargs
     add("kernel/timer", None, Perm::RW);
     for m in ["sleep", "sleep_ms", "until", "epoch_secs"] { add("kernel/timer", Some(m), Perm::RW); }
@@ -675,25 +724,34 @@ pub fn full_caps_for_init() -> Vec<Cap> {
     }
     // Generic file method grants for any file under A/B - enumerated via prefix auto-grant at runtime,
     // but pre-grant a few more VFS dir methods for subdirs that may be created.
-    // Ensure caps fit within window
+    // Ensure caps fit within window — log truncation (window fits ~290 entries at ~28B/entry).
+    if caps.len() > MAX_CAPS_PER_TASK {
+        crate::drivers::serial::SerialPort::puts("[caps] WARN: INIT caps truncated from ");
+        crate::drivers::serial::SerialPort::put_u64(caps.len() as u64);
+        crate::drivers::serial::SerialPort::puts(" to ");
+        crate::drivers::serial::SerialPort::put_u64(MAX_CAPS_PER_TASK as u64);
+        crate::drivers::serial::SerialPort::puts("\n");
+    }
     caps.truncate(MAX_CAPS_PER_TASK);
-    // Debug: warn if serialized size would exceed window (should fit in 8K)
-    // The window is 8192; average entry ~28 bytes, so ~290 entries max. Current ~160 fits.
+    // Window is CAP_SLOT_SIZE (16384, ~585 entries); current count should fit.
+    // Serialized truncation is warned in serialize_to_page.
     caps
 }
 
-/// Serialize caps into an 8K supervisor window (header u32 count + entries).
+/// Serialize caps into a CAP_SLOT_SIZE supervisor window (header u32 count + entries).
 /// Each entry: u32 path_len, path bytes, u32 method_len (0xFFFFFFFF = None), method bytes, u8 perm, 3 pad to 4.
 /// Window is zeroed first; callers must ensure `caps.len() <= MAX_CAPS_PER_TASK`.
 pub fn serialize_to_page(caps: &[Cap], phys: u64) {
     let size = crate::mm::layout::CAP_SLOT_SIZE as usize;
-    // phys is base of 2-page contiguous window; second page at phys+4096
-    let va0 = crate::mm::layout::to_physmap(phys) as *mut u8;
-    let va1 = crate::mm::layout::to_physmap(phys + 4096) as *mut u8;
+    let pages = size / 4096;
+    // phys is base of contiguous window
     unsafe {
-        core::ptr::write_bytes(va0, 0, 4096);
-        core::ptr::write_bytes(va1, 0, 4096);
-        let mut bounce = [0u8; 8192];
+        for i in 0..pages {
+            core::ptr::write_bytes(crate::mm::layout::to_physmap(phys + i as u64 * 4096) as *mut u8, 0, 4096);
+        }
+        let mut bounce = [0u8; 16384];
+        // static assert size fits bounce
+        assert!(size <= bounce.len());
         core::ptr::write_bytes(bounce.as_mut_ptr(), 0, size);
         let mut off = 0usize;
         let mut n_written: u32 = 0;
@@ -701,6 +759,11 @@ pub fn serialize_to_page(caps: &[Cap], phys: u64) {
         off += 4;
         for c in caps {
             if off + 8 + c.path.len() + 8 + c.method.as_ref().map(|m| m.len()).unwrap_or(0) + 4 > size {
+                crate::drivers::serial::SerialPort::puts("[caps] WARN: window truncated at ");
+                crate::drivers::serial::SerialPort::put_u64(n_written as u64);
+                crate::drivers::serial::SerialPort::puts("/");
+                crate::drivers::serial::SerialPort::put_u64(caps.len() as u64);
+                crate::drivers::serial::SerialPort::puts(" entries\n");
                 break;
             }
             // path
@@ -736,7 +799,11 @@ pub fn serialize_to_page(caps: &[Cap], phys: u64) {
             n_written += 1;
         }
         *(bounce.as_mut_ptr() as *mut u32) = n_written;
-        core::ptr::copy_nonoverlapping(bounce.as_ptr(), va0, 4096);
-        core::ptr::copy_nonoverlapping(bounce.as_ptr().add(4096), va1, core::cmp::min(size - 4096, 4096));
+        for i in 0..pages {
+            let src = bounce.as_ptr().add(i * 4096);
+            let dst = crate::mm::layout::to_physmap(phys + i as u64 * 4096) as *mut u8;
+            let copy_len = core::cmp::min(4096, size - i * 4096);
+            core::ptr::copy_nonoverlapping(src, dst, copy_len);
+        }
     }
 }

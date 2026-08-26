@@ -122,6 +122,14 @@ fn doom_caps() -> &'static [libc::process::Cap<'static>] {
         libc::process::Cap { path: "dev/fb", method: None, perm: RW },
         libc::process::Cap { path: "dev/fb", method: Some("mode"), perm: RW },
         libc::process::Cap { path: "dev/fb", method: Some("clear"), perm: RW },
+        libc::process::Cap { path: "dev/input", method: None, perm: R },
+        libc::process::Cap { path: "dev/input/events", method: None, perm: R },
+        libc::process::Cap { path: "drivers", method: None, perm: R },
+        libc::process::Cap { path: "drivers/debugserial", method: None, perm: RW },
+        libc::process::Cap { path: "drivers/audio", method: None, perm: RW },
+        libc::process::Cap { path: "drivers/audio", method: Some("play_pcm"), perm: RW },
+        libc::process::Cap { path: "drivers/audio", method: Some("play_tone"), perm: RW },
+        // legacy alias kept until userspace fully migrated
         libc::process::Cap { path: "driver", method: None, perm: R },
         libc::process::Cap { path: "driver/debugserial", method: None, perm: RW },
         libc::process::Cap { path: "driver/audio", method: None, perm: RW },
@@ -606,12 +614,20 @@ fn play_startup_wav() {
         wire[2] = ((g >> 16) & 0xFF) as u8;
         wire[3] = ((g >> 24) & 0xFF) as u8;
         let _ = unsafe {
-            libc::syscall::write_path(
-                b"/driver/audio:play_pcm\0",
+            let mut r = libc::syscall::write_path(
+                b"/drivers/audio:play_pcm\0",
                 &mut wire[..4 + got],
                 4 + got,
                 0,
-            )
+            );
+            if r < 0 {
+                r = libc::syscall::write_path(
+                    b"/driver/audio:play_pcm\0",
+                    &mut wire[..4 + got],
+                    4 + got,
+                    0,
+                );
+            }
         };
         if iter < 16 {
             serial_puts(b"[wav] wrote\n");
@@ -624,15 +640,17 @@ fn play_startup_wav() {
     libc::stdio::fclose(f);
 }
 
-/// Write a diagnostic line to live serial (COM1) via `/driver/debugserial`.
-/// INIT's stdout is captured (only dumped after exit), so this is the way to
-/// see progress on the boot console immediately.
+/// Write a diagnostic line to live serial (COM1) via `/drivers/debugserial` (canonical).
+/// Legacy `/driver/debugserial` alias is tried as fallback.
 fn serial_puts(s: &[u8]) {
     let mut buf = [0u8; 128];
     let n = s.len().min(buf.len());
     buf[..n].copy_from_slice(&s[..n]);
     unsafe {
-        let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
+        let mut r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
+        if r < 0 {
+            let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
+        }
     }
 }
 
@@ -644,7 +662,10 @@ fn serial_write(s: &[u8]) {
         let n = (s.len() - off).min(buf.len());
         buf[..n].copy_from_slice(&s[off..off + n]);
         unsafe {
-            let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
+            let mut r = libc::syscall::write_path(b"/drivers/debugserial\0", &mut buf[..n], n, 0);
+            if r < 0 {
+                let _ = libc::syscall::write_path(b"/driver/debugserial\0", &mut buf[..n], n, 0);
+            }
         }
         off += n;
     }

@@ -628,6 +628,43 @@ pub fn set_current_root(root: u64) {
     }
 }
 
+/// Snapshot for unispace: (clone_roots, tlb_seq, half_boundary)
+pub fn vmm_global_snapshot() -> (usize, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    let clones = CLONE_ROOTS.load(Ordering::SeqCst);
+    #[cfg(not(target_arch = "x86_64"))]
+    let clones = 0usize;
+    let seq = TLB_SEQ.load(Ordering::Acquire);
+    (clones, seq, HALF_BOUNDARY)
+}
+
+pub fn vmm_cpu_roots_snapshot() -> [u64; crate::smp::MAX_CPUS] {
+    let mut out = [0u64; crate::smp::MAX_CPUS];
+    for i in 0..crate::smp::MAX_CPUS {
+        out[i] = CPU_ROOT[i].load(Ordering::Relaxed);
+    }
+    out
+}
+
+pub fn vmm_tlb_acks_snapshot() -> [u64; crate::smp::MAX_CPUS] {
+    let mut out = [0u64; crate::smp::MAX_CPUS];
+    for i in 0..crate::smp::MAX_CPUS {
+        out[i] = TLB_ACK[i].load(Ordering::Acquire);
+    }
+    out
+}
+
+pub fn vmm_clone_roots_snapshot() -> alloc::vec::Vec<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        clone_roots()
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        alloc::vec::Vec::new()
+    }
+}
+
 /// Per-CPU acknowledgement: the highest shootdown generation each CPU has
 /// flushed and acknowledged.
 static TLB_ACK: [AtomicU64; crate::smp::MAX_CPUS] =

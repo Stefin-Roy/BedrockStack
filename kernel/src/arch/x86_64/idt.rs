@@ -187,6 +187,11 @@ pub fn vec34_count() -> u64 {
     VEC34_COUNT.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+static PF_COUNT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn pf_count() -> u64 {
+    PF_COUNT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 extern "x86-interrupt" fn irq_34(frame: InterruptStackFrame) {
     let u = from_user(&frame);
     if u {
@@ -476,6 +481,7 @@ extern "x86-interrupt" fn page_fault_handler(
     mut frame: InterruptStackFrame,
     error_code: PageFaultErrorCode,
 ) {
+    PF_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let u = from_user(&frame);
     if u {
         swapgs();

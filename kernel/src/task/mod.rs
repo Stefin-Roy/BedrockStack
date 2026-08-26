@@ -276,14 +276,17 @@ pub fn alloc_kernel_stack(alloc: &mut BitmapAllocator) -> Option<(u64, usize)> {
 /// (supervisor-only READ, no USER). Returns the base physical frame
 /// (2 contiguous 4K). The caller fills it via `caps::serialize_to_page`.
 pub fn alloc_caps_page(root: u64, va: u64, alloc: &mut BitmapAllocator) -> Option<u64> {
-    let phys = alloc.alloc_contiguous(2)?;
-    unsafe {
-        core::ptr::write_bytes(crate::mm::layout::to_physmap(phys) as *mut u8, 0, 4096);
-        core::ptr::write_bytes(crate::mm::layout::to_physmap(phys + 4096) as *mut u8, 0, 4096);
+    let pages = (crate::mm::layout::CAP_SLOT_SIZE as usize) / 4096;
+    let phys = alloc.alloc_contiguous(pages)?;
+    for i in 0..pages {
+        unsafe {
+            core::ptr::write_bytes(crate::mm::layout::to_physmap(phys + i as u64 * 4096) as *mut u8, 0, 4096);
+        }
     }
     let mut vmm = Vmm::from_root(root);
-    vmm.map_4k(alloc, va, phys, PageFlags::READ);
-    vmm.map_4k(alloc, va + 4096, phys + 4096, PageFlags::READ);
+    for i in 0..pages {
+        vmm.map_4k(alloc, va + i as u64 * 4096, phys + i as u64 * 4096, PageFlags::READ);
+    }
     Some(phys)
 }
 
@@ -297,7 +300,8 @@ pub fn free_caps_page(root: u64, va: u64, alloc: &mut BitmapAllocator) {
         crate::mm::layout::CAP_SLOT_SIZE,
         &mut frames,
     );
-    debug_assert!(frames.len() <= 2, "caps window should be at most 2 pages");
+    let expected = (crate::mm::layout::CAP_SLOT_SIZE as usize) / 4096;
+    debug_assert!(frames.len() <= expected, "caps window should be at most {} pages", expected);
     for p in frames {
         unsafe { alloc.free(p) };
     }
@@ -1302,10 +1306,10 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
         if root != 0 && root != kernel_root() {
             free_caps_page(root, task.caps_slot_va, alloc);
         } else {
-            // kernel thread caps phys still needs free (2 pages)
-            unsafe {
-                alloc.free(task.caps_phys);
-                alloc.free(task.caps_phys + 4096);
+            // kernel thread caps phys still needs free (CAP_SLOT_SIZE pages)
+            let pages = (crate::mm::layout::CAP_SLOT_SIZE as usize) / 4096;
+            for i in 0..pages {
+                unsafe { alloc.free(task.caps_phys + i as u64 * 4096) };
             }
         }
     }
@@ -1633,6 +1637,40 @@ extern "C" fn smoke_task_b() -> ! {
         yield_now();
     }
     exit_current(1)
+}
+
+/// Snapshot for unispace: (next_id, qlen, current_present, sleeping, waiters, zombies, reclaim, kstack_in_use)
+pub fn sched_snapshot() -> (u64, usize, bool, usize, usize, usize, usize, usize) {
+    let next = NEXT_ID.load(Ordering::Relaxed);
+    let qlen = QUEUE.lock().len();
+    let cur = CURRENT.lock().is_some();
+    let sleeping = SLEEPING.lock().len();
+    let waiters = WAITERS.lock().len();
+    let zombies = ZOMBIES.lock().len();
+    let reclaim = RECLAIM.lock().len();
+    let kstack_used = KSTACK_IN_USE.lock().iter().filter(|&&b| b).count();
+    (next, qlen, cur, sleeping, waiters, zombies, reclaim, kstack_used)
+}
+
+pub fn kstack_snapshot() -> alloc::vec::Vec<(usize, u64)> {
+    let in_use = KSTACK_IN_USE.lock();
+    let mut out = alloc::vec::Vec::new();
+    for (slot, &used) in in_use.iter().enumerate() {
+        if used {
+            let base = KSTACK_VADDR_BASE - (slot as u64) * KSTACK_SIZE;
+            out.push((slot, base));
+        }
+    }
+    out
+}
+
+pub fn queue_snapshot() -> alloc::vec::Vec<(u64, u8)> {
+    let q = QUEUE.lock();
+    q.iter().map(|t| (t.id, t.state as u8)).collect()
+}
+
+pub fn lineage_snapshot() -> alloc::vec::Vec<(u64, u64)> {
+    lineage_map().lock().iter().map(|(&k, &v)| (k, v)).collect()
 }
 
 /// Spawn two kernel-only tasks that alternate on serial, then run the

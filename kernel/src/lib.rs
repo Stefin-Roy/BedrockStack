@@ -408,6 +408,27 @@ impl Kernel {
         match AcpiSubsystem::new(self.rsdp_addr, self.rsdp_data) {
             Ok(a) => {
                 log::info!("ACPI subsystem initialised");
+                // Publish global snapshot for unispace providers before moving into self.
+                // Clone cpus etc. for global; AcpiSubsystem is moved into self afterwards
+                // via a temporary clone for the global (cheap: Vec clone).
+                let global_c = AcpiSubsystem {
+                    interrupt_model: match &a.interrupt_model {
+                        crate::acpi::InterruptModel::Apic(apic) => crate::acpi::InterruptModel::Apic(apic.clone()),
+                        crate::acpi::InterruptModel::Unknown => crate::acpi::InterruptModel::Unknown,
+                    },
+                    processor_info: a.processor_info.clone(),
+                    cpus: a.cpus.clone(),
+                    pci_config_regions: crate::acpi::PciConfigRegions { regions: a.pci_config_regions.regions.clone() },
+                    platform_info: a.platform_info.clone(),
+                    dmar: a.dmar.clone(),
+                    table_count: a.table_count,
+                    // Global snapshot is for RO introspection (cpus, mcfg, dmar);
+                    // the AML interpreter stays with self.acpi (needs Mutex) and
+                    // is not needed by providers.
+                    #[cfg(target_arch = "x86_64")]
+                    aml: None,
+                };
+                crate::acpi::set_global_snapshot(global_c);
                 self.acpi = Some(a);
             }
             Err(e) => {

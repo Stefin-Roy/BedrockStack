@@ -799,3 +799,33 @@ pub fn try_allocate_ap_stack(_cpu_id: u32) -> Result<u64, crate::mm::phys_alloc:
     let base = alloc.try_alloc_contiguous(AP_STACK_PAGES)?;
     Ok(base + AP_STACK_PAGES as u64 * 4096)
 }
+
+pub fn smp_snapshot() -> alloc::vec::Vec<(u32, u32, bool, u8, u64, bool, u32, u64)> {
+    let mut out = alloc::vec::Vec::new();
+    let count = crate::smp::cpu_count() as usize;
+    for i in 0..count.min(MAX_CPUS) {
+        let pc = per_cpu_by_id(i as u32);
+        let state = cpu_state(i as u32) as u8;
+        let has_task = !pc.current_task.load(Ordering::Relaxed).is_null();
+        let preempt = pc.preempt_count.load(Ordering::Relaxed);
+        let ticks = pc.sched_ticks.load(Ordering::Relaxed);
+        out.push((pc.cpu_id, pc.apic_id, pc.is_bsp, state, pc.stack_top, has_task, preempt, ticks));
+    }
+    out
+}
+
+pub fn cpu_states_snapshot() -> [u8; MAX_CPUS] {
+    let mut out = [0u8; MAX_CPUS];
+    for i in 0..MAX_CPUS {
+        out[i] = CPU_STATES[i].load(Ordering::Relaxed);
+    }
+    out
+}
+
+pub fn ap_ready_snapshot() -> [bool; MAX_CPUS] {
+    let mut out = [false; MAX_CPUS];
+    for i in 0..MAX_CPUS {
+        out[i] = AP_READY[i].ready.load(Ordering::Relaxed);
+    }
+    out
+}

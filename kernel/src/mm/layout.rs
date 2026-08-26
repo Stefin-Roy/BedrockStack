@@ -130,7 +130,7 @@ pub const IOMMU_VADDR_FLOOR: u64 = IOMMU_VADDR_BASE - 0x2000_0000;
 /// base via [`pick_caps_va`] (per-task randomization of the supervisor
 /// window).
 pub const CAP_SLOT_VA: u64 = 0x0000_7FFF_8000_0000;
-pub const CAP_SLOT_SIZE: u64 = 8192;
+pub const CAP_SLOT_SIZE: u64 = 16384;
 
 /// Randomized caps-window band: starts 2 MiB above the highest possible
 /// post-ASLR stack top and spans ~254 MiB (≈15 bits of entropy at 4 KiB

@@ -112,3 +112,76 @@ impl Object for SimpleDir {
         Ok(self.remove(name))
     }
 }
+
+/// A hybrid object that presents a Service value while also hosting children.
+///
+/// The `service` provides the value/methods (read/write/invoke) and determines
+/// `kind`, while `inner` hosts child entries. This lets a leaf Service such as
+/// `/kernel/mm/heap` stay a Service for `read()` yet still be traversed to
+/// `/kernel/mm/heap/chunks`. Without this, a `connect()` to a child of a
+/// Service would hit `Unsupported` and `resolve_parsed` would return
+/// `NotADirectory`. `Dir` listing of this object returns the children, not the
+/// service listing — `read()` returns the service value, so discovery of
+/// children is via `read(parent)`'s listing of the parent dir, not this node.
+pub struct ServiceDir {
+    inner: SimpleDir,
+    service: Arc<dyn Object>,
+}
+
+impl ServiceDir {
+    pub fn new(service: Arc<dyn Object>) -> Self {
+        ServiceDir { inner: SimpleDir::new(), service }
+    }
+}
+
+impl Object for ServiceDir {
+    fn kind(&self) -> ObjectKind {
+        self.service.kind()
+    }
+    fn value_schema(&self) -> &'static Schema {
+        self.service.value_schema()
+    }
+    fn owned_value_schema(&self) -> Option<&super::schema::OwnedSchema> {
+        self.service.owned_value_schema()
+    }
+    fn methods(&self) -> &'static [MethodDesc] {
+        self.service.methods()
+    }
+    fn owned_methods(&self) -> &[super::OwnedMethodDesc] {
+        self.service.owned_methods()
+    }
+    fn resolve(&self, name: &str) -> Option<Arc<dyn Object>> {
+        self.inner.resolve(name)
+    }
+    fn cacheable(&self) -> bool {
+        // service value may be dynamic, do not cache
+        false
+    }
+    fn list(&self, out: &mut Vec<ListingEntry>) -> Result<(), UnispaceError> {
+        self.inner.list(out)
+    }
+    fn read_value(&self, out: &mut Vec<u8>, max: usize) -> Result<(), UnispaceError> {
+        self.service.read_value(out, max)
+    }
+    fn read_value_flags(&self, out: &mut Vec<u8>, max: usize, flags: u64) -> Result<(), UnispaceError> {
+        self.service.read_value_flags(out, max, flags)
+    }
+    fn write_value(&self, v: Value) -> Result<(), UnispaceError> {
+        self.service.write_value(v)
+    }
+    fn write_value_flags(&self, v: Value, flags: u64) -> Result<(), UnispaceError> {
+        self.service.write_value_flags(v, flags)
+    }
+    fn write_blob_flags(&self, data: &[u8], flags: u64) -> Option<Result<(), UnispaceError>> {
+        self.service.write_blob_flags(data, flags)
+    }
+    fn invoke(&self, method: usize, v: Value, out: &mut Vec<u8>) -> Result<(), UnispaceError> {
+        self.service.invoke(method, v, out)
+    }
+    fn insert_child(&self, name: &str, obj: Arc<dyn Object>) -> Result<(), UnispaceError> {
+        self.inner.insert_child(name, obj)
+    }
+    fn remove_child(&self, name: &str) -> Result<bool, UnispaceError> {
+        self.inner.remove_child(name)
+    }
+}

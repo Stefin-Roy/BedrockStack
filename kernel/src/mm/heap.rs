@@ -152,7 +152,7 @@ impl ChunkMeta {
 /// guard page) is HEAP_GROW_PAGES + 1 pages (~64 KiB), so the arena can fit
 /// ~8192 regions at most.  If this is ever exhausted we panic rather than
 /// overflow a static array.
-const MAX_CHUNKS: usize = 8192;
+pub const MAX_CHUNKS: usize = 8192;
 
 /// One fully-idle chunk scheduled for unmapping.
 ///
@@ -1524,6 +1524,64 @@ unsafe impl GlobalAlloc for HeapAllocator {
         };
         HeapInner::reclaim_unmapped(root, &records[..count]);
     }
+}
+
+/// Snapshot of heap arena state for unispace introspection (RO).
+/// Returns (low_vaddr, chunk_count, free_list_len). Fully walks the free
+/// list; corruption (cycle or absurd length) is treated as a fault rather
+/// than a truncated lie — the provider reports the true length on success.
+pub fn heap_snapshot() -> Result<(u64, usize, usize), ()> {
+    if !HEAP_INITIALIZED.load(Ordering::SeqCst) {
+        return Ok((0, 0, 0));
+    }
+    let (low, cnt, len, corrupted) = {
+        let heap = HEAP.lock();
+        let low = heap.low_vaddr;
+        let cnt = heap.chunk_count;
+        let mut len = 0usize;
+        let mut cur = heap.free_list;
+        let mut steps = 0usize;
+        let mut corrupted = false;
+        while !cur.is_null() {
+            steps += 1;
+            if steps > FREE_LIST_WALK_BOUND {
+                corrupted = true;
+                break;
+            }
+            len += 1;
+            let next = unsafe { (*cur).next };
+            if next == cur {
+                corrupted = true;
+                break;
+            }
+            cur = next;
+        }
+        (low, cnt, len, corrupted)
+    };
+    if corrupted {
+        crate::drivers::serial::SerialPort::puts("[heap] heap_snapshot: free list exceeds bound or cycle, corruption!\n");
+        return Err(());
+    }
+    Ok((low, cnt, len))
+}
+
+pub fn heap_chunk_snapshot(idx: usize) -> Option<(u64, u64, u64, usize, bool)> {
+    if !HEAP_INITIALIZED.load(Ordering::SeqCst) {
+        return None;
+    }
+    let heap = HEAP.lock();
+    if idx >= heap.chunk_count {
+        return None;
+    }
+    let c = heap.chunks[idx];
+    Some((c.vaddr, c.phys, c.size, c.live, c.scattered))
+}
+
+pub fn heap_chunk_count() -> usize {
+    if !HEAP_INITIALIZED.load(Ordering::SeqCst) {
+        return 0;
+    }
+    HEAP.lock().chunk_count
 }
 
 #[global_allocator]

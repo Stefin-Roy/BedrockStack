@@ -50,6 +50,14 @@ pub fn is_dump_in_progress() -> bool {
     }
 }
 
+pub fn dump_in_progress_snapshot() -> [bool; MAX_CPUS] {
+    let mut out = [false; MAX_CPUS];
+    for i in 0..MAX_CPUS {
+        out[i] = DUMP_IN_PROGRESS[i].load(Ordering::Relaxed);
+    }
+    out
+}
+
 // ── Page-fault recovery during dump ────────────────────────────────
 // These are checked by the PF handler in idt.rs when DUMP_IN_PROGRESS.
 

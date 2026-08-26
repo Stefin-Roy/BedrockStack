@@ -49,6 +49,18 @@ struct XhciControllerState {
 
 static CONTROLLER: spin::Mutex<Option<XhciControllerState>> = spin::Mutex::new(None);
 
+pub fn controller_present() -> bool {
+    CONTROLLER.lock().is_some()
+}
+
+pub fn device_count() -> usize {
+    CONTROLLER
+        .lock()
+        .as_ref()
+        .map(|c| c.slots.lock().slots.len())
+        .unwrap_or(0)
+}
+
 pub fn init_all(pci_devices: &[PciDevice]) -> Vec<Arc<dyn BlockDevice>> {
     use crate::drivers::serial::SerialPort;
     let dma: &'static dyn DmaAllocator = crate::services::kernel_services().dma;

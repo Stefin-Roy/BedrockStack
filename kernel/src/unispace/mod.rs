@@ -482,9 +482,6 @@ pub fn resolve_parsed<'a, 'p>(parsed: &'p path::ParsedPath<'a>) -> Result<(Arc<d
     let mut current: Arc<dyn Object> = root().clone();
     let mut chain_cacheable = true;
     for comp in components {
-        if current.kind() != ObjectKind::Dir {
-            return Err(UnispaceError::NotADirectory);
-        }
         match current.resolve(comp) {
             Some(obj) => {
                 // The child is trustworthy-as-cached only if every dir on the
@@ -492,7 +489,16 @@ pub fn resolve_parsed<'a, 'p>(parsed: &'p path::ParsedPath<'a>) -> Result<(Arc<d
                 chain_cacheable &= current.cacheable();
                 current = obj;
             }
-            None => return Err(UnispaceError::NotFound),
+            None => {
+                if current.kind() != ObjectKind::Dir {
+                    // Allow ServiceDir hybrid (Service that hosts children) to
+                    // still traverse: it returns Some for known children, None
+                    // for unknown. For a plain Service with no children, report
+                    // NotADirectory rather than NotFound.
+                    return Err(UnispaceError::NotADirectory);
+                }
+                return Err(UnispaceError::NotFound);
+            }
         }
     }
     if chain_cacheable && current.cacheable() && !components.is_empty() {

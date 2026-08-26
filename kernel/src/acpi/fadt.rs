@@ -1,6 +1,7 @@
 use crate::acpi::gas::{gas_read16, gas_write16};
 use crate::acpi::platform::{AcpiError, Gas, Pm1ControlBit};
 
+#[derive(Clone, Debug)]
 pub struct Pm1ControlRegisters {
     pub pm1a: Gas,
     pub pm1b: Option<Gas>,

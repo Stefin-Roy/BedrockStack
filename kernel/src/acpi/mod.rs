@@ -23,6 +23,30 @@ pub use platform::{
     ProcessorInfo, ProcessorState, Rmrr, TriggerMode,
 };
 
+use alloc::sync::Arc;
+use spin::Once;
+
+static ACPI_GLOBAL: Once<Arc<AcpiSubsystem>> = Once::new();
+
+pub fn set_global_snapshot(sub: AcpiSubsystem) {
+    if ACPI_GLOBAL.get().is_some() {
+        crate::drivers::serial::SerialPort::puts("[acpi] WARN: global snapshot already set, ignoring duplicate\n");
+        return;
+    }
+    // Use Once directly so racy duplicate does not allocate an extra Arc.
+    ACPI_GLOBAL.call_once(|| Arc::new(sub));
+    // If two callers raced past the early check, the loser’s closure is
+    // dropped without warning — still at-most-once, just no duplicate log.
+}
+
+pub fn global_snapshot() -> Option<Arc<AcpiSubsystem>> {
+    ACPI_GLOBAL.get().cloned()
+}
+
+pub fn global_cpus() -> alloc::vec::Vec<(u32, bool)> {
+    global_snapshot().map(|s| s.cpus.clone()).unwrap_or_default()
+}
+
 /// Resolve a legacy ISA IRQ to its GSI plus polarity/trigger via the MADT
 /// interrupt source override table.  Returns `None` when no override exists
 /// (the caller should then assume the default ISA wiring).
@@ -116,6 +140,8 @@ pub struct AcpiSubsystem {
     pub platform_info: PlatformInfo,
     /// DMA remapping (VT-d) info, if present.
     pub dmar: Option<DmarInfo>,
+    /// Number of SDT entries successfully parsed (for introspection).
+    pub table_count: usize,
     /// Persistent AML interpreter over the DSDT + SSDTs (x86_64). `None` when
     /// no DSDT was found or the tables could not be parsed by the `aml` crate.
     #[cfg(target_arch = "x86_64")]
@@ -224,6 +250,7 @@ impl AcpiSubsystem {
             SerialPort::puts("[acpi] DMAR absent\n");
         }
 
+        let table_count = entries.len();
         #[cfg(target_arch = "x86_64")]
         let subsystem = Self {
             interrupt_model,
@@ -232,6 +259,7 @@ impl AcpiSubsystem {
             pci_config_regions,
             platform_info,
             dmar,
+            table_count,
             aml,
         };
         #[cfg(not(target_arch = "x86_64"))]
@@ -242,6 +270,7 @@ impl AcpiSubsystem {
             pci_config_regions,
             platform_info,
             dmar,
+            table_count,
         };
         Ok(subsystem)
     }

@@ -136,6 +136,7 @@ pub struct DmarInfo {
 }
 
 /// Platform-level ACPI information parsed from FADT.
+#[derive(Clone, Debug)]
 pub struct PlatformInfo {
     pub reset_gas: Option<Gas>,
     pub reset_value: u8,

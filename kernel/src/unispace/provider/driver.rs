@@ -1,20 +1,28 @@
 use alloc::sync::Arc;
-use alloc::vec;
 use alloc::vec::Vec;
-
+#[cfg(target_arch = "x86_64")]
+use alloc::vec;
 use super::super::dir::SimpleDir;
-use super::super::schema::{self, Field, MethodDesc, Schema, Value};
+use super::super::schema::{self, MethodDesc, Schema, Value};
+#[cfg(target_arch = "x86_64")]
+use super::super::schema::Field;
 use super::super::{Object, ObjectKind, UnispaceError};
 
 use crate::drivers::serial::SerialPort;
 
-/// Register the `/driver` system (kernel driver introspection objects).
+/// Register the `/drivers` system (kernel driver introspection objects).
+/// The legacy `/driver` name is kept as an alias for compatibility.
+/// The same `SimpleDir` is registered under both names so children inserted
+/// via `/drivers/ps2` or `/drivers/usb` are automatically visible under the
+/// legacy `/driver` alias as well.
 pub fn register() -> Result<(), UnispaceError> {
-    let driver = Arc::new(SimpleDir::new());
-    driver.insert("debugserial", Arc::new(DebugSerialObject));
+    let drivers = Arc::new(SimpleDir::new());
+    drivers.insert("debugserial", Arc::new(DebugSerialObject));
     #[cfg(target_arch = "x86_64")]
-    driver.insert("audio", Arc::new(AudioObject));
-    super::super::register("driver", driver)
+    drivers.insert("audio", Arc::new(AudioObject));
+    super::super::register("drivers", drivers.clone())?;
+    super::super::register("driver", drivers)?;
+    Ok(())
 }
 
 /// `/driver/debugserial`: read returns the full captured COM1 history,

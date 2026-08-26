@@ -104,15 +104,19 @@ pub extern "C" fn bedrock_sleep_ms(ms: u64) -> isize {
     libc::process::sleep_ms(ms)
 }
 
-/// Drain `/input/events` into `buf` (cap bytes).  Wire: `u32 LE count` then
+/// Drain `/dev/input/events` (canonical, probing in /dev) into `buf` (cap bytes).  Wire: `u32 LE count` then
 /// 24-byte entries `{timestamp u64, device u32, type u32, code u32,
 /// value i32}`.  Non-blocking; returns bytes read or -errno.
+/// Legacy `/input/events` alias is kept in kernel for compatibility.
 #[unsafe(no_mangle)]
 pub extern "C" fn bedrock_read_events(buf: *mut u8, cap: usize) -> isize {
     if buf.is_null() || cap == 0 {
         return -1;
     }
     let slice = unsafe { core::slice::from_raw_parts_mut(buf, cap) };
+    let r = unsafe { libc::syscall::read_path(b"/dev/input/events\0", slice, 0) };
+    if r >= 0 { return r; }
+    // fallback to legacy alias
     unsafe { libc::syscall::read_path(b"/input/events\0", slice, 0) }
 }
 
@@ -128,8 +132,9 @@ pub extern "C" fn bedrock_args(buf: *mut u8, cap: usize) -> isize {
 }
 
 /// Queue `len` bytes of interleaved i16-LE stereo PCM at 48 kHz for the
-/// kernel's audio pump (`/driver/audio:play_pcm`).  Returns 0 on success or
+/// kernel's audio pump (`/drivers/audio:play_pcm`, canonical in /drivers).  Returns 0 on success or
 /// -errno.  Single pushes are capped so one call cannot starve the queue.
+/// Legacy `/driver` alias is tried as fallback.
 #[unsafe(no_mangle)]
 pub extern "C" fn bedrock_audio_play(src: *const u8, len: usize) -> isize {
     if src.is_null() {
@@ -145,11 +150,14 @@ pub extern "C" fn bedrock_audio_play(src: *const u8, len: usize) -> isize {
         ptr::copy_nonoverlapping(src, base.add(4), len);
         let total = 4 + len;
         let scratch = core::slice::from_raw_parts_mut(base, total);
+        let r = libc::syscall::write_path(b"/drivers/audio:play_pcm\0", scratch, total, 0);
+        if r >= 0 { return r; }
         libc::syscall::write_path(b"/driver/audio:play_pcm\0", scratch, total, 0)
     }
 }
 
-/// Append raw bytes to COM1 (`/driver/debugserial`, Blob schema — no prefix).
+/// Append raw bytes to COM1 (`/drivers/debugserial` canonical, Blob schema — no prefix).
+/// Legacy `/driver` alias tried as fallback.
 #[unsafe(no_mangle)]
 pub extern "C" fn bedrock_serial(src: *const u8, len: usize) -> isize {
     if src.is_null() || len == 0 {
@@ -163,7 +171,10 @@ pub extern "C" fn bedrock_serial(src: *const u8, len: usize) -> isize {
         unsafe {
             ptr::copy_nonoverlapping(src.add(off), base, n);
             let scratch = core::slice::from_raw_parts_mut(base, n);
-            let r = libc::syscall::write_path(b"/driver/debugserial\0", scratch, n, 0);
+            let mut r = libc::syscall::write_path(b"/drivers/debugserial\0", scratch, n, 0);
+            if r < 0 {
+                r = libc::syscall::write_path(b"/driver/debugserial\0", scratch, n, 0);
+            }
             if r < 0 {
                 return r;
             }
