@@ -367,13 +367,19 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> u64 {
 /// Validates every page as user-readable before forming a slice into it
 /// (there is no #PF handler for user pointers). Returns the raw path str
 /// and its `ParsedPath`, both borrowing the validated user VA for the
-/// duration of the syscall (CR3 never changes mid-syscall under the
-/// cooperative BSP-only scheduler). Heap cost: one `Vec<&str>` inside
-/// `ParsedPath`; the raw bytes themselves stay in user memory (no
-/// `String`/`Vec<u8>` copy).
+/// duration of the syscall. No lock or `preempt_disable` is held here: CR3
+/// never changes mid-syscall because the scheduler is cooperative, BSP-only
+/// and single global FIFO (deadline wake is one-shot, never periodic LAPIC),
+/// so no other task can run — and only the running task can unmap its own
+/// address space (`munmap`/`brk` run on this very stack). The deadline ISR
+/// touches only atomics (SCHED-L002), never page tables.
+/// Heap cost: one `Vec<&str>` inside `ParsedPath`; the raw bytes themselves
+/// stay in user memory (no `String`/`Vec<u8>` copy).
 fn scan_user_path(ptr: u64) -> Result<(&'static str, crate::unispace::path::ParsedPath<'static>), i64> {
     // SAFETY: syscall runs on task CR3 throughout; validated pages stay
-    // mapped; scheduler is BSP-cooperative so no concurrent unmap.
+    // mapped: the scheduler is cooperative BSP-only (no other task can run,
+    // deadline ISR touches only atomics), and only the running task itself
+    // can unmap its own space, which cannot happen mid-syscall.
     // Transmute to 'static is sound for the syscall duration; the borrow
     // ends before sysretq.
     if ptr >= USER_BOUNDARY {

@@ -54,8 +54,8 @@
 
 **SCHED-L002 — ISR touch-nothing:** `universal_timer::tick` (vector 32/52) never touches scheduler locks; all `wake_sleepers`/`schedule` are idle/cooperative task context.
 
-**SCHED-L003 — Cooperative preempt scaffolding unused:** `PerCpu { need_resched:AtomicBool, preempt_count:AtomicU32, sched_ticks:AtomicU64, sched_active:AtomicBool }` exists but tick does not set `need_resched`; `preempt_disable/enable` exist (`smp/mod.rs:542-556`) and `schedule()` asserts `preempt_is_enabled()` on entry. Future preemptive mode must wrap with `preempt_disable`/`enable` and switch locks to `IrqSafeLock`.
-- `smp/mod.rs:152-158`, `task/mod.rs:1252-1261`
+**SCHED-L003 — Deadline-only, IRQ-safe locks, no periodic tick:** All scheduler locks (`QUEUE`/`CURRENT`/`SLEEPING`/`WAITERS`/`ZOMBIES`/`RECLAIM`/`KSTACK_IN_USE`/`LINEAGE`/`INIT_CAPS_STASH`) are `IrqMutex` (local-IRQ disable), so a one-shot universal_timer deadline that sets `need_resched` via atomics can never deadlock against a lock holder. The LAPIC stays **one-shot only — no periodic mode**; `need_resched` is consumed voluntarily in `schedule()`, which also increments `sched_ticks` and wraps itself in `preempt_disable/enable`. `task::init` sets `sched_active(0,true)`. `reap_dead` debug-asserts idle + kernel root. Deduplicated pid scans go through the single `with_task` helper (`process_state`/`task_vm`/`task_parent`/`pid_live`/`task_args`/`caps_snapshot`). Future SMP/preemptive mode must add per-CPU queues and switch `ADDR_SPACES` assumptions accordingly.
+- `mod.rs` (IrqMutex statics, `with_task`, `schedule`, `init`, `reap_dead`, `free_kernel_stack` assert), `smp/mod.rs:152-158,542-568`, `mm/usermem.rs` (`ADDR_SPACES` IrqMutex), `mm/vmm/mod.rs` (`current_root`)
 
 **SCHED-L004 — CR3 switch stays mapped:** `switch_to` `cmp cr3,rdx / je` skips reload; higher-half (kernel image, heap physmap, APIC) is in every root via `clone_high_half` shared subtree, so code between `mov cr3` and `ret` stays mapped.
 - `switch.rs:113-117`

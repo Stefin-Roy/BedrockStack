@@ -23,9 +23,9 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
-use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
+use crate::filesystems::vfs::irq::IrqMutex;
 use crate::mm::layout::{KSTACK_SIZE, KSTACK_VADDR_BASE, MAX_KSTACKS};
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
@@ -117,9 +117,9 @@ impl Task {
 // Keep pid→parent for every spawn, even after Task is reaped, so that
 // `B→A→Z→Y→X` can be walked through dead `A`. GC removes entries that are
 // no longer ancestors of any live Task.
-static LINEAGE: Once<Mutex<HashMap<u64, u64>>> = Once::new();
-fn lineage_map() -> &'static Mutex<HashMap<u64, u64>> {
-    LINEAGE.call_once(|| Mutex::new(HashMap::new()))
+static LINEAGE: Once<IrqMutex<HashMap<u64, u64>>> = Once::new();
+fn lineage_map() -> &'static IrqMutex<HashMap<u64, u64>> {
+    LINEAGE.call_once(|| IrqMutex::new(HashMap::new()))
 }
 pub fn lineage_insert(pid: u64, parent: u64) {
     lineage_map().lock().insert(pid, parent);
@@ -217,7 +217,11 @@ fn lineage_gc() {
 const KSTACK_PAGES: usize = (KSTACK_SIZE as usize) / 4096;
 
 /// Liveness bitmap for the fixed task-stack window slots.
-static KSTACK_IN_USE: Mutex<[bool; MAX_KSTACKS]> = Mutex::new([false; MAX_KSTACKS]);
+/// IrqMutex: `alloc_kernel_stack`/`free_kernel_stack` may run while a deadline
+/// (universal_timer one-shot, never periodic LAPIC) wakes sleepers; IRQs
+/// disabled avoids `QUEUE`/`SLEEPING` re-entry deadlock (single global FIFO,
+/// SCHED-L001).
+static KSTACK_IN_USE: IrqMutex<[bool; MAX_KSTACKS]> = IrqMutex::new([false; MAX_KSTACKS]);
 
 /// Allocate the next free slot in the fixed task-stack window, mapping its
 /// four frames into the kernel root, and return `(stack_top, slot)`.
@@ -326,7 +330,7 @@ pub fn install_caps(
 pub fn grant_cap_to_pid(pid: u64, cap: crate::caps::Cap) -> Result<(), crate::unispace::UnispaceError> {
     crate::caps::validate_cap(&cap)?;
     // Helper to try to grant to a &mut Task
-    fn do_grant(task: &mut Task, cap: crate::caps::Cap) -> Result<(), crate::unispace::UnispaceError> {
+    fn do_grant(task: &mut Task, cap: &crate::caps::Cap) -> Result<(), crate::unispace::UnispaceError> {
         if task.caps_arc.is_none() {
             let alloc = crate::mm::heap::get_phys_allocator_mut();
             let new_caps = Vec::new();
@@ -358,59 +362,17 @@ pub fn grant_cap_to_pid(pid: u64, cap: crate::caps::Cap) -> Result<(), crate::un
                 }
             }
         }
-        caps.push(cap);
+        caps.push(cap.clone());
         if task.caps_phys != 0 {
             crate::caps::serialize_to_page(caps, task.caps_phys);
         }
         Ok(())
     }
 
-    // Search CURRENT
-    {
-        let mut cur = CURRENT.lock();
-        if let Some(t) = cur.as_mut() {
-            if t.id == pid {
-                return do_grant(*t, cap);
-            }
-        }
+    match with_task_mut(pid, |t| Some(do_grant(t, &cap))) {
+        Some(r) => r,
+        None => Err(crate::unispace::UnispaceError::NotFound),
     }
-    // QUEUE
-    {
-        let mut q = QUEUE.lock();
-        for t in q.iter_mut() {
-            if t.id == pid {
-                return do_grant(*t, cap);
-            }
-        }
-    }
-    // SLEEPING
-    {
-        let mut s = SLEEPING.lock();
-        for (_, t) in s.iter_mut() {
-            if t.id == pid {
-                return do_grant(*t, cap);
-            }
-        }
-    }
-    // WAITERS
-    {
-        let mut w = WAITERS.lock();
-        for (t, _) in w.iter_mut() {
-            if t.id == pid {
-                return do_grant(*t, cap);
-            }
-        }
-    }
-    // ZOMBIES
-    {
-        let mut z = ZOMBIES.lock();
-        for t in z.iter_mut() {
-            if t.id == pid {
-                return do_grant(*t, cap);
-            }
-        }
-    }
-    Err(crate::unispace::UnispaceError::NotFound)
 }
 
 /// Propagate a newly granted capability from the current task up through its parent chain.
@@ -442,6 +404,15 @@ pub(crate) fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
     if slot >= MAX_KSTACKS {
         return;
     }
+    // Targets the kernel root explicitly (`Vmm::from_root(kernel_root())`);
+    // the current CR3 is irrelevant, so this is legal both from `reap_dead`
+    // on the idle/kernel root AND from fork/spawn rollback paths running on
+    // a live user root (same pattern as `alloc_kernel_stack`). KERNEL_ROOT
+    // is stored by `task::init` before any task can spawn or be reaped.
+    debug_assert!(
+        kernel_root() != 0,
+        "free_kernel_stack: task::init not yet run"
+    );
     let mut in_use = KSTACK_IN_USE.lock();
     if !in_use[slot] {
         return;
@@ -458,11 +429,13 @@ pub(crate) fn free_kernel_stack(slot: usize, alloc: &mut BitmapAllocator) {
     }
 }
 
-/// Global FIFO of runnable tasks.
-static QUEUE: Mutex<VecDeque<&'static mut Task>> = Mutex::new(VecDeque::new());
+/// Global FIFO of runnable tasks. IrqMutex: deadline wake (one-shot universal_timer,
+/// never periodic LAPIC — SCHED-L002 ISR touch-nothing) may set `need_resched`
+/// via atomics while a task holds `QUEUE`; IRQs disabled avoids deadlock.
+static QUEUE: IrqMutex<VecDeque<&'static mut Task>> = IrqMutex::new(VecDeque::new());
 
 /// The task currently running on this CPU, or `None` when idle.
-static CURRENT: Mutex<Option<&'static mut Task>> = Mutex::new(None);
+static CURRENT: IrqMutex<Option<&'static mut Task>> = IrqMutex::new(None);
 
 /// Parked dead tasks (zombies) awaiting a parent's `:wait` or the death of
 /// their own parent.
@@ -474,8 +447,8 @@ static CURRENT: Mutex<Option<&'static mut Task>> = Mutex::new(None);
 /// while its parent is still live (the parent may `:wait` it) and freed once
 /// its parent is gone.  `reap_dead` reads the other scheduler lists only while
 /// holding this one, and nothing acquires this lock while holding those, so
-/// there is no ordering cycle.
-static ZOMBIES: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
+/// there is no ordering cycle. IrqMutex for deadline-only `need_resched`.
+static ZOMBIES: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
 
 /// Consumed zombies awaiting idle teardown: their exit code was collected by
 /// a parent's `:wait`, and `reap_dead` frees their user page tables, kernel
@@ -487,7 +460,7 @@ static ZOMBIES: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
 /// here (and is thus invisible to every scheduler scan), so the `:wait` and
 /// `/proc` paths treat it as already reaped, and only `reap_dead` — which runs
 /// on the idle stack under the kernel root — drains this queue.
-static RECLAIM: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
+static RECLAIM: IrqMutex<Vec<&'static mut Task>> = IrqMutex::new(Vec::new());
 
 /// Parked tasks awaiting a child's exit (`/proc/self:wait`), as `(task, pid)`
 /// keyed by the target pid.
@@ -499,7 +472,7 @@ static RECLAIM: Mutex<Vec<&'static mut Task>> = Mutex::new(Vec::new());
 /// waiter list before locking the queue, and no `:wait` activation parks
 /// while holding it.  Only one task can wait on a given child (its parent),
 /// so there is at most one entry per target pid.
-static WAITERS: Mutex<Vec<(&'static mut Task, u64)>> = Mutex::new(Vec::new());
+static WAITERS: IrqMutex<Vec<(&'static mut Task, u64)>> = IrqMutex::new(Vec::new());
 
 /// Parked `ZzZ` tasks awaiting their wake deadline (absolute monotonic ns).
 ///
@@ -513,7 +486,7 @@ static WAITERS: Mutex<Vec<(&'static mut Task, u64)>> = Mutex::new(Vec::new());
 /// `drain`, so a burst wakeup costs O(k) (one shift) instead of O(n·k)
 /// per-element `remove` shifts.  Insertion (`sleep_until`) stays O(n), but a
 /// task sleeps far less often than the idle loop scans.
-static SLEEPING: Mutex<Vec<(u64, &'static mut Task)>> = Mutex::new(Vec::new());
+static SLEEPING: IrqMutex<Vec<(u64, &'static mut Task)>> = IrqMutex::new(Vec::new());
 
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
 /// first `switch_to` away from it; restored when no ready task remains.
@@ -531,8 +504,8 @@ static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Stash for INIT caps — installed by `load_init_from_esp` before `enter_userspace`.
-/// `(caps, mirror phys, window va)`.
-static INIT_CAPS_STASH: Mutex<Option<(Arc<Vec<crate::caps::Cap>>, u64, u64)>> = Mutex::new(None);
+/// `(caps, mirror phys, window va)`. IrqMutex for deadline-only `need_resched`.
+static INIT_CAPS_STASH: IrqMutex<Option<(Arc<Vec<crate::caps::Cap>>, u64, u64)>> = IrqMutex::new(None);
 
 pub fn stash_init_caps(caps: Arc<Vec<crate::caps::Cap>>, phys: u64, va: u64) {
     *INIT_CAPS_STASH.lock() = Some((caps, phys, va));
@@ -556,6 +529,9 @@ fn idle_ctx() -> *mut TaskContext {
 /// task is spawned.
 pub fn init(root: u64) {
     KERNEL_ROOT.store(root, Ordering::Relaxed);
+    // Single global FIFO: mark BSP active for deadline accounting. No periodic
+    // LAPIC — `sched_ticks` increments voluntarily in `schedule()` (deadline-only).
+    crate::smp::set_sched_active(0, true);
 }
 
 /// The kernel page-table root shared by kernel threads and cloned for user
@@ -815,6 +791,135 @@ pub fn kill_user_fault() -> ! {
     kill_current()
 }
 
+/// Unified lookup across the five live sets — single place that scans
+/// `CURRENT`/`QUEUE`/`SLEEPING`/`WAITERS`/`ZOMBIES` in order, never holding
+/// two `IrqMutex` at once. Single global FIFO, deadline-only (no periodic
+/// LAPIC). Deduplicates O(n) scans and keeps contention in one helper.
+fn with_task<R>(pid: u64, mut f: impl FnMut(&Task) -> Option<R>) -> Option<R> {
+    {
+        let cur = CURRENT.lock();
+        if let Some(t) = cur.as_ref() {
+            if t.id == pid {
+                if let Some(r) = f(*t) {
+                    return Some(r);
+                }
+                // pid unique — no need to scan further, but keep same
+                // semantics as before (RECLAIM not live).
+                return None;
+            }
+        }
+    }
+    {
+        let q = QUEUE.lock();
+        for t in q.iter() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let s = SLEEPING.lock();
+        for (_, t) in s.iter() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let w = WAITERS.lock();
+        for (t, _) in w.iter() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let z = ZOMBIES.lock();
+        for t in z.iter() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    None
+}
+
+/// Mutable twin of [`with_task`]: hands the closure `&mut Task` for `pid`,
+/// scanning the five live sets one lock at a time. Exclusive access is sound
+/// under the cooperative BSP-only scheduler — the task being mutated is by
+/// definition not running (or is the caller itself in `CURRENT`), and no
+/// other CPU can reach these lists.
+fn with_task_mut<R>(pid: u64, mut f: impl FnMut(&mut Task) -> Option<R>) -> Option<R> {
+    {
+        let mut cur = CURRENT.lock();
+        if let Some(t) = cur.as_mut() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let mut q = QUEUE.lock();
+        for t in q.iter_mut() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let mut s = SLEEPING.lock();
+        for (_, t) in s.iter_mut() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    {
+        let mut w = WAITERS.lock();
+        for (t, _) in w.iter_mut() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    // ZOMBIES stay mutable-reachable for late cap fixes; RECLAIM does not
+    // (already consumed, invisible to every scan).
+    {
+        let mut z = ZOMBIES.lock();
+        for t in z.iter_mut() {
+            if t.id == pid {
+                return f(*t);
+            }
+        }
+    }
+    None
+}
+
+/// Remove the live (non-zombie) task `pid` from whichever list parks it
+/// (`QUEUE`/`SLEEPING`/`WAITERS`), returning it. Zombies are deliberately not
+/// removable here — they are consumed only via [`take_zombie`].
+fn take_from_lists(pid: u64) -> Option<&'static mut Task> {
+    {
+        let mut q = QUEUE.lock();
+        if let Some(i) = q.iter().position(|t| t.id == pid) {
+            return q.remove(i);
+        }
+    }
+    {
+        let mut s = SLEEPING.lock();
+        if let Some(i) = s.iter().position(|(_, t)| t.id == pid) {
+            return Some(s.remove(i).1);
+        }
+    }
+    {
+        let mut w = WAITERS.lock();
+        if let Some(i) = w.iter().position(|(t, _)| t.id == pid) {
+            return Some(w.remove(i).0);
+        }
+    }
+    None
+}
+
 /// Snapshot the state of `pid` (excluding already-reaped tasks).
 ///
 /// The scheduler is cooperative and BSP-only, so every live task is exactly one
@@ -823,94 +928,14 @@ pub fn kill_user_fault() -> ! {
 /// or a zombie in `ZOMBIES` (`Dead`). The five locks are taken and read
 /// separately, never nested with each other.
 pub fn process_state(pid: u64) -> Option<TaskState> {
-    {
-        let cur = CURRENT.lock();
-        if let Some(t) = cur.as_ref() {
-            if t.id == pid {
-                return Some(t.state);
-            }
-        }
-    }
-    {
-        let q = QUEUE.lock();
-        for t in q.iter() {
-            if t.id == pid {
-                return Some(t.state);
-            }
-        }
-    }
-    {
-        let s = SLEEPING.lock();
-        for (_, t) in s.iter() {
-            if t.id == pid {
-                return Some(t.state);
-            }
-        }
-    }
-    {
-        let w = WAITERS.lock();
-        for (t, _) in w.iter() {
-            if t.id == pid {
-                return Some(TaskState::ZzZ);
-            }
-        }
-    }
-    {
-        let z = ZOMBIES.lock();
-        for t in z.iter() {
-            if t.id == pid {
-                return Some(TaskState::Dead);
-            }
-        }
-    }
-    None
+    with_task(pid, |t| Some(t.state))
 }
 
 /// Look up the eager user-memory table index (`vm`) of `pid`, mirroring the
 /// `process_state` scan of the five scheduler lists. `None` for a reaped or
 /// unknown pid, or a kernel-only task (`vm == 0`).
 pub fn task_vm(pid: u64) -> Option<usize> {
-    {
-        let cur = CURRENT.lock();
-        if let Some(t) = cur.as_ref() {
-            if t.id == pid && t.vm != 0 {
-                return Some(t.vm);
-            }
-        }
-    }
-    {
-        let q = QUEUE.lock();
-        for t in q.iter() {
-            if t.id == pid && t.vm != 0 {
-                return Some(t.vm);
-            }
-        }
-    }
-    {
-        let s = SLEEPING.lock();
-        for (_, t) in s.iter() {
-            if t.id == pid && t.vm != 0 {
-                return Some(t.vm);
-            }
-        }
-    }
-    {
-        let w = WAITERS.lock();
-        for (t, _) in w.iter() {
-            if t.id == pid && t.vm != 0 {
-                return Some(t.vm);
-            }
-        }
-    }
-    {
-        let z = ZOMBIES.lock();
-        for t in z.iter() {
-            if t.id == pid && t.vm != 0 {
-                return Some(t.vm);
-            }
-        }
-    }
-    None
+    with_task(pid, |t| if t.vm != 0 { Some(t.vm) } else { None })
 }
 
 /// Kill the task with id `pid`, handing it to the idle loop for reaping.
@@ -926,60 +951,22 @@ pub fn task_vm(pid: u64) -> Option<usize> {
 /// Cooperative BSP-only: every live non-executing task is in `QUEUE`,
 /// `SLEEPING`, or `WAITERS`, and the only `Running` task is the caller.
 pub fn kill(pid: u64) -> Result<(), ()> {
-    {
-        let is_self = {
-            let cur = CURRENT.lock();
-            cur.as_ref().map(|t| t.id == pid).unwrap_or(false)
-        };
-        if is_self {
-            CURRENT
-                .lock()
-                .as_mut()
-                .map(|t| t.exit_code = KILLED_EXIT_CODE);
-            kill_current(); // diverges: marked Dead and parked, never returns
-        }
+    let is_self = {
+        let cur = CURRENT.lock();
+        cur.as_ref().map(|t| t.id == pid).unwrap_or(false)
+    };
+    if is_self {
+        CURRENT
+            .lock()
+            .as_mut()
+            .map(|t| t.exit_code = KILLED_EXIT_CODE);
+        kill_current(); // diverges: marked Dead and parked, never returns
     }
-    {
-        let mut q = QUEUE.lock();
-        let mut i = 0;
-        while i < q.len() {
-            if q[i].id == pid {
-                if let Some(t) = q.remove(i) {
-                    t.state = TaskState::Dead;
-                    t.exit_code = KILLED_EXIT_CODE;
-                    drop(q); // ZOMBIES is never acquired while QUEUE is held
-                    park_zombie(t);
-                    return Ok(());
-                }
-            }
-            i += 1;
-        }
-    }
-    {
-        let mut s = SLEEPING.lock();
-        for i in 0..s.len() {
-            if s[i].1.id == pid {
-                let t = s.remove(i).1;
-                t.state = TaskState::Dead;
-                t.exit_code = KILLED_EXIT_CODE;
-                drop(s);
-                park_zombie(t);
-                return Ok(());
-            }
-        }
-    }
-    {
-        let mut w = WAITERS.lock();
-        for i in 0..w.len() {
-            if w[i].0.id == pid {
-                let t = w.remove(i).0;
-                t.state = TaskState::Dead;
-                t.exit_code = KILLED_EXIT_CODE;
-                drop(w);
-                park_zombie(t);
-                return Ok(());
-            }
-        }
+    if let Some(t) = take_from_lists(pid) {
+        t.state = TaskState::Dead;
+        t.exit_code = KILLED_EXIT_CODE;
+        park_zombie(t);
+        return Ok(());
     }
     Err(())
 }
@@ -1039,44 +1026,7 @@ fn wake_waiters_for(pid: u64) {
 
 /// The recorded parent pid of `pid`, scanning every scheduler list.
 fn task_parent(pid: u64) -> Option<u64> {
-    if let Some(t) = CURRENT.lock().as_ref() {
-        if t.id == pid {
-            return Some(t.parent_pid);
-        }
-    }
-    {
-        let q = QUEUE.lock();
-        for t in q.iter() {
-            if t.id == pid {
-                return Some(t.parent_pid);
-            }
-        }
-    }
-    {
-        let s = SLEEPING.lock();
-        for (_, t) in s.iter() {
-            if t.id == pid {
-                return Some(t.parent_pid);
-            }
-        }
-    }
-    {
-        let w = WAITERS.lock();
-        for (t, _) in w.iter() {
-            if t.id == pid {
-                return Some(t.parent_pid);
-            }
-        }
-    }
-    {
-        let z = ZOMBIES.lock();
-        for t in z.iter() {
-            if t.id == pid {
-                return Some(t.parent_pid);
-            }
-        }
-    }
-    None
+    with_task(pid, |t| Some(t.parent_pid))
 }
 
 /// Public accessor for `task_parent`: the recorded parent pid of `pid`, if any.
@@ -1094,26 +1044,10 @@ fn zombie_present(pid: u64) -> bool {
 /// orphan checks — its child is kept until the parent is reaped, not the moment
 /// the parent parks into ZOMBIES (otherwise `kill` of a waiter could free its
 /// child before the waiter consumes the exit code). RECLAIM tasks are not live
-/// (already consumed, awaiting teardown).
+/// (already consumed, awaiting teardown). Single global, `IrqMutex` therefore
+/// no ISR re-entry; deduped via `with_task`.
 fn pid_live(pid: u64) -> bool {
-    if let Some(t) = CURRENT.lock().as_ref() {
-        if t.id == pid {
-            return true;
-        }
-    }
-    if QUEUE.lock().iter().any(|t| t.id == pid) {
-        return true;
-    }
-    if SLEEPING.lock().iter().any(|(_, t)| t.id == pid) {
-        return true;
-    }
-    if WAITERS.lock().iter().any(|(t, _)| t.id == pid) {
-        return true;
-    }
-    if ZOMBIES.lock().iter().any(|t| t.id == pid) {
-        return true;
-    }
-    false
+    with_task(pid, |_| Some(())).is_some()
 }
 
 /// Remove and return the zombie `pid`, if parked.
@@ -1185,44 +1119,7 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
 /// The `:spawn` argument string recorded for `pid`, if the task still exists
 /// (live or zombie).  `/proc/self/args` is backed by this.
 pub fn task_args(pid: u64) -> Option<String> {
-    if let Some(t) = CURRENT.lock().as_ref() {
-        if t.id == pid {
-            return Some(t.args.clone());
-        }
-    }
-    {
-        let q = QUEUE.lock();
-        for t in q.iter() {
-            if t.id == pid {
-                return Some(t.args.clone());
-            }
-        }
-    }
-    {
-        let s = SLEEPING.lock();
-        for (_, t) in s.iter() {
-            if t.id == pid {
-                return Some(t.args.clone());
-            }
-        }
-    }
-    {
-        let w = WAITERS.lock();
-        for (t, _) in w.iter() {
-            if t.id == pid {
-                return Some(t.args.clone());
-            }
-        }
-    }
-    {
-        let z = ZOMBIES.lock();
-        for t in z.iter() {
-            if t.id == pid {
-                return Some(t.args.clone());
-            }
-        }
-    }
-    None
+    with_task(pid, |t| Some(t.args.clone()))
 }
 
 /// The retained exit code of a zombie `pid`, if any.
@@ -1251,44 +1148,7 @@ pub fn caps_snapshot(pid: u64) -> Option<Vec<crate::caps::Cap>> {
             Some(arc) => Some((**arc).clone()),
         }
     }
-    if let Some(t) = CURRENT.lock().as_ref() {
-        if t.id == pid {
-            return clone_from_task(t);
-        }
-    }
-    {
-        let q = QUEUE.lock();
-        for t in q.iter() {
-            if t.id == pid {
-                return clone_from_task(t);
-            }
-        }
-    }
-    {
-        let s = SLEEPING.lock();
-        for (_, t) in s.iter() {
-            if t.id == pid {
-                return clone_from_task(t);
-            }
-        }
-    }
-    {
-        let w = WAITERS.lock();
-        for (t, _) in w.iter() {
-            if t.id == pid {
-                return clone_from_task(t);
-            }
-        }
-    }
-    {
-        let z = ZOMBIES.lock();
-        for t in z.iter() {
-            if t.id == pid {
-                return clone_from_task(t);
-            }
-        }
-    }
-    None
+    with_task(pid, clone_from_task)
 }
 
 /// Tear down one dead task: destroy its private page tables, free its kernel
@@ -1349,22 +1209,57 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
 /// rsp0 is only consumed on a ring-3→ring-0 transition, and no user task runs
 /// while the BSP is idling.  The next task switch re-pins rsp0.
 pub fn reap_dead(alloc: &mut BitmapAllocator) {
+    // Single global FIFO, idle-only: must be called from idle (no CURRENT)
+    // and on the kernel root (APIC MMIO for TLB shootdown). APs halt (SMP
+    // out) so no AP ever reaps. `IrqMutex` keeps deadline wake ISR from
+    // nesting, but the idle check enforces the SCHED-L001 ordering.
+    // Unconditional (not debug_assert): reaping on a user root or with a live
+    // CURRENT would corrupt page tables / free a running task's state in
+    // release builds too. `is_sched_active` gates the pre-`task::init` window.
+    assert!(CURRENT.lock().is_none(), "reap_dead: must be idle, CURRENT Some");
+    assert!(
+        crate::smp::is_sched_active(),
+        "reap_dead: scheduler not initialized (sched_active false)"
+    );
+    assert!(
+        kernel_root() != 0 && crate::mm::vmm::current_root() == kernel_root(),
+        "reap_dead: must be on kernel root, current={:#x} kernel={:#x}",
+        crate::mm::vmm::current_root(),
+        kernel_root()
+    );
     {
         let mut reclaim = RECLAIM.lock();
         for task in reclaim.drain(..) {
             reap_one(task, alloc);
         }
     }
+    // Zombie pass, two-phase so `pid_live` (which locks the other five
+    // lists) never runs while holding `ZOMBIES` — the "no ordering cycle"
+    // argument then holds structurally instead of resting on the idle-only
+    // convention.
+    let orphan_candidates: Vec<(usize, u64)> = {
+        let zombies = ZOMBIES.lock();
+        zombies
+            .iter()
+            .enumerate()
+            // parent_pid == 0 (kernel-launched, e.g. INIT from
+            // `enter_userspace`) has no possible waiter: orphaned by
+            // definition, matching the pre-two-phase behavior.
+            .map(|(i, t)| (i, t.parent_pid))
+            .collect()
+    };
+    let mut free_idx: Vec<usize> = Vec::new();
+    for (i, ppid) in orphan_candidates {
+        if ppid == 0 || !pid_live(ppid) {
+            free_idx.push(i);
+        }
+    }
+    free_idx.sort_unstable_by(|a, b| b.cmp(a));
     let mut free: Vec<&'static mut Task> = Vec::new();
     {
         let mut zombies = ZOMBIES.lock();
-        let mut i = 0;
-        while i < zombies.len() {
-            if zombies[i].parent_pid == 0 || !pid_live(zombies[i].parent_pid) {
-                free.push(zombies.remove(i));
-            } else {
-                i += 1;
-            }
+        for i in free_idx {
+            free.push(zombies.remove(i));
         }
     }
     for task in free {
@@ -1379,16 +1274,21 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
 /// yield). A `Dead` task (from `exit_current`) is parked and the scheduler
 /// drops to idle. No spin lock is held across `switch_to`.
 ///
-/// BSP-only cooperative: interrupts remain enabled, but `schedule` itself is
-/// not re-entered from IRQ. Future preemptive wiring must wrap with
-/// `preempt_disable`/`preempt_enable` and use `IrqSafeLock`.
+/// Single global FIFO, deadline-only: LAPIC stays one-shot (no periodic mode,
+/// SCHED-L002 ISR touch-nothing). `IrqMutex` (SCHED-L001) + `preempt_disable`
+/// guard the queue while a deadline wakes sleepers; `sched_ticks` counts
+/// voluntary dispatches for accounting (no quantum preemption).
 pub fn schedule() {
-    // Cooperative BSP-only: timer ISR never touches scheduler locks (S9).
-    // If preemptive tick is ever wired, this must be wrapped with
-    // `preempt_disable`/`preempt_enable` and locks switched to `IrqSafeLock`.
-    // For now assert we are not in IRQ context (interrupts may be enabled,
-    // but we are not re-entered).
-    debug_assert!(crate::smp::preempt_is_enabled(), "schedule: preempt disabled nested?");
+    debug_assert!(
+        crate::smp::is_sched_active(),
+        "schedule: called before task::init"
+    );
+    crate::smp::preempt_disable();
+    // Deadline-only: `need_resched` may be set by deadline expiry helpers
+    // (never a periodic LAPIC tick). Consume here; entering `schedule` *is*
+    // the yield.
+    let _ = crate::smp::take_need_resched();
+    crate::smp::inc_sched_ticks();
     // Wake expired sleepers before picking the next task so a burst of
     // sleepers never starves while Ready tasks continuously yield. This was
     // previously only in the idle loops (Kernel::run / enter_userspace) which
@@ -1439,6 +1339,11 @@ pub fn schedule() {
                         park_zombie(p);
                     }
                     crate::mm::vmm::set_current_root(root);
+                    // This context (a Dead task) never resumes through here,
+                    // so the preempt-disable taken on entry MUST be released
+                    // before the final switch — post-switch release would
+                    // leak a per-CPU disable.
+                    crate::smp::preempt_enable();
                     unsafe {
                         switch_to(pctx, idle_ctx(), root);
                     }
@@ -1457,12 +1362,14 @@ pub fn schedule() {
                     *CURRENT.lock() = Some(p);
                     set_kernel_stack_meta(stack_top);
                     drop(q);
+                    crate::smp::preempt_enable();
                     return;
                 }
                 None => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
                     drop(q);
+                    crate::smp::preempt_enable();
                     return;
                 }
             }
@@ -1481,6 +1388,10 @@ pub fn schedule() {
                 park_zombie(p);
             }
             crate::mm::vmm::set_current_root(next_root);
+            // A Dead task never resumes through here (ZzZ resumes via its
+            // registered ctx on wake, but releasing before the switch is the
+            // one placement balanced for both cases).
+            crate::smp::preempt_enable();
             unsafe {
                 switch_to(pctx, next_ptr, next_root);
             }
@@ -1494,6 +1405,7 @@ pub fn schedule() {
             unsafe {
                 switch_to(pctx, next_ptr, next_root);
             }
+            crate::smp::preempt_enable();
         }
         None => {
             drop(q);
@@ -1501,6 +1413,7 @@ pub fn schedule() {
             unsafe {
                 switch_to(idle_ctx(), next_ptr, next_root);
             }
+            crate::smp::preempt_enable();
         }
     }
 }

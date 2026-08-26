@@ -311,6 +311,10 @@ pub extern "C" fn ap_entry64() -> ! {
     // Now safe to enable interrupts — GDT, TSS, and IDT are all set.
     crate::arch::CurrentArch::enable_interrupts();
 
+    // This CPU's scheduler is deliberately NEVER marked active
+    // (`PerCpu.sched_active` stays false from smp::init): APs halt here and
+    // never run tasks or reap. `is_sched_active()` on an AP correctly reads
+    // false, which is what `reap_dead`/`schedule` assert against.
     loop {
         crate::arch::CurrentArch::halt();
     }

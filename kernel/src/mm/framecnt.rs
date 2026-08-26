@@ -13,12 +13,13 @@
 //! adds 1. Therefore "sole owner" ⇔ entry ∈ `{0, 1}`; "shared" ⇔ ≥ 2.
 //!
 //! # Race model
-//! Fork (`share_frame`) runs under `ADDR_SPACES` against a *live* parent task,
-//! and teardown of a space only ever happens from that space's own exit path,
-//! so incref/decref pairs on the same frame are ordered by the scheduler.
-//! The atomics make the counter itself consistent even if those operations
-//! ever interleave: a decrement racing a final increment can momentarily
-//! under-count but never double-frees (a free requires observing exactly 1).
+//! Fork (`share_frame`) runs under `ADDR_SPACES` (`IrqMutex`) against a *live*
+//! parent task, and teardown only ever happens from that space's own exit path
+//! (idle `reap_dead` on kernel root, single global FIFO; deadline-only, no
+//! periodic LAPIC — the ISR touches only atomics). The cooperative BSP-only
+//! scheduler keeps incref/decref pairs ordered in practice, and the CAS loop
+//! remains correct even if two forks ever race: atomics guarantee a free
+//! only happens on observing exactly 1.
 //!
 //! INVARIANT (INV-FC-01): every *leaf* frame reachable from more than one
 //! address-space root MUST have been passed through [`share_frame`] by the

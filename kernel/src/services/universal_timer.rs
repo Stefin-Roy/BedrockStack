@@ -168,6 +168,11 @@ impl UniversalTimerImpl {
         }
 
         self.reprogram(&mut queue);
+        drop(queue);
+        // Deadline expiry is a reschedule hint: flag the local CPU so the
+        // next `schedule()` consumes it (`take_need_resched`). Atomics only —
+        // never scheduler locks (SCHED-L002 ISR touch-nothing).
+        crate::smp::set_need_resched();
     }
 
     /// Program the clockevent to the earliest pending deadline.

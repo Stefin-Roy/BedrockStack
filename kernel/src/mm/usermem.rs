@@ -24,8 +24,8 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
 
+use crate::filesystems::vfs::irq::IrqMutex;
 use crate::mm::layout::to_physmap;
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
@@ -141,7 +141,12 @@ struct Table {
     free: Vec<usize>,
 }
 
-static ADDR_SPACES: Mutex<Table> = Mutex::new(Table {
+/// IrqMutex: `brk`/`mmap`/`munmap` may be called from a task that also
+/// holds scheduler state; deadline wake (one-shot, never periodic LAPIC) must
+/// not deadlock. Single global FIFO, cooperative BSP-only — no lock is held
+/// across the syscall path outside these functions (`scan_user_path` borrows
+/// user memory lock-free under that scheduling assumption).
+static ADDR_SPACES: IrqMutex<Table> = IrqMutex::new(Table {
     slots: Vec::new(),
     free: Vec::new(),
 });
@@ -563,7 +568,10 @@ pub fn munmap(idx: usize, addr: u64, len: u64, alloc: &mut BitmapAllocator) -> R
 /// returns. The first write to any shared page faults into the CoW resolver,
 /// which copies or upgrades based on the refcount — so the parent's stale-W
 /// window between the PTE sweep and the shootdown below is unexploitable:
-/// the BSP-only scheduler guarantees neither task can run in it.
+/// fork runs under `ADDR_SPACES` (`IrqMutex`) against a live parent task,
+/// and the scheduler is cooperative BSP-only single global FIFO (deadline
+/// ISR touches only atomics), so no other task can touch either root
+/// mid-fork.
 ///
 /// On failure the child's tables/shares are unwound by
 /// [`crate::mm::vmm::clone_user_space_cow`] and nothing is registered.

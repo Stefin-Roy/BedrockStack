@@ -628,6 +628,15 @@ pub fn set_current_root(root: u64) {
     }
 }
 
+pub fn current_root() -> u64 {
+    let cpu = crate::smp::current_cpu_id() as usize;
+    if cpu < crate::smp::MAX_CPUS {
+        CPU_ROOT[cpu].load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Snapshot for unispace: (clone_roots, tlb_seq, half_boundary)
 pub fn vmm_global_snapshot() -> (usize, u64, u64) {
     #[cfg(target_arch = "x86_64")]
