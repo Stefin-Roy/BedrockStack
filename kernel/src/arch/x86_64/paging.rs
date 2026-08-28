@@ -76,13 +76,14 @@ pub fn setup(
         Cr0::update(|f| f.insert(Cr0Flags::WRITE_PROTECT));
     }
 
-    // ── Enable SMEP + SMAP + PKE (BSP) — runtime-gated, no-op when unsupported ──
+    // ── Enable SMEP + SMAP + PKE + MCE (BSP) — runtime-gated, no-op when unsupported ──
     // SMAP is safe here: every user-VA deref runs inside syscall_dispatch's
     // UserAccess (stac/clac) guard. PKE must be on before any task applies a
-    // non-zero PKRU.
+    // non-zero PKRU. MCE must be on before MCA bank programming.
     crate::arch::x86_64::cpufeat::enable_smep();
     crate::arch::x86_64::cpufeat::enable_smap();
     crate::arch::x86_64::cpufeat::enable_pke();
+    crate::arch::x86_64::cpufeat::enable_mce();
 
     let mut vmm = Vmm::new(allocator);
     let guard_page = stack_guard & !(PAGE_4K - 1);

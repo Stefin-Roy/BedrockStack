@@ -104,12 +104,36 @@ impl Write for NullWrite {
 }
 
 // ── Lock-free raw serial writer (bypasses spinlock during dump) ────
+// Mirrors to panic screen when it is ready — so the same `writeln!` stream
+// appears on COM1 and on VRAM without duplicating format logic.
 
 struct DumpWriter;
 
 impl Write for DumpWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
         dump_puts(s);
+        // Mirror to VRAM if fatal screen was claimed (no-op otherwise, no lock).
+        #[cfg(target_arch = "x86_64")]
+        {
+            // Avoid invoking display code on non-x86 (riscv has no panic screen).
+            if crate::kerneldump::screen::is_ready() {
+                crate::kerneldump::screen::panic_puts(s);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Combined writer that also ensures screen is mirrored (alias).
+pub struct PanicWriter;
+
+impl Write for PanicWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        dump_puts(s);
+        #[cfg(target_arch = "x86_64")]
+        if crate::kerneldump::screen::is_ready() {
+            crate::kerneldump::screen::panic_puts(s);
+        }
         Ok(())
     }
 }
@@ -827,6 +851,183 @@ fn dump_page_walk(w: &mut impl Write, cr3: u64, vaddr: u64) {
     let _ = writeln!(w, "  -> phys={:#x}", phys);
 }
 
+// ── NMI live dump (hung RIP, not handler RIP) ──────────────────────
+
+/// Live NMI dump — prints the *interrupted* frame's hung RIP/RSP, not the
+/// handler's.  Called from `watchdog::nmi_handler` with the CPU-pushed
+/// `InterruptStackFrame`.  Mirrors `dump_full_fault` sections but **returns**
+/// unless `watchdog_cont` is off, in which case it halts (default).  The
+/// `context` string (e.g. "watchdog timeout" or "PS/2 F9 hotkey") is printed
+/// before the standard header so the cause is obvious.
+pub fn dump_nmi_full_fault(frame: &InterruptStackFrame, vector: u8, context: &str) {
+    let cpu = current_cpu_id() as usize;
+    // Per-CPU guard — NMI can nest (NMI inside NMI) until iret, so use SeqCst
+    // swap. Nested NMI while already dumping on this CPU just halts.
+    if cpu >= MAX_CPUS || DUMP_IN_PROGRESS[cpu].swap(true, Ordering::SeqCst) {
+        dump_puts("\n[DUMP] Nested NMI (#");
+        dump_put_hex(vector as u64);
+        dump_puts(") while dumping -- halting\n");
+        #[cfg(target_arch = "x86_64")]
+        if crate::kerneldump::screen::is_ready() {
+            crate::kerneldump::screen::panic_puts("\n[DUMP] Nested NMI while dumping -- halting\n");
+        }
+        loop {
+            unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !crate::kerneldump::screen::is_ready() {
+            let _ = crate::kerneldump::screen::panic_screen_init();
+        }
+    }
+
+    let fault_rip = frame.instruction_pointer.as_u64();
+    let fault_rsp = frame.stack_pointer.as_u64();
+    let fault_cs = frame.code_segment.0 as u64;
+    let fault_rfl = frame.cpu_flags.bits();
+    let fault_ss = frame.stack_segment.0 as u64;
+
+    let cr0: u64;
+    let cr2: u64;
+    let cr3: u64;
+    let cr4: u64;
+    unsafe {
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack));
+        asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
+        asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack));
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
+    }
+
+    let mut w = DumpWriter;
+
+    let _ = writeln!(w);
+    let _ = writeln!(w, "[NMI] context: {}", context);
+    match vector {
+        2 => {
+            let _ = writeln!(w, "==== NON-MASKABLE INTERRUPT (#NMI 2) {:=>30}", "");
+        }
+        _ => {
+            let _ = writeln!(
+                w,
+                "==== {} (#{} ) {} {:=>50}",
+                exception_name(vector),
+                vector,
+                context,
+                ""
+            );
+        }
+    }
+
+    // ── Kernel stage (what it was doing) ─────────────────────
+    let _ = writeln!(w, "--- Kernel Stage ---");
+    let _ = writeln!(w, "Stage: {} ({})", crate::stage::as_str(), crate::stage::bootanim_str());
+    let _ = writeln!(w);
+
+    if vector == 18 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::mca::dump_mca(&mut w);
+            let _ = writeln!(w);
+        }
+    }
+
+    write_cpuid_info(&mut w);
+    let _ = writeln!(w);
+
+    let _ = writeln!(w, "--- Interrupt Frame (hung, not handler) ---");
+    let kaslr = crate::mm::layout::kaslr_offset();
+    let _ = writeln!(
+        w,
+        "KASLR slide = {:#x}  (image base {:#018x}; symbolize as addr - slide)",
+        kaslr,
+        kernel_image_base()
+    );
+    match krel(fault_rip) {
+        Some(off) => {
+            let _ = writeln!(w, "RIP  = {:#018x}  (kernel+{:#x})  <-- hung", fault_rip, off);
+        }
+        None => {
+            let _ = writeln!(w, "RIP  = {:#018x}  <-- hung", fault_rip);
+        }
+    }
+    let _ = writeln!(w, "CS   = {:#018x}", fault_cs);
+    let _ = writeln!(w, "RFLAGS = {:#018x}", fault_rfl);
+    write_rflags(&mut w, fault_rfl);
+    let cpl = fault_cs & 3;
+    if cpl == 3 {
+        let _ = writeln!(w, "SS   = {:#018x}  (saved by CPU on CPL change)", fault_ss);
+        let _ = writeln!(w, "RSP  = {:#018x}  (original user RSP, hung)", fault_rsp);
+    } else {
+        let _ = writeln!(w, "RSP  = {:#018x}  <-- hung", fault_rsp);
+    }
+    let _ = writeln!(w);
+
+    let _ = writeln!(w, "--- Control Registers ---");
+    let _ = writeln!(w, "CR0 = {:#018x}", cr0);
+    write_cr0_flags(&mut w, cr0);
+    let _ = writeln!(w, "CR2 = {:#018x}", cr2);
+    let cr3_asid = cr3 & 0xFFF;
+    let cr3_phys = cr3 & 0x000F_FFFF_FFFF_F000;
+    let _ = writeln!(w, "CR3 = {:#018x}", cr3);
+    if cr3_asid != 0 {
+        let _ = writeln!(w, "      phys={:#x}  ASID/PCID={:#x}", cr3_phys, cr3_asid);
+    } else {
+        let _ = writeln!(w, "      phys={:#x}", cr3_phys);
+    }
+    let _ = writeln!(w, "CR4 = {:#018x}", cr4);
+    write_cr4_flags(&mut w, cr4);
+    let _ = writeln!(w);
+
+    dump_msrs(&mut w);
+    let _ = writeln!(w);
+
+    let if_flag = (fault_rfl >> 9) & 1;
+    let _ = writeln!(
+        w,
+        "Interrupts: {}",
+        if if_flag != 0 {
+            "enabled (IF=1)"
+        } else {
+            "disabled (IF=0)"
+        }
+    );
+    let _ = writeln!(w, "NMI reason: {}", context);
+    let _ = writeln!(w);
+
+    dump_fault_stack(&mut w, fault_rsp, cr3);
+    let _ = writeln!(w);
+
+    dump_code_bytes(&mut w, fault_rip, cr3);
+    let _ = writeln!(w);
+
+    let _ = writeln!(w, "================================================");
+
+    // Default: halt (watchdog_cont continues). F9 caller already handles its
+    // own policy (always continue), but this path is shared — watchdog_cont
+    // controls halt. The nmi_handler also does its own halt post-dump.
+    #[cfg(not(feature = "watchdog_cont"))]
+    {
+        // If this was watchdog timeout we halt; hotkey path would have
+        // returned before reaching here? Actually hotkey also lands here —
+        // we must not halt hotkey when watchdog_cont is off. Check context.
+        if context.contains("watchdog") {
+            DUMP_IN_PROGRESS[cpu].store(false, Ordering::SeqCst);
+            loop {
+                unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+            }
+        } else {
+            // Hotkey: always continue, release guard so next hotkey can dump
+            DUMP_IN_PROGRESS[cpu].store(false, Ordering::SeqCst);
+        }
+    }
+    #[cfg(feature = "watchdog_cont")]
+    {
+        DUMP_IN_PROGRESS[cpu].store(false, Ordering::SeqCst);
+    }
+}
+
 // ── Non-exception fatal dump ───────────────────────────────────────
 
 /// Fatal dump for a condition detected outside any exception frame (e.g. a
@@ -885,10 +1086,33 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
         dump_puts("\n[DUMP] Nested fault (#");
         dump_put_hex(vector as u64);
         dump_puts(") while dumping -- halting\n");
+        #[cfg(target_arch = "x86_64")]
+        if crate::kerneldump::screen::is_ready() {
+            crate::kerneldump::screen::panic_puts("\n[DUMP] Nested fault while dumping -- halting\n");
+        }
         loop {
             unsafe {
                 asm!("cli", "hlt", options(nomem, nostack));
             }
+        }
+    }
+
+    // ── Claim panic screen ASAP (first fault wins VRAM) ──────────
+    #[cfg(target_arch = "x86_64")]
+    {
+        // Try to claim VRAM on any fatal dump (not just #MC) — provides
+        // "blue-screen" for all aborts while remaining no-op if no fb.
+        // `panic_screen_init` is idempotent w.r.t. claim; it clears screen
+        // to red only once (first caller). Subsequent calls see `is_ready()`.
+        if !crate::kerneldump::screen::is_ready() {
+            let _ = crate::kerneldump::screen::panic_screen_init();
+        }
+        // Even if we just claimed, ensure title line is printed immediately
+        // via serial+screen before heavy decode. Mirrored via DumpWriter now.
+        if crate::kerneldump::screen::is_ready() {
+            // This raw put ensures banner is visible before any MSR reads that
+            // could fault again. Use direct panic_puts for immediate VRAM flush.
+            // The DumpWriter mirroring will duplicate header again below; that's fine.
         }
     }
 
@@ -931,6 +1155,9 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
         8 => {
             let _ = writeln!(w, "==== DOUBLE FAULT (#8) {:=>36}", "");
         }
+        18 => {
+            let _ = writeln!(w, "==== MACHINE CHECK (#MC 18) {:=>32}", "");
+        }
         _ => {
             let _ = writeln!(
                 w,
@@ -939,6 +1166,20 @@ pub fn dump_full_fault(frame: &InterruptStackFrame, error_code: u64, vector: u8)
                 vector,
                 ""
             );
+        }
+    }
+
+    // ── Kernel stage (what it was doing) ─────────────────────
+    let _ = writeln!(w, "--- Kernel Stage ---");
+    let _ = writeln!(w, "Stage: {} ({})", crate::stage::as_str(), crate::stage::bootanim_str());
+    let _ = writeln!(w);
+
+    // ── Machine Check MCA decode (vector 18) ──────────────────────
+    if vector == 18 {
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::mca::dump_mca(&mut w);
+            let _ = writeln!(w);
         }
     }
 

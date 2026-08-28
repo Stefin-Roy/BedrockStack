@@ -551,6 +551,36 @@ fn drain_child_stream(pid: isize, suffix: &[u8], header: &[u8]) {
     }
 }
 
+/// Returns true if `nochime` was passed on the kernel command line (checked via
+/// `/kernel/bootargs`). Matches `nochime`, `-nochime`, `--nochime` as whitespace-
+/// separated words, mirroring `kernel::bootargs::contains_word`. Best-effort:
+/// if the read fails we assume chime enabled (no surprise mute).
+fn is_nochime() -> bool {
+    let mut buf = [0u8; 512];
+    let rc = unsafe { libc::syscall::read_path(b"/kernel/bootargs\0", &mut buf, 0) };
+    if rc <= 0 {
+        return false;
+    }
+    let b = &buf[..rc as usize];
+    let w = b"nochime";
+    let mut i = 0usize;
+    while i < b.len() {
+        while i < b.len() && (b[i] == b' ' || b[i] == b'\t' || b[i] == b'\n' || b[i] == b'\r') {
+            i += 1;
+        }
+        if i >= b.len() { break; }
+        let start = i;
+        while i < b.len() && b[i] != b' ' && b[i] != b'\t' && b[i] != b'\n' && b[i] != b'\r' {
+            i += 1;
+        }
+        let token = &b[start..i];
+        if token == w { return true; }
+        if token.len() == w.len()+1 && token[0]==b'-' && &token[1..]==w { return true; }
+        if token.len() == w.len()+2 && token[0]==b'-' && token[1]==b'-' && &token[2..]==w { return true; }
+    }
+    false
+}
+
 /// Play the startup chime from the ESP. The asset is RIFF/WAVE PCM 48 kHz
 /// stereo 16-bit — the kernel's native `:play_pcm` format — so we just parse
 /// the header for the `data` offset and stream the payload in 20 ms chunks
@@ -855,8 +885,12 @@ pub extern "C" fn entry_main() -> usize {
             serial_puts_dec(b"[INIT] POSIXCHECK exit code=", code as u64, b"\n");
         }
     }
-    serial_puts(b"[INIT] PLAYING SOUND FUNCTION\n");
-    play_startup_wav();
+    if is_nochime() {
+        serial_puts(b"[INIT] nochime: skip startup chime\n");
+    } else {
+        serial_puts(b"[INIT] PLAYING SOUND FUNCTION\n");
+        play_startup_wav();
+    }
     loop {
         serial_puts(b"[INIT] reached paint loop\n");
         paint_gradient(&mode);

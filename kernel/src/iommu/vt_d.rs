@@ -52,12 +52,46 @@ const CAP_NFR_MASK: u64 = 0xFF << 40;
 const ECAP_C: u64 = 1 << 0;
 const ECAP_SC: u64 = 1 << 7;
 
-// FSTS bits
+// FSTS bits — PPF is RO (derived from FRCD.F), only PFO/IQE (and AFO/ICE/ITE) are RW1C (§10.4.5).
 const FSTS_PPF: u32 = 1 << 1;
 const FSTS_PFO: u32 = 1 << 0;
 const FSTS_IQE: u32 = 1 << 4;
-// FSTS IPS? bit 8 is not defined in older rev, but used as catch-all.
+// Detection includes PPF; clearing must exclude PPF (RO).
 const FSTS_ALL_FAULT: u32 = FSTS_PPF | FSTS_PFO | FSTS_IQE;
+const FSTS_W1C_MASK: u32 = FSTS_PFO | FSTS_IQE;
+
+// VT-d Fault Reason decode (Table 30 DMA + Table 15 IR). Only DMA 01h-0Eh and 20h-2Bh named; unknown -> hex.
+fn decode_fault_reason(fr: u8) -> &'static str {
+    match fr {
+        0x01 => "LRT.2 root not present",
+        0x02 => "LCT.2 ctx not present",
+        0x03 => "LCT.4 AW/TT/SSPTPTR invalid",
+        0x04 => "LGN.1 addr overflow (MGAW/AGAW/HAW)",
+        0x05 => "LGN.2 write perm fail",
+        0x06 => "LGN.3 read perm fail",
+        0x07 => "LSS.1 2nd-stage entry error",
+        0x08 => "LRT.1 root entry error",
+        0x09 => "LCT.1 ctx entry error",
+        0x0A => "LRT.3 root reserved bit",
+        0x0B => "LCT.3 ctx reserved bit",
+        0x0C => "LSS.2 2nd-stage reserved bit",
+        0x0D => "LCT.5 TT blocked",
+        0x0E => "LGN.4 intr range blocked",
+        0x20 => "IR 20h reserved field in remappable req",
+        0x21 => "IR 21h intr index over limit",
+        0x22 => "IR 22h IRTE not present",
+        0x23 => "IR 23h IRTA access error",
+        0x24 => "IR 24h IRTE reserved bit",
+        0x25 => "IR 25h compatibility format blocked",
+        0x26 => "IR 26h SID verify fail",
+        0x27 => "IR 27h PID access error",
+        0x28 => "IR 28h PID reserved bit",
+        0x29 => "IR 29h invalid MSI in intr range",
+        0x2A => "IR 2Ah EIME=0 required",
+        0x2B => "IR 2Bh IR disabled but MSI",
+        _ => "unknown",
+    }
+}
 
 // Context entry fields (128-bit, two u64)
 // LO: bits 0 = present, 1 = FPD, 2:3=TT, bits 12-63 = SLPT ptr
@@ -102,6 +136,7 @@ pub struct VtDUnit {
     pub ecap: u64,
     pub gcmd: u32,
     pub agaw: Agaw,
+    pub sagaw: u64, // raw SAGAW bits 12:8 for global intersection
     pub mgaw: u8,
     pub haw: u8,
     pub fro: u64,
@@ -124,15 +159,21 @@ impl VtDUnit {
         let fro = ((cap & CAP_FRO_MASK) >> CAP_FRO_SHIFT) * 16;
         let nfr = (((cap & CAP_NFR_MASK) >> CAP_NFR_SHIFT) as u8) + 1;
         let sagaw = (cap & CAP_SAGAW_MASK) >> CAP_SAGAW_SHIFT;
-        // Choose AGAW respecting SAGAW, MGAW, and HAW (spec §9.3 AW checks).
-        let supports_48 = (sagaw & (1 << 2)) != 0 && mgaw >= 48 && haw >= 48;
-        let supports_39 = (sagaw & (1 << 1)) != 0 && mgaw >= 39 && haw >= 39;
+        // Choose AGAW purely from SAGAW (spec 11.4.2). MGAW/HAW limit effective
+        // IOVA width (capped in Domain::new) but do not gate AW code support.
+        // QEMU and bare-metal report SAGAW=48-only with MGAW=HAW=39; gating on
+        // mgaw>=48 would incorrectly force 39 and cause FR=03h (AW not supported).
+        let supports_48 = (sagaw & (1 << 2)) != 0;
+        let supports_39 = (sagaw & (1 << 1)) != 0;
         let agaw = if supports_48 {
             Agaw::Level4
         } else if supports_39 {
             Agaw::Level3
+        } else if sagaw == 0 {
+            // No SAGAW (SSTS=0 or broken firmware): best-effort fallback using MGAW/HAW.
+            if mgaw >= 48 && haw >= 48 { Agaw::Level4 } else { Agaw::Level3 }
         } else {
-            // Fallback: if nothing matches, pick 39 and hope hardware clamps (will fault on enable)
+            // SAGAW reports only 30-bit etc. not handled (Levels 5): fallback to 39 and let global intersection abort.
             Agaw::Level3
         };
         let qi = QiState::new(reg_va, ecap);
@@ -150,7 +191,13 @@ impl VtDUnit {
         SerialPort::put_hex(cap);
         SerialPort::puts(" ecap=");
         SerialPort::put_hex(ecap);
-        SerialPort::puts(" sc=");
+        SerialPort::puts(" sagaw=");
+        SerialPort::put_hex(sagaw);
+        SerialPort::puts(" (39=");
+        SerialPort::put_u64(if supports_39 {1} else {0});
+        SerialPort::puts(" 48=");
+        SerialPort::put_u64(if supports_48 {1} else {0});
+        SerialPort::puts(") sc=");
         SerialPort::put_u64(sc as u64);
         SerialPort::puts(" c=");
         SerialPort::put_u64(coherency as u64);
@@ -175,6 +222,7 @@ impl VtDUnit {
             ecap,
             gcmd: 0,
             agaw,
+            sagaw,
             mgaw,
             haw,
             fro,
@@ -282,7 +330,8 @@ impl VtDUnit {
         unsafe {
             write64(self.reg_va, REG_RTADDR, rtaddr_val);
             fence(Ordering::SeqCst);
-            let mut gcmd = read32(self.reg_va, REG_GCMD);
+            // GCMD is write-only; read GSTS to preserve active controls (e.g. QIE) per §10.4.4.
+            let mut gcmd = read32(self.reg_va, REG_GSTS);
             gcmd |= GCMD_SRTP;
             write32(self.reg_va, REG_GCMD, gcmd);
         }
@@ -313,7 +362,8 @@ impl VtDUnit {
 
     pub fn enable_translation(&mut self) -> bool {
         unsafe {
-            let mut gcmd = read32(self.reg_va, REG_GCMD);
+            // GCMD write-only: derive new value from GSTS per §10.4.4 to avoid clearing QIE etc.
+            let mut gcmd = read32(self.reg_va, REG_GSTS);
             gcmd |= GCMD_TE;
             write32(self.reg_va, REG_GCMD, gcmd);
             fence(Ordering::SeqCst);
@@ -340,7 +390,8 @@ impl VtDUnit {
     #[allow(dead_code)]
     pub fn disable_translation(&mut self) {
         unsafe {
-            let mut gcmd = read32(self.reg_va, REG_GCMD);
+            // GCMD write-only: read GSTS to preserve other bits (§10.4.4).
+            let mut gcmd = read32(self.reg_va, REG_GSTS);
             gcmd &= !GCMD_TE;
             write32(self.reg_va, REG_GCMD, gcmd);
         }
@@ -421,12 +472,12 @@ impl VtDUnit {
         SerialPort::puts(" nfr=");
         SerialPort::put_u64(self.nfr as u64);
         SerialPort::puts("\n");
-        // FRCD: each 16B, bit63 of low qword is F, high qword holds reason/source.
+        // FRCD: each 16B, low qword (rec_off+0) holds fault info/address [63:12]; high qword (rec_off+8) bit 63 (=bit127) is F (RW1C).
         for i in 0..(self.nfr as u64) {
             let rec_off = self.fro + i * 16;
             let low = unsafe { read64(self.reg_va, rec_off) };
             let high = unsafe { read64(self.reg_va, rec_off + 8) };
-            let fault = (low >> 63) & 1;
+            let fault = (high >> 63) & 1;
             if fault == 0 {
                 continue;
             }
@@ -437,18 +488,50 @@ impl VtDUnit {
             SerialPort::puts(" hi=");
             SerialPort::put_hex(high);
             SerialPort::puts("\n");
-            // Clear F by writing 1 to bit63 (W1C for FRCD.F) — keep other bits.
+            // Decode fields per spec Fig 11-15 (11.4.7.6)
+            let fr = ((high >> 32) & 0xFF) as u8;
+            let sid = (high & 0xFFFF) as u16;
+            let fi = low & !0xFFFu64;
+            let t1 = (high >> 62) & 1;
+            let t2 = (high >> 28) & 1;
+            let at = (high >> 60) & 3;
+            let sid_bus = ((sid >> 8) & 0xFF) as u8;
+            let sid_dev = ((sid >> 3) & 0x1F) as u8;
+            let sid_func = (sid & 0x7) as u8;
+            SerialPort::puts("    decoded: SID=");
+            SerialPort::put_hex(sid as u64);
+            SerialPort::puts(" (");
+            SerialPort::put_u64(sid_bus as u64);
+            SerialPort::puts(":");
+            SerialPort::put_u64(sid_dev as u64);
+            SerialPort::puts(".");
+            SerialPort::put_u64(sid_func as u64);
+            SerialPort::puts(") FR=");
+            SerialPort::put_hex(fr as u64);
+            SerialPort::puts(" ");
+            SerialPort::puts(decode_fault_reason(fr));
+            SerialPort::puts(" FI=");
+            SerialPort::put_hex(fi);
+            SerialPort::puts(" AT=");
+            SerialPort::put_u64(at);
+            SerialPort::puts(" T=");
+            SerialPort::put_u64(t1);
+            SerialPort::put_u64(t2);
+            SerialPort::puts("\n");
+            // Clear F by writing 1 to bit 63 of the upper qword (bit 127 overall); F is RW1C.
             unsafe {
-                // Spec p11-43: FRCD.F is RW1C
-                write64(self.reg_va, rec_off, low | (1u64 << 63));
+                // Spec §10.4.8 (§11.4.8): FRCD.F at bit 127 is RW1C
+                write64(self.reg_va, rec_off + 8, high | (1u64 << 63));
                 fence(Ordering::SeqCst);
             }
         }
-        // Clear FSTS W1C bits that are set. PPF is derived from FRCD.F, but we clear by writing 1s.
-        let to_clear = fsts & FSTS_ALL_FAULT;
+        // Clear FSTS W1C bits that are set. PPF is RO (derived from FRCD.F) — do not attempt to clear by writing 1.
+        let to_clear = fsts & FSTS_W1C_MASK;
         unsafe {
-            write32(self.reg_va, REG_FSTS, to_clear);
-            fence(Ordering::SeqCst);
+            if to_clear != 0 {
+                write32(self.reg_va, REG_FSTS, to_clear);
+                fence(Ordering::SeqCst);
+            }
         }
     }
 
@@ -466,13 +549,13 @@ impl VtDUnit {
     /// Program fault interrupt as MSI to LAPIC. Handles xAPIC and x2APIC.
     pub fn program_fault_msi(&self, vector: u8, dest_apic: u32) {
         let fe_data = vector as u32; // delivery fixed, vector
-        // xAPIC: FEADDR 0xFEE00000 | dest[7:0]<<12 ; x2APIC: high 24 bits in FEUADDR
+        // Standard MSI address is 0xFEE00000 | dest[7:0]<<12 (xAPIC). Upper 32 bits (FEUADDR) must be 0 for
+        // non-remapped MSI (base is 0x00000000_FEE00000). x2APIC destinations >255 require VT-d IR, not FEUADDR.
         let fe_addr = 0xFEE00000u32 | ((dest_apic & 0xFF) << 12);
-        let fe_uaddr = (dest_apic >> 8) & 0xFFFFFF;
         unsafe {
             write32(self.reg_va, REG_FEDATA, fe_data);
             write32(self.reg_va, REG_FEADDR, fe_addr);
-            write32(self.reg_va, REG_FEUADDR, fe_uaddr);
+            write32(self.reg_va, REG_FEUADDR, 0);
         }
         SerialPort::puts("[iommu] fault MSI vec=");
         SerialPort::put_u64(vector as u64);
@@ -496,12 +579,16 @@ pub struct Domain {
 }
 
 impl Domain {
-    pub fn new(agaw: Agaw, slpt_root_phys: u64, _mgaw: u8, haw: u8, allow_snp: bool) -> Self {
+    pub fn new(agaw: Agaw, slpt_root_phys: u64, mgaw: u8, haw: u8, allow_snp: bool) -> Self {
         let bits = match agaw { Agaw::Level3 => 39, Agaw::Level4 => 48 };
-        // IOVA limit is AGAW, but also capped by HAW for physical backing (spec §3.7)
+        // IOVA limit is AGAW, capped by both HAW and MGAW (spec §3.7: min(MGAW,AGAW,HAW)).
+        // For QEMU/bare-metal SAGAW=48, MGAW=HAW=39 => limit 512G, still holds FB/RMRR below 4G.
         let mut limit = if bits == 39 { 1u64 << 39 } else { 1u64 << 48 };
         if (haw as u64) < bits {
-            limit = 1u64 << (haw as u64);
+            limit = core::cmp::min(limit, 1u64 << (haw as u64));
+        }
+        if (mgaw as u64) < bits {
+            limit = core::cmp::min(limit, 1u64 << (mgaw as u64));
         }
         Domain {
             slpt_root_phys,
@@ -552,8 +639,9 @@ impl Domain {
             }
             let mut overlaps = false;
             for r in rmrrs {
-                let r_start = r.base_address;
-                let Some(r_end) = r.limit_address.checked_add(1) else {
+                // Page-align RMRR identically to init's identity-map rounding (base down, limit up).
+                let r_start = r.base_address & !0xFFF;
+                let Some(r_end) = (r.limit_address | 0xFFF).checked_add(1) else {
                     return None;
                 };
                 let Some(candidate_end) = candidate.checked_add(pages) else {
@@ -596,11 +684,24 @@ pub fn is_enabled() -> bool {
 
 /// Initialize IOMMU after ACPI tables and before DMA services.
 /// Returns true if at least one unit successfully enabled TE.
+/// `fb_range` is `(phys_base, size_bytes)` for the GOP scanout buffer; when
+/// `Some` it is identity-mapped before TE so the iGPU display engine can
+/// continue DMA-reading `fb_phys` as IOVA. `None`/zero skips FB mapping.
+/// Gated by `noiommu` at callsite (`services/x86_64`); this also bails if
+/// `noiommu` is set. Verification of FB/RMRR identity is additionally gated
+/// behind `iommu_verify` (`bootargs::is_iommu_verify`) — failure aborts to
+/// fallback noiommu (returns false, caller uses unprotected DMA).
 pub fn init(
     dmar: &DmarInfo,
     _root: u64,
     alloc_ptr: *mut BitmapAllocator,
+    fb_range: Option<(u64, u64)>,
 ) -> bool {
+    // `noiommu` is opt-out master gate — even direct calls must respect it.
+    if crate::bootargs::is_noiommu() {
+        SerialPort::puts("[iommu] noiommu set — skip init\n");
+        return false;
+    }
     if dmar.drhds.is_empty() {
         SerialPort::puts("[iommu] no DRHD\n");
         return false;
@@ -647,22 +748,48 @@ pub fn init(
         SerialPort::puts("[iommu] no units mapped\n");
         return false;
     }
-    // Decide domain AGAW as minimum supported across units (most restrictive)
-    let mut global_agaw = units[0].agaw;
-    let mut min_haw = units[0].haw;
-    let mut min_mgaw = units[0].mgaw;
+    // Decide domain AGAW as intersection of SAGAW across units (highest common).
+    // MGAW/HAW limit effective IOVA width via Domain::new (min cap), not AW code.
+    let mut common_sagaw = units[0].sagaw;
     for u in &units[1..] {
-        global_agaw = match (global_agaw, u.agaw) {
-            (Agaw::Level3, _) | (_, Agaw::Level3) => Agaw::Level3,
-            _ => Agaw::Level4,
-        };
-        min_haw = core::cmp::min(min_haw, u.haw);
-        min_mgaw = core::cmp::min(min_mgaw, u.mgaw);
+        common_sagaw &= u.sagaw;
     }
-    // If global_agaw 48 but min_haw/mgaw <48, downgrade to 39
-    if matches!(global_agaw, Agaw::Level4) && (min_haw < 48 || min_mgaw < 48) {
-        global_agaw = Agaw::Level3;
-    }
+    let global_agaw = if (common_sagaw & (1 << 2)) != 0 {
+        Agaw::Level4
+    } else if (common_sagaw & (1 << 1)) != 0 {
+        Agaw::Level3
+    } else if common_sagaw == 0 {
+        // No common SAGAW (e.g., only 30-bit or mismatched): try best-effort fallback using per-unit agaw intersection
+        let mut fallback = units[0].agaw;
+        for u in &units[1..] {
+            fallback = match (fallback, u.agaw) {
+                (Agaw::Level3, _) | (_, Agaw::Level3) => Agaw::Level3,
+                _ => Agaw::Level4,
+            };
+        }
+        SerialPort::puts("[iommu] WARN: no common SAGAW (common=");
+        SerialPort::put_hex(common_sagaw);
+        SerialPort::puts(") fallback agaw=");
+        SerialPort::put_u64(match fallback { Agaw::Level3=>39, Agaw::Level4=>48 });
+        SerialPort::puts("\n");
+        fallback
+    } else {
+        SerialPort::puts("[iommu] no common AGAW (common_sagaw=");
+        SerialPort::put_hex(common_sagaw);
+        SerialPort::puts(") => abort IOMMU\n");
+        return false;
+    };
+    let min_haw = units.iter().map(|u| u.haw).min().unwrap();
+    let min_mgaw = units.iter().map(|u| u.mgaw).min().unwrap();
+    SerialPort::puts("[iommu] global agaw=");
+    SerialPort::put_u64(match global_agaw { Agaw::Level3=>39, Agaw::Level4=>48 });
+    SerialPort::puts(" common_sagaw=");
+    SerialPort::put_hex(common_sagaw);
+    SerialPort::puts(" min_haw=");
+    SerialPort::put_u64(min_haw as u64);
+    SerialPort::puts(" min_mgaw=");
+    SerialPort::put_u64(min_mgaw as u64);
+    SerialPort::puts("\n");
     // SNP (snoop) requires ECAP.SC=1 on every unit; QEMU reports SC=0 (ecap 0xf00f0a),
     // so SNP is reserved(0) even for leaf. Use global conservative value.
     let allow_snp = units.iter().all(|u| u.sc);
@@ -680,6 +807,9 @@ pub fn init(
     let slpt_va = crate::mm::layout::to_physmap(slpt_root);
     unsafe { core::ptr::write_bytes(slpt_va as *mut u8, 0, 4096) };
     let mut domain = Domain::new(global_agaw, slpt_root, min_mgaw, min_haw, allow_snp);
+    // Effective RMRR set for IOVA allocation — starts as firmware RMRRs and will also reserve the GOP framebuffer
+    // (instead of bumping next_iova past high MMIO which would exhaust 32-bit IOVA space for alloc_iova_below).
+    let mut effective_rmrrs: Vec<crate::acpi::Rmrr> = dmar.rmrrs.clone();
 
     // Identity-map RMRR ranges into SLPT BEFORE enabling translation.
     for rmrr in &dmar.rmrrs {
@@ -715,8 +845,156 @@ pub fn init(
         }
     }
 
+    // Identity-map GOP framebuffer (display scanout) BEFORE enabling translation.
+    // Without this the iGPU display engine DMAs `fb_phys` as IOVA and faults -> stripes
+    // (user report: machine-art display with IOMMU on, clean with noiommu). `fb_range`
+    // is passed from `Kernel::fb_phys` + stride*height*bpp. This is not RMRR (firmware
+    // does not list FB as RMRR), so we synthesize the identity. `noiommu` already
+    // bailed above; this block only runs when IOMMU is actually enabling.
+    if let Some((fb_base_raw, fb_size)) = fb_range {
+        if fb_size != 0 && fb_base_raw != 0 {
+            let fb_base = fb_base_raw & !0xFFF;
+            let fb_end_raw = fb_base_raw.checked_add(fb_size).unwrap_or(0);
+            // round exclusive end up to 4K (fb_size may not be page-aligned)
+            let fb_end_excl = (fb_end_raw + 0xFFF) & !0xFFF;
+            if fb_end_excl <= fb_base || fb_base >= domain.iova_limit || fb_end_excl > domain.iova_limit {
+                SerialPort::puts("[iommu] FB range invalid/over IOVA limit (");
+                SerialPort::put_hex(fb_base);
+                SerialPort::puts(" + ");
+                SerialPort::put_hex(fb_size);
+                SerialPort::puts(" end=");
+                SerialPort::put_hex(fb_end_excl);
+                SerialPort::puts(" limit=");
+                SerialPort::put_hex(domain.iova_limit);
+                SerialPort::puts(") -> abort IOMMU, fallback to noiommu\n");
+                return false;
+            }
+            let fb_pages = (fb_end_excl - fb_base) / 4096;
+            SerialPort::puts("[iommu] FB identity base=");
+            SerialPort::put_hex(fb_base);
+            SerialPort::puts(" size=");
+            SerialPort::put_hex(fb_size);
+            SerialPort::puts(" pages=");
+            SerialPort::put_u64(fb_pages);
+            SerialPort::puts("\n");
+            let mut fb_map_failed = false;
+            for p in 0..fb_pages {
+                let addr = fb_base + p * 4096;
+                // Skip if already identity-mapped by overlapping RMRR (avoid Already mapped)
+                if let Some(pa) = slpt::translate(slpt_root, addr, global_agaw) {
+                    if pa == addr {
+                        continue;
+                    }
+                    // Stale mismatch — treat as error (verify will also catch)
+                    SerialPort::puts("[iommu] FB overlap mismatch addr=");
+                    SerialPort::put_hex(addr);
+                    SerialPort::puts(" pa=");
+                    SerialPort::put_hex(pa);
+                    SerialPort::puts("\n");
+                    if crate::bootargs::is_iommu_verify() {
+                        return false;
+                    }
+                    // without verify, clear and re-map? attempt overwrite via translate fixup below
+                    // fall through to map attempt which will hit Already mapped -> need explicit overwrite
+                    // So skip duplicate mismatch silently for best-effort
+                    continue;
+                }
+                if let Err(e) = slpt::map_4k(slpt_root, alloc, addr, addr, global_agaw, allow_snp) {
+                    // If Already mapped due to RMRR overlap, ignore; else fail
+                    if e == "IOMMU SLPT: iova already mapped" {
+                        continue;
+                    }
+                    SerialPort::puts("[iommu] FB map fail ");
+                    SerialPort::put_hex(addr);
+                    SerialPort::puts(" err=");
+                    SerialPort::puts(e);
+                    SerialPort::puts("\n");
+                    fb_map_failed = true;
+                    break;
+                }
+            }
+            if fb_map_failed {
+                SerialPort::puts("[iommu] FB map failed -> abort IOMMU, fallback to noiommu\n");
+                return false;
+            }
+            // Reserve FB range for IOVA allocation without bumping next_iova past high MMIO.
+            // Bumping to 0xE0000000+ would exhaust 32-bit IOVA space for alloc_iova_below.
+            // Instead treat FB as an RMRR-like reserved range (page-aligned) checked in alloc_iova_with_limit.
+            effective_rmrrs.push(crate::acpi::Rmrr {
+                segment: 0,
+                base_address: fb_base,
+                limit_address: fb_end_excl - 1,
+                devices: alloc::vec::Vec::new(),
+            });
+            SerialPort::puts("[iommu] FB reserved for IOVA allocator base=");
+            SerialPort::put_hex(fb_base);
+            SerialPort::puts(" end=");
+            SerialPort::put_hex(fb_end_excl);
+            SerialPort::puts("\n");
+            // Gated verification: when `iommu_verify` bootarg present, re-walk and ensure identity
+            if crate::bootargs::is_iommu_verify() {
+                let mut verify_ok = true;
+                for p in 0..fb_pages {
+                    let addr = fb_base + p * 4096;
+                    match slpt::translate(slpt_root, addr, global_agaw) {
+                        Some(pa) if pa == addr => {},
+                        Some(pa) => {
+                            SerialPort::puts("[iommu] verify FB mismatch IOVA=");
+                            SerialPort::put_hex(addr);
+                            SerialPort::puts(" -> ");
+                            SerialPort::put_hex(pa);
+                            SerialPort::puts("\n");
+                            verify_ok = false;
+                            break;
+                        },
+                        None => {
+                            SerialPort::puts("[iommu] verify FB missing IOVA=");
+                            SerialPort::put_hex(addr);
+                            SerialPort::puts("\n");
+                            verify_ok = false;
+                            break;
+                        }
+                    }
+                }
+                if !verify_ok {
+                    SerialPort::puts("[iommu] verify FB failed -> abort IOMMU, fallback to noiommu\n");
+                    return false;
+                }
+                // Also verify RMRRs still identity
+                for rmrr in &dmar.rmrrs {
+                    let base = rmrr.base_address & !0xFFF;
+                    let limit_inc = rmrr.limit_address;
+                    let end = (limit_inc | 0xFFF).wrapping_add(1);
+                    if end <= base || end > domain.iova_limit { continue; }
+                    let pages = (end - base)/4096;
+                    for p in 0..pages {
+                        let addr = base + p*4096;
+                        match slpt::translate(slpt_root, addr, global_agaw) {
+                            Some(pa) if pa == addr => {},
+                            _ => {
+                                SerialPort::puts("[iommu] verify RMRR fail addr=");
+                                SerialPort::put_hex(addr);
+                                SerialPort::puts("\n");
+                                verify_ok = false;
+                                break;
+                            }
+                        }
+                    }
+                    if !verify_ok { break; }
+                }
+                if !verify_ok {
+                    SerialPort::puts("[iommu] verify RMRR failed -> abort IOMMU\n");
+                    return false;
+                }
+                SerialPort::puts("[iommu] verify FB+RMRR identity ok\n");
+            }
+        }
+    }
+
     // For each unit: alloc tables (root/context) pointing to SLPT, set RTADDR, enable QI
+    // Use domain (global) AGAW for context entries; unit-local AGAW may be wider than domain and would mis-walk.
     for (idx, unit) in units.iter_mut().enumerate() {
+        unit.agaw = global_agaw;
         let drhd = &dmar.drhds[idx];
         if let Err(e) = unit.alloc_tables(drhd, alloc, slpt_root) {
             SerialPort::puts("[iommu] alloc_tables fail ");
@@ -751,6 +1029,38 @@ pub fn init(
         return false;
     }
 
+    // Early fault window: display engine DMAs continuously; if FB/RMRR identity was wrong
+    // or any early DMA faults, it will appear within microseconds after TE.
+    // On any fault, fallback fully to noiommu so USB/storage (xHCI) does not hang
+    // waiting for faulting DMA. Previously we tried per-unit fallback but that
+    // left the include_all unit enabled and hung at xHCI init on this ASUS.
+    {
+        let mut any_fault = false;
+        for _ in 0..200_000 {
+            for u in &units {
+                let fsts = unsafe { read32(u.reg_va, REG_FSTS) };
+                if fsts & FSTS_ALL_FAULT != 0 {
+                    any_fault = true;
+                    break;
+                }
+            }
+            if any_fault {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+        if any_fault {
+            SerialPort::puts("[iommu] early faults after TE -> full fallback to noiommu, dumping FRCD\n");
+            for u in &mut units {
+                u.drain_faults();
+                if u.enabled {
+                    u.disable_translation();
+                }
+            }
+            return false;
+        }
+    }
+
     SerialPort::puts("[iommu] enabled units=");
     SerialPort::put_u64(ok_count as u64);
     SerialPort::puts("/");
@@ -770,7 +1080,7 @@ pub fn init(
     let state = IommuState {
         units,
         domain,
-        rmrrs: dmar.rmrrs.clone(),
+        rmrrs: effective_rmrrs,
         lock: Mutex::new(()),
     };
     IOMMU_STATE.call_once(|| Mutex::new(state));
@@ -836,22 +1146,29 @@ fn map_phys_to_iova_inner(
     alloc: &mut BitmapAllocator,
     limit: Option<u64>,
 ) -> Option<u64> {
-    if size == 0 || (phys & 0xFFF) != 0 {
+    if size == 0 {
         return None;
     }
+    // Support arbitrary phys alignment: map the spanned pages and return offset IOVA.
+    let page_offset = phys & 0xFFF;
+    let total_size = size.checked_add(page_offset)?;
+    let phys_aligned = phys & !0xFFF;
     let state_mutex = IOMMU_STATE.get()?;
     let mut state = state_mutex.lock();
     let rmrrs_snapshot = state.rmrrs.clone();
-    let iova = match limit {
-        Some(lim) => state.domain.alloc_iova_below(size, lim, &rmrrs_snapshot)?,
-        None => state.domain.alloc_iova(size, &rmrrs_snapshot)?,
-    };
+    let prev_next_iova = state.domain.next_iova;
+    let agaw = state.domain.agaw;
+    let slpt_root = state.domain.slpt_root_phys;
     let allow_snp = state.domain.allow_snp;
-    let pages = size.checked_add(0xFFF)? / 4096;
+    let iova = match limit {
+        Some(lim) => state.domain.alloc_iova_below(total_size, lim, &rmrrs_snapshot)?,
+        None => state.domain.alloc_iova(total_size, &rmrrs_snapshot)?,
+    };
+    let pages = (total_size.checked_add(0xFFF)? & !0xFFF) / 4096;
     for p in 0..pages {
         let i = iova.checked_add(p.checked_mul(4096)?)?;
-        let pa = phys.checked_add(p.checked_mul(4096)?)?;
-        if let Err(e) = slpt::map_4k(state.domain.slpt_root_phys, alloc, i, pa, state.domain.agaw, allow_snp) {
+        let pa = phys_aligned.checked_add(p.checked_mul(4096)?)?;
+        if let Err(e) = slpt::map_4k(slpt_root, alloc, i, pa, agaw, allow_snp) {
             SerialPort::puts("[iommu] map_phys fail ");
             SerialPort::put_hex(i);
             SerialPort::puts("->");
@@ -859,6 +1176,12 @@ fn map_phys_to_iova_inner(
             SerialPort::puts(" err=");
             SerialPort::puts(e);
             SerialPort::puts("\n");
+            // Rollback: unmap pages already successfully mapped in this call and restore bump allocator.
+            for rb in 0..p {
+                let rb_iova = iova.checked_add((rb as u64).checked_mul(4096)?).unwrap_or(0);
+                let _ = slpt::unmap_4k(slpt_root, rb_iova, agaw);
+            }
+            state.domain.next_iova = prev_next_iova;
             return None;
         }
     }
@@ -868,7 +1191,7 @@ fn map_phys_to_iova_inner(
         }
     }
     fence(Ordering::SeqCst);
-    Some(iova + (phys & 0xFFF))
+    Some(iova + page_offset)
 }
 
 pub fn translate_iova(iova: u64) -> Option<u64> {
@@ -890,4 +1213,29 @@ pub fn program_fault_msi(vector: u8, apic_id: u32) {
             u.set_fault_intr(true);
         }
     }
+}
+
+pub fn has_pending_faults() -> bool {
+    let Some(m) = IOMMU_STATE.get() else { return false };
+    let guard = m.lock();
+    for u in &guard.units {
+        let fsts = unsafe { read32(u.reg_va, REG_FSTS) };
+        if fsts & FSTS_ALL_FAULT != 0 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn disable_all() {
+    let Some(m) = IOMMU_STATE.get() else { return };
+    let mut guard = m.lock();
+    for u in &mut guard.units {
+        if u.enabled {
+            u.disable_translation();
+            u.drain_faults();
+        }
+    }
+    IOMMU_ENABLED.store(false, Ordering::Release);
+    SerialPort::puts("[iommu] globally disabled due to faults -> fallback to noiommu\n");
 }

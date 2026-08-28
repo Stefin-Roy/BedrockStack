@@ -16,14 +16,28 @@ use crate::smp::{MAX_CPUS, current_cpu_id};
 
 /// IST slot used by the double-fault handler.
 pub const DOUBLE_FAULT_IST_INDEX: u16 = 0;
+/// IST slot used by the machine-check handler (#MC is abort, must not run on corrupt stack).
+pub const MCE_IST_INDEX: u16 = 1;
+/// IST slot used by the NMI watchdog + F9 hotkey (#NMI is async, must not run on corrupt stack).
+pub const NMI_IST_INDEX: u16 = 2;
 
 /// Size of the dedicated double-fault stack (20 KB).
 const DF_STACK_SIZE: usize = 4096 * 5;
+/// Size of the dedicated machine-check stack (20 KB, matches DF).
+const MCE_STACK_SIZE: usize = 4096 * 5;
+/// Size of the dedicated NMI stack (20 KB, matches DF/MCE).
+const NMI_STACK_SIZE: usize = 4096 * 5;
 
 /// Per-CPU double-fault stacks.  Each CPU's TSS.IST[0] points into its own
 /// slot so that a simultaneous double fault on two CPUs does not corrupt
 /// either stack.
 static mut DF_STACKS: [[u8; DF_STACK_SIZE]; MAX_CPUS] = [[0; DF_STACK_SIZE]; MAX_CPUS];
+/// Per-CPU machine-check stacks.  Separate from DF so a #MC during #DF handling
+/// (or vice-versa) never collides.
+static mut MCE_STACKS: [[u8; MCE_STACK_SIZE]; MAX_CPUS] = [[0; MCE_STACK_SIZE]; MAX_CPUS];
+/// Per-CPU NMI stacks.  NMI can arrive at any time (including with IF=0 or
+/// on a corrupted stack), so it needs its own IST just like #DF/#MC.
+static mut NMI_STACKS: [[u8; NMI_STACK_SIZE]; MAX_CPUS] = [[0; NMI_STACK_SIZE]; MAX_CPUS];
 
 /// Per-CPU TSS objects (each CPU gets its own IST stack).
 ///
@@ -76,13 +90,23 @@ pub fn init() {
     assert!(cpu_id < MAX_CPUS, "GDT: CPU {} out of range", cpu_id);
 
     // ── build per-CPU TSS ───────────────────────────────────────────
-    let stack_end = {
+    let df_end = {
         let df_stack = unsafe { &DF_STACKS[cpu_id] };
         VirtAddr::from_ptr(df_stack.as_ptr()) + DF_STACK_SIZE as u64
     };
+    let mce_end = {
+        let mce_stack = unsafe { &MCE_STACKS[cpu_id] };
+        VirtAddr::from_ptr(mce_stack.as_ptr()) + MCE_STACK_SIZE as u64
+    };
+    let nmi_end = {
+        let nmi_stack = unsafe { &NMI_STACKS[cpu_id] };
+        VirtAddr::from_ptr(nmi_stack.as_ptr()) + NMI_STACK_SIZE as u64
+    };
 
     let mut tss = TaskStateSegment::new();
-    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = stack_end;
+    tss.interrupt_stack_table[DOUBLE_FAULT_IST_INDEX as usize] = df_end;
+    tss.interrupt_stack_table[MCE_IST_INDEX as usize] = mce_end;
+    tss.interrupt_stack_table[NMI_IST_INDEX as usize] = nmi_end;
 
     // Store TSS at a stable address *before* creating the GDT descriptor.
     unsafe {

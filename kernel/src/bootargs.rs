@@ -143,3 +143,68 @@ pub fn is_nokaslr() -> bool {
 pub fn is_noiommu() -> bool {
     contains_word("noiommu")
 }
+
+/// `nobgrt` disables BGRT parsing (also `-nobgrt`). When present the
+/// ACPI BGRT table is ignored and `AcpiSubsystem.bgrt` stays `None`.
+pub fn is_nobgrt() -> bool {
+    contains_word("nobgrt")
+}
+
+/// `nobootanim` disables the boot animation (also `-nobootanim`).
+/// When present no BGRT logo, hex, track or stage text is drawn.
+pub fn is_nobootanim() -> bool {
+    contains_word("nobootanim")
+}
+
+/// `iommu_verify` gates extra IOMMU verification before enabling VT-d
+/// (also `verifyiommu`, `verify_iommu`, `iommuverify`). When present the
+/// framebuffer + RMRR identity maps are re-validated via SLPT translate and
+/// any mismatch aborts IOMMU enable (fallback to `noiommu` path). Without
+/// this flag the IOMMU enables best-effort. No-serial verification gate.
+pub fn is_iommu_verify() -> bool {
+    contains_word("iommu_verify")
+        || contains_word("verifyiommu")
+        || contains_word("verify_iommu")
+        || contains_word("iommuverify")
+        || contains_word("verify")
+}
+
+/// `nochime` suppresses the INIT startup chime (also `-nochime`).
+/// When present the userspace `INIT` must not play `/B/EFI/BEDROCK/STARTUP.WAV`
+/// and the kernel dumps the boot log to `/EFI/BEDROCK/boot.log` on the ESP
+/// right before `INIT` is launched.
+pub fn is_nochime() -> bool {
+    contains_word("nochime")
+}
+
+/// `nocpuslowrepeat` disables the 100 ms periodic `cpu_slow` re-application
+/// (also `-nocpuslowrepeat`, `--nocpuslowrepeat`). When present the kernel
+/// still performs the initial `cpu_slow` MSR programming on BSP + APs, but
+/// does not re-arm the 100 ms periodic timer that re-enforces the limit
+/// against firmware overwrites.
+pub fn is_nocpuslowrepeat() -> bool {
+    contains_word("nocpuslowrepeat")
+}
+
+/// `nowatchdog` disables the NMI watchdog (also `-nowatchdog`,
+/// `--nowatchdog`, `no_watchdog`, `nowdog`). When present the kernel skips
+/// `watchdog::init()` entirely (no PMU/PIT/soft arming, no NMI handler
+/// pet). The F9 hotkey still works via the soft path only if the watchdog
+/// is armed, so with `nowatchdog` F9 is also inert. Default is watchdog
+/// enabled; pass `nowatchdog` to silence it (e.g. for bring-up where the
+/// 3 s NMI fires before userspace is ready).
+pub fn is_nowatchdog() -> bool {
+    contains_word("nowatchdog")
+        || contains_word("no_watchdog")
+        || contains_word("nowdog")
+        || contains_word("disable_watchdog")
+        || contains_word("nowd")
+}
+
+/// Explicit opt-in `watchdog` (also `-watchdog`). When present it forces
+/// the watchdog on even if a future default changes. Currently a no-op
+/// alias that returns true when the plain word `watchdog` appears; the
+/// disable check above takes precedence.
+pub fn is_watchdog() -> bool {
+    contains_word("watchdog")
+}

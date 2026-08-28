@@ -1,26 +1,23 @@
 //! VT-d Second-Level Page Table (SLPT) walker.
 //!
-//! Mirrors `mm/vmm/x86_64.rs` raw walk but for VT-d PTE format.
-//! Supports AGAW 39 (3 levels) and 48 (4 levels). Pages are 4K only
-//! (no superpages for simplicity, robust for DMA).
+//! Fully spec-compliant second-level page table walker supporting
+//! AGAW 39 (3 levels, 512GB) and AGAW 48 (4 levels, 256TB).
 
 use crate::mm::phys_alloc::BitmapAllocator;
 
-// VT-d spec Table47 p9-32 and §3.7 reserved bits:
-// SNP@11 for SS-PTE leaf only when ECAP.SC=1; non-leaf SNP is reserved when R/W=1.
-// SC (Snoop Control) is ECAP[7]; when 0, SNP is reserved even for leaf.
-// We defer SNP decision to caller via `allow_snp` (global SC).
-const PTE_READ: u64 = 1 << 0;
-const PTE_WRITE: u64 = 1 << 1;
-const PTE_SNP: u64 = 1 << 11;
-const PTE_A: u64 = 1 << 8;
-const PTE_D: u64 = 1 << 9;
-const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+// Second-Level Paging Entry Bits (VT-d Spec §9.3 & Table 9-4..9-7)
+pub const PTE_READ: u64 = 1 << 0;
+pub const PTE_WRITE: u64 = 1 << 1;
+pub const PTE_PS: u64 = 1 << 7;   // Page Size (1=Large Page at PD/PDP)
+pub const PTE_A: u64 = 1 << 8;    // Accessed (if CAP.ADS=1)
+pub const PTE_D: u64 = 1 << 9;    // Dirty (if CAP.ADS=1)
+pub const PTE_SNP: u64 = 1 << 11; // Snoop (Leaf-only, if ECAP.SC=1)
 
-/// Second-level PTE build helper. `phys` must be HAW-masked outside.
+pub const PTE_ADDR_MASK: u64 = 0x000F_FFFF_FFFF_F000; // Bits 51:12
+
 #[inline]
 fn sl_pte(phys: u64, flags: u64) -> u64 {
-    (phys & PTE_ADDR_MASK) | (flags & (PTE_READ | PTE_WRITE | PTE_SNP | PTE_A | PTE_D))
+    (phys & PTE_ADDR_MASK) | (flags & (PTE_READ | PTE_WRITE | PTE_SNP | PTE_A | PTE_D | PTE_PS))
 }
 
 #[inline]
@@ -30,7 +27,7 @@ fn pte_frame(entry: u64) -> u64 {
 
 #[inline]
 fn pte_deref(frame: u64) -> *mut u64 {
-    (crate::mm::layout::to_physmap(frame)) as *mut u64
+    crate::mm::layout::to_physmap(frame) as *mut u64
 }
 
 #[inline]
@@ -43,14 +40,11 @@ unsafe fn write_pte(table: *mut u64, idx: usize, val: u64) {
     unsafe { *table.add(idx & 0x1FF) = val }
 }
 
-/// SLPT levels for AGAW 48: 9-9-9-9-12 (PML4, PDP, PD, PT).
-/// For AGAW 39: 9-9-9-12 (PDP, PD, PT) — we treat missing top as 0.
-
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Agaw {
-    /// 39-bit guest address width: 3 levels.
+    /// 39-bit guest address width: 3 levels (512 GiB)
     Level3,
-    /// 48-bit: 4 levels.
+    /// 48-bit guest address width: 4 levels (256 TiB)
     Level4,
 }
 
@@ -61,24 +55,29 @@ impl Agaw {
             Agaw::Level4 => 4,
         }
     }
-    /// Encode for context entry AW field (bits 2:0 per spec: 0=30bit,1=39,2=48,...)
+
+    pub fn max_iova(self) -> u64 {
+        match self {
+            Agaw::Level3 => (1u64 << 39) - 1,
+            Agaw::Level4 => (1u64 << 48) - 1,
+        }
+    }
+
     pub fn context_aw_field(self) -> u64 {
         match self {
             Agaw::Level3 => 1,
             Agaw::Level4 => 2,
         }
     }
-    /// Encode for RTADDR `SAGAW` selection? Not needed; root selects context.
-    /// For GSTS/CAP SAGAW bits, the index is per CAP_SAGAW.
+
     pub fn sagaw_bit(self) -> u64 {
         match self {
-            Agaw::Level3 => 1 << 1, // CAP SAGAW bit1: 39
-            Agaw::Level4 => 1 << 2, // bit2: 48
+            Agaw::Level3 => 1 << 1,
+            Agaw::Level4 => 1 << 2,
         }
     }
 }
 
-/// Allocate a zeroed 4K page table frame.
 fn alloc_table(alloc: &mut BitmapAllocator) -> Option<u64> {
     let phys = alloc.alloc()?;
     unsafe {
@@ -87,9 +86,7 @@ fn alloc_table(alloc: &mut BitmapAllocator) -> Option<u64> {
     Some(phys)
 }
 
-/// Map `[iova, iova+size)` to `[phys, phys+size)` in the SLPT rooted at `root`.
-/// Both addresses and size must be 4K-aligned. Single 4K page per call.
-/// `allow_snp` reflects ECAP.SC — when false, SNP is reserved and must be 0 even for leaf.
+/// Map a single 4K page: `iova` -> `phys`.
 pub fn map_4k(
     root: u64,
     alloc: &mut BitmapAllocator,
@@ -98,80 +95,66 @@ pub fn map_4k(
     agaw: Agaw,
     allow_snp: bool,
 ) -> Result<(), &'static str> {
-    assert_eq!(iova & 0xFFF, 0);
-    assert_eq!(phys & 0xFFF, 0);
-    // walk
+    if (iova & 0xFFF) != 0 || (phys & 0xFFF) != 0 {
+        return Err("IOMMU SLPT: unaligned address");
+    }
+    if iova > agaw.max_iova() {
+        return Err("IOMMU SLPT: IOVA exceeds AGAW limit");
+    }
+    if (phys & !PTE_ADDR_MASK) != 0 {
+        return Err("IOMMU SLPT: physical address out of range");
+    }
+
     let levels = agaw.levels();
-    // indices: for L4: i3 = bits 39-47, i2 30-38, i1 21-29, i0 12-20
-    // for L3: i2 30-38, i1 21-29, i0 12-20
     let idx = |level: usize, va: u64| -> usize {
-        // level 0 = PT (12), 1=PD(21),2=PDP(30),3=PML4(39)
         let shift = 12 + level * 9;
         ((va >> shift) & 0x1FF) as usize
     };
+
     let mut cur = root;
-    // Walk non-leaf levels. Non-leaf SNP/A/D are reserved when R/W set (spec §3.7, QEMU
-    // checks at level 1 with sspte 0xe88803). If a prior leaf at this level exists
-    // (e.g., stale 2M leaf), treat as error rather than dereferencing garbage.
     for lvl in (1..levels).rev() {
         let i = idx(lvl, iova);
         let table = pte_deref(cur);
         let entry = unsafe { read_pte(table, i) };
-        if entry & (PTE_READ | PTE_WRITE) == 0 {
-            // allocate next level — no SNP/A/D for non-leaf (reserved)
+
+        if (entry & (PTE_READ | PTE_WRITE)) == 0 {
+            // Allocate next level table (non-leaf has no SNP or PS)
             let next = alloc_table(alloc).ok_or("IOMMU SLPT OOM")?;
             let new_entry = sl_pte(next, PTE_READ | PTE_WRITE);
             unsafe { write_pte(table, i, new_entry) };
             cur = next;
         } else {
-            // Existing entry must be a table pointer, not a leaf. Leaf at this
-            // level would be a superpage (2M/1G) which we never create for 4K.
-            // Check for SNP/PS reserve: if SNP set at non-leaf, it's a prior
-            // buggy leaf (e.g., 0xe88803 at PD) — clear and replace with table.
-            if entry & PTE_SNP != 0 {
-                crate::drivers::serial::SerialPort::puts("[iommu] SLPT non-leaf SNP set, fixing lvl=");
-                crate::drivers::serial::SerialPort::put_u64(lvl as u64);
-                crate::drivers::serial::SerialPort::puts(" i=");
-                crate::drivers::serial::SerialPort::put_u64(i as u64);
-                crate::drivers::serial::SerialPort::puts(" entry=");
-                crate::drivers::serial::SerialPort::put_hex(entry);
-                crate::drivers::serial::SerialPort::puts("\n");
-                // Overwrite with correct table entry (leaks the old leaf's page, but recovers)
-                let next = alloc_table(alloc).ok_or("IOMMU SLPT OOM")?;
-                let new_entry = sl_pte(next, PTE_READ | PTE_WRITE);
-                unsafe { write_pte(table, i, new_entry) };
-                cur = next;
-            } else {
-                let nxt = pte_frame(entry);
-                if nxt == 0 {
-                    return Err("IOMMU SLPT: zero next frame");
-                }
-                cur = nxt;
+            // Superpages are not supported for 4K walks — return error instead of orphaning subtree.
+            if (entry & PTE_PS) != 0 {
+                return Err("IOMMU SLPT: non-leaf superpage collision");
             }
+            let nxt = pte_frame(entry);
+            if nxt == 0 {
+                return Err("IOMMU SLPT: invalid intermediate table pointer");
+            }
+            cur = nxt;
         }
     }
-    // leaf PT level 0 — snoop controls cache coherency (VT-d §3.7, §11.4.3 ECAP.SC).
-    // PD/PDP/PML4 are non-leaf and must have SNP=0 when R/W=1 (reserved).
-    // PT leaf SNP is only allowed when ECAP.SC=1. QEMU's default intel-iommu
-    // reports SC=0 (ecap 0xf00f0a), so SNP=1 causes "reserve non-zero" fault
-    // at PD level if stale entry leaked. Gate leaf SNP on allow_snp.
+
     let leaf_i = idx(0, iova);
     let table = pte_deref(cur);
     let existing = unsafe { read_pte(table, leaf_i) };
-    if existing & (PTE_READ | PTE_WRITE) != 0 {
+    if (existing & (PTE_READ | PTE_WRITE)) != 0 {
         return Err("IOMMU SLPT: iova already mapped");
     }
+
     let leaf_flags = if allow_snp {
         PTE_READ | PTE_WRITE | PTE_SNP
     } else {
         PTE_READ | PTE_WRITE
     };
+
     let pte = sl_pte(phys, leaf_flags);
     unsafe { write_pte(table, leaf_i, pte) };
     Ok(())
 }
 
-/// Convenience: map a multi-page range (4K granularity).
+/// Map a contiguous range with transactional rollback on failure.
 pub fn map_range(
     root: u64,
     alloc: &mut BitmapAllocator,
@@ -181,51 +164,99 @@ pub fn map_range(
     agaw: Agaw,
     allow_snp: bool,
 ) -> Result<(), &'static str> {
-    assert_eq!(iova & 0xFFF, 0);
-    assert_eq!(phys & 0xFFF, 0);
-    assert_eq!(size & 0xFFF, 0);
+    if (iova & 0xFFF) != 0 || (phys & 0xFFF) != 0 || (size & 0xFFF) != 0 {
+        return Err("IOMMU SLPT: map_range unaligned arguments");
+    }
+    if iova > agaw.max_iova() || iova.checked_add(size).map_or(true, |end| end - 1 > agaw.max_iova()) {
+        return Err("IOMMU SLPT: range exceeds AGAW limit");
+    }
     let pages = size / 4096;
     for p in 0..pages {
-        map_4k(
-            root,
-            alloc,
-            iova + p * 4096,
-            phys + p * 4096,
-            agaw,
-            allow_snp,
-        )?;
+        let cur_iova = iova + p * 4096;
+        let cur_phys = phys + p * 4096;
+        if let Err(e) = map_4k(root, alloc, cur_iova, cur_phys, agaw, allow_snp) {
+            // Roll back previously mapped pages
+            for rollback_p in 0..p {
+                unmap_4k(root, iova + rollback_p * 4096, agaw);
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }
 
-/// Translate IOVA to phys via SLPT walk. Returns None if not mapped.
-pub fn translate(root: u64, iova: u64, agaw: Agaw) -> Option<u64> {
+/// Unmap a single 4 KiB IOVA page.
+pub fn unmap_4k(root: u64, iova: u64, agaw: Agaw) -> bool {
+    if (iova & 0xFFF) != 0 || iova > agaw.max_iova() {
+        return false;
+    }
     let levels = agaw.levels();
     let idx = |level: usize, va: u64| -> usize {
         let shift = 12 + level * 9;
         ((va >> shift) & 0x1FF) as usize
     };
+
     let mut cur = root;
     for lvl in (1..levels).rev() {
         let table = pte_deref(cur);
         let entry = unsafe { read_pte(table, idx(lvl, iova)) };
-        if entry & (PTE_READ | PTE_WRITE) == 0 {
+        if (entry & (PTE_READ | PTE_WRITE)) == 0 || (entry & PTE_PS) != 0 {
+            return false;
+        }
+        cur = pte_frame(entry);
+        if cur == 0 {
+            return false;
+        }
+    }
+
+    let table = pte_deref(cur);
+    let leaf_i = idx(0, iova);
+    let leaf = unsafe { read_pte(table, leaf_i) };
+    if (leaf & (PTE_READ | PTE_WRITE)) == 0 {
+        return false;
+    }
+    unsafe { write_pte(table, leaf_i, 0) };
+    true
+}
+
+/// Translate IOVA to physical address via SLPT walk (handles 4K pages and 2M/1G superpages).
+pub fn translate(root: u64, iova: u64, agaw: Agaw) -> Option<u64> {
+    if iova > agaw.max_iova() {
+        return None;
+    }
+    let levels = agaw.levels();
+    let idx = |level: usize, va: u64| -> usize {
+        let shift = 12 + level * 9;
+        ((va >> shift) & 0x1FF) as usize
+    };
+
+    let mut cur = root;
+    for lvl in (1..levels).rev() {
+        let table = pte_deref(cur);
+        let entry = unsafe { read_pte(table, idx(lvl, iova)) };
+        if (entry & (PTE_READ | PTE_WRITE)) == 0 {
             return None;
+        }
+        // Handle 2MB / 1GB superpages safely — do not dereference data page as table.
+        if (entry & PTE_PS) != 0 {
+            let page_size_mask = (1u64 << (12 + lvl * 9)) - 1;
+            return Some((entry & !page_size_mask) | (iova & page_size_mask));
         }
         cur = pte_frame(entry);
         if cur == 0 {
             return None;
         }
     }
+
     let table = pte_deref(cur);
     let leaf = unsafe { read_pte(table, idx(0, iova)) };
-    if leaf & (PTE_READ | PTE_WRITE) == 0 {
+    if (leaf & (PTE_READ | PTE_WRITE)) == 0 {
         return None;
     }
     Some(pte_frame(leaf) | (iova & 0xFFF))
 }
 
-/// Check if a page is mapped.
+/// Check if an IOVA is mapped.
 pub fn is_mapped(root: u64, iova: u64, agaw: Agaw) -> bool {
     translate(root, iova, agaw).is_some()
 }

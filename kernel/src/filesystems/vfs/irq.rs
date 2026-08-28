@@ -55,6 +55,22 @@ impl<T> IrqMutex<T> {
             class: self.class,
         }
     }
+
+    pub fn try_lock(&self) -> Option<IrqGuard<'_, T>> {
+        let was = crate::arch::CurrentArch::are_interrupts_enabled();
+        if was {
+            crate::arch::CurrentArch::disable_interrupts();
+        }
+        let inner_guard = self.inner.try_lock()?;
+        #[cfg(feature = "lockdep")]
+        crate::smp::lockdep::acquire(self.class);
+        Some(IrqGuard {
+            guard: Some(inner_guard),
+            was_enabled: was,
+            #[cfg(feature = "lockdep")]
+            class: self.class,
+        })
+    }
 }
 
 pub struct IrqGuard<'a, T> {

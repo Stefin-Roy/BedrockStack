@@ -134,8 +134,7 @@ pub fn init_qi(
     let dw: u64 = 0; // 128-bit descriptors
     let iqa_val = (page_phys & !0xFFF) | (qs & 0x7) | ((dw & 1) << 11);
     unsafe {
-        // Spec §6.5.2: Head/Tail must be 0 before enable.
-        write64(qi.base_va, REG_IQH, 0);
+        // IQH is RO per §10.4.21; hardware clears it when QIES==0 or IQA is programmed. Only reset IQT.
         write64(qi.base_va, REG_IQT, 0);
         fence(Ordering::SeqCst);
         write64(qi.base_va, REG_IQA, iqa_val);
@@ -154,7 +153,8 @@ pub fn init_qi(
         return true;
     }
     unsafe {
-        let mut gcmd = read32(qi.base_va, REG_GCMD);
+        // GCMD is write-only (§10.4.4); read GSTS to preserve TE/SRTP etc.
+        let mut gcmd = read32(qi.base_va, REG_GSTS);
         gcmd |= GCMD_QIE;
         write32(qi.base_va, REG_GCMD, gcmd);
     }
@@ -227,6 +227,7 @@ pub fn qi_submit(qi: &mut QiState, dw0: u64, dw1: u64) -> bool {
     }
     // Poll IQH byte offset. Wrap-aware: IQH==tail means drained (assuming single producer).
     // Also watch FSTS IQE — an invalid descriptor leaves head stuck and sets IQE.
+    // IQH bits 18:4 are QH byte offset, 3:0 reserved (§10.4.21); mask to avoid false mismatch on reserved bits.
     let mut spins = 0u64;
     let qsize_bytes = (qi.queue_size as u64) * 16;
     while spins < 500_000 {
@@ -238,9 +239,9 @@ pub fn qi_submit(qi: &mut QiState, dw0: u64, dw1: u64) -> bool {
             clear_qi_error(qi.base_va);
             return false;
         }
-        let iqh_mod = raw_iqh % qsize_bytes;
-        let tail_mod = tail_off % qsize_bytes;
-        if iqh_mod == tail_mod {
+        let iqh_off = raw_iqh & 0x7FFF0;
+        if (iqh_off % qsize_bytes) == (tail_off % qsize_bytes) {
+            qi.head = (iqh_off as usize) / 16;
             return true;
         }
         core::hint::spin_loop();
@@ -265,10 +266,11 @@ pub fn qi_invalidate_context(qi: &mut QiState) -> bool {
 /// Spec Figure6-3: Type 2h, G=01b global, DID@16 (low). For global, DID is
 /// ignored but must be in the DID field (bits 31:16); setting it at 32 as well
 /// would hit reserved bits for a 128-bit queue and cause IQE.
+/// Per §6.5.2.3, set DR (bit7) / DW (bit6) to drain in-flight DMA reads/writes.
 pub fn qi_invalidate_iotlb(qi: &mut QiState, did: u16) -> bool {
     let did64 = did as u64;
-    // 0x2 = IOTLB type (bits 3:0 + 11:9), gran 01b at bit4, DID at 16
-    let dw0 = 0x2u64 | (1u64 << 4) | (did64 << 16);
+    // Type 2h | Gran Global (01b<<4) | DW (1<<6) | DR (1<<7) | DID<<16
+    let dw0 = 0x2u64 | (1u64 << 4) | (1u64 << 6) | (1u64 << 7) | (did64 << 16);
     let dw1 = 0;
     qi_submit(qi, dw0, dw1)
 }
@@ -306,7 +308,8 @@ pub fn qi_invalidate_wait(qi: &mut QiState) -> bool {
             core::hint::spin_loop();
             spins += 1;
         }
-        return true;
+        // Timed out waiting for status write — report failure so caller knows invalidation may not be observable.
+        return false;
     }
     // SW submission failed (e.g., IQE): degrade to fence-only wait.
     qi_submit(qi, 0x5u64 | (1u64 << 6), 0)
@@ -340,11 +343,9 @@ pub fn reg_invalidate_iotlb_global(base_va: u64) -> bool {
     let ecap = unsafe { read64(base_va, REG_ECAP) };
     let off = iotlb_reg_offset(ecap);
     if off == 0 {
-        // IRO=0 would place the IOTLB registers over the base register file
-        // (VER/CAP/ECAP); no compliant unit reports it. Skip rather than
-        // corrupt the register page.
-        SerialPort::puts("[iommu] reg iotlb IRO=0 unusable, skip\n");
-        return true;
+        // IRO=0 would place the IOTLB registers over VER/CAP/ECAP (§11.4.3); no compliant unit reports it.
+        SerialPort::puts("[iommu] reg iotlb IRO=0 unusable\n");
+        return false;
     }
     let ivt = 1u64 << 63;
     let iirg_global = 1u64 << 60;
@@ -362,8 +363,8 @@ pub fn reg_invalidate_iotlb_global(base_va: u64) -> bool {
         core::hint::spin_loop();
         polls += 1;
     }
-    SerialPort::puts("[iommu] reg iotlb timeout (non-fatal if QI)\n");
-    true
+    SerialPort::puts("[iommu] reg iotlb timeout\n");
+    false
 }
 
 // Helper to emit trace when iommu_trace enabled

@@ -23,6 +23,13 @@ pub fn program_one_shot(count: u16) {
     outb(PIT_DATA0, (count >> 8) as u8);
 }
 
+pub fn program_periodic(count: u16) {
+    // Channel 0, lobyte/hibyte, mode 2 rate generator, binary.
+    outb(PIT_CMD, 0x34);
+    outb(PIT_DATA0, (count & 0xFF) as u8);
+    outb(PIT_DATA0, (count >> 8) as u8);
+}
+
 pub fn has_fired() -> bool {
     outb(PIT_CMD, 0xE2);
     inb(PIT_DATA0) & 0x80 != 0

@@ -66,12 +66,13 @@ pub fn init_services(
     root: u64,
     alloc: *mut BitmapAllocator,
     acpi: Option<&'static AcpiSubsystem>,
+    fb_range: Option<(u64, u64)>,
 ) -> KernelServices {
     #[cfg(target_arch = "x86_64")]
-    return x86_64::x86_services(root, alloc, acpi);
+    return x86_64::x86_services(root, alloc, acpi, fb_range);
 
     #[cfg(target_arch = "riscv64")]
-    return riscv64::riscv_services(root, alloc, acpi);
+    return riscv64::riscv_services(root, alloc, acpi, fb_range);
 }
 
 // ── Global accessor for hot-path driver use ─────────────────────────

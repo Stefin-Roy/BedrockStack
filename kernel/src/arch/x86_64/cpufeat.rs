@@ -168,3 +168,27 @@ pub fn pku_enter() {
         unsafe { wrpkru(0) };
     }
 }
+
+// ── Machine Check Enable (MCE) ─────────────────────────────────────
+// CR4.MCE — enables the #MC exception mechanism. Must be set on every
+// CPU before MCA banks are programmed. Gate on CPUID.01H:EDX[7].
+
+/// CR4.MCE — machine-check enable.
+const CR4_MCE: u64 = 1 << 6;
+
+/// True when this CPU reports MCE support via CPUID.
+fn has_mce() -> bool {
+    // Use raw cpuid without the x86_64 crate wrapper to avoid feature dep
+    let res = core::arch::x86_64::__cpuid(1);
+    (res.edx & (1 << 7)) != 0
+}
+
+/// Enable CR4.MCE on this CPU when supported; no-op otherwise.
+///
+/// Idempotent — safe from paging::setup (BSP), X86_64::init, and ap_entry64.
+pub fn enable_mce() {
+    if !has_mce() {
+        return;
+    }
+    unsafe { set_cr4_bit(CR4_MCE) };
+}

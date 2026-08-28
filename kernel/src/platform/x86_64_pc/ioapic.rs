@@ -176,3 +176,37 @@ pub fn unmask_irq(gsi: u32) {
     let low = ioapic_read(state, index);
     ioapic_write(state, index, low & !(REDIR_MASK as u32));
 }
+
+/// Program a GSI to deliver as NMI (delivery 100, vector ignored).
+/// Used by the watchdog PIT fallback — the PIT’s GSI 0 fires as NMI
+/// even when IF=0, so a hung spin with interrupts disabled still
+/// enters `nmi_handler` and dumps the interrupted RIP.
+pub fn enable_nmi(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> bool {
+    let mut guard = IOAPIC.lock();
+    let state = match guard.as_mut() {
+        Some(s) => s,
+        None => return false,
+    };
+    if gsi < state.gsi_base || gsi >= state.gsi_base + state.entries {
+        return false;
+    }
+    let index = 0x10 + 2 * (gsi - state.gsi_base);
+    // Delivery NMI = 0b100 << 8, vector field ignored.
+    let mut low: u32 = 0b100 << 8;
+    if polarity == Polarity::ActiveLow {
+        low |= REDIR_POLARITY as u32;
+    }
+    if trigger == TriggerMode::Level {
+        low |= REDIR_TRIGGER as u32;
+    }
+    low &= !(REDIR_MASK as u32);
+    // Destination: physical, BSP APIC ID 0 (QEMU smp 4 ids 0..3).
+    // NMI is maskable only by LVT mask, not IF — so IF=0 hangs still NMI.
+    let high: u32 = 0; // APIC ID 0 << 24
+    ioapic_write(state, index + 1, high);
+    ioapic_write(state, index, low);
+    SerialPort::puts("[ioapic] enabled GSI ");
+    SerialPort::put_u64(gsi as u64);
+    SerialPort::puts(" as NMI\n");
+    true
+}

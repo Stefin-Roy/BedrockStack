@@ -42,9 +42,10 @@ if not exist "%NTFS_IMAGE%" (
 echo Running QEMU with BedrockOS (x86_64^)...
 "%QEMU_PATH%" ^
     -machine q35 ^
+    -cpu qemu64,pmu=on ^
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
-    -accel whpx ^
+    -accel tcg ^
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
     -device ahci,id=ahci ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^

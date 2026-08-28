@@ -28,8 +28,8 @@ mb2_info_req_end:
     .word 5
     .word 1
     .long 20
-    .long 1024                        // width: any
-    .long 768                        // height: any
+    .long 1920                        // width: any
+    .long 1080                        // height: any
     .long 32                       // depth
     .balign 8
 

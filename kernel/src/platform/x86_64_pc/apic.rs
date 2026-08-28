@@ -12,6 +12,11 @@ const LAPIC_SVR: u32 = 0xF0;
 const LAPIC_TPR: u32 = 0x80;
 const LAPIC_EOI: u32 = 0xB0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
+const LAPIC_LVT_THERMAL: u32 = 0x330;
+const LAPIC_LVT_PERF: u32 = 0x340;
+const LAPIC_LVT_LINT0: u32 = 0x350;
+const LAPIC_LVT_LINT1: u32 = 0x360;
+const LAPIC_LVT_ERROR: u32 = 0x370;
 const LAPIC_INIT_COUNT: u32 = 0x380;
 const LAPIC_CURR_COUNT: u32 = 0x390;
 const LAPIC_DIVIDE_CONFIG: u32 = 0x3E0;
@@ -20,6 +25,12 @@ const LAPIC_ICR_LOW: u32 = 0x300;
 const LAPIC_ICR_HIGH: u32 = 0x310;
 
 const TIMER_VECTOR: u8 = 32;
+
+/// LVT delivery modes (bits 10:8)
+const LVT_DELIVERY_FIXED: u32 = 0b000;
+const LVT_DELIVERY_NMI: u32 = 0b100;
+const LVT_DELIVERY_EXTINT: u32 = 0b111;
+const LVT_MASK_BIT: u32 = 1 << 16;
 
 /// Set when the local APIC is operating in x2APIC mode (IA32_APIC_BASE[10]).
 static X2APIC_MODE: AtomicBool = AtomicBool::new(false);
@@ -113,6 +124,19 @@ fn lapic_read(reg: u32) -> u32 {
 
 pub fn apic_eoi() {
     lapic_write(LAPIC_EOI, 0);
+}
+
+/// Configure a local APIC LVT entry.
+///
+/// `reg` is the LVT offset (e.g. `LAPIC_LVT_PERF`), `delivery` is 3-bit mode,
+/// `masked` sets bit 16.  Vector is ignored for NMI/ExtINT.
+pub fn lvt_write(reg: u32, delivery: u32, masked: bool) {
+    let val = (delivery << 8) | if masked { LVT_MASK_BIT } else { 0 };
+    lapic_write(reg, val);
+}
+
+pub fn lvt_read(reg: u32) -> u32 {
+    lapic_read(reg)
 }
 
 /// Returns the current LAPIC timer count (decrements from init_count to 0).
@@ -226,6 +250,34 @@ pub fn lapic_base() -> u64 {
 pub fn send_ipi(dest_apic_id: u32, vector: u8) {
     // delivery mode = 000 (fixed), assert, edge trigger, physical destination
     send_ipi_raw(dest_apic_id, vector as u32);
+}
+
+/// Send an NMI IPI to `dest_apic_id`.
+///
+/// Vector is ignored for NMI delivery; the target CPU's NMI handler fires
+/// regardless of IF. Uses `send_ipi_raw` to cover both xAPIC/x2APIC paths.
+pub fn send_nmi_ipi(dest_apic_id: u32) {
+    // delivery = 100 (NMI), trigger=0 edge, level=1 assert
+    let icr_low = (LVT_DELIVERY_NMI << 8) | (1 << 14);
+    send_ipi_raw(dest_apic_id, icr_low);
+}
+
+/// Send NMI to all CPUs except self (broadcast). Uses x2APIC/all-excluding-self
+/// shorthand when in x2APIC mode, same as `send_ipi_all_except_self`.
+pub fn send_nmi_all_except_self() {
+    if X2APIC_MODE.load(Ordering::Relaxed) {
+        let icr = (u64::from(LVT_DELIVERY_NMI << 8) | (1 << 14)) | (3u64 << 18);
+        wrmsr(IA32_X2APIC_ICR_MSR, icr);
+    } else {
+        while lapic_read(LAPIC_ICR_LOW) & (1 << 12) != 0 {
+            core::hint::spin_loop();
+        }
+        lapic_write(LAPIC_ICR_HIGH, 0);
+        lapic_write(
+            LAPIC_ICR_LOW,
+            (3 << 18) | (LVT_DELIVERY_NMI << 8) | (1 << 14),
+        );
+    }
 }
 
 /// Send INIT IPI to a specific APIC ID (assert).

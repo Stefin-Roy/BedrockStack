@@ -12,6 +12,7 @@ pub fn riscv_services(
     root: u64,
     alloc: *mut BitmapAllocator,
     _acpi: Option<&'static AcpiSubsystem>,
+    _fb_range: Option<(u64, u64)>,
 ) -> KernelServices {
     KernelServices {
         timer: crate::services::universal_timer::universal_timer(),

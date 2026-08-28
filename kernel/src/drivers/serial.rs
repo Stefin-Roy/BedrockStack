@@ -102,6 +102,112 @@ pub fn capture_bytes(out: &mut Vec<u8>) {
     log.write_to(out);
 }
 
+/// Try to dump the last `max_lines` of captured log into `w`.
+/// Lock-free `try_lock`; returns `false` if `CAPTURE` is contended (no output).
+/// Emits at most 1 KiB, no heap, no IRQ side effects beyond the try.
+/// Used by the fault dumper and the on-screen panic screen to show the
+/// 2-4 lines that immediately preceded the fault.
+pub fn try_dump_last_lines<W: core::fmt::Write>(w: &mut W, max_lines: usize) -> bool {
+    const MAX_BYTES: usize = 1024;
+    let mut buf = [0u8; MAX_BYTES];
+    let mut copy_len = 0usize;
+    {
+        let Some(guard) = CAPTURE.try_lock() else {
+            return false;
+        };
+        let len = if guard.growable {
+            guard.vec.len()
+        } else {
+            guard.ring_len
+        };
+        if len == 0 {
+            return true;
+        }
+        let get = |i: usize| -> u8 {
+            if guard.growable {
+                guard.vec[i]
+            } else if guard.ring_len == CAPTURE_RING_CAP {
+                guard.ring[(guard.ring_pos + i) % CAPTURE_RING_CAP]
+            } else {
+                guard.ring[i]
+            }
+        };
+        let mut k = 0usize;
+        for i in 0..len {
+            if get(i) == b'\n' {
+                k += 1;
+            }
+        }
+        let has_trailing = get(len - 1) != b'\n';
+        let total = k + if has_trailing { 1 } else { 0 };
+        let mut start = 0usize;
+        if total > max_lines {
+            if has_trailing {
+                let target = k.saturating_sub(max_lines);
+                let mut cnt = 0usize;
+                for i in 0..len {
+                    if get(i) == b'\n' {
+                        if cnt == target {
+                            start = i + 1;
+                            break;
+                        }
+                        cnt += 1;
+                    }
+                }
+            } else {
+                // has_trailing == false, total == k
+                let target = k.saturating_sub(max_lines).saturating_sub(1);
+                let mut cnt = 0usize;
+                for i in 0..len {
+                    if get(i) == b'\n' {
+                        if cnt == target {
+                            start = i + 1;
+                            break;
+                        }
+                        cnt += 1;
+                    }
+                }
+                if k == max_lines {
+                    // exact, start 0 already
+                    start = 0;
+                }
+            }
+        }
+        let mut needed = len.saturating_sub(start);
+        if needed > MAX_BYTES {
+            let trunc = len - MAX_BYTES;
+            // align to next newline to avoid half-line at start
+            let mut aligned = trunc;
+            for i in trunc..len {
+                if get(i) == b'\n' {
+                    aligned = i + 1;
+                    break;
+                }
+            }
+            if aligned != trunc && len - aligned <= MAX_BYTES {
+                start = aligned;
+                needed = len - start;
+            } else {
+                start = trunc;
+                needed = MAX_BYTES;
+            }
+        }
+        copy_len = needed.min(MAX_BYTES);
+        for i in 0..copy_len {
+            buf[i] = get(start + i);
+        }
+    }
+    if copy_len == 0 {
+        return true;
+    }
+    let s = core::str::from_utf8(&buf[..copy_len]).unwrap_or("<non-utf8 log>\n");
+    let _ = w.write_str(s);
+    if buf[copy_len - 1] != b'\n' {
+        let _ = w.write_str("\n");
+    }
+    true
+}
+
 /// Record `c` into the capture log, then write it to the hardware.  This is
 /// the single byte sink for all locked output paths.  The capture push never
 /// calls back into serial while holding `CAPTURE`, so there is no re-entrancy.

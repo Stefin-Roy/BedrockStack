@@ -285,6 +285,13 @@ fn map_physical_slice(paddr: u64, len: usize) -> Option<&'static [u8]> {
 /// surrounding text, or `None` if BGRT is absent/invalid and the fallback
 /// (hex) should be used.
 pub fn blit_bgrt_logo(fb: &mut Framebuffer, cx: usize, cy: usize) -> Option<(usize, usize)> {
+    // Runtime kill-switch: `nobgrt` disables BGRT parsing *and* blitting.
+    // This ensures the vulnerable BMP path is never entered even if a
+    // BgrtInfo somehow survived (e.g. global snapshot from an earlier boot).
+    if crate::bootargs::is_nobgrt() {
+        SerialPort::puts("[bgrt] blit skipped via nobgrt\n");
+        return None;
+    }
     let info = crate::acpi::global_snapshot()
         .and_then(|s| s.bgrt.clone())
         .or_else(|| {

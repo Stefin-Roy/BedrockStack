@@ -5,6 +5,7 @@ extern crate alloc;
 pub mod acpi;
 pub mod acpi_log;
 pub mod arch;
+pub mod stage;
 #[cfg(target_arch = "x86_64")]
 pub mod audio;
 pub mod boot;
@@ -33,6 +34,10 @@ pub mod caps;
 pub mod iommu;
 #[cfg(target_arch = "x86_64")]
 pub mod usb;
+#[cfg(target_arch = "x86_64")]
+pub mod watchdog;
+#[cfg(target_arch = "x86_64")]
+pub mod bootlog;
 
 use acpi::AcpiSubsystem;
 use arch::CurrentArch;
@@ -237,6 +242,7 @@ impl Kernel {
     }
 
     pub fn init(&mut self) {
+        crate::stage::set(crate::stage::Stage::Early);
         // The physical allocator was moved during `Kernel::new()`; re-point
         // the stashed heap/DMA pointer before any code path can need it.
         heap::set_phys_allocator(&mut self.allocator);
@@ -257,6 +263,7 @@ impl Kernel {
         unsafe {
             heap::init(self.page_table_root, &mut self.allocator);
         }
+        crate::stage::set(crate::stage::Stage::Heap);
         crate::drivers::serial::switch_to_growable();
 
         CurrentArch::init();
@@ -265,6 +272,7 @@ impl Kernel {
         crate::random::reseed_strong();
 
         // Parse ACPI tables (needs VMM live for mapped physical regions).
+        crate::stage::set(crate::stage::Stage::Acpi);
         self.init_acpi();
 
         // Reserve DMAR RMRR ranges early (before the service container hands
@@ -292,18 +300,40 @@ impl Kernel {
         // Phase D: bind the framebuffer's shadow buffer to a heap (guard-mapped,
         // NX) VM-backed allocation via direct kernel-heap alloc. Early so the
         // boot animation can show the BGRT logo before the rest of the boot.
+        crate::stage::set(crate::stage::Stage::Framebuffer);
         self.init_framebuffer_shadow();
 
         // Early boot animation: static BGRT/hex + "BedrockOS" (no track/pulse).
         // The track is added by `enable_bar()` after IRQs are live.
+        // Gated by `nobootanim` so a broken BGRT/BMP can be bypassed at boot
+        // without rebuilding: `nobgrt` alone still shows the hex fallback.
         #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
-        crate::bootanim::early_show(&mut self.framebuffer);
+        if !crate::bootargs::is_nobootanim() {
+            crate::bootanim::early_show(&mut self.framebuffer);
+        }
 
         // Initialise I/O APIC(s) from ACPI interrupt model (x86_64 only).
+        crate::stage::set(crate::stage::Stage::IoApic);
         #[cfg(target_arch = "x86_64")]
         self.init_ioapic();
 
         // Build the service container for driver dispatch.
+        crate::stage::set(crate::stage::Stage::Services);
+        // Compute framebuffer identity range for IOMMU: the display scanout
+        // engine DMAs `fb_phys` as IOVA, so VT-d must identity-map it before
+        // TE. If size is 0 or phys 0 we pass None and IOMMU skips FB mapping.
+        // This range is also RMRR-reserved above, but IOMMU identity is separate
+        // and gated by `noiommu` inside vt_d::init. Verification of this
+        // identity is additionally gated behind `iommu_verify` bootarg — on
+        // failure vt_d::init aborts and we fallback to noiommu path.
+        let fb_range: Option<(u64, u64)> = {
+            let sz = self.framebuffer.total_bytes() as u64;
+            if sz != 0 && self.fb_phys != 0 {
+                Some((self.fb_phys, sz))
+            } else {
+                None
+            }
+        };
         let acpi_static = self
             .acpi
             .as_ref()
@@ -312,12 +342,14 @@ impl Kernel {
             self.page_table_root,
             &mut self.allocator as *mut _,
             acpi_static,
+            fb_range,
         ));
         let svc_static: &'static crate::services::KernelServices = alloc::boxed::Box::leak(svc);
         crate::services::set_global(svc_static);
         self.services = Some(svc_static);
 
         // Initialise SMP — discover and start Application Processors.
+        crate::stage::set(crate::stage::Stage::Smp);
         let ncpus =
             unsafe { crate::smp::init(self.page_table_root, self.acpi.as_ref(), self.svc()) };
         log::info!("SMP: {} CPU(s) online", ncpus);
@@ -326,10 +358,35 @@ impl Kernel {
         // Enable interrupts after arch init, page tables, and SMP are live.
         self.svc().platform.enable_interrupts();
 
+        // Periodic 100 ms re-application of `cpu_slow` (opt-out with
+        // `nocpuslowrepeat`). Each CPU re-arms on its own base; BSP arms
+        // here, APs arm in `ap_entry64`. Guarded inside `limiter` so
+        // non-`cpu_slow` builds are no-ops.
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::limiter::arm_repeat();
+
+        // Arm the true NMI watchdog (PMU LVTPC NMI, 3s, halt by default,
+        // continue with --features watchdog_cont). Falls back to soft
+        // 1s UniversalTimer check when PMU unavailable (e.g. QEMU TCG
+        // without pmu=on) — still dumps but hung RIP is degraded.
+        // Gated behind `nowatchdog` (also `-nowatchdog`, `--nowatchdog`);
+        // default is enabled.
+        crate::stage::set(crate::stage::Stage::Watchdog);
+        #[cfg(target_arch = "x86_64")]
+        {
+            if crate::bootargs::is_nowatchdog() {
+                crate::drivers::serial::SerialPort::puts("[wdog] disabled via nowatchdog\n");
+            } else {
+                crate::watchdog::init();
+            }
+        }
+
         // Now that the LAPIC timer IRQ can fire, add the indeterminate track
         // and arm the 30 fps sweep over the early static image.
         #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
-        crate::bootanim::enable_bar();
+        if !crate::bootargs::is_nobootanim() {
+            crate::bootanim::enable_bar();
+        }
     }
 
     /// Phase D: allocate the framebuffer shadow buffer on the kernel heap and bind it.
@@ -715,6 +772,7 @@ impl Kernel {
 
         #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
         crate::bootanim::set_stage(crate::bootanim::Stage::Launch);
+        crate::stage::set(crate::stage::Stage::Launch);
         // Stop the spinner: paints black in one `clear()` + `flush_full()`
         // (single VRAM copy) before INIT's desktop paint takes over.
         #[cfg(all(target_arch = "x86_64", feature = "bootanim"))]
@@ -725,9 +783,11 @@ impl Kernel {
         // serial notice when INIT is absent. Control returns only after INIT
         // has exited and parked into idle; the poll/halt loop below is the
         // long-lived idle from then on.
+        crate::stage::set(crate::stage::Stage::Running);
         #[cfg(target_arch = "x86_64")]
         crate::task::load::load_init_from_esp(&mut self.allocator);
 
+        crate::stage::set(crate::stage::Stage::Running);
         loop {
             #[cfg(target_arch = "x86_64")]
             {
@@ -760,6 +820,14 @@ impl Kernel {
                 // sleep bookkeeping happens here in idle context.
                 crate::task::wake_sleepers();
                 crate::task::schedule();
+
+                // Continuous boot.log tail to ESP: append new serial capture
+                // every ~5 s (throttled inside). Best-effort, never panics,
+                // always forever — survives INIT exit and runs for the life
+                // of the kernel. Uses APPEND after the initial TRUNC, and
+                // syncs the FAT so the log persists across power cycles.
+                #[cfg(target_arch = "x86_64")]
+                crate::bootlog::maybe_sync();
 
                 // Nothing ready: park until the earliest sleeping deadline so
                 // a sleeper wakes on time, else fall through to the plain

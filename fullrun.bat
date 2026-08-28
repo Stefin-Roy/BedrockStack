@@ -150,6 +150,7 @@ if not exist "%QEMU_PATH%" (
 )
 "%QEMU_PATH%" ^
     -machine q35 ^
+    -cpu qemu64,pmu=on ^
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
@@ -324,17 +325,20 @@ set GRUB_CFG_CACHED=%GRUB_CFG%.cached
 set GRUB_SKIP=0
 if exist "%GRUB_EFI%" if exist "%GRUB_CFG_CACHED%" (
     > "%TARGET_DIR%\_grub_cmp.cfg" (
-    echo set timeout=0
+    echo set timeout=5
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1920x1080x32
-    echo set gfxpayload=keep
+    echo set gfxmode=1920x1080x32,1920x1080,auto
+    echo set gfxpayload=1920x1080x32,1920x1080,auto
+    echo insmod gfxterm
+    echo terminal_output gfxterm
     echo.
     echo menuentry "BedrockOS" {
     echo     insmod part_gpt
     echo     insmod fat
+    echo     set gfxpayload=1920x1080x32,1920x1080,auto
     echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
     echo     multiboot2 /EFI/BEDROCK/KERNEL
     echo     boot
@@ -354,17 +358,20 @@ if %GRUB_SKIP% equ 1 (
 
     REM Write grub.cfg
     (
-    echo set timeout=0
+    echo set timeout=5
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1920x1080x32
-    echo set gfxpayload=keep
+    echo set gfxmode=1920x1080x32,1920x1080,auto
+    echo set gfxpayload=1920x1080x32,1920x1080,auto
+    echo insmod gfxterm
+    echo terminal_output gfxterm
     echo.
     echo menuentry "BedrockOS" {
     echo     insmod part_gpt
     echo     insmod fat
+    echo     set gfxpayload=1920x1080x32,1920x1080,auto
     echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
     echo     multiboot2 /EFI/BEDROCK/KERNEL
     echo     boot
@@ -430,6 +437,7 @@ if not exist "%QEMU_PATH%" (
 )
 "%QEMU_PATH%" ^
     -machine q35 ^
+    -cpu qemu64,pmu=on ^
     -drive if=pflash,format=raw,readonly=on,file="%OVMF_PATH%" ^
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^

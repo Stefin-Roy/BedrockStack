@@ -156,6 +156,63 @@ static CMD_LOCK: Mutex<()> = Mutex::new(());
 /// The UInputL device id assigned to this keyboard during init.
 static DEVICE_ID: AtomicU32 = AtomicU32::new(0);
 
+// ── F9 hotkey (lock-free, NMI-safe) ─────────────────────────────────
+// Raw F9 make is 0x43 (Set1, not E0-extended). We track last raw byte to
+// reject E0-prefixed phantoms and debounce via watchdog HOTKEY_TSC.
+static HOTKEY_LAST_RAW: AtomicU8 = AtomicU8::new(0);
+
+#[inline]
+fn hotkey_check_raw(byte: u8) {
+    let prev = HOTKEY_LAST_RAW.swap(byte, Ordering::Relaxed);
+    // F9 press: 0x43 not preceded by E0, not a break (0xC3)
+    if byte == 0x43 && prev != 0xE0 {
+        crate::watchdog::request_hotkey_dump();
+    }
+    // Breaks and E0 2nd bytes are already stored but ignored above
+}
+
+/// Poll the 8042 directly for an F9 make — NMI-safe, no locks, no heap.
+/// Even when IF=0 (IrqMutex hang) the PS/2 IRQ never fires, but its byte
+/// still sits in the 8042 output buffer (OBF=1). An NMI can poll 0x64/0x60
+/// and drain it. Returns true if an F9 press was consumed.
+pub fn poll_for_hotkey_nmi() -> bool {
+    // Only called from NMI IST — no other CPU touches 0x60/0x64 here concurrently
+    // because PS/2 IRQ is masked by the NMI's IF=0 gate (or absent when hung).
+    let mut found = false;
+    let mut last: u8 = HOTKEY_LAST_RAW.load(Ordering::Relaxed);
+    // Drain at most 8 bytes per NMI to bound time
+    for _ in 0..8 {
+        let st = inb(PS2_CMD);
+        if st & ST_OUTPUT_BUFFER_FULL == 0 {
+            break;
+        }
+        if st & ST_AUX_OUTPUT != 0 {
+            // Mouse byte — discard
+            let _ = inb(PS2_DATA);
+            continue;
+        }
+        let b = inb(PS2_DATA);
+        if b == 0x43 && last != 0xE0 {
+            crate::watchdog::request_hotkey_dump();
+            found = true;
+        }
+        if b == 0xF0 {
+            // break prefix — next byte is release, ignore
+            last = b;
+            HOTKEY_LAST_RAW.store(b, Ordering::Relaxed);
+            continue;
+        }
+        last = b;
+        HOTKEY_LAST_RAW.store(b, Ordering::Relaxed);
+        // If raw hotkey was just set, also consume it via flag check in NMI handler
+        // so we don't need a second NMI.
+        if b == 0x43 {
+            // already requested
+        }
+    }
+    found
+}
+
 // ── Low-level 8042 access (time-bounded) ──────────────────────────
 
 fn status() -> u8 {
@@ -427,6 +484,8 @@ fn irq_handler() {
         if from_aux {
             continue;
         }
+        // Lock-free F9 hotkey — works even when queue/decoding wedged
+        hotkey_check_raw(byte);
         if !RAW_QUEUE.push(byte) {
             QUEUE_OVERFLOWS.fetch_add(1, Ordering::Relaxed);
             break;
@@ -794,6 +853,11 @@ fn decode_byte(byte: u8) -> Option<Decoded> {
 /// Submit one decoded key event to the UInputL core as a normalized
 /// `InputEvent` (type = Key, value = 1 pressed / 0 released).
 fn submit_decoded(decoded: Decoded) {
+    // Decoded F9 also triggers hotkey (USB HID F9 via same KeyCode path)
+    match decoded {
+        Decoded::Press(KeyCode::F9) => crate::watchdog::request_hotkey_dump(),
+        _ => {}
+    }
     let id = DEVICE_ID.load(Ordering::Relaxed);
     if id == 0 {
         return;

@@ -1473,6 +1473,8 @@ pub fn schedule() {
         crate::smp::is_sched_active(),
         "schedule: called before task::init"
     );
+    #[cfg(target_arch = "x86_64")]
+    crate::watchdog::pet();
     crate::smp::preempt_disable();
     // Deadline-only: `need_resched` may be set by deadline expiry helpers
     // (never a periodic LAPIC tick). Consume here.

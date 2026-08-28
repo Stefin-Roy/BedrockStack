@@ -14,7 +14,7 @@ pub mod vt_d;
 #[cfg(target_arch = "x86_64")]
 pub use dma_remap::IommuDma;
 #[cfg(target_arch = "x86_64")]
-pub use vt_d::{fault_handler, init, is_enabled, is_present, program_fault_msi};
+pub use vt_d::{disable_all, fault_handler, has_pending_faults, init, is_enabled, is_present, program_fault_msi};
 
 #[cfg(target_arch = "x86_64")]
 pub fn update_alloc(alloc: *mut crate::mm::phys_alloc::BitmapAllocator) {
@@ -36,10 +36,15 @@ pub fn init(
     _dmar: &crate::acpi::DmarInfo,
     _root: u64,
     _alloc: *mut crate::mm::phys_alloc::BitmapAllocator,
+    _fb_range: Option<(u64, u64)>,
 ) -> bool {
     false
 }
 #[cfg(not(target_arch = "x86_64"))]
 pub fn program_fault_msi(_vector: u8, _apic_id: u32) {}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn has_pending_faults() -> bool { false }
+#[cfg(not(target_arch = "x86_64"))]
+pub fn disable_all() {}
 #[cfg(not(target_arch = "x86_64"))]
 pub fn update_alloc(_alloc: *mut crate::mm::phys_alloc::BitmapAllocator) {}

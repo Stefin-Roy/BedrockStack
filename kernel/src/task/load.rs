@@ -418,7 +418,158 @@ fn precreate(path: &str, name: &str, payload: &mut Vec<u8>, out: &mut Vec<u8>) {
 /// function resumes here, reads `/A/init/test` back through unispace and
 /// prints its bytes to serial, and prints the task's stdout
 /// (`/proc/<pid>/std/out`) — closing the write→read→exit→resume loop.
+/// Dump captured serial log to ESP at `/EFI/BEDROCK/boot.log` right before
+/// `INIT` is loaded. Always runs (not gated on `-nochime`) so the boot log is
+/// available on every boot; `-nochime` only suppresses the chime. Runs before
+/// `INIT` is read so the log contains everything up to launch. Best-effort:
+/// if the ESP is not mounted or the write fails, just log and continue
+/// (never abort INIT launch on a debug dump failure).
+fn dump_boot_log() {
+    // If IOMMU is spuriously faulting (display engine), auto-fallback before any
+    // storage DMA for the dump. This lets the dump itself succeed via unprotected
+    // DMA and restores display, while preserving the fault log in the capture.
+    if crate::iommu::is_enabled() && crate::iommu::has_pending_faults() {
+        SerialPort::puts("[sched] pre-dump IOMMU faults -> auto fallback to noiommu for boot.log\n");
+        crate::iommu::fault_handler();
+        crate::iommu::disable_all();
+    }
+    // Collect the global capture log (starts at ~8 KiB ring pre-heap, then growable Vec).
+    let mut bytes: Vec<u8> = Vec::new();
+    crate::drivers::serial::capture_bytes(&mut bytes);
+    if bytes.is_empty() {
+        SerialPort::puts("[sched] boot log empty, skip boot.log\n");
+        return;
+    }
+    // VFS path is `B>EFI/BEDROCK/boot.log` (drive letter + `>` + path).
+    // Use CREATE|TRUNC|WRITE to replace any prior boot.log on each boot.
+    let path = "B>EFI/BEDROCK/boot.log";
+    let flags = crate::filesystems::vfs::types::OpenFlags::WRITE
+        | crate::filesystems::vfs::types::OpenFlags::CREATE
+        | crate::filesystems::vfs::types::OpenFlags::TRUNC;
+    match crate::filesystems::vfs::open(path, flags) {
+        Ok(fd) => {
+            let mut written: usize = 0;
+            let mut off = 0usize;
+            let mut ok = true;
+            while off < bytes.len() {
+                // Write in chunks to avoid huge single syscalls holding NS_LOCK too long
+                let chunk = &bytes[off..core::cmp::min(off + 4096, bytes.len())];
+                match crate::filesystems::vfs::write(fd, chunk) {
+                    Ok(n) if n > 0 => {
+                        off += n;
+                        written += n;
+                        if n != chunk.len() {
+                            // short write — retry remainder on next loop
+                        }
+                    }
+                    Ok(_) => {
+                        SerialPort::puts("[sched] boot.log short write\n");
+                        ok = false;
+                        break;
+                    }
+                    Err(e) => {
+                        SerialPort::puts("[sched] boot.log write err=");
+                        SerialPort::puts(e.discriminant_name());
+                        SerialPort::puts("\n");
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let _ = crate::filesystems::vfs::close(fd);
+            // Sync drive so the FAT directory entry + clusters hit the medium
+            // before INIT potentially re-mounts or the user power-cycles.
+            let _ = crate::filesystems::vfs::sync_all();
+            if ok {
+                SerialPort::puts("[sched] boot.log dumped ");
+                SerialPort::put_u64(written as u64);
+                SerialPort::puts(" bytes to B>EFI/BEDROCK/boot.log\n");
+                #[cfg(target_arch = "x86_64")]
+                crate::bootlog::mark_initial_flushed(bytes.len());
+            } else {
+                SerialPort::puts("[sched] boot.log incomplete\n");
+                if crate::iommu::is_enabled() {
+                    SerialPort::puts("[sched] retry incomplete boot.log after IOMMU disable\n");
+                    crate::iommu::fault_handler();
+                    crate::iommu::disable_all();
+                    // Retry whole file after fallback
+                    let mut ok2 = true;
+                    if let Ok(fd2) = crate::filesystems::vfs::open(path, flags) {
+                        let mut off2 = 0;
+                        while off2 < bytes.len() {
+                            let chunk = &bytes[off2..core::cmp::min(off2 + 4096, bytes.len())];
+                            match crate::filesystems::vfs::write(fd2, chunk) {
+                                Ok(n) if n > 0 => off2 += n,
+                                _ => { ok2 = false; break; }
+                            }
+                        }
+                        let _ = crate::filesystems::vfs::close(fd2);
+                        let _ = crate::filesystems::vfs::sync_all();
+                        if ok2 && off2 == bytes.len() {
+                            #[cfg(target_arch = "x86_64")]
+                            crate::bootlog::mark_initial_flushed(bytes.len());
+                        }
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            SerialPort::puts("[sched] open boot.log failed ");
+            SerialPort::puts(e.discriminant_name());
+            SerialPort::puts("\n");
+            // If IOMMU was faulting, the VFS mount or DMA may have failed - disable and retry once
+            if crate::iommu::is_enabled() {
+                SerialPort::puts("[sched] retry boot.log after IOMMU disable\n");
+                crate::iommu::fault_handler();
+                crate::iommu::disable_all();
+                // Retry open once after fallback to unprotected DMA
+                let mut retry_ok = false;
+                match crate::filesystems::vfs::open(path, flags) {
+                    Ok(fd2) => {
+                        let mut off2 = 0;
+                        let mut ok2 = true;
+                        while off2 < bytes.len() {
+                            let chunk = &bytes[off2..core::cmp::min(off2 + 4096, bytes.len())];
+                            match crate::filesystems::vfs::write(fd2, chunk) {
+                                Ok(n) if n > 0 => off2 += n,
+                                _ => { ok2 = false; break; }
+                            }
+                        }
+                        let _ = crate::filesystems::vfs::close(fd2);
+                        let _ = crate::filesystems::vfs::sync_all();
+                        if ok2 && off2 == bytes.len() {
+                            SerialPort::puts("[sched] boot.log retry dumped after IOMMU fallback\n");
+                            #[cfg(target_arch = "x86_64")]
+                            crate::bootlog::mark_initial_flushed(bytes.len());
+                            return;
+                        }
+                        retry_ok = ok2 && off2 == bytes.len();
+                    }
+                    Err(e2) => {
+                        SerialPort::puts("[sched] retry open failed ");
+                        SerialPort::puts(e2.discriminant_name());
+                        SerialPort::puts("\n");
+                    }
+                }
+                if retry_ok {
+                    return;
+                }
+            }
+            // Fallback attempt via unispace (handles diff path form /B/...)
+            let mut out: Vec<u8> = Vec::new();
+            let res = unispace::write("/B/EFI/BEDROCK/boot.log", &bytes, &mut out);
+            if res.is_ok() {
+                #[cfg(target_arch = "x86_64")]
+                crate::bootlog::mark_initial_flushed(bytes.len());
+            }
+        }
+    }
+}
+
 pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
+    // Always dump boot log to ESP before pulling INIT (available every boot;
+    // -nochime only gates the chime, not the log)
+    dump_boot_log();
     let mut elf: Vec<u8> = Vec::new();
     if let Err(_) = unispace::read("/B/EFI/BEDROCK/INIT", &mut elf, usize::MAX) {
         log::info!("[sched] INIT not found, skipping user-mode launch");

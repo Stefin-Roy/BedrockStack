@@ -232,6 +232,33 @@ fn panic(info: &PanicInfo) -> ! {
     use core::fmt::Write;
     let _ = write!(SerialPort::new(), "{}", info.message());
     SerialPort::puts("\n");
+    // Stage + last 4 lines of serial log that preceded the panic,
+    // so the crash is self-describing without needing the full dump.
+    // Mirrors to the on-screen panic buffer if it was already claimed.
+    SerialPort::puts("--- Kernel Stage ---\n");
+    SerialPort::puts("Stage: ");
+    SerialPort::puts(kernel::stage::as_str());
+    SerialPort::puts(" (");
+    SerialPort::puts(kernel::stage::bootanim_str());
+    SerialPort::puts(")\n");
+    SerialPort::puts("--- Last Log (4 lines) ---\n");
+    {
+        struct PanicWriter;
+        impl Write for PanicWriter {
+            fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                SerialPort::puts(s);
+                #[cfg(target_arch = "x86_64")]
+                if kernel::kerneldump::screen::is_ready() {
+                    kernel::kerneldump::screen::panic_puts(s);
+                }
+                Ok(())
+            }
+        }
+        let mut w = PanicWriter;
+        if !kernel::drivers::serial::try_dump_last_lines(&mut w, 4) {
+            let _ = write!(w, "(log unavailable: contended)\n");
+        }
+    }
     // Disable interrupts and spin forever with wfi to prevent reboot.
     CurrentArch::disable_interrupts();
     loop {

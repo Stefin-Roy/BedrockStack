@@ -25,11 +25,11 @@ if %errorlevel% neq 0 exit /b %errorlevel%
 
  REM Build user INIT (release)
 echo [3/4] Building user init (release)...
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Build DOOM game (release)
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Copy to USB folder
@@ -57,11 +57,11 @@ cargo build --target x86_64-unknown-none -p kernel --features "kernelmb2 cpu_slo
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [2/3] Building user init (release)...
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p user --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 REM Build DOOM game (release)
-cargo build -Zjson-target-spec -Zbuild-std=core -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
+cargo build -Zjson-target-spec -Zbuild-std=core,alloc -Zbuild-std-features=compiler-builtins-mem --target user/x86_64-bedrock-user.json -p doom --release 2>&1
 if %errorlevel% neq 0 exit /b %errorlevel%
 
 echo [3/3] Creating GRUB standalone image and copying to USB folder...
@@ -79,17 +79,20 @@ REM Check GRUB cache - only regenerate if the config changed
 set GRUB_SKIP=0
 if exist "%GRUB_EFI%" if exist "%GRUB_CFG_CACHED%" (
     > "%TARGET_DIR%\_grub_cmp.cfg" (
-    echo set timeout=0
+    echo set timeout=5
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1920x1080x32
-    echo set gfxpayload=keep
+    echo set gfxmode=1920x1080x32,1920x1080,auto
+    echo set gfxpayload=1920x1080x32,1920x1080,auto
+    echo insmod gfxterm
+    echo terminal_output gfxterm
     echo.
     echo menuentry "BedrockOS" {
     echo     insmod part_gpt
     echo     insmod fat
+    echo     set gfxpayload=1920x1080x32,1920x1080,auto
     echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
     echo     multiboot2 /EFI/BEDROCK/KERNEL
     echo     boot
@@ -107,17 +110,20 @@ if %GRUB_SKIP% equ 1 (
 
     REM Write grub.cfg
     (
-    echo set timeout=0
+    echo set timeout=5
     echo set default=0
     echo insmod efi_gop
     echo insmod video
     echo insmod all_video
-    echo set gfxmode=1920x1080x32
-    echo set gfxpayload=keep
+    echo set gfxmode=1920x1080x32,1920x1080,auto
+    echo set gfxpayload=1920x1080x32,1920x1080,auto
+    echo insmod gfxterm
+    echo terminal_output gfxterm
     echo.
     echo menuentry "BedrockOS" {
     echo     insmod part_gpt
     echo     insmod fat
+    echo     set gfxpayload=1920x1080x32,1920x1080,auto
     echo     search --no-floppy --set=root --file /EFI/BEDROCK/KERNEL
     echo     multiboot2 /EFI/BEDROCK/KERNEL
     echo     boot

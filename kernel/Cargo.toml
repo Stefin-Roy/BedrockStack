@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["bootanim"]
+default = ['bootanim']
 bootanim = []
 cpu_slow = []
 forceslowlogging = []
@@ -17,6 +17,7 @@ kernelmb2 = []
 selftest = []
 iommu_trace = []
 lockdep = []
+watchdog_cont = []
 
 [dependencies]
 spin = "0.9"

@@ -85,6 +85,9 @@ pub enum Stage {
 ///
 /// Kept for compatibility: draws the full screen (with track) and arms.
 pub fn start(fb: &mut Framebuffer) {
+    if crate::bootargs::is_nobootanim() {
+        return;
+    }
     if fb.width() == 0 || fb.height() == 0 || fb.bpp() == 0 {
         return;
     }
@@ -107,6 +110,9 @@ pub fn start(fb: &mut Framebuffer) {
 /// indeterminate track. Called immediately after BGRT parse + shadow
 /// allocation, before interrupts are enabled. No timer is armed.
 pub fn early_show(fb: &mut Framebuffer) {
+    if crate::bootargs::is_nobootanim() {
+        return;
+    }
     if fb.width() == 0 || fb.height() == 0 || fb.bpp() == 0 {
         return;
     }
@@ -124,6 +130,9 @@ pub fn early_show(fb: &mut Framebuffer) {
 /// Add the indeterminate track/stage and arm the 30 fps sweep.
 /// No-op if already armed or if `early_show` was never called.
 pub fn enable_bar() {
+    if crate::bootargs::is_nobootanim() {
+        return;
+    }
     if TIMER_ID.lock().is_some() {
         return;
     }
@@ -158,6 +167,13 @@ pub fn enable_bar() {
 /// `flush_full()` (`copy_nonoverlapping` whole VRAM). One memset plus one
 /// bulk copy — no per-pixel loops, no dirty-rect walk.
 pub fn stop() {
+    if crate::bootargs::is_nobootanim() {
+        // No animation was ever started, but still clear the parked ptr.
+        FB_PTR.store(0, Ordering::Relaxed);
+        FRAME.store(0, Ordering::Relaxed);
+        STAGE.store(0, Ordering::Relaxed);
+        return;
+    }
     if let Some(id) = TIMER_ID.lock().take() {
         universal_timer::universal_timer().cancel(id);
     }
@@ -180,11 +196,21 @@ pub fn stop() {
 
 /// Update the stage text shown below the track. Lock-free, ISR-visible.
 pub fn set_stage(stage: Stage) {
+    // Always publish to kernel stage tracker (for dumps/screens) even when
+    // bootanim is disabled — map bootanim 0..9 -> kernel 7..16.
+    crate::stage::set_raw(stage as u8 + 7);
+    if crate::bootargs::is_nobootanim() {
+        return;
+    }
     STAGE.store(stage as u8, Ordering::Relaxed);
 }
 
 /// Raw index variant for call sites that don't want the enum.
 pub fn set_stage_raw(idx: u8) {
+    crate::stage::set_raw(idx.saturating_add(7).min(16));
+    if crate::bootargs::is_nobootanim() {
+        return;
+    }
     let max = (STAGE_TEXTS.len() as u8).saturating_sub(1);
     STAGE.store(idx.min(max), Ordering::Relaxed);
 }

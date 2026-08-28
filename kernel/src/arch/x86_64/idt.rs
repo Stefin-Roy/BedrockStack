@@ -243,6 +243,14 @@ pub fn init() {
                 .set_handler_fn(double_fault_handler)
                 .set_stack_index(crate::arch::x86_64::gdt::DOUBLE_FAULT_IST_INDEX)
                 .disable_interrupts(true);
+            idt.machine_check
+                .set_handler_fn(machine_check_handler)
+                .set_stack_index(crate::arch::x86_64::gdt::MCE_IST_INDEX)
+                .disable_interrupts(true);
+            idt.non_maskable_interrupt
+                .set_handler_fn(crate::watchdog::nmi_handler)
+                .set_stack_index(crate::arch::x86_64::gdt::NMI_IST_INDEX)
+                .disable_interrupts(true);
         }
 
         // Register APIC timer interrupt at vector 32 (interrupt gate, clears IF).
@@ -310,12 +318,15 @@ pub fn init() {
 ///
 /// Runs on whichever CPU's LAPIC fired.  Each CPU processes its own
 /// universal-timer base (drains expired timers, reprograms the LAPIC
-/// one-shot), then signals EOI.
+/// one-shot), then signals EOI.  Also pets the NMI watchdog (lock-free).
 extern "x86-interrupt" fn timer_handler(frame: InterruptStackFrame) {
     let u = from_user(&frame);
     if u {
         swapgs();
     }
+    // Pet NMI watchdog before any queue lock — hangs that wedge the queue
+    // still get a heartbeat from the timer ISR path.
+    crate::watchdog::pet();
     let ptr = TIMER_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
@@ -341,6 +352,7 @@ extern "x86-interrupt" fn ipi_timer_handler(frame: InterruptStackFrame) {
     if u {
         swapgs();
     }
+    crate::watchdog::pet();
     let ptr = TIMER_IPI_CALLBACK.load(Ordering::Acquire);
     if !ptr.is_null() {
         let handler: fn() = unsafe { core::mem::transmute(ptr) };
@@ -503,6 +515,30 @@ extern "x86-interrupt" fn double_fault_handler(frame: InterruptStackFrame, error
         swapgs();
     }
     crate::kerneldump::dump_full_fault(&frame, error_code, 8);
+}
+
+extern "x86-interrupt" fn machine_check_handler(frame: InterruptStackFrame) -> ! {
+    let u = from_user(&frame);
+    if u {
+        swapgs();
+    }
+    // Immediate banner onto VRAM + serial before heavy dump — ASAP visibility.
+    // `panic_screen_init` clears VRAM to MCE red and claims ownership (first CPU wins).
+    #[cfg(target_arch = "x86_64")]
+    {
+        // `panic_screen_init` is lock-free, no heap. If no fb, it's a no-op.
+        let _ = crate::kerneldump::screen::panic_screen_init();
+        if crate::kerneldump::screen::is_ready() {
+            crate::kerneldump::screen::panic_puts("!!! FATAL MACHINE CHECK (#MC 18) !!!\n");
+            crate::kerneldump::screen::panic_puts("CPU halting — see serial for full dump\n");
+        }
+        // Always emit on serial as well (lock-free dump path).
+        crate::drivers::serial::dump_puts("\n!!! FATAL MACHINE CHECK (#MC 18) !!!\n");
+        crate::drivers::serial::dump_puts("CPU halting — dumping MCA + registers\n");
+    }
+    // Delegate to the full dump (which will also emit MCA banks, regs, stack, code).
+    // `dump_full_fault` never returns (cli;hlt loop) and mirrors to screen via DumpWriter.
+    crate::kerneldump::dump_full_fault(&frame, 0, 18);
 }
 
 extern "x86-interrupt" fn page_fault_handler(

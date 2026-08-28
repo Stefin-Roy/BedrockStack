@@ -835,7 +835,7 @@ SECTIONS
         /* AML parsing is recursive and can retain several parser frames while
          * executing control methods.  Keep the downward-growing kernel stack
          * well clear of the preceding .bss (which contains allocator state). */
-        . += 0x40000;
+        . += 0x100000;
         __stack_end = .;
     }
     . = ALIGN(4096);

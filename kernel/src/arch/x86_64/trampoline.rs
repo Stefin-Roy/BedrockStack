@@ -275,11 +275,14 @@ pub extern "C" fn ap_entry64() -> ! {
     let pc = current_per_cpu();
     let cpu_id = pc.cpu_id;
 
-    // Match the BSP's CR4 SMEP/SMAP/PKE bits (trampoline's hardcoded CR4
-    // predates all three; the 32-bit asm cannot CPUID-gate them).
+    // Match the BSP's CR4 SMEP/SMAP/PKE/MCE bits (trampoline's hardcoded CR4
+    // predates all four; the 32-bit asm cannot CPUID-gate them).
     crate::arch::x86_64::cpufeat::enable_smep();
     crate::arch::x86_64::cpufeat::enable_smap();
     crate::arch::x86_64::cpufeat::enable_pke();
+    crate::arch::x86_64::cpufeat::enable_mce();
+    #[cfg(target_arch = "x86_64")]
+    crate::arch::x86_64::mca::enable_mca();
 
     // Signal ready immediately — APs never write to .idt (fixed in Arch::init_ap),
     // so there is no race with protect_idt() on the BSP.
@@ -310,6 +313,13 @@ pub extern "C" fn ap_entry64() -> ! {
 
     // Now safe to enable interrupts — GDT, TSS, and IDT are all set.
     crate::arch::CurrentArch::enable_interrupts();
+
+    // Periodic 100 ms re-application of `cpu_slow` on this AP's own
+    // `UniversalTimer` base (opt-out with `nocpuslowrepeat`). The one-shot
+    // above already limited this AP; the periodic keeps it limited against
+    // firmware overwrites. No-op when `cpu_slow` is off or `nocpuslowrepeat`
+    // is present. Only the first CPU to arm logs.
+    crate::arch::x86_64::limiter::arm_repeat();
 
     // This CPU's scheduler is deliberately NEVER marked active
     // (`PerCpu.sched_active` stays false from smp::init): APs halt here and

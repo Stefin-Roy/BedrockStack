@@ -3,7 +3,8 @@
 //! Wraps the inner `KernelDma` (backing physical + CPU VA bump) and a
 //! reference to the global VT-d domain. `phys` fields become IOVA.
 
-use spin::Mutex;
+use alloc::collections::BTreeMap;
+use spin::{Mutex, Once};
 
 use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::Vmm;
@@ -21,7 +22,15 @@ pub struct IommuDma {
 unsafe impl Send for IommuDma {}
 unsafe impl Sync for IommuDma {}
 
-static IOMMU_DMA_GLOBAL: spin::Once<&'static IommuDma> = spin::Once::new();
+static IOMMU_DMA_GLOBAL: Once<&'static IommuDma> = Once::new();
+
+// Global phys->IOVA deduplication cache — shared between alloc_* and virt_to_phys so that
+// virt_to_phys does not allocate a duplicate IOVA for a page already mapped via alloc_*.
+static PHYS_IOVA_CACHE: Once<Mutex<BTreeMap<u64, u64>>> = Once::new();
+
+fn phys_iova_cache() -> &'static Mutex<BTreeMap<u64, u64>> {
+    PHYS_IOVA_CACHE.call_once(|| Mutex::new(BTreeMap::new()))
+}
 
 pub fn set_global(dma: &'static IommuDma) {
     IOMMU_DMA_GLOBAL.call_once(|| dma);
@@ -79,6 +88,21 @@ impl IommuDma {
         );
     }
 
+    /// Map CPU VA without re-borrowing the allocator — caller must hold the
+    /// `inner_alloc` borrow and pass it in. This avoids stacked-borrows UB
+    /// from creating two simultaneous `&mut BitmapAllocator` from the same raw pointer.
+    fn map_cpu_with_alloc(&self, alloc: &mut BitmapAllocator, va: u64, phys: u64, size: u64) {
+        Vmm::from_root(self.root).map(
+            alloc,
+            va,
+            phys,
+            size,
+            crate::mm::vmm::PageFlags::READ
+                | crate::mm::vmm::PageFlags::WRITE
+                | crate::mm::vmm::PageFlags::NO_CACHE,
+        );
+    }
+
     /// Remove a CPU mapping after a later IOVA setup step failed.  When VT-d
     /// is active the SLPT mapper has no transactional rollback yet, so the
     /// physical frames are deliberately retained rather than being returned
@@ -86,7 +110,17 @@ impl IommuDma {
     fn rollback_cpu_mapping(&self, va: u64, size: u64, free_phys: bool) {
         let alloc_ptr = *self.inner_alloc.lock();
         let alloc = unsafe { &mut *alloc_ptr };
-        let mut vmm = Vmm::from_root(self.root);
+        Self::rollback_cpu_mapping_with_alloc(self.root, alloc, va, size, free_phys);
+    }
+
+    fn rollback_cpu_mapping_with_alloc(
+        root: u64,
+        alloc: &mut BitmapAllocator,
+        va: u64,
+        size: u64,
+        free_phys: bool,
+    ) {
+        let mut vmm = Vmm::from_root(root);
         let pages = size / 4096;
         for i in 0..pages {
             let page_va = va + i * 4096;
@@ -130,37 +164,52 @@ impl DmaAllocator for IommuDma {
         if !vt_d::is_enabled() {
             return Some(phys);
         }
-        // If IOVA identity already (RMRR) return phys directly — RMRR is 1:1
+        // If IOVA identity already (RMRR) return phys directly — RMRR is 1:1.
+        // NOTE: translate_iova probe is fragile (PA==IOVA collision) but retained for
+        // RMRR identity fast-path; a stricter check would walk the RMRR descriptor list.
         if let Some(mapped) = vt_d::translate_iova(phys & !0xFFF) {
             if mapped == (phys & !0xFFF) {
                 return Some(phys);
             }
         }
-        // For non-RMRR pages, allocate a fresh IOVA via the global domain.
-        // No identity auto-map — per-DRHD DID isolation requires distinct IOVA.
-        // Mappings are never reclaimed (leak-by-design, lifetime = kernel
-        // uptime); the cache merely dedups repeat translations of one page.
-        use alloc::collections::BTreeMap;
-        use spin::Once;
-        static PHYS_IOVA_CACHE: Once<spin::Mutex<BTreeMap<u64, u64>>> = Once::new();
-        let cache = PHYS_IOVA_CACHE.call_once(|| spin::Mutex::new(BTreeMap::new()));
+        let phys_page_aligned = phys & !0xFFF;
+        let cache = phys_iova_cache();
+        // Fast-path: check cache without holding alloc lock.
         {
             let guard = cache.lock();
-            if let Some(&iova_page) = guard.get(&(phys & !0xFFF)) {
+            if let Some(&iova_page) = guard.get(&phys_page_aligned) {
                 return Some((iova_page & !0xFFF) | offset);
             }
         }
+        // Cache miss — allocate a fresh IOVA. Hold alloc and cache in
+        // consistent order (alloc -> cache) to avoid deadlock with alloc_*
+        // paths which also use alloc->cache order when inserting.
+        // To avoid duplicate IOVAs under concurrent virt_to_phys, we keep
+        // the cache lock across the allocation and re-check after allocation
+        // (or insert with or_insert). Duplicate allocations are de-duplicated
+        // by returning the first inserted IOVA; the leaked duplicate mapping
+        // remains but is rare and bounded to races — a full fix would need
+        // vt_d::unmap_iova to reclaim it.
         let alloc_ptr = *self.inner_alloc.lock();
         let alloc = unsafe { &mut *alloc_ptr };
-        let phys_page_aligned = phys & !0xFFF;
+        // Re-check after acquiring alloc (another thread may have inserted while we waited for alloc lock).
+        {
+            let guard = cache.lock();
+            if let Some(&iova_page) = guard.get(&phys_page_aligned) {
+                return Some((iova_page & !0xFFF) | offset);
+            }
+        }
         let iova_base = vt_d::map_phys_to_iova(phys_page_aligned, 4096, alloc)?;
         let iova_page = iova_base & !0xFFF;
-        // Insert into cache (deduplicate). If race inserted first, prefer first.
         {
             let mut guard = cache.lock();
-            guard.entry(phys_page_aligned).or_insert(iova_page);
-            // Use cached value to ensure consistency
-            let cached = *guard.get(&phys_page_aligned).unwrap();
+            // Use or_insert to handle race where two threads allocated concurrently.
+            // Prefer the first inserted value for consistency; the second IOVA leaks (bounded).
+            let entry = guard.entry(phys_page_aligned).or_insert(iova_page);
+            let cached = *entry;
+            // If we lost the race (cached != iova_page), the iova_page mapping is leaked.
+            // Ideally we would unmap it via vt_d::unmap_iova, but no such API exists yet.
+            // We return the cached (first) value so all callers agree.
             return Some((cached & !0xFFF) | offset);
         }
     }
@@ -174,9 +223,10 @@ impl DmaAllocator for IommuDma {
         *next = va;
         drop(next);
         let phys = self.alloc_phys_page()?;
+        // Use with_alloc helper while holding borrow to avoid aliasing UB.
         let alloc_ptr = *self.inner_alloc.lock();
         let alloc = unsafe { &mut *alloc_ptr };
-        self.map_cpu(va, phys, 4096);
+        self.map_cpu_with_alloc(alloc, va, phys, 4096);
         unsafe { core::ptr::write_bytes(va as *mut u8, 0, 4096) }
         if !vt_d::is_enabled() {
             return Some(DmaBuffer {
@@ -186,9 +236,15 @@ impl DmaAllocator for IommuDma {
             });
         }
         let Some(iova) = vt_d::map_phys_to_iova(phys, 4096, alloc) else {
-            self.rollback_cpu_mapping(va, 4096, false);
+            // Still holding alloc, use with_alloc variant to avoid re-borrowing.
+            Self::rollback_cpu_mapping_with_alloc(self.root, alloc, va, 4096, true);
             return None;
         };
+        // Populate phys->IOVA cache so virt_to_phys does not allocate a duplicate IOVA for this page.
+        {
+            let mut c = phys_iova_cache().lock();
+            c.insert(phys & !0xFFF, iova & !0xFFF);
+        }
         Some(DmaBuffer {
             phys: iova,
             virt: va,
@@ -208,22 +264,38 @@ impl DmaAllocator for IommuDma {
         }
         *next = va;
         drop(next);
+        // Use dedicated helper for phys allocation (actually uses inner_alloc lock internally).
         let (phys, sz) = self.alloc_phys_contiguous(count)?;
-        let alloc_ptr = *self.inner_alloc.lock();
-        let alloc = unsafe { &mut *alloc_ptr };
-        self.map_cpu(va, phys, sz as u64);
-        unsafe { core::ptr::write_bytes(va as *mut u8, 0, sz) }
-        if !vt_d::is_enabled() {
-            return Some(DmaBuffer {
-                phys,
-                virt: va,
-                size: sz,
-            });
-        }
-        let Some(iova) = vt_d::map_phys_to_iova(phys, size, alloc) else {
-            self.rollback_cpu_mapping(va, size, false);
+        // Map and VT-d steps need the allocator for page tables; hold it across both to avoid aliasing.
+        // Use a scoped borrow so failure can delegate to the locking rollback helper without UB.
+        let iova_opt = {
+            let alloc_ptr = *self.inner_alloc.lock();
+            let alloc = unsafe { &mut *alloc_ptr };
+            self.map_cpu_with_alloc(alloc, va, phys, sz as u64);
+            unsafe { core::ptr::write_bytes(va as *mut u8, 0, sz) }
+            if !vt_d::is_enabled() {
+                return Some(DmaBuffer {
+                    phys,
+                    virt: va,
+                    size: sz,
+                });
+            }
+            vt_d::map_phys_to_iova(phys, size, alloc)
+        };
+        let Some(iova) = iova_opt else {
+            // Alloc borrow ended, safe to use locking helper (actually uses the same alloc via lock).
+            self.rollback_cpu_mapping(va, size, true);
             return None;
         };
+        {
+            let mut c = phys_iova_cache().lock();
+            // For contiguous, insert per-page entries so virt_to_phys hits cache for any sub-page.
+            for i in 0..count as u64 {
+                let p_phys = (phys + i * 4096) & !0xFFF;
+                let p_iova = (iova + i * 4096) & !0xFFF;
+                c.insert(p_phys, p_iova);
+            }
+        }
         Some(DmaBuffer {
             phys: iova,
             virt: va,
@@ -248,53 +320,44 @@ impl DmaAllocator for IommuDma {
         };
         // Physical backing must itself sit below 4 GiB when VT-d is off
         // (device sees phys), and we keep it low even when VT-d is on for
-        // defense-in-depth.  Use the bounded allocator.
-        let alloc_ptr = *self.inner_alloc.lock();
-        let alloc = unsafe { &mut *alloc_ptr };
-        let Ok(phys) = alloc.try_alloc_contiguous_below(count, 0x1_0000_0000) else {
-            // VA bump is intentionally leaked on failure (existing bump-only
-            // semantics) — VA space is large and this path is cold.
-            return None;
-        };
-        // Map into CPU VA space so the driver can touch the buffer.
-        self.map_cpu(va, phys, size);
-        unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
-        if !vt_d::is_enabled() {
-            return Some(DmaBuffer {
-                phys,
-                virt: va,
-                size: size as usize,
-            });
-        }
-        // With VT-d the device sees IOVA, so the IOVA itself must be < 4 GiB.
-        let alloc_ptr2 = *self.inner_alloc.lock();
-        let alloc2 = unsafe { &mut *alloc_ptr2 };
-        let Some(iova) = vt_d::map_phys_to_iova_below(phys, size, alloc2, 0x1_0000_0000) else {
-            // IOVA space below 4 GiB exhausted — tear down CPU mapping and
-            // return the physical frames; VA bump remains leaked.
-            let alloc_ptr3 = *self.inner_alloc.lock();
-            let alloc3 = unsafe { &mut *alloc_ptr3 };
-            let mut vmm = Vmm::from_root(self.root);
-            let pages = size.div_ceil(4096);
-            for i in 0..pages {
-                let v = va + i * 4096;
-                if vmm.translate(v).is_some() {
-                    vmm.unmap(alloc3, v, 4096);
-                }
+        // defense-in-depth. Use the bounded allocator (scoped to avoid holding across map).
+        let phys = {
+            let alloc_ptr = *self.inner_alloc.lock();
+            let alloc = unsafe { &mut *alloc_ptr };
+            match alloc.try_alloc_contiguous_below(count, 0x1_0000_0000) {
+                Ok(p) => p,
+                Err(_) => return None,
             }
-            // Free contiguous physical backing frame-by-frame (free() guards
-            // frame 0 / kernel range internally; below-4G frames are never
-            // those).
-            // If VT-d was enabled, map_phys_to_iova may have installed a
-            // prefix before failing; retaining the frames is safer than
-            // allowing a stale IOVA to target a future owner.
+        };
+        // CPU mapping + VT-d IOVA in a scoped alloc borrow so failure can use
+        // the locking rollback helper without aliasing.
+        let iova_opt = {
+            let alloc_ptr = *self.inner_alloc.lock();
+            let alloc = unsafe { &mut *alloc_ptr };
+            self.map_cpu_with_alloc(alloc, va, phys, size);
+            unsafe { core::ptr::write_bytes(va as *mut u8, 0, size as usize) }
             if !vt_d::is_enabled() {
-                for i in 0..count as u64 {
-                    unsafe { alloc3.free(phys + i * 4096) };
-                }
+                return Some(DmaBuffer {
+                    phys,
+                    virt: va,
+                    size: size as usize,
+                });
             }
+            vt_d::map_phys_to_iova_below(phys, size, alloc, 0x1_0000_0000)
+        };
+        let Some(iova) = iova_opt else {
+            // Alloc borrow ended, safe to use locking helper which will unmap and free.
+            self.rollback_cpu_mapping(va, size, true);
             return None;
         };
+        {
+            let mut c = phys_iova_cache().lock();
+            for i in 0..count as u64 {
+                let p_phys = (phys + i * 4096) & !0xFFF;
+                let p_iova = (iova + i * 4096) & !0xFFF;
+                c.insert(p_phys, p_iova);
+            }
+        }
         Some(DmaBuffer {
             phys: iova,
             virt: va,

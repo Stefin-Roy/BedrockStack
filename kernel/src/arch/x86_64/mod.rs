@@ -1,8 +1,8 @@
 pub mod cpufeat;
 pub mod gdt;
 pub mod idt;
-#[cfg(feature = "cpu_slow")]
 pub mod limiter;
+pub mod mca;
 #[cfg(feature = "kernelmb2")]
 mod multiboot2;
 pub mod paging;
@@ -28,6 +28,10 @@ impl X86_64 {
         gdt::init();
         SerialPort::puts("[arch] x86_64 init: IDT\n");
         idt::init();
+        // Ensure CR4.MCE is set before touching MCA MSRs (firmware may have cleared it).
+        crate::arch::x86_64::cpufeat::enable_mce();
+        #[cfg(target_arch = "x86_64")]
+        crate::arch::x86_64::mca::enable_mca();
         SerialPort::puts("[arch] x86_64 init: APIC\n");
         apic::init();
         // Record the BSP's APIC ID after APIC init.
@@ -42,6 +46,7 @@ impl X86_64 {
         crate::arch::x86_64::gdt::init();
         crate::arch::x86_64::idt::init_ap();
         crate::platform::x86_64_pc::apic::init_ap();
+        crate::watchdog::init_ap();
     }
 
     pub fn halt() {

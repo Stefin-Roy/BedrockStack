@@ -255,28 +255,39 @@ impl AcpiSubsystem {
 
         // BGRT — boot graphics (UEFI logo). Parsed even on riscv64 if present,
         // but the bootanim blitter is x86_64-only.
-        let bgrt = entries
-            .iter()
-            .find(|e| e.signature == sig(b"BGRT"))
-            .and_then(|e| match bgrt::parse_bgrt(e) {
-                Ok(v) => Some(v),
-                Err(err) => {
-                    log::warn!("ACPI: BGRT parse failed: {:?} (ignored)", err);
-                    SerialPort::puts("[bgrt] parse failed\n");
-                    None
-                }
-            });
-        if let Some(ref bg) = bgrt {
-            log::info!(
-                "ACPI: BGRT at addr=0x{:x} offset=({}, {})",
-                bg.image_address,
-                bg.offset_x,
-                bg.offset_y
-            );
+        // Gated by `nobgrt` (and `-nobgrt` / `--nobgrt`) so broken firmware
+        // that overflows during BGRT/BMP parsing can be bypassed without a
+        // rebuild. When disabled we skip the table entirely; if `nobootanim`
+        // is *not* set the bootanim will fallback to the hexagon.
+        let bgrt = if crate::bootargs::is_nobgrt() {
+            log::info!("ACPI: BGRT disabled via nobgrt");
+            SerialPort::puts("[bgrt] disabled via nobgrt\n");
+            None
         } else {
-            log::info!("ACPI: BGRT absent");
-            SerialPort::puts("[bgrt] absent\n");
-        }
+            let b = entries
+                .iter()
+                .find(|e| e.signature == sig(b"BGRT"))
+                .and_then(|e| match bgrt::parse_bgrt(e) {
+                    Ok(v) => Some(v),
+                    Err(err) => {
+                        log::warn!("ACPI: BGRT parse failed: {:?} (ignored)", err);
+                        SerialPort::puts("[bgrt] parse failed\n");
+                        None
+                    }
+                });
+            if let Some(ref bg) = b {
+                log::info!(
+                    "ACPI: BGRT at addr=0x{:x} offset=({}, {})",
+                    bg.image_address,
+                    bg.offset_x,
+                    bg.offset_y
+                );
+            } else {
+                log::info!("ACPI: BGRT absent");
+                SerialPort::puts("[bgrt] absent\n");
+            }
+            b
+        };
 
         let table_count = entries.len();
         #[cfg(target_arch = "x86_64")]

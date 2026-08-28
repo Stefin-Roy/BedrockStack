@@ -15,6 +15,7 @@ pub fn x86_services(
     root: u64,
     alloc: *mut BitmapAllocator,
     acpi: Option<&'static AcpiSubsystem>,
+    fb_range: Option<(u64, u64)>,
 ) -> KernelServices {
     let acpi_provider: Option<&'static dyn AcpiProvider> = acpi.map(|a| {
         // leak the X86Acpi so it has a 'static lifetime
@@ -33,9 +34,19 @@ pub fn x86_services(
             crate::services::dma::init_dma_allocator(root, alloc)
         } else if let Some(subsys) = acpi {
             if let Some(ref dmar) = subsys.dmar {
-                let ok = crate::iommu::init(dmar, root, alloc);
+                // vt_d::init handles `noiommu` internally as well, but we keep
+                // outer gate for log clarity. `fb_range` is passed so the display
+                // scanout buffer is identity-mapped before TE — without this the
+                // iGPU DMA faults and display shows stripes (user report).
+                // Verification of that identity is additionally gated behind
+                // `iommu_verify` bootarg; on failure init returns false and we
+                // fallback to noiommu path (DMA UNPROTECTED) rather than corrupt.
+                let ok = crate::iommu::init(dmar, root, alloc, fb_range);
                 if ok {
                     crate::drivers::serial::SerialPort::puts("[svc] IOMMU enabled\n");
+                    if crate::bootargs::is_iommu_verify() {
+                        crate::drivers::serial::SerialPort::puts("[svc] IOMMU verify passed\n");
+                    }
                     let iommu_dma = alloc::boxed::Box::new(crate::iommu::dma_remap::IommuDma::new(
                         root, alloc,
                     ));
@@ -50,7 +61,11 @@ pub fn x86_services(
                     }
                     leaked as &'static dyn crate::services::dma::DmaAllocator
                 } else {
-                    crate::drivers::serial::SerialPort::puts("[svc] IOMMU init failed — DMA UNPROTECTED (use noiommu to silence)\n");
+                    if crate::bootargs::is_iommu_verify() {
+                        crate::drivers::serial::SerialPort::puts("[svc] IOMMU verify failed or init error — fallback to noiommu (DMA UNPROTECTED)\n");
+                    } else {
+                        crate::drivers::serial::SerialPort::puts("[svc] IOMMU init failed — DMA UNPROTECTED (use noiommu to silence)\n");
+                    }
                     crate::services::dma::init_dma_allocator(root, alloc)
                 }
             } else {
