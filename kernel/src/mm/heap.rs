@@ -1,6 +1,5 @@
 use core::alloc::{GlobalAlloc, Layout};
 use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
-use spin::Mutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::vfs::irq::IrqMutex;
@@ -1082,12 +1081,14 @@ impl HeapInner {
 }
 
 static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
-// Keep plain `Mutex` (not `IrqMutex`) for the global heap: growth may
+// PreemptMutex (not `IrqMutex`) for the global heap: growth may
 // trigger `VMM::map` → `shootdown_tlb()` which waits for IPI acks. An
 // `IrqMutex` would hold IRQs disabled across that wait, deadlocking if the
 // target CPU is spinning on `HEAP` with IRQs off (e.g. inside a `VFS IrqMutex`).
+// Full preemption: PreemptMutex disables preemption (not IRQs) so holder
+// cannot be preempted and deadlock spinner on BSP.
 // The per-CPU cache (below) *is* `IrqMutex` so IRQ-time `free` never spins.
-static HEAP: Mutex<HeapInner> = Mutex::new(HeapInner::empty());
+static HEAP: crate::sync::PreemptMutex<HeapInner> = crate::sync::PreemptMutex::new(HeapInner::empty());
 
 /// Raw pointer to the physical allocator, stashed so `alloc()` can grow the heap.
 ///
@@ -1434,11 +1435,20 @@ unsafe impl GlobalAlloc for HeapAllocator {
         // can observe live == 0 after the cache lock is released, unmap the
         // chunk, and the allocator can return that stale cached pointer.  The
         // lock order is HEAP -> per-CPU cache, matching drain_cached_blocks.
+        // MONIKA INVASIVE: when reclamation is disabled, the second cache
+        // probe inside HEAP is unnecessary and only widens the HEAP hold window
+        // (holding HEAP while taking PER_CPU_CACHE IrqMutex). The outer probe
+        // already checked the same CPU's cache without HEAP, so skip the inner
+        // probe when ENABLE_HEAP_CHUNK_RECLAIM==false to avoid HEAP->IrqMutex
+        // inversion that deadlocks with VFS IrqMutex->HEAP paths (observed
+        // DOOM spawn hang with HEAP spin and IF=0).
         let mut heap = HEAP.lock();
-        let cached = per_cpu_alloc_cached(layout);
-        if !cached.is_null() {
-            heap.mark_live(cached as u64);
-            return cached;
+        if ENABLE_HEAP_CHUNK_RECLAIM {
+            let cached = per_cpu_alloc_cached(layout);
+            if !cached.is_null() {
+                heap.mark_live(cached as u64);
+                return cached;
+            }
         }
         let ptr = heap.alloc_inner(layout);
         let ptr = if ptr.is_null() {

@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
@@ -67,7 +67,7 @@ struct AcpiVmmState {
 unsafe impl Send for AcpiVmmState {}
 unsafe impl Sync for AcpiVmmState {}
 
-static ACPI_STATE: Mutex<Option<AcpiVmmState>> = Mutex::new(None);
+static ACPI_STATE: IrqMutex<Option<AcpiVmmState>> = IrqMutex::new(None);
 
 /// Initialise the ACPI VMM state. Must be called once after higher-half page
 /// tables are activated and before any `AcpiSubsystem::new()` call.
@@ -148,7 +148,7 @@ pub struct AcpiSubsystem {
     /// Persistent AML interpreter over the DSDT + SSDTs (x86_64). `None` when
     /// no DSDT was found or the tables could not be parsed by the `aml` crate.
     #[cfg(target_arch = "x86_64")]
-    pub aml: Option<spin::Mutex<::aml::AmlContext>>,
+    pub aml: Option<IrqMutex<::aml::AmlContext>>,
 }
 
 impl AcpiSubsystem {
@@ -326,7 +326,7 @@ impl AcpiSubsystem {
     fn aml_boot(
         entries: &[tables::SdtEntry],
         dsdt_fallback: u64,
-    ) -> (Option<spin::Mutex<::aml::AmlContext>>, Option<u8>) {
+    ) -> (Option<IrqMutex<::aml::AmlContext>>, Option<u8>) {
         if dsdt_fallback == 0 && !entries.iter().any(|e| e.signature == sig(b"DSDT")) {
             log::warn!("ACPI: no DSDT -- ACPI PM1 shutdown disabled");
             return (None, None);
@@ -344,7 +344,7 @@ impl AcpiSubsystem {
                     Some(t) => log::info!("ACPI: \\_S5 SLP_TYP = 0x{:02x}", t),
                     None => log::warn!("ACPI: \\_S5 not decodable -- ACPI PM1 shutdown disabled"),
                 }
-                (Some(spin::Mutex::new(ctx)), slp)
+                (Some(IrqMutex::new(ctx)), slp)
             }
             Err(e) => {
                 log::error!(

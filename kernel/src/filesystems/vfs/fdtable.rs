@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::error::VfsError;
 use super::file::FileDescription;
@@ -11,13 +11,13 @@ struct FdTableInner {
 }
 
 pub struct FdTable {
-    inner: Mutex<FdTableInner>,
+    inner: IrqMutex<FdTableInner>,
 }
 
 impl FdTable {
     pub const fn new() -> Self {
         FdTable {
-            inner: Mutex::new(FdTableInner {
+            inner: IrqMutex::new(FdTableInner {
                 fds: Vec::new(),
                 free_list: Vec::new(),
             }),

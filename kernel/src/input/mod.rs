@@ -42,8 +42,6 @@ mod queue;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
-use spin::Mutex;
-
 use keymap::Keymap;
 use queue::InputQueue;
 
@@ -76,7 +74,7 @@ pub struct InputDevice {
     pub poll: Option<fn()>,
 }
 
-static DEVICES: Mutex<Vec<InputDevice>> = Mutex::new(Vec::new());
+static DEVICES: crate::filesystems::vfs::irq::IrqMutex<Vec<InputDevice>> = crate::filesystems::vfs::irq::IrqMutex::new(Vec::new());
 static NEXT_ID: AtomicU32 = AtomicU32::new(1);
 
 struct Subscriber {
@@ -84,7 +82,7 @@ struct Subscriber {
     handler: fn(&InputEvent),
 }
 
-static SUBSCRIBERS: Mutex<Vec<Subscriber>> = Mutex::new(Vec::new());
+static SUBSCRIBERS: crate::filesystems::vfs::irq::IrqMutex<Vec<Subscriber>> = crate::filesystems::vfs::irq::IrqMutex::new(Vec::new());
 
 /// Device currently grabbed by a consumer, or 0 for no grab.
 static GRAB_DEVICE: AtomicU32 = AtomicU32::new(0);
@@ -167,6 +165,14 @@ pub fn device_snapshot() -> Vec<(u32, &'static str, u32)> {
 /// was full (the event is dropped and the overflow counter bumped).  Safe to
 /// call from interrupt context.
 pub fn submit_event(ev: InputEvent) -> bool {
+    // F9 hotkey — any device (PS/2 via RAW/decoder or USB HID) should arm the
+    // NMI dump. PS/2 raw path already does in hotkey_check_raw/submit_decoded,
+    // but USB HID goes through here directly. Centralizing covers both when
+    // the system is still dispatching input (non-IF=0 hang). NMI poll
+    // poll_for_hotkey_nmi covers the IF=0 dead-spin case for PS/2.
+    if ev.type_ == InputType::Key && ev.code == KeyCode::F9.code() && ev.value == 1 {
+        crate::watchdog::request_hotkey_dump();
+    }
     let ev = ev.with_timestamp(crate::services::universal_timer::now_ns());
     if queue().push(ev) {
         true

@@ -6,10 +6,14 @@
 //! - `pet()` is lock-free (TSC store) and called from `timer_handler`
 //!   before the `UniversalTimer` queue lock and from `task::schedule()`.
 //! - `nmi_handler` receives the *interrupted* `InterruptStackFrame` — the
-//!   hung `RIP` is dumped, not the handler's own `RIP`. Two consecutive
-//!   identical `RIP`s are required to confirm a hang (filters idle `hlt`).
+//!   hung `RIP` is dumped, not the handler's own `RIP`. A hang is declared
+//!   when `now - heartbeat > 3s` and the CPU is not idle, regardless of
+//!   whether the same `RIP` repeats — loops are hung whether they spin on one
+//!   instruction or many. `LAST_RIP` is kept for diagnostic correlation but
+//!   is not a gating condition (previous same-RIP gate missed loops).
 //! - `HOTKEY_PENDING` (F9) is lock-free; BSP sets it in `ps2::irq_handler`
-//!   (raw `0x43`) and NMI broadcasts `NMI IPI` to all APs.
+//!   (raw `0x43`) or via `input::submit_event` (any `KeyCode::F9` from
+//!   PS/2 or USB HID), and NMI broadcasts `NMI IPI` to all APs.
 //! - Default: dump then `cli;hlt` (halt). With `--features watchdog_cont` the
 //!   watchdog dump returns so the system keeps running and can re-dump.
 
@@ -381,11 +385,11 @@ mod imp {
         let now = now_ns();
         let hb = HEARTBEAT[cpu_idx].load(Ordering::Relaxed);
 
-        // Idle filter: if no current task, this CPU is in idle halt loop — not hung.
-        // Reading PerCpu.current_task is NMI-safe (single atomic load, no lock).
-        let is_idle = {
-            // try_current_per_cpu may be null very early — treat as not idle
-            // so early hangs still dump.
+        // Hang = heartbeat stale. Don't suppress when idle — `hlt` with IF=1
+        // still pets via timer (hb fresh), so no false dump. Early `cli;hlt`
+        // after #MC/#PF or before `sched_active` has stale hb and should dump.
+        // `is_idle` kept only for logging, not gating.
+        let _is_idle = {
             let per = crate::smp::try_current_per_cpu();
             if let Some(p) = per {
                 let has_task = !p.current_task.load(Ordering::Relaxed).is_null();
@@ -395,49 +399,43 @@ mod imp {
             }
         };
 
-        if !is_idle && now.wrapping_sub(hb) > WATCHDOG_TIMEOUT_NS {
+        if now.wrapping_sub(hb) > WATCHDOG_TIMEOUT_NS {
             let rip = frame.instruction_pointer.as_u64();
-            let last = LAST_RIP[cpu_idx].load(Ordering::Relaxed);
-            if last == rip && rip != 0 {
-                // Two consecutive NMIs with same RIP → real hang, not transient idle
-                let last_dump = LAST_DUMP_NS.load(Ordering::Relaxed);
-                if now.wrapping_sub(last_dump) >= DEBOUNCE_NS {
-                    LAST_DUMP_NS.store(now, Ordering::Relaxed);
-                    // Broadcast to peers for full system view
-                    if NMI_ARMED.load(Ordering::Relaxed) {
-                        apic::send_nmi_all_except_self();
-                        for _ in 0..2000 {
-                            core::hint::spin_loop();
-                        }
-                    }
-                    // Dump *interrupted* frame (hung RIP), not handler RIP
-                    crate::kerneldump::dump::dump_nmi_full_fault(
-                        &frame,
-                        2,
-                        "watchdog timeout (NMI)",
-                    );
-                    // Default halt, feature watchdog_cont continues
-                    #[cfg(not(feature = "watchdog_cont"))]
-                    {
-                        // halt forever — mirrors dump_full_fault final loop but inside NMI IST
-                        // Re-enable DUMP guard already set by dump_nmi; just halt.
-                        NMI_IN_PROGRESS[cpu_idx].store(false, Ordering::SeqCst);
-                        if from_user {
-                            unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };
-                        }
-                        loop {
-                            unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-                        }
-                    }
-                    #[cfg(feature = "watchdog_cont")]
-                    {
-                        // continue — reset heartbeat so we don't retrigger instantly
-                        HEARTBEAT[cpu_idx].store(now, Ordering::Relaxed);
-                        LAST_RIP[cpu_idx].store(0, Ordering::Relaxed);
+            // Hang = heartbeat stale + not idle. Any RIP (loop or single insn)
+            // is hung — don't require same RIP twice (misses loops).
+            // Keep LAST_RIP for post-mortem correlation only.
+            LAST_RIP[cpu_idx].store(rip, Ordering::Relaxed);
+            let last_dump = LAST_DUMP_NS.load(Ordering::Relaxed);
+            if now.wrapping_sub(last_dump) >= DEBOUNCE_NS {
+                LAST_DUMP_NS.store(now, Ordering::Relaxed);
+                // Broadcast to peers for full system view
+                if NMI_ARMED.load(Ordering::Relaxed) {
+                    apic::send_nmi_all_except_self();
+                    for _ in 0..2000 {
+                        core::hint::spin_loop();
                     }
                 }
-            } else {
-                LAST_RIP[cpu_idx].store(rip, Ordering::Relaxed);
+                // Dump *interrupted* frame (hung RIP), not handler RIP
+                crate::kerneldump::dump::dump_nmi_full_fault(&frame, 2, "watchdog timeout (NMI)");
+                // Default halt, feature watchdog_cont continues
+                #[cfg(not(feature = "watchdog_cont"))]
+                {
+                    // halt forever — mirrors dump_full_fault final loop but inside NMI IST
+                    // Re-enable DUMP guard already set by dump_nmi; just halt.
+                    NMI_IN_PROGRESS[cpu_idx].store(false, Ordering::SeqCst);
+                    if from_user {
+                        unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };
+                    }
+                    loop {
+                        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
+                    }
+                }
+                #[cfg(feature = "watchdog_cont")]
+                {
+                    // continue — reset heartbeat so we don't retrigger instantly
+                    HEARTBEAT[cpu_idx].store(now, Ordering::Relaxed);
+                    LAST_RIP[cpu_idx].store(0, Ordering::Relaxed);
+                }
             }
         } else if now.wrapping_sub(hb) <= WATCHDOG_TIMEOUT_NS {
             LAST_RIP[cpu_idx].store(0, Ordering::Relaxed);

@@ -26,6 +26,7 @@ pub mod platform;
 pub mod random;
 pub mod services;
 pub mod smp;
+pub mod sync;
 #[cfg(target_arch = "x86_64")]
 pub mod task;
 pub mod unispace;
@@ -803,7 +804,11 @@ impl Kernel {
                 // Reap parked dead tasks: free their user page tables, kernel
                 // stacks, and task boxes.  Runs here (idle stack, kernel CR3)
                 // so no task is ever torn down while parked on its own stack.
+                // Full preemption: reap must not be preempted (it walks page
+                // tables and frees allocator frames).
+                crate::smp::preempt_disable();
                 crate::task::reap_dead(&mut self.allocator);
+                crate::smp::preempt_enable();
 
                 // Hot-plug: poll the retained xHCI controller for port
                 // changes and register any newly attached block devices
@@ -818,6 +823,10 @@ impl Kernel {
                 // Returns to idle once every task is running, sleeping, or
                 // dead — the timer ISR never touches the scheduler, so all
                 // sleep bookkeeping happens here in idle context.
+                // Idle CR3/TSS fixup is centralized in `task::schedule()`
+                // (the `Dead->idle`/`ZzZ->idle`/`None->None` branches) to
+                // avoid duplicate `mov cr3`+serial spam; `schedule()` is the
+                // sole owner of CR3 transitions on BSP.
                 crate::task::wake_sleepers();
                 crate::task::schedule();
 

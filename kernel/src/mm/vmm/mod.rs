@@ -589,11 +589,13 @@ unsafe fn invpcid_all() {
 
 /// Serialize all page-table mutations (map / unmap / table reclamation).
 ///
-/// A plain spin lock (interrupts stay enabled while spinning) so a CPU blocked
-/// here can still take an IPI and acknowledge a TLB shootdown — holding this
-/// lock across the shootdown *wait* is never done (see [`shootdown_tlb`]).
-pub(crate) fn lock() -> spin::MutexGuard<'static, ()> {
-    static VMM_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// PreemptMutex (preemption disabled, IRQs stay enabled while spinning) so a
+/// CPU blocked here can still take an IPI and acknowledge a TLB shootdown —
+/// holding this lock across the shootdown *wait* is never done (see
+/// [`shootdown_tlb`]). Full preemption: holder cannot be preempted and
+/// deadlock spinner on BSP.
+pub(crate) fn lock() -> crate::sync::PreemptGuard<'static, ()> {
+    static VMM_LOCK: crate::sync::PreemptMutex<()> = crate::sync::PreemptMutex::new(());
     VMM_LOCK.lock()
 }
 

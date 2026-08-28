@@ -20,7 +20,7 @@
 
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use framebuffer::{Color, Display, Framebuffer};
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::services::universal_timer;
 
@@ -60,7 +60,7 @@ const STAGE_TEXTS: &[&str] = &[
 
 static FRAME: AtomicU64 = AtomicU64::new(0);
 static STAGE: AtomicU8 = AtomicU8::new(0);
-static TIMER_ID: Mutex<Option<universal_timer::TimerId>> = Mutex::new(None);
+static TIMER_ID: IrqMutex<Option<universal_timer::TimerId>> = IrqMutex::new(None);
 static FB_PTR: AtomicU64 = AtomicU64::new(0);
 
 // ── public API ─────────────────────────────────────────────────────────

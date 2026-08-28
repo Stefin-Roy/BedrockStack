@@ -35,7 +35,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering};
 
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 use x86_64::instructions::interrupts;
 
 use crate::drivers::serial::SerialPort;
@@ -150,8 +150,8 @@ static IRQ_VECTOR: AtomicU8 = AtomicU8::new(0);
 static LED_STATE: AtomicU8 = AtomicU8::new(0xFF); // 0xFF = never successfully sent
 static LED_ERR_LOGGED: AtomicBool = AtomicBool::new(false);
 
-static INIT_LOCK: Mutex<()> = Mutex::new(());
-static CMD_LOCK: Mutex<()> = Mutex::new(());
+static INIT_LOCK: PreemptMutex<()> = PreemptMutex::new(());
+static CMD_LOCK: PreemptMutex<()> = PreemptMutex::new(());
 
 /// The UInputL device id assigned to this keyboard during init.
 static DEVICE_ID: AtomicU32 = AtomicU32::new(0);
@@ -172,7 +172,7 @@ fn hotkey_check_raw(byte: u8) {
 }
 
 /// Poll the 8042 directly for an F9 make — NMI-safe, no locks, no heap.
-/// Even when IF=0 (IrqMutex hang) the PS/2 IRQ never fires, but its byte
+/// Even when IF=0 (PreemptMutex hang) the PS/2 IRQ never fires, but its byte
 /// still sits in the 8042 output buffer (OBF=1). An NMI can poll 0x64/0x60
 /// and drain it. Returns true if an F9 press was consumed.
 pub fn poll_for_hotkey_nmi() -> bool {
@@ -842,7 +842,7 @@ impl Decoder {
     }
 }
 
-static DECODER: Mutex<Decoder> = Mutex::new(Decoder::new());
+static DECODER: PreemptMutex<Decoder> = PreemptMutex::new(Decoder::new());
 
 fn decode_byte(byte: u8) -> Option<Decoded> {
     DECODER.lock().feed(byte)

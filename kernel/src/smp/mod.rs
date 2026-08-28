@@ -557,6 +557,32 @@ pub fn preempt_enable() {
     debug_assert!(prev > 0, "preempt_enable without disable");
 }
 
+/// Enable preemption and if need_resched is pending and we are now
+/// preemptible on an active CPU, invoke the scheduler. Returns true if
+/// a reschedule was attempted.
+///
+/// Safe to call before `early_init_bsp` (via `try_current_per_cpu`): if no
+/// PerCpu is live it is a no-op and preserves the `prev==0` debug_assert
+/// (never fires on `None` — the caller never incremented).
+#[inline]
+pub fn preempt_enable_and_maybe_resched() -> bool {
+    core::sync::atomic::compiler_fence(Ordering::Release);
+    let Some(pc) = try_current_per_cpu() else {
+        return false;
+    };
+    let prev = pc.preempt_count.fetch_sub(1, Ordering::Relaxed);
+    debug_assert!(prev > 0, "preempt_enable without disable");
+    #[cfg(target_arch = "x86_64")]
+    if prev == 1 && pc.need_resched.load(Ordering::Relaxed) && pc.sched_active.load(Ordering::Acquire) {
+        // consume the flag
+        if pc.need_resched.swap(false, Ordering::Relaxed) {
+            crate::task::maybe_resched_from_preempt();
+            return true;
+        }
+    }
+    false
+}
+
 /// Returns true when preemption is enabled (count ==0).
 #[inline]
 pub fn preempt_is_enabled() -> bool {

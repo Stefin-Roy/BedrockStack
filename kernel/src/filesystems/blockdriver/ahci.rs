@@ -23,7 +23,6 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use spin::Mutex;
 
 use super::driver::StorageDriver;
 use super::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
@@ -155,7 +154,7 @@ struct PortPtr(*const AhciPort);
 unsafe impl Send for PortPtr {}
 unsafe impl Sync for PortPtr {}
 
-static IRQ_PORTS: Mutex<Vec<PortPtr>> = Mutex::new(Vec::new());
+static IRQ_PORTS: crate::filesystems::vfs::irq::IrqMutex<Vec<PortPtr>> = crate::filesystems::vfs::irq::IrqMutex::new(Vec::new());
 
 struct AhciPort {
     hba: Hba,
@@ -176,7 +175,7 @@ struct AhciPort {
     slots: [Slot; AHCI_MAX_SLOTS],
     slot_alloc: core::sync::atomic::AtomicU32,
     irq_completed: AtomicU32,
-    submit_lock: spin::Mutex<()>,
+    submit_lock: crate::sync::PreemptMutex<()>,
 }
 
 unsafe impl Sync for AhciPort {}
@@ -1186,7 +1185,7 @@ fn init_one(
         slots,
         slot_alloc: core::sync::atomic::AtomicU32::new(0),
         irq_completed: AtomicU32::new(0),
-        submit_lock: spin::Mutex::new(()),
+        submit_lock: crate::sync::PreemptMutex::new(()),
     };
 
     port.identify()?;

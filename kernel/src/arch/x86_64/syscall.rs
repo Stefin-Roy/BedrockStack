@@ -320,19 +320,20 @@ impl Drop for UserAccess {
 /// r10 (the old fourth argument) is now unused.
 #[unsafe(no_mangle)]
 pub extern "sysv64" fn syscall_dispatch(frame: &mut SyscallFrame) {
-    // SMAP fence for every user-VA dereference below (see `UserAccess`).
-    let _ua = UserAccess::new();
-    // PKU: the kernel works with all keys accessible so a task that disabled
-    // its own key can never lock the kernel out of a buffer it must copy.
-    crate::arch::x86_64::cpufeat::pku_enter();
+    // Fine-grained preemption (BSP-only full preemption):
+    // only the validate→copy windows pin CR3 (preempt_disable + SMAP + PKU).
+    // VFS/provider work between those windows runs preemptible (IrqMutex/
+    // PreemptMutex protect short critical sections). This keeps latency low
+    // while still closing the user-pointer TOCTOU.
     let out = dispatch_inner(frame);
-    // Restore the task's own key rights; they persist across sysretq, so the
-    // user resumes under its restrictions. (Handlers that diverge —
-    // `exit`, a kill — never reach this; the next context switch applies the
-    // successor's PKRU instead.)
-    let pkru = current_task_pkru();
-    crate::arch::x86_64::cpufeat::pku_apply(pkru);
     frame.rax = out;
+    // Reschedule check before sysretq (no pin needed here).
+    if crate::smp::need_resched() && crate::smp::is_sched_active() && crate::task::is_current_running() {
+        if crate::smp::take_need_resched() {
+            crate::task::schedule();
+            return;
+        }
+    }
 }
 
 /// PKRU of the current task (0 when in kernel context).
@@ -367,19 +368,21 @@ fn dispatch_inner(frame: &mut SyscallFrame) -> u64 {
 /// Validates every page as user-readable before forming a slice into it
 /// (there is no #PF handler for user pointers). Returns the raw path str
 /// and its `ParsedPath`, both borrowing the validated user VA for the
-/// duration of the syscall. No lock or `preempt_disable` is held here: CR3
-/// never changes mid-syscall because the scheduler is cooperative, BSP-only
-/// and single global FIFO (deadline wake is one-shot, never periodic LAPIC),
-/// so no other task can run — and only the running task can unmap its own
-/// address space (`munmap`/`brk` run on this very stack). The deadline ISR
-/// touches only atomics (SCHED-L002), never page tables.
+/// duration of the syscall. The caller (`syscall_dispatch`) holds
+/// `preempt_disable` for the whole syscall so CR3 stays pinned and only the
+/// running task can unmap its own address space (`munmap`/`brk` run on this
+/// very stack). The deadline ISR touches only atomics (SCHED-L002), never
+/// page tables.
 /// Heap cost: one `Vec<&str>` inside `ParsedPath`; the raw bytes themselves
 /// stay in user memory (no `String`/`Vec<u8>` copy).
+/// Leftover zero-copy variant superseded by `scan_user_path_owned` (owned heap
+/// copy + preempt-pinned window). Kept only for `cfg(test)` reference so
+/// `#[allow(dead_code)]` no longer hides the warning in normal builds.
+#[cfg(test)]
 fn scan_user_path(ptr: u64) -> Result<(&'static str, crate::unispace::path::ParsedPath<'static>), i64> {
-    // SAFETY: syscall runs on task CR3 throughout; validated pages stay
-    // mapped: the scheduler is cooperative BSP-only (no other task can run,
-    // deadline ISR touches only atomics), and only the running task itself
-    // can unmap its own space, which cannot happen mid-syscall.
+    // SAFETY: syscall runs on task CR3 throughout (preempt_disable pinned);
+    // validated pages stay mapped: only the running task itself can unmap its
+    // own space, which cannot happen mid-syscall while pinned.
     // Transmute to 'static is sound for the syscall duration; the borrow
     // ends before sysretq.
     if ptr >= USER_BOUNDARY {
@@ -421,6 +424,118 @@ fn scan_user_path(ptr: u64) -> Result<(&'static str, crate::unispace::path::Pars
     Ok((s_static, parsed))
 }
 
+/// Owned path scan for fine-grained preemption: pins CR3, copies user path
+/// into an owned heap String, and parses from that owned buffer. The returned
+/// `ParsedPath` borrows from the returned `String`'s heap allocation (transmuted
+/// to 'static), so the caller must keep the `String` alive as long as the path
+/// is used. This allows the VFS/provider work between path scan and buffer
+/// copies to run preemptible (IrqMutex/PreemptMutex protect short sections).
+fn scan_user_path_owned(ptr: u64) -> Result<(String, crate::unispace::path::ParsedPath<'static>), i64> {
+    crate::smp::preempt_disable();
+    let _ua = UserAccess::new();
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let res = (|| -> Result<(String, crate::unispace::path::ParsedPath<'static>), i64> {
+        if ptr >= USER_BOUNDARY {
+            return Err(-14);
+        }
+        let root = current_task_root()?;
+        let mut va = ptr;
+        let mut nul_off: Option<u64> = None;
+        while va < USER_BOUNDARY && va - ptr < MAX_COPY {
+            let page = va & !0xFFF;
+            match crate::mm::vmm::translate_user(root, page) {
+                Some((_, user, _)) if user => {}
+                _ => return Err(-14),
+            }
+            let page_end = page + 0x1000;
+            let cap = core::cmp::min(page_end, core::cmp::min(USER_BOUNDARY, ptr + MAX_COPY));
+            if cap <= va { break; }
+            let src = unsafe { core::slice::from_raw_parts(va as *const u8, (cap - va) as usize) };
+            if let Some(i) = src.iter().position(|&b| b == 0) {
+                nul_off = Some(va + i as u64 - ptr);
+                break;
+            }
+            va = cap;
+        }
+        let len = match nul_off {
+            Some(off) => off as usize,
+            None => {
+                let scanned = (va - ptr) as usize;
+                if scanned as u64 >= MAX_COPY { return Err(-36); }
+                return Err(-22);
+            }
+        };
+        let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len) };
+        let s = core::str::from_utf8(bytes).map_err(|_| -22i64)?;
+        let owned = String::from(s);
+        // SAFETY: owned's heap buffer lives as long as owned String, which caller keeps.
+        let owned_static: &'static str = unsafe { &* (owned.as_str() as *const str) };
+        let parsed = crate::unispace::path::parse(owned_static).map_err(|e| errno(e))?;
+        Ok((owned, parsed))
+    })();
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    drop(_ua);
+    crate::smp::preempt_enable();
+    res
+}
+
+/// Copy user buffer `[ptr, ptr+len)` into an owned `Vec<u8>` under a pinned
+/// window (preempt_disable + SMAP + PKU). Used to make write's input buffer
+/// owned so `write_parsed` can run preemptible.
+fn copy_user_buffer_owned(ptr: u64, len: u64, writable: bool) -> Result<Vec<u8>, i64> {
+    if !user_range_ok(ptr, len) {
+        return Err(-14);
+    }
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    crate::smp::preempt_disable();
+    let _ua = UserAccess::new();
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let res = (|| -> Result<Vec<u8>, i64> {
+        let root = current_task_root()?;
+        validate_user_range(root, ptr, len, writable)?;
+        let src = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+        Ok(src.to_vec())
+    })();
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    drop(_ua);
+    crate::smp::preempt_enable();
+    res
+}
+
+/// Pinned copy-out: validate `dst` writable for `dst_len` and copy `data` into
+/// user VA (zero-filling remainder). `data.len()` may be <= `dst_len`.
+fn copy_out_pinned(dst: u64, dst_len: u64, data: &[u8]) -> Result<usize, i64> {
+    if !user_range_ok(dst, dst_len) {
+        return Err(-14);
+    }
+    if dst_len == 0 {
+        return Ok(0);
+    }
+    crate::smp::preempt_disable();
+    let _ua = UserAccess::new();
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let res = (|| -> Result<usize, i64> {
+        let root = current_task_root()?;
+        validate_user_range(root, dst, dst_len, true)?;
+        Ok(copy_validated_out(dst, dst_len, data))
+    })();
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    drop(_ua);
+    crate::smp::preempt_enable();
+    res
+}
+
+#[allow(dead_code)]
+/// Legacy pinned helper for slices where dst_len == data.len()
+fn copy_out_pinned_slice(dst: u64, data: &[u8]) -> Result<usize, i64> {
+    copy_out_pinned(dst, data.len() as u64, data)
+}
+
 /// 0 read(path, buf, buf_len): read the object's value into `buf`.
 ///
 /// The kernel never buffers more than `buf_len` bytes of the object, so a
@@ -428,10 +543,11 @@ fn scan_user_path(ptr: u64) -> Result<(&'static str, crate::unispace::path::Pars
 /// source object is; `copy_user_out` further validates the buffer pages.
 #[allow(unused_variables)]
 fn sys_read(frame: &mut SyscallFrame) {
-    let (raw, parsed) = match scan_user_path(frame.rdi) {
+    let (raw_owned, parsed) = match scan_user_path_owned(frame.rdi) {
         Ok(v) => v,
         Err(e) => { frame.rax = e as u64; return; }
     };
+    let raw = raw_owned.as_str();
     #[cfg(feature = "heap_trace")]
     let trace_t0_ms = crate::services::universal_timer::now_ns() / 1_000_000;
     #[cfg(feature = "heap_trace")]
@@ -466,7 +582,7 @@ fn sys_read(frame: &mut SyscallFrame) {
         SerialPort::puts("ms\n");
     }
     match r {
-        Ok(()) => match copy_user_out(frame.rsi, frame.rdx, &data) {
+        Ok(()) => match copy_out_pinned(frame.rsi, frame.rdx, &data) {
             Ok(n) => frame.rax = n as u64,
             Err(e) => frame.rax = e as u64,
         },
@@ -478,18 +594,15 @@ fn sys_read(frame: &mut SyscallFrame) {
 /// schema, apply it, and rewrite the provider's output (or error detail) into
 /// `buf` in place. Returns the number of output bytes — not the input length.
 fn sys_write(frame: &mut SyscallFrame) {
-    let (raw, parsed) = match scan_user_path(frame.rdi) {
+    let (raw_owned, parsed) = match scan_user_path_owned(frame.rdi) {
         Ok(v) => v,
         Err(e) => { frame.rax = e as u64; return; }
     };
-    // Fast-path: whole-buffer write-through to `/dev/fb`.  A full-screen blit
-    // is a few MB; routing it through the general path (schema decode + the
-    // response zero-fill) would waste a full page-walk and copy.  Here we
-    // validate the user pages and copy straight from user VA into the scanout
-    // — one copy, no allocations.  `r10` keeps its meaning as the byte offset
-    // (`flags`). Raw comparison keeps both "/dev/fb" and "dev/fb" spellings
-    // matching the original `String == "/dev/fb"` check (leading slash optional
-    // per path::parse, but raw is verbatim).
+    let raw = raw_owned.as_str();
+    // Fast-path: whole-buffer write-through to `/dev/fb`.  Pinned window keeps
+    // the user slice valid across the blit; the blit itself holds COPY_LOCK
+    // (IrqMutex) which disables preemption for its short critical section, but
+    // the validate→copy window here is the only place where user VA is derefed.
     if raw == "/dev/fb" {
         if let Some(caps) = crate::caps::current_caps() {
             if let Err(e) = crate::caps::check_path_on(Some(caps.as_slice()), &parsed.components, None, crate::caps::Perm::RW) {
@@ -499,40 +612,40 @@ fn sys_write(frame: &mut SyscallFrame) {
         }
         let src = frame.rsi;
         let len = frame.rdx;
-        let root = match current_task_root() {
-            Ok(r) => r,
-            Err(e) => { frame.rax = e as u64; return; }
-        };
-        if !user_range_ok(src, len) || validate_user_range(root, src, len, false).is_err() {
-            frame.rax = (-14i64) as u64;
-            return;
-        }
-        let bytes = unsafe { core::slice::from_raw_parts(src as *const u8, len as usize) };
-        if crate::display::write_at(frame.r10, bytes) {
-            frame.rax = len as u64;
-        } else {
-            frame.rax = errno(UnispaceError::InvalidArgument) as u64;
+        // Pinned copy directly into scanout while user pages are validated.
+        crate::smp::preempt_disable();
+        let _ua = UserAccess::new();
+        crate::arch::x86_64::cpufeat::pku_enter();
+        let fb_res = (|| -> Result<u64, i64> {
+            let root = current_task_root()?;
+            if !user_range_ok(src, len) || validate_user_range(root, src, len, false).is_err() {
+                return Err(-14);
+            }
+            let bytes = unsafe { core::slice::from_raw_parts(src as *const u8, len as usize) };
+            if crate::display::write_at(frame.r10, bytes) {
+                Ok(len)
+            } else {
+                Err(errno(UnispaceError::InvalidArgument) as i64)
+            }
+        })();
+        let pkru = current_task_pkru();
+        crate::arch::x86_64::cpufeat::pku_apply(pkru);
+        drop(_ua);
+        crate::smp::preempt_enable();
+        match fb_res {
+            Ok(n) => frame.rax = n,
+            Err(e) => frame.rax = e as u64,
         }
         return;
     }
     let mut resp = Vec::new();
-    // The buffer is read in and rewritten in place, so validate the whole
-    // range once (present, user-accessible, writable — writable subsumes
-    // readable) and copy straight from user VA into the provider, no `Vec`
-    // input copy.  `write_parsed` decodes `data` synchronously and never
-    // retains it, so handing it the validated user slice is safe; the
-    // response is copied back raw after.
-    let root = match current_task_root() {
-        Ok(r) => r,
+    // Copy user input buffer into an owned Vec under a pinned window so
+    // `write_parsed` can run preemptible (provider locks are IrqMutex/PreemptMutex).
+    let data_owned = match copy_user_buffer_owned(frame.rsi, frame.rdx, true) {
+        Ok(v) => v,
         Err(e) => { frame.rax = e as u64; return; }
     };
-    if !user_range_ok(frame.rsi, frame.rdx)
-        || validate_user_range(root, frame.rsi, frame.rdx, true).is_err()
-    {
-        frame.rax = (-14i64) as u64;
-        return;
-    }
-    let data = unsafe { core::slice::from_raw_parts(frame.rsi as *const u8, frame.rdx as usize) };
+    let data = data_owned.as_slice();
     match unispace::write_parsed(&parsed, data, &mut resp, frame.r10) {
         Ok(()) => {
             // A method's output may legitimately exceed its input length
@@ -541,26 +654,31 @@ fn sys_write(frame: &mut SyscallFrame) {
             // input before copying so we never write to an unvalidated or
             // unmapped page. The caller must size the buffer for both.
             let out_len = core::cmp::max(frame.rdx, resp.len() as u64);
-            if out_len > frame.rdx {
-                if !user_range_ok(frame.rsi, out_len)
-                    || validate_user_range(root, frame.rsi, out_len, true).is_err()
-                {
-                    // Buffer too small/unwritable for the full output: report
-                    // the output size so the caller can grow and retry, but do
-                    // not fault. Copy what fits in the validated input range.
-                    let n = copy_validated_out(frame.rsi, frame.rdx, &resp);
-                    if n < resp.len() {
-                        frame.rax = (-14i64) as u64; // EFAULT: output truncated
-                        return;
+            // Pinned copy-out (validate + copy + zero-fill) for both cases.
+            let n = match copy_out_pinned(frame.rsi, out_len, &resp) {
+                Ok(n) => n,
+                Err(_) => {
+                    // Fallback: try truncated copy of what fits in original buffer
+                    match copy_out_pinned(frame.rsi, frame.rdx, &resp) {
+                        Ok(n) => {
+                            if n < resp.len() {
+                                frame.rax = (-14i64) as u64;
+                                return;
+                            }
+                            n
+                        }
+                        Err(_) => {
+                            frame.rax = (-14i64) as u64;
+                            return;
+                        }
                     }
                 }
-            }
-            let n = copy_validated_out(frame.rsi, out_len, &resp);
+            };
             frame.rax = n as u64;
         }
         Err(e) => {
             // Best-effort copy of any error-detail bytes; the errno wins.
-            let _ = copy_validated_out(frame.rsi, frame.rdx, &resp);
+            let _ = copy_out_pinned(frame.rsi, frame.rdx, &resp);
             frame.rax = errno(e) as u64;
         }
     }
@@ -568,11 +686,15 @@ fn sys_write(frame: &mut SyscallFrame) {
 
 // ── User-pointer helpers ─────────────────────────────────────────────
 //
-// The kernel runs on the process CR3 throughout a syscall (the entry stub
-// does not reload it), so user memory is directly addressable. The helpers
-// still validate every page first — there is no page-fault handler installed
-// for user pointers, so a raw copy at a bogus address would double-fault and
-// abort the kernel. Malformed pointers only produce `Err`.
+// User memory is directly addressable only while CR3 is pinned
+// (preempt_disable + SMAP + PKU). Helpers that touch user VA must run
+// inside a pinned window; helpers like `copy_validated_out` assume the
+// caller already validated and pinned. Fine-grained preemption keeps the
+// VFS/provider work (between validate→copy windows) preemptible.
+// so user memory is directly addressable. The helpers still validate every
+// page first — there is no page-fault handler installed for user pointers,
+// so a raw copy at a bogus address would double-fault and abort the kernel.
+// Malformed pointers only produce `Err`.
 
 /// Top of the user canonical range; everything at or above this is kernel
 /// (higher-half) space.
@@ -626,48 +748,55 @@ fn validate_user_range(root: u64, ptr: u64, len: u64, writable: bool) -> Result<
 /// `MAX_COPY` bytes and the `USER_BOUNDARY`. Decodes UTF-8, returning
 /// `-EINVAL` on bad bytes. Returns `ENAMETOOLONG` if no NUL within cap.
 pub fn copy_user_cstring(ptr: u64) -> Result<String, i64> {
-    if ptr >= USER_BOUNDARY {
-        return Err(-14); // EFAULT
-    }
-    let root = current_task_root()?;
-    let mut out: Vec<u8> = Vec::new();
-    let mut va = ptr;
-    let mut found_nul = false;
-    while va < USER_BOUNDARY && va - ptr < MAX_COPY {
-        let page = va & !0xFFF;
-        // Validate this page is present and user-accessible before reading it.
-        match crate::mm::vmm::translate_user(root, page) {
-            Some((_, user, _)) if user => {}
-            _ => return Err(-14), // EFAULT
+    // Fine-grained pin: this helper may be called with preemption enabled.
+    crate::smp::preempt_disable();
+    let _ua = UserAccess::new();
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let res = (|| -> Result<String, i64> {
+        if ptr >= USER_BOUNDARY {
+            return Err(-14); // EFAULT
         }
-        // Read up to the end of this page, capped by the user boundary and the
-        // MAX_COPY budget.
-        let page_end = page + 0x1000;
-        let cap = core::cmp::min(page_end, core::cmp::min(USER_BOUNDARY, ptr + MAX_COPY));
-        if cap <= va {
-            break;
-        }
-        let src = unsafe { core::slice::from_raw_parts(va as *const u8, (cap - va) as usize) };
-        match src.iter().position(|&b| b == 0) {
-            Some(i) => {
-                out.extend_from_slice(&src[..i]);
-                found_nul = true;
+        let root = current_task_root()?;
+        let mut out: Vec<u8> = Vec::new();
+        let mut va = ptr;
+        let mut found_nul = false;
+        while va < USER_BOUNDARY && va - ptr < MAX_COPY {
+            let page = va & !0xFFF;
+            match crate::mm::vmm::translate_user(root, page) {
+                Some((_, user, _)) if user => {}
+                _ => return Err(-14), // EFAULT
+            }
+            let page_end = page + 0x1000;
+            let cap = core::cmp::min(page_end, core::cmp::min(USER_BOUNDARY, ptr + MAX_COPY));
+            if cap <= va {
                 break;
             }
-            None => {
-                out.extend_from_slice(src);
-                va = cap;
+            let src = unsafe { core::slice::from_raw_parts(va as *const u8, (cap - va) as usize) };
+            match src.iter().position(|&b| b == 0) {
+                Some(i) => {
+                    out.extend_from_slice(&src[..i]);
+                    found_nul = true;
+                    break;
+                }
+                None => {
+                    out.extend_from_slice(src);
+                    va = cap;
+                }
             }
         }
-    }
-    if !found_nul && out.len() as u64 >= MAX_COPY {
-        return Err(-36); // ENAMETOOLONG
-    }
-    if !found_nul && out.len() > 0 {
-        // Truncated without NUL and hit USER_BOUNDARY before MAX_COPY
-        return Err(-22); // EINVAL
-    }
-    String::from_utf8(out).map_err(|_| -22) // EINVAL
+        if !found_nul && out.len() as u64 >= MAX_COPY {
+            return Err(-36); // ENAMETOOLONG
+        }
+        if !found_nul && out.len() > 0 {
+            return Err(-22); // EINVAL
+        }
+        String::from_utf8(out).map_err(|_| -22)
+    })();
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    drop(_ua);
+    crate::smp::preempt_enable();
+    res
 }
 
 /// Copy `data` into a user buffer of size `len` whose pages were already
@@ -695,12 +824,23 @@ fn copy_validated_out(dst: u64, len: u64, data: &[u8]) -> usize {
 /// remainder is zero-filled, so the caller's buffer is always defined.
 /// Returns the number of bytes copied.
 pub fn copy_user_out(dst: u64, len: u64, data: &[u8]) -> Result<usize, i64> {
-    let root = current_task_root()?;
-    if !user_range_ok(dst, len) {
-        return Err(-14);
-    }
-    validate_user_range(root, dst, len, true)?;
-    Ok(copy_validated_out(dst, len, data))
+    // Fine-grained pin for legacy callers.
+    crate::smp::preempt_disable();
+    let _ua = UserAccess::new();
+    crate::arch::x86_64::cpufeat::pku_enter();
+    let res = (|| -> Result<usize, i64> {
+        let root = current_task_root()?;
+        if !user_range_ok(dst, len) {
+            return Err(-14);
+        }
+        validate_user_range(root, dst, len, true)?;
+        Ok(copy_validated_out(dst, len, data))
+    })();
+    let pkru = current_task_pkru();
+    crate::arch::x86_64::cpufeat::pku_apply(pkru);
+    drop(_ua);
+    crate::smp::preempt_enable();
+    res
 }
 
 /// Map a unispace error to a negative errno for the caller's `rax`.

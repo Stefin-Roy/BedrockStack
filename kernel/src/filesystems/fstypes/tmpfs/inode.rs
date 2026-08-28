@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
@@ -17,14 +17,14 @@ const ROOT_INO: u64 = 1;
 
 pub(super) enum TmpfsEntry {
     File {
-        data: Mutex<Vec<u8>>,
+        data: IrqMutex<Vec<u8>>,
     },
     Dir {
-        children: Mutex<HashMap<String, Arc<TmpfsInode>>>,
+        children: IrqMutex<HashMap<String, Arc<TmpfsInode>>>,
     },
     /// Raw bytes: symlink targets are arbitrary paths and need not be UTF-8.
     Symlink {
-        target: Mutex<Vec<u8>>,
+        target: IrqMutex<Vec<u8>>,
     },
     Fifo,
 }
@@ -33,8 +33,8 @@ pub(super) struct TmpfsInode {
     pub ino: u64,
     pub file_type: FileType,
     pub entry: TmpfsEntry,
-    pub mtime: Mutex<u64>,
-    pub mode: Mutex<u32>,
+    pub mtime: IrqMutex<u64>,
+    pub mode: IrqMutex<u32>,
     pub size: AtomicU64,
     /// Shared superblock usage counter (bytes), kept in sync on write/truncate.
     pub used: Arc<AtomicU64>,
@@ -46,10 +46,10 @@ impl TmpfsInode {
             ino: ROOT_INO,
             file_type: FileType::Directory,
             entry: TmpfsEntry::Dir {
-                children: Mutex::new(HashMap::new()),
+                children: IrqMutex::new(HashMap::new()),
             },
-            mtime: Mutex::new(0),
-            mode: Mutex::new(0o755),
+            mtime: IrqMutex::new(0),
+            mode: IrqMutex::new(0o755),
             size: AtomicU64::new(0),
             used,
         }
@@ -226,10 +226,10 @@ impl InodeOps for TmpfsInode {
                     ino,
                     file_type: FileType::Regular,
                     entry: TmpfsEntry::File {
-                        data: Mutex::new(Vec::new()),
+                        data: IrqMutex::new(Vec::new()),
                     },
-                    mtime: Mutex::new(crate::services::wallclock::now_secs()),
-                    mode: Mutex::new(0o644),
+                    mtime: IrqMutex::new(crate::services::wallclock::now_secs()),
+                    mode: IrqMutex::new(0o644),
                     size: AtomicU64::new(0),
                     used: self.used.clone(),
                 });
@@ -266,10 +266,10 @@ impl InodeOps for TmpfsInode {
                     ino,
                     file_type: FileType::Directory,
                     entry: TmpfsEntry::Dir {
-                        children: Mutex::new(HashMap::new()),
+                        children: IrqMutex::new(HashMap::new()),
                     },
-                    mtime: Mutex::new(crate::services::wallclock::now_secs()),
-                    mode: Mutex::new(0o755),
+                    mtime: IrqMutex::new(crate::services::wallclock::now_secs()),
+                    mode: IrqMutex::new(0o755),
                     size: AtomicU64::new(0),
                     used: self.used.clone(),
                 });
@@ -401,10 +401,10 @@ impl InodeOps for TmpfsInode {
                     ino,
                     file_type: FileType::Symlink,
                     entry: TmpfsEntry::Symlink {
-                        target: Mutex::new(target.as_bytes().to_vec()),
+                        target: IrqMutex::new(target.as_bytes().to_vec()),
                     },
-                    mtime: Mutex::new(crate::services::wallclock::now_secs()),
-                    mode: Mutex::new(0o777),
+                    mtime: IrqMutex::new(crate::services::wallclock::now_secs()),
+                    mode: IrqMutex::new(0o777),
                     size: AtomicU64::new(target.len() as u64),
                     used: self.used.clone(),
                 });
@@ -452,13 +452,13 @@ impl InodeOps for TmpfsInode {
                     else if mode & 0o20000 == 0o20000 { FileType::CharDevice }
                     else if mode & 0o140000 == 0o140000 { FileType::Socket }
                     else { FileType::Regular };
-                let entry = if ft == FileType::Fifo { TmpfsEntry::Fifo } else { TmpfsEntry::File { data: Mutex::new(Vec::new()) } };
+                let entry = if ft == FileType::Fifo { TmpfsEntry::Fifo } else { TmpfsEntry::File { data: IrqMutex::new(Vec::new()) } };
                 let child = Arc::new(TmpfsInode {
                     ino,
                     file_type: ft,
                     entry,
-                    mtime: Mutex::new(crate::services::wallclock::now_secs()),
-                    mode: Mutex::new(mode & 0o7777),
+                    mtime: IrqMutex::new(crate::services::wallclock::now_secs()),
+                    mode: IrqMutex::new(mode & 0o7777),
                     size: AtomicU64::new(0),
                     used: self.used.clone(),
                 });
@@ -479,8 +479,8 @@ impl InodeOps for TmpfsInode {
                     ino,
                     file_type: FileType::Fifo,
                     entry: TmpfsEntry::Fifo,
-                    mtime: Mutex::new(crate::services::wallclock::now_secs()),
-                    mode: Mutex::new(mode & 0o777),
+                    mtime: IrqMutex::new(crate::services::wallclock::now_secs()),
+                    mode: IrqMutex::new(mode & 0o777),
                     size: AtomicU64::new(0),
                     used: self.used.clone(),
                 });

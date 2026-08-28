@@ -8,7 +8,7 @@
 //!   0x10 + 2*i  (low  32 bits)
 //!   0x10 + 2*i+1 (high 32 bits)
 
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::mm::vmm::PageFlags;
@@ -27,7 +27,7 @@ struct IoApicState {
     next_vector: u8,
 }
 
-static IOAPIC: Mutex<Option<IoApicState>> = Mutex::new(None);
+static IOAPIC: IrqMutex<Option<IoApicState>> = IrqMutex::new(None);
 
 fn ioapic_write(state: &IoApicState, reg: u32, val: u32) {
     let base = state.base_virt as *mut u32;

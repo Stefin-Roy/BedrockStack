@@ -39,15 +39,15 @@ struct ProtocolCap {
 /// State retained after init so the idle loop can poll for post-boot port
 /// changes and enumerate/detach devices without re-probing the controller.
 struct XhciControllerState {
-    ports: spin::Mutex<ports::UsbPorts>,
-    slots: spin::Mutex<device::DeviceSlotManager>,
-    cmd_ring: spin::Mutex<memory::TrbRing>,
+    ports: crate::sync::PreemptMutex<ports::UsbPorts>,
+    slots: crate::sync::PreemptMutex<device::DeviceSlotManager>,
+    cmd_ring: crate::sync::PreemptMutex<memory::TrbRing>,
     doorbell_va: u64,
     dma: &'static dyn DmaAllocator,
     protocol_caps: Vec<ProtocolCap>,
 }
 
-static CONTROLLER: spin::Mutex<Option<XhciControllerState>> = spin::Mutex::new(None);
+static CONTROLLER: crate::sync::PreemptMutex<Option<XhciControllerState>> = crate::sync::PreemptMutex::new(None);
 
 pub fn controller_present() -> bool {
     CONTROLLER.lock().is_some()
@@ -334,9 +334,9 @@ fn init_controller(
     };
 
     *CONTROLLER.lock() = Some(XhciControllerState {
-        ports: spin::Mutex::new(usb_ports),
-        slots: spin::Mutex::new(dev_mgr),
-        cmd_ring: spin::Mutex::new(cmd_ring),
+        ports: crate::sync::PreemptMutex::new(usb_ports),
+        slots: crate::sync::PreemptMutex::new(dev_mgr),
+        cmd_ring: crate::sync::PreemptMutex::new(cmd_ring),
         doorbell_va,
         dma,
         protocol_caps,

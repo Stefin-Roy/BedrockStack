@@ -15,7 +15,7 @@
 
 use core::ops::Range;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 ///
 /// Start of the canonical higher-half region (also Start of x86_64's standard
@@ -393,7 +393,7 @@ const fn region(name: &'static str, base: u64, floor: u64) -> Region {
 }
 
 /// The live device windows, keyed by name.
-static REGIONS: Mutex<[Region; 4]> = Mutex::new([
+static REGIONS: IrqMutex<[Region; 4]> = IrqMutex::new([
     region("acpi", ACPI_VADDR_BASE, ACPI_VADDR_FLOOR),
     region("ecam", ECAM_VADDR_BASE, ECAM_VADDR_FLOOR),
     region("dma", DMA_VADDR_BASE, DMA_VADDR_FLOOR),

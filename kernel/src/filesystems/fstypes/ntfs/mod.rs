@@ -17,7 +17,7 @@ pub mod selftest;
 /// Last detailed NTFS mount error for diagnostics (sector read vs usa_fixup
 /// vs MFT FILE miss). Stored as `&'static str` so it survives the
 /// `VfsError::IOError` collapse and can be surfaced in `lib.rs:577`.
-static LAST_NTFS_DETAIL: spin::Mutex<Option<&'static str>> = spin::Mutex::new(None);
+static LAST_NTFS_DETAIL: crate::filesystems::vfs::irq::IrqMutex<Option<&'static str>> = crate::filesystems::vfs::irq::IrqMutex::new(None);
 
 pub fn last_error() -> Option<&'static str> {
     *LAST_NTFS_DETAIL.lock()

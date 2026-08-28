@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::traits::BlockDevice;
 use crate::pci::PciDevice;
@@ -16,9 +16,9 @@ pub trait StorageDriver: Send + Sync {
     ) -> Result<Vec<Arc<dyn BlockDevice>>, &'static str>;
 }
 
-static REGISTRY: Mutex<Vec<&'static dyn StorageDriver>> = Mutex::new(Vec::new());
+static REGISTRY: IrqMutex<Vec<&'static dyn StorageDriver>> = IrqMutex::new(Vec::new());
 
-pub static BLOCK_DEVICES: Mutex<Vec<Arc<dyn BlockDevice>>> = Mutex::new(Vec::new());
+pub static BLOCK_DEVICES: IrqMutex<Vec<Arc<dyn BlockDevice>>> = IrqMutex::new(Vec::new());
 
 /// Append devices that are not already registered.  Deduplicate by
 /// Arc pointer equality only: two distinct physical disks may share the

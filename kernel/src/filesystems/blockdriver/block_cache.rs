@@ -12,11 +12,11 @@ struct CachedSector {
 
 pub struct CachedDevice {
     inner: Arc<dyn BlockDevice>,
-    // Use a plain spin Mutex, not IrqMutex: CachedDevice::submit holds
-    // the cache across inner device I/O (wait_slots) which relies on
-    // IRQ-driven completion.  An IrqMutex would disable IRQs on this CPU
-    // for the entire wait and stall the AHCI IRQ.
-    cache: spin::Mutex<BlockCache>,
+    // PreemptMutex (preemption off, IRQs stay enabled): submit holds the cache
+    // across inner device I/O (wait_slots) which relies on IRQ-driven completion.
+    // An IrqMutex would disable IRQs on this CPU for the entire wait and stall
+    // the AHCI IRQ, while a plain spin would deadlock under full preemption.
+    cache: crate::sync::PreemptMutex<BlockCache>,
 }
 
 struct BlockCache {
@@ -179,7 +179,7 @@ impl CachedDevice {
     pub fn new(inner: Arc<dyn BlockDevice>) -> Arc<Self> {
         Arc::new(CachedDevice {
             inner,
-            cache: spin::Mutex::new(BlockCache::new()),
+            cache: crate::sync::PreemptMutex::new(BlockCache::new()),
         })
     }
 }

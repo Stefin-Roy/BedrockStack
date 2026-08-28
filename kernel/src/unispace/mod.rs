@@ -429,10 +429,10 @@ struct ResolveEntry {
     generation: u64,
     obj: Arc<dyn Object>,
 }
-static RESOLVE_CACHE: [spin::Mutex<Option<ResolveEntry>>; RESOLVE_SHARDS] = {
-    // `spin::Mutex::new` is const; build the array without heap.
+static RESOLVE_CACHE: [crate::filesystems::vfs::irq::IrqMutex<Option<ResolveEntry>>; RESOLVE_SHARDS] = {
+    // `IrqMutex::new` is const; build the array without heap.
     #[allow(clippy::declare_interior_mutable_const)]
-    const EMPTY: spin::Mutex<Option<ResolveEntry>> = spin::Mutex::new(None);
+    const EMPTY: crate::filesystems::vfs::irq::IrqMutex<Option<ResolveEntry>> = crate::filesystems::vfs::irq::IrqMutex::new(None);
     [EMPTY; RESOLVE_SHARDS]
 };
 

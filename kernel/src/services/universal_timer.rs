@@ -22,6 +22,13 @@ impl<T> IrqSafeLock<T> {
     }
 
     fn lock(&self) -> IrqSafeGuard<'_, T> {
+        let preempt_was_enabled = crate::smp::preempt_is_enabled();
+        if preempt_was_enabled {
+            if let Some(pc) = crate::smp::try_current_per_cpu() {
+                pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            }
+        }
         let was_enabled = crate::arch::CurrentArch::are_interrupts_enabled();
         if was_enabled {
             crate::arch::CurrentArch::disable_interrupts();
@@ -29,6 +36,7 @@ impl<T> IrqSafeLock<T> {
         IrqSafeGuard {
             guard: Some(self.inner.lock()),
             was_enabled,
+            preempt_was_enabled,
         }
     }
 }
@@ -36,6 +44,7 @@ impl<T> IrqSafeLock<T> {
 struct IrqSafeGuard<'a, T> {
     guard: Option<spin::MutexGuard<'a, T>>,
     was_enabled: bool,
+    preempt_was_enabled: bool,
 }
 
 impl<'a, T> IrqSafeGuard<'a, T> {
@@ -63,6 +72,19 @@ impl<T> Drop for IrqSafeGuard<'_, T> {
         drop(g);
         if self.was_enabled {
             crate::arch::CurrentArch::enable_interrupts();
+        }
+        if self.preempt_was_enabled {
+            if let Some(pc) = crate::smp::try_current_per_cpu() {
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+                let prev = pc.preempt_count.fetch_sub(1, core::sync::atomic::Ordering::Relaxed);
+                debug_assert!(prev > 0);
+                #[cfg(target_arch = "x86_64")]
+                if prev == 1 && pc.need_resched.load(Ordering::Relaxed) && pc.sched_active.load(Ordering::Acquire) {
+                    if pc.need_resched.swap(false, Ordering::Relaxed) {
+                        crate::task::maybe_resched_from_preempt();
+                    }
+                }
+            }
         }
     }
 }

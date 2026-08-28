@@ -35,10 +35,10 @@ pub static FD_TABLE: FdTable = FdTable::new();
 /// Namespace lock: held across mount/unmount and across open()'s
 /// resolve→attach sequence so an unmount cannot tear a drive down between
 /// its final busy-check and DRIVE_MAP removal while an open() is attaching
-/// to it.  A plain spin Mutex -- must NOT be an IrqMutex, since it is held
+/// to it.  PreemptMutex (preemption off, IRQs stay enabled) since it is held
 /// across device I/O (sync/shutdown) where IRQ-disabled spinning would
-/// stall interrupt delivery.
-pub static NS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+/// stall interrupt delivery, but preemption must still be disabled on BSP.
+pub static NS_LOCK: crate::sync::PreemptMutex<()> = crate::sync::PreemptMutex::new(());
 
 pub struct CurrentWorkingDirectory {
     pub drive: char,

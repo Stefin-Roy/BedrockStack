@@ -160,6 +160,9 @@ macro_rules! device_irq_guard {
                 swapgs();
             }
             device_irq_handler($vec);
+            // Full preemption: check for pending reschedule after every device IRQ,
+            // after EOI so switched-away context does not leave unacked LAPIC.
+            crate::task::try_preempt_from_irq(u);
             if u {
                 swapgs();
             }
@@ -199,6 +202,7 @@ extern "x86-interrupt" fn irq_34(frame: InterruptStackFrame) {
     }
     VEC34_COUNT.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     device_irq_handler(34);
+    crate::task::try_preempt_from_irq(u);
     if u {
         swapgs();
     }
@@ -549,6 +553,26 @@ extern "x86-interrupt" fn page_fault_handler(
     let u = from_user(&frame);
     if u {
         swapgs();
+    }
+    // MONIKA INVASIVE: log supervisor I-fetch at low VA (RIP==CR3) before dump
+    if !u {
+        let rip = frame.instruction_pointer.as_u64();
+        let cr3: u64;
+        unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+        if rip < 0x0000_8000_0000_0000 && error_code.contains(PageFaultErrorCode::INSTRUCTION_FETCH) {
+            crate::drivers::serial::dump_puts("\n[PF] supervisor I-fetch low RIP=0x");
+            crate::drivers::serial::dump_put_hex(rip);
+            crate::drivers::serial::dump_puts(" CR3=0x");
+            crate::drivers::serial::dump_put_hex(cr3);
+            crate::drivers::serial::dump_puts(" err=0x");
+            crate::drivers::serial::dump_put_hex(error_code.bits());
+            crate::drivers::serial::dump_puts(" pid=");
+            crate::drivers::serial::dump_put_hex(crate::task::current_pid().unwrap_or(0));
+            crate::drivers::serial::dump_puts("\n");
+            if rip == (cr3 & !0xFFF) {
+                crate::drivers::serial::dump_puts("[PF] RIP==CR3 detected - TaskContext corruption!\n");
+            }
+        }
     }
     if u {
         // Ring-3 page fault. Demand paging and COW make #PF a legitimate

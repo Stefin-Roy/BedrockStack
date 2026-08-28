@@ -1,5 +1,5 @@
 use core::ptr::{read_volatile, write_volatile};
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::PciDevice;
 use super::bar::Bar;
@@ -15,7 +15,7 @@ pub struct MsixDiag {
     pub table_va: u64,
     pub pba_va: u64,
 }
-static MSIX_DIAG: Mutex<Option<MsixDiag>> = Mutex::new(None);
+static MSIX_DIAG: IrqMutex<Option<MsixDiag>> = IrqMutex::new(None);
 
 /// Store diagnostic addresses for the MSI-X table and PBA.
 pub fn set_diag_addrs(table_va: u64, pba_va: u64) {

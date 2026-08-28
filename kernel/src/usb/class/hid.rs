@@ -28,7 +28,7 @@
 //! One keyboard and one mouse are supported in this phase; a second device of
 //! the same kind is rejected by `init_interface`.
 
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::input;
@@ -95,8 +95,8 @@ struct HidDeviceInner {
     prev_y: u8,
 }
 
-static KEYBOARD: Mutex<Option<HidDeviceInner>> = Mutex::new(None);
-static MOUSE: Mutex<Option<HidDeviceInner>> = Mutex::new(None);
+static KEYBOARD: PreemptMutex<Option<HidDeviceInner>> = PreemptMutex::new(None);
+static MOUSE: PreemptMutex<Option<HidDeviceInner>> = PreemptMutex::new(None);
 
 pub struct HidDriver;
 

@@ -10,7 +10,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::services::dma::DmaAllocator;
@@ -81,7 +81,7 @@ pub trait UsbClassDriver: Send + Sync {
     ) -> Result<BoundUsbDevice, &'static str>;
 }
 
-static REGISTRY: Mutex<Vec<&'static dyn UsbClassDriver>> = Mutex::new(Vec::new());
+static REGISTRY: PreemptMutex<Vec<&'static dyn UsbClassDriver>> = PreemptMutex::new(Vec::new());
 static REGISTERED: AtomicBool = AtomicBool::new(false);
 
 pub fn register(driver: &'static dyn UsbClassDriver) {

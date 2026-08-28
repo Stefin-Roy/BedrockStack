@@ -40,6 +40,18 @@ impl<T> IrqMutex<T> {
     }
 
     pub fn lock(&self) -> IrqGuard<'_, T> {
+        // Disable preemption before IRQs so a timer tick cannot preempt the
+        // holder and then deadlock a spinner that disabled IRQs (BSP-only
+        // full preemption, SCHED-L002). Order: preempt -> IRQ.
+        // Use try_current_per_cpu to stay safe before early_init_bsp.
+        let preempt_was_enabled = crate::smp::preempt_is_enabled();
+        if preempt_was_enabled {
+            // try_current_per_cpu handles pre-early_init null-PerCpu safely
+            if let Some(pc) = crate::smp::try_current_per_cpu() {
+                pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            }
+        }
         let was = crate::arch::CurrentArch::are_interrupts_enabled();
         if was {
             crate::arch::CurrentArch::disable_interrupts();
@@ -51,22 +63,42 @@ impl<T> IrqMutex<T> {
         IrqGuard {
             guard: Some(self.inner.lock()),
             was_enabled: was,
+            preempt_was_enabled,
             #[cfg(feature = "lockdep")]
             class: self.class,
         }
     }
 
     pub fn try_lock(&self) -> Option<IrqGuard<'_, T>> {
+        let preempt_was_enabled = crate::smp::preempt_is_enabled();
+        if preempt_was_enabled {
+            if let Some(pc) = crate::smp::try_current_per_cpu() {
+                pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+            }
+        }
         let was = crate::arch::CurrentArch::are_interrupts_enabled();
         if was {
             crate::arch::CurrentArch::disable_interrupts();
         }
-        let inner_guard = self.inner.try_lock()?;
+        let inner_guard = match self.inner.try_lock() {
+            Some(g) => g,
+            None => {
+                if was {
+                    crate::arch::CurrentArch::enable_interrupts();
+                }
+                if preempt_was_enabled {
+                    crate::smp::preempt_enable_and_maybe_resched();
+                }
+                return None;
+            }
+        };
         #[cfg(feature = "lockdep")]
         crate::smp::lockdep::acquire(self.class);
         Some(IrqGuard {
             guard: Some(inner_guard),
             was_enabled: was,
+            preempt_was_enabled,
             #[cfg(feature = "lockdep")]
             class: self.class,
         })
@@ -76,6 +108,7 @@ impl<T> IrqMutex<T> {
 pub struct IrqGuard<'a, T> {
     guard: Option<spin::MutexGuard<'a, T>>,
     was_enabled: bool,
+    preempt_was_enabled: bool,
     #[cfg(feature = "lockdep")]
     class: u32,
 }
@@ -109,6 +142,9 @@ impl<T> Drop for IrqGuard<'_, T> {
         crate::smp::lockdep::release(self.class);
         if self.was_enabled {
             crate::arch::CurrentArch::enable_interrupts();
+        }
+        if self.preempt_was_enabled {
+            crate::smp::preempt_enable_and_maybe_resched();
         }
     }
 }

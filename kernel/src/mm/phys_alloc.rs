@@ -46,7 +46,7 @@ pub struct BitmapAllocator {
     /// `inner.next_free` remains authoritative (holds lock); hint merely shards
     /// start_word so concurrent allocators don't all probe word 0. No buddy yet.
     next_free_hint: AtomicUsize,
-    inner: spin::Mutex<BitmapAllocatorInner>,
+    inner: crate::sync::PreemptMutex<BitmapAllocatorInner>,
 }
 
 unsafe impl Send for BitmapAllocator {}
@@ -207,7 +207,7 @@ impl BitmapAllocator {
             usable_len,
             free_count: AtomicUsize::new(0),
             next_free_hint: AtomicUsize::new(hint),
-            inner: spin::Mutex::new(BitmapAllocatorInner { next_free: hint }),
+            inner: crate::sync::PreemptMutex::new(BitmapAllocatorInner { next_free: hint }),
         }
         .with_seeded_free_count()
     }
@@ -270,7 +270,7 @@ impl BitmapAllocator {
     }
 
     /// Full bitmap word scan; caller must hold `inner`.
-    fn count_free_locked(&self, _guard: &spin::MutexGuard<'_, BitmapAllocatorInner>) -> usize {
+    fn count_free_locked(&self, _guard: &crate::sync::PreemptGuard<'_, BitmapAllocatorInner>) -> usize {
         let total_words = (self.total_frames + 63) / 64;
         let bitmap_u64 = self.bitmap_ptr() as *const u64;
         let mut free = 0usize;

@@ -1,6 +1,6 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::filesystems::blockdriver::traits::BlockDevice;
 use crate::filesystems::vfs::error::VfsError;
@@ -19,7 +19,7 @@ pub trait FileSystem: Send + Sync {
     ) -> Result<(Arc<SuperBlock>, Arc<dyn InodeOps>), VfsError>;
 }
 
-static REGISTRY: Mutex<Vec<&'static dyn FileSystem>> = Mutex::new(Vec::new());
+static REGISTRY: IrqMutex<Vec<&'static dyn FileSystem>> = IrqMutex::new(Vec::new());
 
 pub fn register(fs: &'static dyn FileSystem) {
     REGISTRY.lock().push(fs);

@@ -1,5 +1,5 @@
 use alloc::sync::Arc;
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::blockdriver::traits::{BlockDevice, IoBuffer, IoCompletions, IoRequest};
@@ -195,7 +195,7 @@ impl UsbMassStorageInner {
 }
 
 pub struct UsbMassStorageDevice {
-    inner: Mutex<UsbMassStorageInner>,
+    inner: PreemptMutex<UsbMassStorageInner>,
     sector_count: u64,
     model: [u8; 32],
 }
@@ -216,7 +216,7 @@ impl UsbMassStorageDevice {
         let cbw_page = dma.alloc_page().ok_or("OOM for USB MSD CBW page")?;
         let csw_page = dma.alloc_page().ok_or("OOM for USB MSD CSW page")?;
 
-        let inner = Mutex::new(UsbMassStorageInner {
+        let inner = PreemptMutex::new(UsbMassStorageInner {
             doorbell_va,
             slot_id,
             bulk_out_dci,

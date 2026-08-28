@@ -9,7 +9,7 @@
 //! return all-ones (empty config space) rather than failing.
 
 use ::aml::Handler;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::mm::vmm::PageFlags;
 
@@ -20,7 +20,7 @@ struct MmioCache {
     next: usize,
 }
 
-static MMIO_CACHE: Mutex<MmioCache> = Mutex::new(MmioCache {
+static MMIO_CACHE: IrqMutex<MmioCache> = IrqMutex::new(MmioCache {
     entries: [None; CACHE_SLOTS],
     next: 0,
 });

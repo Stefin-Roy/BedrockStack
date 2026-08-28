@@ -9,7 +9,6 @@
 
 use alloc::boxed::Box;
 use core::ptr::{read_volatile, write_volatile};
-use spin::Mutex;
 
 use super::AudioDevice;
 use super::codec::{self, VerbSender};
@@ -113,7 +112,9 @@ static LAST_OUT_LPIB: core::sync::atomic::AtomicU32 = core::sync::atomic::Atomic
 static OUT_BUF_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static OUT_SLOT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static OUT_RING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static OUT_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static OUT_LOCK: crate::filesystems::vfs::irq::IrqMutex<()> = crate::filesystems::vfs::irq::IrqMutex::new(());
+static IN_LOCK: crate::filesystems::vfs::irq::IrqMutex<()> = crate::filesystems::vfs::irq::IrqMutex::new(());
+static POLL_LOCK: crate::filesystems::vfs::irq::IrqMutex<()> = crate::filesystems::vfs::irq::IrqMutex::new(());
 
 static IN_CAPTURED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IN_CONSUMED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -121,8 +122,6 @@ static LAST_IN_LPIB: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU
 static IN_BUF_VIRT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IN_SLOT_BYTES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static IN_RING_SLOTS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static IN_LOCK: spin::Mutex<()> = spin::Mutex::new(());
-static POLL_LOCK: spin::Mutex<()> = spin::Mutex::new(());
 
 use core::sync::atomic::Ordering;
 
@@ -447,7 +446,7 @@ impl VerbSender for Inner {
 }
 
 pub struct HdaAudio {
-    inner: Mutex<Inner>,
+    inner: crate::filesystems::vfs::irq::IrqMutex<Inner>,
     cap_ready: core::sync::atomic::AtomicBool,
 }
 
@@ -672,7 +671,7 @@ pub fn init(dev: &crate::pci::PciDevice) -> Result<&'static dyn AudioDevice, &'s
     };
 
     let audio = Box::new(HdaAudio {
-        inner: Mutex::new(Inner {
+        inner: crate::filesystems::vfs::irq::IrqMutex::new(Inner {
             mmio,
             corb_phys: corb.phys,
             corb_virt: corb.virt,

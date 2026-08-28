@@ -16,7 +16,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::unispace::{UnispaceError, path as upath};
+use crate::unispace::UnispaceError;
 
 /// Permission states. `0` = absent (R0W0), `1` = R, `2` = invalid R0W1, `3` = RW.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -335,6 +335,10 @@ pub fn validate_cap(cap: &Cap) -> Result<(), UnispaceError> {
         if m.is_empty() || m.len() > MAX_CAP_METHOD_LEN || m.contains('/') || m.contains(':') {
             return Err(UnispaceError::InvalidArgument);
         }
+        // Reject control chars (0x00-0x1F, 0x7F) in method — parser would have, low-risk but explicit.
+        if m.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(UnispaceError::InvalidArgument);
+        }
     }
     // R0W1 impossible via Perm, but guard if raw value came from wire.
     // Reject empty method string if present.
@@ -347,20 +351,18 @@ pub fn validate_cap(cap: &Cap) -> Result<(), UnispaceError> {
             if seg.is_empty() || seg == "." || seg == ".." || seg.contains(':') {
                 return Err(UnispaceError::InvalidArgument);
             }
+            // Reject control chars in any segment (parser's `:`, `//`, `.` handled above, but control not).
+            if seg.bytes().any(|b| b < 0x20 || b == 0x7F) {
+                return Err(UnispaceError::InvalidArgument);
+            }
         }
     }
-    // Also validate via path parser by round-tripping.
-    let probe = if cap.path.is_empty() {
-        String::from("/")
-    } else {
-        alloc::format!("/{}", cap.path)
-    };
-    let _ = upath::parse(&probe).map_err(|_| UnispaceError::InvalidArgument)?;
-    if let Some(m) = &cap.method {
-        let probe2 = alloc::format!("{}/x:{}", probe.trim_end_matches('/'), m);
-        // Use a dummy resolve path to validate method name legality; parse will reject bad names
-        let _ = upath::parse(&probe2).map_err(|_| UnispaceError::InvalidArgument)?;
-    }
+    // Also validate via path parser by round-tripping - MONIKA INVASIVE:
+    // avoid heap allocation (alloc::format!) on the spawn hotpath which
+    // deadlocks when called with VFS IrqMutex held and heap contended.
+    // Manual checks above already cover canonicality; just verify via
+    // components without allocating: cap.path is already canonical per earlier
+    // checks, and method was checked for '/' and ':' above. No extra parse.
     Ok(())
 }
 

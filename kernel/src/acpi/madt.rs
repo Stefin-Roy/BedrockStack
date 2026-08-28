@@ -5,7 +5,7 @@ use crate::acpi::platform::{
 use crate::drivers::serial::SerialPort;
 use alloc::vec::Vec;
 use log::info;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 fn r8(buf: &[u8], off: usize) -> u8 {
     buf[off]
@@ -40,7 +40,7 @@ pub struct IrqOverride {
     pub trigger: TriggerMode,
 }
 
-static OVERRIDES: Mutex<Vec<IrqOverride>> = Mutex::new(Vec::new());
+static OVERRIDES: IrqMutex<Vec<IrqOverride>> = IrqMutex::new(Vec::new());
 
 /// Look up the MADT interrupt source override for a legacy ISA IRQ.
 ///

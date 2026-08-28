@@ -37,7 +37,7 @@ pub struct FramebufferDevice {
 static FB: Once<FramebufferDevice> = Once::new();
 
 /// Serializes reads/writes/clears of the framebuffer memory itself.
-static COPY_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+static COPY_LOCK: crate::filesystems::vfs::irq::IrqMutex<()> = crate::filesystems::vfs::irq::IrqMutex::new(());
 
 /// Store the boot framebuffer snapshot.
 ///

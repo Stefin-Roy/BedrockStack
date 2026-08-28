@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use hashbrown::HashMap;
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 
 use crate::filesystems::blockdriver::block_cache::CachedDevice;
 use crate::filesystems::blockdriver::traits::BlockDevice;
@@ -21,24 +21,24 @@ use super::io::read_sectors;
 pub struct Fat32SuperBlock {
     pub(crate) device: Arc<dyn BlockDevice>,
     pub(crate) bpb: Bpb,
-    pub(crate) fat_cache: Mutex<FatCache>,
+    pub(crate) fat_cache: PreemptMutex<FatCache>,
     pub(crate) next_ino: AtomicU64,
     /// Stable inode numbers keyed by (parent directory cluster, entry name).
     /// FAT has no inode table, so the identity is the namespace location.
-    pub(crate) ino_map: Mutex<HashMap<(u32, String), u64>>,
+    pub(crate) ino_map: PreemptMutex<HashMap<(u32, String), u64>>,
     /// Live inode handles keyed by (parent cluster, case-folded entry name).
     /// Lets unlink/rmdir distinguish "open handles exist -- defer cluster
     /// release to their Drop" from "orphaned name -- free the chain now",
     /// closing both the stale-handle dirent-stomp and the evicted-dentry
     /// cluster-leak holes.
-    pub(crate) handle_registry: Mutex<HashMap<(u32, String), Vec<Weak<super::inode::Fat32Inode>>>>,
+    pub(crate) handle_registry: PreemptMutex<HashMap<(u32, String), Vec<Weak<super::inode::Fat32Inode>>>>,
     /// Shared chain metadata. Unispace resolves paths into fresh inode views,
     /// so a per-inode chain cache would be discarded after every syscall.
-    pub(crate) chain_cache: Mutex<HashMap<u32, Arc<Vec<u32>>>>,
+    pub(crate) chain_cache: PreemptMutex<HashMap<u32, Arc<Vec<u32>>>>,
     /// In-RAM allocation bitmap (built during the initial free-cluster scan).
     /// `None` on oversized volumes that use the FAT-scan allocator.
-    pub(crate) alloc_bitmap: Mutex<Option<super::alloc::AllocBitmap>>,
-    pub(crate) next_alloc_hint: Mutex<u32>,
+    pub(crate) alloc_bitmap: PreemptMutex<Option<super::alloc::AllocBitmap>>,
+    pub(crate) next_alloc_hint: PreemptMutex<u32>,
     pub(crate) free_clus_count: AtomicU32,
     pub(crate) volume_dirty: AtomicBool,
 }
@@ -305,13 +305,13 @@ impl FileSystem for Fat32FileSystem {
         let sb = Arc::new(Fat32SuperBlock {
             device: cached,
             bpb: bpb.clone(),
-            fat_cache: Mutex::new(FatCache::new(&bpb)),
+            fat_cache: PreemptMutex::new(FatCache::new(&bpb)),
             next_ino: AtomicU64::new(2),
-            ino_map: Mutex::new(HashMap::new()),
-            handle_registry: Mutex::new(HashMap::new()),
-            chain_cache: Mutex::new(HashMap::new()),
-            alloc_bitmap: Mutex::new(None),
-            next_alloc_hint: Mutex::new(2),
+            ino_map: PreemptMutex::new(HashMap::new()),
+            handle_registry: PreemptMutex::new(HashMap::new()),
+            chain_cache: PreemptMutex::new(HashMap::new()),
+            alloc_bitmap: PreemptMutex::new(None),
+            next_alloc_hint: PreemptMutex::new(2),
             free_clus_count: AtomicU32::new(0),
             volume_dirty: AtomicBool::new(false),
         });
@@ -350,10 +350,10 @@ impl FileSystem for Fat32FileSystem {
             parent_clus: root_clus,
             entry_name: String::new(),
             unlinked: AtomicBool::new(false),
-            dir_cache: Mutex::new(None),
+            dir_cache: PreemptMutex::new(None),
             dir_generation: AtomicU64::new(0),
-            dir_lock: Mutex::new(()),
-            write_lock: spin::RwLock::new(()),
+            dir_lock: PreemptMutex::new(()),
+            write_lock: crate::sync::PreemptRwLock::new(()),
         }) as Arc<dyn InodeOps>;
 
         let root_inode = Arc::new(Inode::new(root_ops.clone()));

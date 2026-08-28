@@ -1,8 +1,11 @@
-//! Cooperative task scheduler.
+//! Preemptive task scheduler (BSP-only, full kernel preemption).
 //!
 //! A single global FIFO run queue of kernel tasks is switched by `switch_to`.
 //! The scheduler runs on the BSP only (APs idle in `ap_entry64`), so no
-//! per-CPU queues or cross-CPU locking are needed yet.  Tasks are
+//! per-CPU queues or cross-CPU locking are needed yet. Preemption is tick-
+//! driven via the slice timer (UniversalTimer one-shot) and device IRQs; both
+//! user and kernel contexts are preemptible when `preempt_count==0` (IrqMutex
+//! and PreemptMutex disable preemption across critical sections). Tasks are
 //! `Box::leak`ed to `&'static mut`; exiting tasks park as zombies in `ZOMBIES`
 //! (retaining their exit code and `/proc` directory) until a parent's `:wait`
 //! consumes them or their own parent dies, and `reap_dead` frees their root
@@ -31,7 +34,8 @@ use crate::mm::phys_alloc::BitmapAllocator;
 use crate::mm::vmm::{PageFlags, Vmm};
 use hashbrown::HashMap;
 use spin::Once;
-use switch::switch_to;
+#[allow(unused_imports)]
+use switch::{switch_to, switch_to_checked};
 pub use switch::{TaskContext, user_iret_addr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -700,23 +704,23 @@ fn preempt_kick() {
 /// Preemption entry from IRQ context (slice-expiry tick, any deadline tick,
 /// or the resched IPI), invoked *after* EOI.
 ///
-/// `from_user` gates the switch: only contexts interrupted in **ring 3** are
-/// preempted here. Kernel-context ticks merely leave `need_resched` set,
-/// consumed at the next sleep/exit/wait/idle dispatch. Rationale: large
-/// parts of the kernel (VFS caches, unispace registries, drivers) still hold
-/// plain spin mutexes that do not disable IRQs; switching a holder away can
-/// deadlock a spinner that disables IRQs while waiting (no further ticks).
-/// Until those locks are audited to IrqMutex, kernel-mode preemption stays
-/// off. Ring-3 entry is safe: the CPU already switched to the task's kernel
-/// stack via rsp0, and the scheduler's own locks are never held across the
-/// iretq boundary.
+/// Under full BSP-only preemption both ring-3 and kernel contexts are
+/// preemptible when `preempt_count == 0`. Kernel holders are protected by
+/// `IrqMutex` (now `preempt_disable`+`cli`) or explicit `preempt_disable`
+/// around intentionally-plain locks (HEAP, VMM_LOCK, NS_LOCK, BLOCK_CACHE
+/// wait split). The `from_user` flag is retained for future auditing but no
+/// longer gates the switch.
 ///
-/// Additional gates (both modes): `sched_active`, `preempt_count == 0`,
+/// Additional gates: `sched_active`, `preempt_count == 0`,
 /// non-null current, current state == `Running`. APs never schedule.
-pub fn try_preempt_from_irq(from_user: bool) {
-    if !from_user {
-        return;
-    }
+/// Unified: `schedule()` now always leaves idle with `preempt_count==0`
+/// (see `Dead->idle`/`ZzZ->idle` enable-before-switch), so this gating
+/// on `preempt_is_enabled()` correctly blocks while a lock is held but
+/// allows idle (null `current_task`) to be tick-preemptible — previously
+/// `ZzZ->idle` left count==1 and this check would have hidden a pending
+/// `need_resched` until next `schedule()` enable. Test: `is_sched_active`
+/// + null task + count==0 still reaches `take_need_resched`.
+pub fn try_preempt_from_irq(_from_user: bool) {
     if !crate::smp::is_sched_active() || !crate::smp::preempt_is_enabled() {
         return;
     }
@@ -1089,7 +1093,13 @@ fn take_from_lists(pid: u64) -> Option<&'static mut Task> {
 
 /// Snapshot the state of `pid` (excluding already-reaped tasks).
 ///
-/// The scheduler is cooperative and BSP-only, so every live task is exactly one
+/// True if CURRENT holds a Running task (helper for syscall return resched).
+pub fn is_current_running() -> bool {
+    let cur = CURRENT.lock();
+    matches!(cur.as_deref(), Some(t) if t.state == TaskState::Running)
+}
+
+/// The scheduler is BSP-only (single global queue), so every live task is exactly one
 /// of: the current task (`Running`, in `CURRENT`), a ready task in `QUEUE`, a
 /// parked sleeper in `SLEEPING` (`ZzZ`), a parked waiter in `WAITERS` (`ZzZ`),
 /// or a zombie in `ZOMBIES` (`Dead`). The five locks are taken and read
@@ -1115,7 +1125,7 @@ pub fn task_vm(pid: u64) -> Option<usize> {
 ///   into `ZOMBIES`; its own children then orphan out on the next reap;
 /// - anything else (already reaped, or an unknown id) yields `Err(())`.
 ///
-/// Cooperative BSP-only: every live non-executing task is in `QUEUE`,
+/// BSP-only: every live non-executing task is in `QUEUE`,
 /// `SLEEPING`, or `WAITERS`, and the only `Running` task is the caller.
 pub fn kill(pid: u64) -> Result<(), ()> {
     let is_self = {
@@ -1451,6 +1461,31 @@ fn idle_stack_top() -> u64 {
     core::ptr::addr_of!(__kernel_end) as *const u8 as u64
 }
 
+/// Public accessor for idle stack top (used by Kernel::run fixup).
+pub fn idle_stack_top_pub() -> u64 {
+    idle_stack_top()
+}
+
+/// Ensure idle runs on `K$ROOT` with correct `rsp0`. Centralized helper so
+/// `Dead->idle`, `ZzZ->idle`, and `None->None` share one `mov cr3` path
+/// instead of duplicating serial spam (see `lib.rs` removal). Also re-pins
+/// `TSS.rsp0`/`PerCpu.syscall_rsp0` to the idle stack so a just-freed KSTACK
+/// is never used for ring-0 entry (see `reap_dead`).
+#[inline]
+fn ensure_idle_root(kroot: u64) {
+    if kroot == 0 {
+        return;
+    }
+    let cur: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cur, options(nomem, nostack)) };
+    if (cur & !0xFFF) != (kroot & !0xFFF) {
+        crate::drivers::serial::SerialPort::puts("[sched] idle CR3 fixup to kernel root\n");
+        crate::mm::vmm::set_current_root(kroot);
+        unsafe { core::arch::asm!("mov cr3, {}", in(reg) kroot, options(nostack)) };
+    }
+    set_kernel_stack_meta(idle_stack_top());
+}
+
 /// Weighted round-robin budget: Interactive dispatches remaining before one
 /// Batch dispatch resets it.
 static WRR_CREDIT: AtomicU32 = AtomicU32::new(WEIGHT_INTERACTIVE);
@@ -1528,6 +1563,11 @@ pub fn schedule() {
     let (next_ptr, next_root) = match next {
         Some(t) => {
             t.state = TaskState::Running;
+            // Invasive validation: next context must not alias its root (the
+            // observed RIP==CR3 fault). Also ensure high-half RIP.
+            debug_assert!(t.root != 0 && t.root & 0xFFF == 0);
+            debug_assert!(t.ctx.rip != t.root, "next rip == root");
+            debug_assert!(t.ctx.is_valid(), "next ctx invalid");
             // Arm the expiry timer only while competition remains in the
             // queue; a lone task runs untimed (no periodic tick, SCHED-011).
             // A later arrival re-arms via `preempt_kick` (spawn/fork).
@@ -1551,30 +1591,38 @@ pub fn schedule() {
         None => {
             // No ready task.
             match prev {
-                Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
-                    // Park the current task and resume idle.  A Dead task is
-                    // parked into ZOMBIES (after `drop(q)`, so ZOMBIES is
-                    // never acquired while QUEUE is held) for a later idle
-                    // loop reap or a parent's :wait; a ZzZ task is already
-                    // registered in the sleeping/waiter list, so it is simply
-                    // left out of the queue.  `pctx` stays valid either way.
+                Some(p) if p.state == TaskState::Dead => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
                     cancel_slice_timer();
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
+                    debug_assert!(root != 0, "KERNEL_ROOT zero on Dead->idle");
                     drop(q);
-                    if p.state == TaskState::Dead {
-                        park_zombie(p);
-                    }
-                    crate::mm::vmm::set_current_root(root);
-                    // This context (a Dead task) never resumes through here,
-                    // so the preempt-disable taken on entry MUST be released
-                    // before the final switch — post-switch release would
-                    // leak a per-CPU disable.
+                    park_zombie(p);
+                    // Idle must run on KERNEL_ROOT — unified fixup (was WARN-only, never `mov cr3`).
+                    ensure_idle_root(root);
+                    // Dead never resumes — release preempt before switch so idle resumes count==0 and is tick-preemptible (unified with ZzZ).
                     crate::smp::preempt_enable();
                     unsafe {
-                        switch_to(pctx, idle_ctx(), root);
+                        switch_to_checked(pctx, idle_ctx(), root);
+                    }
+                    return;
+                }
+                Some(p) if p.state == TaskState::ZzZ => {
+                    // Unified with Dead->idle: enable-before-switch so idle resumes with count==0 and is tick-preemptible.
+                    // Previously this parked "elevated" (count==1 across switch, enable after) leaving idle non-preemptible until next schedule.
+                    crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
+                    *CURRENT.lock() = None;
+                    cancel_slice_timer();
+                    let pctx = core::ptr::addr_of_mut!(p.ctx);
+                    let root = KERNEL_ROOT.load(Ordering::Relaxed);
+                    debug_assert!(root != 0, "KERNEL_ROOT zero on ZzZ->idle");
+                    drop(q);
+                    ensure_idle_root(root);
+                    crate::smp::preempt_enable();
+                    unsafe {
+                        switch_to_checked(pctx, idle_ctx(), root);
                     }
                     return;
                 }
@@ -1584,9 +1632,13 @@ pub fn schedule() {
                     // PerCpu.current_task=null while the task continued on its
                     // stack (S0). Now restore CURRENT/PerCpu and keep Running.
                     let stack_top = p.kernel_stack_top;
+                    let p_root = p.root;
+                    let p_valid = p.ctx.is_valid();
+                    let p_rip_ne_root = p.ctx.rip != p.root;
                     let ptr = &mut *p as *mut Task as *mut core::ffi::c_void;
                     // Keep state Running (p was Running before take).
-                    debug_assert!(p.state == TaskState::Running);
+                    debug_assert!(p_valid, "fast-path ctx invalid");
+                    debug_assert!(p_rip_ne_root, "fast-path RIP==CR3");
                     // Alone on the CPU: run untimed. No slice-expiry timer is
                     // armed, so a lone CPU-bound task is not interrupted
                     // periodically; the next arrival re-arms via
@@ -1598,12 +1650,18 @@ pub fn schedule() {
                     cancel_slice_timer();
                     drop(q);
                     crate::smp::preempt_enable();
+                    // Ensure CR3 still matches the lone task (no idle alias).
+                    let cur_cr3: u64;
+                    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cur_cr3, options(nomem, nostack)) };
+                    debug_assert!((cur_cr3 & !0xFFF) == (p_root & !0xFFF), "fast-path CR3 mismatch");
                     return;
                 }
                 None => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
                     cancel_slice_timer();
+                    let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
+                    ensure_idle_root(kroot);
                     drop(q);
                     crate::smp::preempt_enable();
                     return;
@@ -1613,24 +1671,24 @@ pub fn schedule() {
     };
 
     match prev {
-        // A Dead or ZzZ task may also switch straight to the next ready task
-        // (queue non-empty).  Only a Dead task is parked into ZOMBIES — a
-        // ZzZ task is already registered in the sleeping/waiter list — both
-        // dealt with after `drop(q)`.
-        Some(p) if p.state == TaskState::Dead || p.state == TaskState::ZzZ => {
+        Some(p) if p.state == TaskState::Dead => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             drop(q);
-            if p.state == TaskState::Dead {
-                park_zombie(p);
-            }
+            park_zombie(p);
             crate::mm::vmm::set_current_root(next_root);
-            // A Dead task never resumes through here (ZzZ resumes via its
-            // registered ctx on wake, but releasing before the switch is the
-            // one placement balanced for both cases).
             crate::smp::preempt_enable();
             unsafe {
-                switch_to(pctx, next_ptr, next_root);
+                switch_to_checked(pctx, next_ptr, next_root);
             }
+        }
+        Some(p) if p.state == TaskState::ZzZ => {
+            let pctx = core::ptr::addr_of_mut!(p.ctx);
+            drop(q);
+            crate::mm::vmm::set_current_root(next_root);
+            unsafe {
+                switch_to_checked(pctx, next_ptr, next_root);
+            }
+            crate::smp::preempt_enable();
         }
         Some(p) => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
@@ -1639,7 +1697,7 @@ pub fn schedule() {
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
             unsafe {
-                switch_to(pctx, next_ptr, next_root);
+                switch_to_checked(pctx, next_ptr, next_root);
             }
             crate::smp::preempt_enable();
         }
@@ -1647,11 +1705,36 @@ pub fn schedule() {
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
             unsafe {
-                switch_to(idle_ctx(), next_ptr, next_root);
+                switch_to_checked(idle_ctx(), next_ptr, next_root);
             }
             crate::smp::preempt_enable();
         }
     }
+}
+
+/// Called from `smp::preempt_enable_and_maybe_resched` when dropping the
+/// last preempt_disable with need_resched set. Checks CURRENT state and
+/// competition before calling schedule, to avoid spurious idle switches.
+pub fn maybe_resched_from_preempt() {
+    if !crate::smp::is_sched_active() || !crate::smp::preempt_is_enabled() {
+        return;
+    }
+    let pc = crate::smp::current_per_cpu();
+    if pc.current_task.load(Ordering::Relaxed).is_null() {
+        return;
+    }
+    let should = {
+        let cur = CURRENT.lock();
+        match cur.as_deref() {
+            Some(t) if t.state == TaskState::Running => true,
+            _ => false,
+        }
+    };
+    if !should {
+        return;
+    }
+    // Defer to schedule — it will re-check WRR and timer arming.
+    schedule();
 }
 
 /// Launch a task directly into ring 3 (used once a loader has built a user
@@ -1671,20 +1754,67 @@ pub fn enter_userspace(
     vm: usize,
     alloc: &mut BitmapAllocator,
 ) -> u64 {
+    // Defensive checks - the observed fault was RIP==CR3==0x2e05000
+    // (supervisor I-fetch on user root, PD[23]=0). Catch aliasing early.
+    assert!(root != 0, "enter_userspace: root zero");
+    assert!(root & 0xFFF == 0, "enter_userspace: root not aligned");
+    assert!(entry != root, "enter_userspace: entry == root (RIP==CR3)");
+    assert!(
+        entry >= 0x400000 && entry < 0x0000_8000_0000_0000,
+        "enter_userspace: entry out of user range {:#x}",
+        entry
+    );
+    assert!(
+        user_stack_top >= 0x0000_7FFF_0000_0000 - 256 * 1024 * 1024
+            && user_stack_top <= 0x0000_7FFF_0000_0000
+            && user_stack_top & 0xFFF == 0,
+        "enter_userspace: bad user_stack_top {:#x}",
+        user_stack_top
+    );
     // This task gets its own slot in the fixed kernel-stack window; the iretq
     // frame lives on top of it.
     let (kernel_stack_top, slot) =
         alloc_kernel_stack(alloc).expect("enter_userspace: no kernel stack slot");
+    assert!(
+        kernel_stack_top >= crate::mm::layout::KSTACK_VADDR_FLOOR
+            && kernel_stack_top <= crate::mm::layout::KSTACK_VADDR_BASE,
+        "enter_userspace: kernel_stack_top out of window {:#x}",
+        kernel_stack_top
+    );
     // 5-word iretq frame at the top of the kernel stack (RIP, CS, RFLAGS,
     // RSP, SS) — `user_iret` pops exactly this.
     let frame_base = kernel_stack_top - 40;
+    // Ensure the frame itself is not aliased to the page-table root and is
+    // inside the KSTACK window (shared via PML4 511).
+    assert!(frame_base != root, "enter_userspace: frame_base == root");
+    assert!(
+        frame_base >= crate::mm::layout::KSTACK_VADDR_FLOOR,
+        "enter_userspace: frame_base below window {:#x}",
+        frame_base
+    );
     unsafe {
         *(frame_base as *mut u64) = entry; // RIP
         *(frame_base as *mut u64).add(1) = 0x2B; // user CS
         *(frame_base as *mut u64).add(2) = 0x202; // RFLAGS: IF set
         *(frame_base as *mut u64).add(3) = user_stack_top;
         *(frame_base as *mut u64).add(4) = 0x23; // user SS
+        // Verify the frame landed correctly before the context switch - read back
+        // through the same VA (KSTACK is shared, so this is visible under any CR3).
+        debug_assert!(*(frame_base as *const u64) == entry);
+        debug_assert!(*((frame_base + 8) as *const u64) == 0x2B);
     }
+    // Log the validated handoff (post-alloc, pre-switch) for post-mortem.
+    crate::drivers::serial::SerialPort::puts("[sched] enter_userspace validate: entry=0x");
+    crate::drivers::serial::SerialPort::put_hex(entry);
+    crate::drivers::serial::SerialPort::puts(" root=0x");
+    crate::drivers::serial::SerialPort::put_hex(root);
+    crate::drivers::serial::SerialPort::puts(" kstack=0x");
+    crate::drivers::serial::SerialPort::put_hex(kernel_stack_top);
+    crate::drivers::serial::SerialPort::puts(" frame=0x");
+    crate::drivers::serial::SerialPort::put_hex(frame_base);
+    crate::drivers::serial::SerialPort::puts(" user_iret=0x");
+    crate::drivers::serial::SerialPort::put_hex(crate::task::switch::user_iret_addr());
+    crate::drivers::serial::SerialPort::puts("\n");
 
     // Kernel GS pair: GS.base = PerCpu, KERNEL_GS_BASE = user GS. `user_iret`
     // performs the final swapgs before iretq, so the user lands with
@@ -1712,6 +1842,36 @@ pub fn enter_userspace(
     let t: &'static mut Task = Box::leak(Box::new(task));
     let pid = t.id;
     let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
+    // Debug: verify ctx_ptr != idle_ctx and values are sane before publishing
+    {
+        let idle = idle_ctx() as *const TaskContext as u64;
+        let newc = ctx_ptr as *const TaskContext as u64;
+        if idle == newc {
+            crate::drivers::serial::SerialPort::puts("[sched] FATAL: ctx_ptr == idle_ctx!\n");
+            crate::kerneldump::dump_fatal("ctx alias idle");
+        }
+        let rip = unsafe { (*ctx_ptr).rip };
+        let rsp = unsafe { (*ctx_ptr).rsp };
+        let exp_rip = user_iret_addr();
+        if rip != exp_rip || rsp != frame_base {
+            crate::drivers::serial::SerialPort::puts("[sched] FATAL: ctx mismatch before publish rip=0x");
+            crate::drivers::serial::SerialPort::put_hex(rip);
+            crate::drivers::serial::SerialPort::puts(" exp=0x");
+            crate::drivers::serial::SerialPort::put_hex(exp_rip);
+            crate::drivers::serial::SerialPort::puts(" rsp=0x");
+            crate::drivers::serial::SerialPort::put_hex(rsp);
+            crate::drivers::serial::SerialPort::puts(" frame=0x");
+            crate::drivers::serial::SerialPort::put_hex(frame_base);
+            crate::drivers::serial::SerialPort::puts("\n");
+            crate::kerneldump::dump_fatal("ctx pre-publish mismatch");
+        }
+    }
+    // Publish the task. This window must be atomic w.r.t IRQs/preemption:
+    // an IRQ's try_preempt_from_irq must not see a half-published CURRENT
+    // and call schedule() before the iret frame is valid. Disable preemption
+    // (IRQ remains enabled so the timer tick still fires, but the preempt
+    // gate blocks the scheduler).
+    crate::smp::preempt_disable();
     set_kernel_stack_meta(kernel_stack_top);
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
@@ -1719,9 +1879,32 @@ pub fn enter_userspace(
     *CURRENT.lock() = Some(t);
 
     crate::mm::vmm::set_current_root(root);
-    unsafe {
-        switch_to(idle_ctx(), ctx_ptr, root);
+    // Hardened handoff: validate idle->INIT switch (RIP==CR3 would #PF at PD[23]=0)
+    crate::drivers::serial::SerialPort::puts("[sched] switch idle->INIT root=0x");
+    crate::drivers::serial::SerialPort::put_hex(root);
+    crate::drivers::serial::SerialPort::puts(" ctx.rip=0x");
+    crate::drivers::serial::SerialPort::put_hex(unsafe { (*ctx_ptr).rip });
+    crate::drivers::serial::SerialPort::puts(" rsp=0x");
+    crate::drivers::serial::SerialPort::put_hex(unsafe { (*ctx_ptr).rsp });
+    crate::drivers::serial::SerialPort::puts(" idle=0x");
+    crate::drivers::serial::SerialPort::put_hex(idle_ctx() as *const TaskContext as u64);
+    crate::drivers::serial::SerialPort::puts(" new=0x");
+    crate::drivers::serial::SerialPort::put_hex(ctx_ptr as *const TaskContext as u64);
+    crate::drivers::serial::SerialPort::puts("\n");
+    // Re-validate after publish — catches IRQ clobber
+    {
+        let rip2 = unsafe { (*ctx_ptr).rip };
+        let rsp2 = unsafe { (*ctx_ptr).rsp };
+        if rip2 != user_iret_addr() || rsp2 != frame_base {
+            crate::drivers::serial::SerialPort::puts("[sched] FATAL: ctx corrupted after publish\n");
+            crate::kerneldump::dump_fatal("ctx post-publish corrupt");
+        }
     }
+    unsafe {
+        switch_to_checked(idle_ctx(), ctx_ptr, root);
+    }
+    // Returned to idle after INIT exit — re-enable preempt (balance the disable above).
+    crate::smp::preempt_enable();
     // The scheduler reaches idle not only when the launched task exits, but
     // whenever no task is ready — including while it is parked in a blocking
     // syscall (e.g. `:wait` on a child it spawned). Keep idling until the

@@ -59,6 +59,40 @@ impl TaskContext {
             rflags: 0x202,
         }
     }
+
+    /// Validate that `rsp`/`rip`/`rflags` form a sane kernel resume target.
+    /// Called before every `switch_to`; a malformed `rip` (low half, equals
+    /// `cr3`, non-canonical) would otherwise fault as supervisor I-fetch on
+    /// the user root (observed `RIP=CR3=0x2e05000`, error `0x10`).
+    #[inline]
+    pub fn is_valid(&self) -> bool {
+        // RIP must be canonical high-half kernel text (or user_iret) and never
+        // the low half.  Low half values are user entry points that belong in
+        // the iretq frame, not in TaskContext.rip.
+        if self.rip < 0x0000_8000_0000_0000 {
+            // Below USER_BOUNDARY is low — only valid if it's the `user_iret`
+            // stub itself which lives high.  So any low RIP is invalid here.
+            // The only allowed low RIP would be 0 for the idle anchor (never
+            // dispatched as next).
+            if self.rip != 0 {
+                return false;
+            }
+        }
+        // RSP must be canonical high (kernel stacks) or zero for idle.
+        if self.rsp != 0 && self.rsp < 0x0000_8000_0000_0000 {
+            return false;
+        }
+        // RFLAGS must keep IF=1 for a fresh task (0x202) and not have reserved
+        // bits set that would #GP on popfq.  We allow the exact 0x202 we create.
+        if self.rflags != 0x202 && self.rflags != 0 {
+            // Still allow saved contexts where IF may be transiently 0, but
+            // require bit 1 (reserved 1) set and bits 22..63 zero.
+            if self.rflags & 0x2 == 0 {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 // ── switch_to ─────────────────────────────────────────────────────
@@ -169,4 +203,51 @@ unsafe extern "C" {
 /// user-bound task.
 pub fn user_iret_addr() -> u64 {
     core::ptr::addr_of!(user_iret) as u64
+}
+
+/// Checked wrapper around `switch_to` - validates that `new` is sane and
+/// `new_cr3` does not alias `new.rip`/`new.rsp` (the `RIP==CR3=0x2e05000`
+/// I-fetch fault). Panics to serial instead of triple-faulting via `ret`.
+pub(crate) unsafe fn switch_to_checked(
+    old: *mut TaskContext,
+    new: *const TaskContext,
+    new_cr3: u64,
+) {
+    // Validate new context before touching CR3/stack.
+    let ctx = unsafe { &*new };
+    if !ctx.is_valid() {
+        crate::drivers::serial::SerialPort::puts("[sched] FATAL: invalid TaskContext rip=0x");
+        crate::drivers::serial::SerialPort::put_hex(ctx.rip);
+        crate::drivers::serial::SerialPort::puts(" rsp=0x");
+        crate::drivers::serial::SerialPort::put_hex(ctx.rsp);
+        crate::drivers::serial::SerialPort::puts(" cr3=0x");
+        crate::drivers::serial::SerialPort::put_hex(new_cr3);
+        crate::drivers::serial::SerialPort::puts("\n");
+        crate::kerneldump::dump_fatal("invalid TaskContext");
+    }
+    if ctx.rip != 0 && ctx.rip == new_cr3 {
+        crate::drivers::serial::SerialPort::puts("[sched] FATAL: rip == cr3 0x");
+        crate::drivers::serial::SerialPort::put_hex(new_cr3);
+        crate::drivers::serial::SerialPort::puts("\n");
+        crate::kerneldump::dump_fatal("rip==cr3");
+    }
+    if ctx.rsp != 0 && ctx.rsp == new_cr3 {
+        crate::drivers::serial::SerialPort::puts("[sched] FATAL: rsp == cr3 0x");
+        crate::drivers::serial::SerialPort::put_hex(new_cr3);
+        crate::drivers::serial::SerialPort::puts("\n");
+        crate::kerneldump::dump_fatal("rsp==cr3");
+    }
+    // Low half CR3 with high RIP is expected (user root with kernel code via
+    // high-half clone), but low RIP on supervisor CR3 is never valid - the
+    // idle path must be on KERNEL_ROOT. Enforce that a low RIP is never
+    // dispatched as TaskContext.rip (user entry lives in the iret frame).
+    if ctx.rip != 0 && ctx.rip < 0x0000_8000_0000_0000 {
+        crate::drivers::serial::SerialPort::puts("[sched] FATAL: low TaskContext.rip 0x");
+        crate::drivers::serial::SerialPort::put_hex(ctx.rip);
+        crate::drivers::serial::SerialPort::puts(" cr3=0x");
+        crate::drivers::serial::SerialPort::put_hex(new_cr3);
+        crate::drivers::serial::SerialPort::puts("\n");
+        crate::kerneldump::dump_fatal("low TaskContext rip");
+    }
+    unsafe { switch_to(old, new, new_cr3) };
 }

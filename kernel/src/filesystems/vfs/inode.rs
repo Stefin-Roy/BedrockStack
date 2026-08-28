@@ -3,7 +3,6 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
 
 use super::error::VfsError;
 use super::irq::IrqMutex;
@@ -85,7 +84,7 @@ pub struct Inode {
     pub file_type: FileType,
     pub size: AtomicU64,
     pub meta: IrqMutex<InodeMeta>,
-    pub append_lock: Mutex<()>,
+    pub append_lock: IrqMutex<()>,
 }
 
 impl Inode {
@@ -99,7 +98,7 @@ impl Inode {
             file_type,
             size: AtomicU64::new(size),
             meta: IrqMutex::new(InodeMeta { mtime: 0 }),
-            append_lock: Mutex::new(()),
+            append_lock: IrqMutex::new(()),
         }
     }
 

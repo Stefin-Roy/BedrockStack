@@ -25,7 +25,7 @@ pub mod hda;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
-use spin::{Mutex, Once};
+use spin::Once;
 
 /// The fixed stream format the engine drives: 48 kHz, 16-bit signed, stereo.
 pub const SAMPLE_RATE: u32 = 48_000;
@@ -92,7 +92,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 /// 4× ≈42.6 ms DOOM chunks ≈ 250 ms worst. Fire-forget still holds —
 /// enqueuers park only when truly full.
 const PUMP_QUEUE_CAP: usize = 4;
-static PUMP_QUEUE: Mutex<VecDeque<Vec<i16>>> = Mutex::new(VecDeque::new());
+static PUMP_QUEUE: crate::filesystems::vfs::irq::IrqMutex<VecDeque<Vec<i16>>> = crate::filesystems::vfs::irq::IrqMutex::new(VecDeque::new());
 static PUMP_ALIVE: AtomicBool = AtomicBool::new(false);
 
 /// Persistent sine phase (raw f64 bits) across `play_tone` calls, so

@@ -1,7 +1,7 @@
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::sync::PreemptMutex;
 
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
@@ -30,7 +30,7 @@ pub struct NtfsInode {
     pub(crate) file_type: FileType,
     pub(crate) size: u64,
     pub(crate) mtime: u64,
-    pub(crate) data: Mutex<DataSource>,
+    pub(crate) data: PreemptMutex<DataSource>,
     /// True when a $DATA attribute is compressed or encrypted (unsupported).
     pub(crate) unsupported: bool,
 }
@@ -156,7 +156,7 @@ impl NtfsInode {
             file_type,
             size,
             mtime,
-            data: Mutex::new(data),
+            data: PreemptMutex::new(data),
             unsupported,
         }))
     }

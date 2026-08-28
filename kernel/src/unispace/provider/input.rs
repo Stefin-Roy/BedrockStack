@@ -31,7 +31,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use super::super::dir::SimpleDir;
 use super::super::schema::{self, EnumVariant, Field, MethodDesc, Schema, Value};
@@ -301,13 +301,13 @@ impl Object for OverflowsObject {
 /// not implement layout logic.  Single-consumer: `:get`/`:flush` are the only
 /// drains of `/input/events` when used interactively.
 struct KbdObject {
-    keymap: Mutex<Keymap>,
+    keymap: IrqMutex<Keymap>,
 }
 
 impl KbdObject {
     fn new() -> Self {
         KbdObject {
-            keymap: Mutex::new(Keymap::new()),
+            keymap: IrqMutex::new(Keymap::new()),
         }
     }
 

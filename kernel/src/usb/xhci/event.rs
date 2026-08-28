@@ -1,5 +1,4 @@
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use spin::Mutex;
 
 macro_rules! usb_trace {
     ($($arg:tt)*) => {
@@ -253,7 +252,7 @@ pub fn mfindex() -> u32 {
     unsafe { core::ptr::read_volatile((rt_va + 0x48) as *const u32) }
 }
 
-static EVENT_RING_LOCK: Mutex<()> = Mutex::new(());
+static EVENT_RING_LOCK: crate::filesystems::vfs::irq::IrqMutex<()> = crate::filesystems::vfs::irq::IrqMutex::new(());
 
 pub fn consume_pending_events() {
     let _guard = EVENT_RING_LOCK.lock();

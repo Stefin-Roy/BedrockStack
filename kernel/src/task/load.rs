@@ -617,6 +617,19 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     SerialPort::puts(" stack 0x");
     SerialPort::put_hex(user_stack_top);
     SerialPort::puts("\n");
+    // MONIKA INVASIVE: validate before handoff - guarantees entry != root
+    if entry == root {
+        SerialPort::puts("[sched] FATAL: entry == root\n");
+        crate::mm::vmm::destroy_root(root, alloc);
+        crate::mm::usermem::unregister(vm);
+        return;
+    }
+    if root & 0xFFF != 0 || entry & 0xFFF != root & 0xFFF && entry == root {
+        SerialPort::puts("[sched] FATAL: misaligned\n");
+        crate::mm::vmm::destroy_root(root, alloc);
+        crate::mm::usermem::unregister(vm);
+        return;
+    }
 
     // Prove the pre-swapgs handoff: with `set_user_gs(0)` in effect the kernel
     // must run with GS.base = PerCpu and KERNEL_GS_BASE = 0. `enter_userspace`

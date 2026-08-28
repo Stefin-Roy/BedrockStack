@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use spin::Mutex;
+use crate::filesystems::vfs::irq::IrqMutex;
 
 use crate::acpi::PciConfigRegions;
 use crate::mm::phys_alloc::BitmapAllocator;
@@ -18,7 +18,7 @@ struct PciVmmState {
 unsafe impl Send for PciVmmState {}
 unsafe impl Sync for PciVmmState {}
 
-static PCI_VMM: Mutex<Option<PciVmmState>> = Mutex::new(None);
+static PCI_VMM: IrqMutex<Option<PciVmmState>> = IrqMutex::new(None);
 
 pub fn init_vmm(root: u64, alloc: *mut BitmapAllocator) {
     *PCI_VMM.lock() = Some(PciVmmState {
@@ -73,7 +73,7 @@ impl MappedRegion {
     }
 }
 
-static MAPPED: Mutex<Option<Vec<MappedRegion>>> = Mutex::new(None);
+static MAPPED: IrqMutex<Option<Vec<MappedRegion>>> = IrqMutex::new(None);
 
 pub fn map_all(regions: &PciConfigRegions) {
     let mut mapped = Vec::new();

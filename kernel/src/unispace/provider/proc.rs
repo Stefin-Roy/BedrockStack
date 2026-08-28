@@ -975,15 +975,54 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
     crate::drivers::serial::SerialPort::puts(" caps=");
     crate::drivers::serial::SerialPort::put_u64(caps.len() as u64);
     crate::drivers::serial::SerialPort::puts("\n");
+    // MONIKA INVASIVE: staged timing and pre-allocate ELF buffer to avoid
+    // repeated heap reallocations while holding VFS locks (observed hang at
+    // spawn_caps with HEAP spin and IF=0). Try to stat file first to size.
+    let t0 = crate::services::universal_timer::now_ns();
+    // Best-effort stat to pre-size Vec and avoid O(n^2) realloc copy during read.
+    // Costs an extra `write(:stat)` + decode roundtrip (2× IrqMutex traversals
+    // per spawn) but stays best-effort and reserves outside the VFS lock.
+    let mut stat_out = Vec::new();
+    let file_len: Option<usize> = {
+        let stat_path = alloc::format!("{}:stat", path);
+        if super::super::write(&stat_path, &[], &mut stat_out).is_ok() {
+            if let Ok(v) = crate::unispace::schema::decode_value(&stat_out, &crate::unispace::provider::vfs::STAT_OUTPUT) {
+                if let crate::unispace::schema::Value::Struct(fields) = v {
+                    if let Some(crate::unispace::schema::Value::U64(sz)) = fields.get(1) {
+                        // Gate: try_reserve_exact is below outside the lock; reject absurd sizes here.
+                        let sz_usize = *sz as usize;
+                        if sz_usize > 64 * 1024 * 1024 {
+                            None
+                        } else {
+                            Some(sz_usize)
+                        }
+                    } else { None }
+                } else { None }
+            } else { None }
+        } else { None }
+    };
     let mut elf = Vec::new();
-    if let Err(e) = super::super::read(path, &mut elf, usize::MAX) {
-        crate::drivers::serial::SerialPort::puts("[proc] spawn read ELF failed: ");
-        crate::drivers::serial::SerialPort::puts(alloc::format!("{:?}", e).as_str());
+    if let Some(sz) = file_len {
+        // Reserve once outside any VFS lock; use try_reserve to avoid panic on huge (already bounded above).
+        let _ = elf.try_reserve_exact(sz);
+        crate::drivers::serial::SerialPort::puts("[proc] stat size=");
+        crate::drivers::serial::SerialPort::put_u64(sz as u64);
         crate::drivers::serial::SerialPort::puts("\n");
+    }
+    crate::drivers::serial::SerialPort::puts("[proc] read ELF start\n");
+    let _t1 = crate::services::universal_timer::now_ns();
+    if let Err(e) = super::super::read(path, &mut elf, file_len.unwrap_or(usize::MAX)) {
+        crate::drivers::serial::SerialPort::puts("[proc] spawn read ELF failed\n");
         return Err(e);
     }
+    crate::drivers::serial::SerialPort::puts("[proc] read ELF done bytes=");
+    crate::drivers::serial::SerialPort::put_u64(elf.len() as u64);
+    crate::drivers::serial::SerialPort::puts(" dt_ms=");
+    crate::drivers::serial::SerialPort::put_u64((crate::services::universal_timer::now_ns() - t0)/1_000_000);
+    crate::drivers::serial::SerialPort::puts("\n");
 
     let alloc = crate::mm::heap::get_phys_allocator_mut();
+    let t2 = crate::services::universal_timer::now_ns();
     let (root, entry, user_stack_top, vm) =
         crate::task::load::create_process(&elf, alloc).map_err(|e| {
             crate::drivers::serial::SerialPort::puts("[proc] create_process failed: ");
@@ -991,6 +1030,9 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
             crate::drivers::serial::SerialPort::puts("\n");
             UnispaceError::DecodeError
         })?;
+    crate::drivers::serial::SerialPort::puts("[proc] create_process done dt_ms=");
+    crate::drivers::serial::SerialPort::put_u64((crate::services::universal_timer::now_ns() - t2)/1_000_000);
+    crate::drivers::serial::SerialPort::puts("\n");
 
     let (kernel_stack_top, slot) =
         crate::task::alloc_kernel_stack(alloc).ok_or(UnispaceError::Unsupported)?;
@@ -1004,8 +1046,6 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
                 crate::drivers::serial::SerialPort::puts(&c.path);
                 crate::drivers::serial::SerialPort::puts(":");
                 if let Some(m) = &c.method { crate::drivers::serial::SerialPort::puts(m); }
-                crate::drivers::serial::SerialPort::puts(" err=");
-                crate::drivers::serial::SerialPort::puts(alloc::format!("{:?}", e).as_str());
                 crate::drivers::serial::SerialPort::puts("\n");
                 return Err(e);
             }

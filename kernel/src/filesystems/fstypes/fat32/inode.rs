@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use hashbrown::HashSet;
-use spin::Mutex;
+use crate::sync::{PreemptMutex, PreemptRwLock};
 
 use crate::filesystems::vfs::error::VfsError;
 use crate::filesystems::vfs::inode::InodeOps;
@@ -46,13 +46,15 @@ pub struct Fat32Inode {
     pub(crate) parent_clus: u32,
     pub(crate) entry_name: String,
     pub(crate) unlinked: AtomicBool,
-    pub(crate) dir_cache: Mutex<Option<(u64, Arc<Vec<DirEntrySlot>>)>>,
+    pub(crate) dir_cache: PreemptMutex<Option<(u64, Arc<Vec<DirEntrySlot>>)>>,
     pub(crate) dir_generation: AtomicU64,
-    pub(crate) dir_lock: Mutex<()>,
+    pub(crate) dir_lock: PreemptMutex<()>,
     /// Serializes writes and truncates per inode.  Readers take the read
     /// half so concurrent reads of one file don't serialize each other;
     /// the FAT/cluster layers have their own sb-level locking.
-    pub(crate) write_lock: spin::RwLock<()>,
+    /// PreemptRwLock so a holder cannot be preempted and deadlock a spinner
+    /// on the BSP (full preemption).
+    pub(crate) write_lock: PreemptRwLock<()>,
 }
 
 impl Drop for Fat32Inode {
@@ -539,10 +541,10 @@ impl InodeOps for Fat32Inode {
                     parent_clus: self.first_clus.load(Ordering::Relaxed),
                     entry_name: String::from(name),
                     unlinked: AtomicBool::new(false),
-                    dir_cache: Mutex::new(None),
+                    dir_cache: PreemptMutex::new(None),
                     dir_generation: AtomicU64::new(0),
-                    dir_lock: Mutex::new(()),
-                    write_lock: spin::RwLock::new(()),
+                    dir_lock: PreemptMutex::new(()),
+                    write_lock: PreemptRwLock::new(()),
                 });
                 if name != ".." {
                     self.sb
@@ -628,10 +630,10 @@ impl InodeOps for Fat32Inode {
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
             unlinked: AtomicBool::new(false),
-            dir_cache: Mutex::new(None),
+            dir_cache: PreemptMutex::new(None),
             dir_generation: AtomicU64::new(0),
-            dir_lock: Mutex::new(()),
-            write_lock: spin::RwLock::new(()),
+            dir_lock: PreemptMutex::new(()),
+            write_lock: PreemptRwLock::new(()),
         });
         self.sb
             .register_handle(self.first_clus.load(Ordering::Relaxed), name, &node);
@@ -801,10 +803,10 @@ impl InodeOps for Fat32Inode {
             parent_clus: self.first_clus.load(Ordering::Relaxed),
             entry_name: String::from(name),
             unlinked: AtomicBool::new(false),
-            dir_cache: Mutex::new(None),
+            dir_cache: PreemptMutex::new(None),
             dir_generation: AtomicU64::new(0),
-            dir_lock: Mutex::new(()),
-            write_lock: spin::RwLock::new(()),
+            dir_lock: PreemptMutex::new(()),
+            write_lock: PreemptRwLock::new(()),
         });
         self.sb
             .register_handle(self.first_clus.load(Ordering::Relaxed), name, &node);
