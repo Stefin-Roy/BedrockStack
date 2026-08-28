@@ -12,11 +12,6 @@ const LAPIC_SVR: u32 = 0xF0;
 const LAPIC_TPR: u32 = 0x80;
 const LAPIC_EOI: u32 = 0xB0;
 const LAPIC_LVT_TIMER: u32 = 0x320;
-const LAPIC_LVT_THERMAL: u32 = 0x330;
-const LAPIC_LVT_PERF: u32 = 0x340;
-const LAPIC_LVT_LINT0: u32 = 0x350;
-const LAPIC_LVT_LINT1: u32 = 0x360;
-const LAPIC_LVT_ERROR: u32 = 0x370;
 const LAPIC_INIT_COUNT: u32 = 0x380;
 const LAPIC_CURR_COUNT: u32 = 0x390;
 const LAPIC_DIVIDE_CONFIG: u32 = 0x3E0;
@@ -27,9 +22,7 @@ const LAPIC_ICR_HIGH: u32 = 0x310;
 const TIMER_VECTOR: u8 = 32;
 
 /// LVT delivery modes (bits 10:8)
-const LVT_DELIVERY_FIXED: u32 = 0b000;
 const LVT_DELIVERY_NMI: u32 = 0b100;
-const LVT_DELIVERY_EXTINT: u32 = 0b111;
 const LVT_MASK_BIT: u32 = 1 << 16;
 
 /// Set when the local APIC is operating in x2APIC mode (IA32_APIC_BASE[10]).

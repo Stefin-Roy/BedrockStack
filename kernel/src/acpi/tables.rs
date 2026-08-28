@@ -281,6 +281,7 @@ fn map_sdt(phys_addr: u64) -> Result<Option<SdtEntry>, AcpiError> {
 /// checksum, and return its full raw bytes. Used for tables referenced by
 /// other tables rather than walked from the RSDT/XSDT (e.g. the DSDT pointer
 /// in the FADT). Returns `None` when the table is missing or malformed.
+#[cfg(target_arch = "x86_64")]
 pub fn map_sdt_bytes(phys_addr: u64, expected_sig: &[u8; 4]) -> Option<&'static [u8]> {
     let vaddr = try_map_region(phys_addr, 8).ok()?;
     let hdr_len = unsafe {

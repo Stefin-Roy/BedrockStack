@@ -7,7 +7,7 @@ use core::panic::PanicInfo;
 use kernel::arch::CurrentArch;
 #[cfg(any(target_arch = "riscv64", not(feature = "kernelmb2")))]
 use kernel::boot::FramebufferInfo;
-#[cfg(not(feature = "kernelmb2"))]
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelmb2")))]
 use kernel::boot::MemoryRegion;
 use kernel::drivers::serial::SerialPort;
 

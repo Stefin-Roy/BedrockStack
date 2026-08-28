@@ -308,20 +308,24 @@ fn kaslr_pick_offset() -> u64 {
             (crate::random::random_u32() as usize) % total
         } else {
             // Last resort: standalone RDRAND/jitter (no heap, pre-RNG)
-            let mut rng_val: u64 = 0;
-            let mut have = false;
+            let rng_val: u64;
+            let have: bool;
             #[cfg(target_arch = "x86_64")]
             {
+                let mut tmp_val: u64 = 0;
+                let mut tmp_have = false;
                 if has_rdrand_kaslr() {
-                    for _ in 0..10 { if rdrand64_kaslr(&mut rng_val) { have=true; break; } }
+                    for _ in 0..10 { if rdrand64_kaslr(&mut tmp_val) { tmp_have=true; break; } }
                 }
-                if !have {
+                if !tmp_have {
                     let t0 = rdtsc_kaslr();
                     for _ in 0..64 { core::hint::spin_loop(); }
                     let t1 = rdtsc_kaslr();
-                    rng_val = t0 ^ t1.rotate_left(17) ^ crate::drivers::serial::SerialPort::puts as *const () as u64;
-                    have = true;
+                    tmp_val = t0 ^ t1.rotate_left(17) ^ crate::drivers::serial::SerialPort::puts as *const () as u64;
+                    tmp_have = true;
                 }
+                rng_val = tmp_val;
+                have = tmp_have;
             }
             #[cfg(target_arch = "riscv64")]
             {

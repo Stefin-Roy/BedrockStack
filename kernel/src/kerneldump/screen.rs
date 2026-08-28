@@ -187,15 +187,6 @@ fn col_start(col: usize) -> usize {
 fn col_end(col: usize) -> usize {
     (col + 1) * col_w_px()
 }
-#[inline]
-fn rows_per_col() -> usize {
-    let h = FB_H.load(Ordering::Relaxed);
-    if h <= BANNER_H {
-        0
-    } else {
-        (h - BANNER_H) / CHAR_H
-    }
-}
 
 // Colors — direct RGB tuples
 const BG_R: u8 = 0x8B;
@@ -400,32 +391,6 @@ fn scroll_up_one_line() {
     sfence();
 }
 
-/// Advance to next line, handling column overflow. Assumes CUR_X is at column start.
-fn advance_line() {
-    let c = cols();
-    let cur = CUR_COL.load(Ordering::Relaxed);
-    let h = FB_H.load(Ordering::Relaxed);
-    let y = CUR_Y.load(Ordering::Relaxed) + CHAR_H;
-    if y + CHAR_H > h {
-        // column full
-        if cur + 1 < c {
-            let nc = cur + 1;
-            CUR_COL.store(nc, Ordering::Relaxed);
-            CUR_X.store(col_start(nc), Ordering::Relaxed);
-            CUR_Y.store(BANNER_H, Ordering::Relaxed);
-        } else {
-            // all columns full — scroll
-            scroll_up_one_line();
-            // stay in last column
-            CUR_Y.store(h - CHAR_H, Ordering::Relaxed);
-            CUR_X.store(col_start(cur), Ordering::Relaxed);
-        }
-    } else {
-        CUR_Y.store(y, Ordering::Relaxed);
-        CUR_X.store(col_start(cur), Ordering::Relaxed);
-    }
-}
-
 fn draw_glyph_at(x: usize, y: usize, ch: u8) {
     let va = FB_VA.load(Ordering::Relaxed) as *mut u8;
     let stride = FB_STRIDE.load(Ordering::Relaxed);
@@ -472,7 +437,6 @@ pub fn panic_puts(s: &str) {
         return;
     }
     let c = cols();
-    let cw = col_w_px();
     for b in s.bytes() {
         match b {
             b'\n' => {

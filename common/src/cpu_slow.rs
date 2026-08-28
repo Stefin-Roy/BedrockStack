@@ -41,7 +41,6 @@ const IA32_ENERGY_PERF_BIAS: u32 = 0x1B0;
 
 const IA32_PM_ENABLE: u32 = 0x770;
 const IA32_HWP_CAPABILITIES: u32 = 0x771;
-const IA32_HWP_REQUEST_PKG: u32 = 0x772;
 const IA32_HWP_REQUEST: u32 = 0x774;
 const IA32_HWP_STATUS: u32 = 0x777;
 
@@ -60,20 +59,13 @@ const SLOW_MAX_RATIO: u8 = 8;
 // CPUID feature bits
 // ---------------------------------------------------------------------------
 
-const CPUID_ECX_VMX: u32 = 1 << 5;
 const CPUID_ECX_EIST: u32 = 1 << 7;
 const CPUID_ECX_TM2: u32 = 1 << 8;
 
 const CPUID_ECX_HYPERVISOR: u32 = 1 << 31;
 
 const CPUID_LEAF6_EAX_HWP: u32 = 1 << 7;
-const CPUID_LEAF6_EAX_HWP_NOTIFICATION: u32 = 1 << 8;
-const CPUID_LEAF6_EAX_HWP_ACTIVITY_WINDOW: u32 = 1 << 9;
 const CPUID_LEAF6_EAX_HWP_EPP: u32 = 1 << 10;
-const CPUID_LEAF6_EAX_HWP_PACKAGE: u32 = 1 << 11;
-const CPUID_LEAF6_EAX_HWP_ACTIVITY_WINDOW_PACKAGE: u32 = 1 << 12;
-const CPUID_LEAF6_EAX_HWP_PECI: u32 = 1 << 13;
-const CPUID_LEAF6_EAX_HWP_FLEXIBLE: u32 = 1 << 17;
 
 
 // ---------------------------------------------------------------------------
@@ -82,7 +74,6 @@ const CPUID_LEAF6_EAX_HWP_FLEXIBLE: u32 = 1 << 17;
 
 const HWP_MIN_SHIFT: u32 = 0;
 const HWP_MAX_SHIFT: u32 = 8;
-const HWP_DESIRED_SHIFT: u32 = 16;
 const HWP_EPP_SHIFT: u32 = 24;
 
 const HWP_BYTE_MASK: u64 = 0xff;
@@ -92,9 +83,6 @@ const HWP_MIN_MASK: u64 =
 
 const HWP_MAX_MASK: u64 =
     HWP_BYTE_MASK << HWP_MAX_SHIFT;
-
-const HWP_DESIRED_MASK: u64 =
-    HWP_BYTE_MASK << HWP_DESIRED_SHIFT;
 
 const HWP_EPP_MASK: u64 =
     HWP_BYTE_MASK << HWP_EPP_SHIFT;
@@ -203,13 +191,15 @@ pub unsafe fn wrmsr(msr: u32, value: u64) {
     let low = value as u32;
     let high = (value >> 32) as u32;
 
-    asm!(
-        "wrmsr",
-        in("ecx") msr,
-        in("eax") low,
-        in("edx") high,
-        options(nomem, nostack, preserves_flags)
-    );
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") msr,
+            in("eax") low,
+            in("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 }
 
 
@@ -218,13 +208,15 @@ pub unsafe fn rdmsr(msr: u32) -> u64 {
     let low: u32;
     let high: u32;
 
-    asm!(
-        "rdmsr",
-        in("ecx") msr,
-        out("eax") low,
-        out("edx") high,
-        options(nomem, nostack, preserves_flags)
-    );
+    unsafe {
+        asm!(
+            "rdmsr",
+            in("ecx") msr,
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
 
     (low as u64) | ((high as u64) << 32)
 }
@@ -244,20 +236,22 @@ pub unsafe fn cpuid(
     let ecx: u32;
     let edx: u32;
 
-    asm!(
-        "push rbx",
-        "cpuid",
-        "mov {ebx_out:e}, ebx",
-        "pop rbx",
+    unsafe {
+        asm!(
+            "push rbx",
+            "cpuid",
+            "mov {ebx_out:e}, ebx",
+            "pop rbx",
 
-        ebx_out = out(reg) ebx,
+            ebx_out = out(reg) ebx,
 
-        inout("eax") leaf => eax,
-        inout("ecx") subleaf => ecx,
-        out("edx") edx,
+            inout("eax") leaf => eax,
+            inout("ecx") subleaf => ecx,
+            out("edx") edx,
 
-        options(nomem, preserves_flags)
-    );
+            options(nomem, preserves_flags)
+        );
+    }
 
     (eax, ebx, ecx, edx)
 }
@@ -403,31 +397,7 @@ fn has_hwp_epp() -> bool {
 }
 
 
-fn has_hwp_package() -> bool {
-    if cpuid_max_leaf() < 6 {
-        return false;
-    }
 
-    let (eax, _, _, _) = unsafe {
-        cpuid(6, 0)
-    };
-
-    (eax & CPUID_LEAF6_EAX_HWP_PACKAGE) != 0
-}
-
-
-fn has_extended_clock_modulation() -> bool {
-    if cpuid_max_leaf() < 6 {
-        return false;
-    }
-
-    let (eax, _, _, _) = unsafe {
-        cpuid(6, 0)
-    };
-
-    // CPUID.06H:EAX[5]
-    (eax & (1 << 5)) != 0
-}
 
 
 // ---------------------------------------------------------------------------
@@ -451,11 +421,11 @@ fn hwp_enabled() -> bool {
 
 #[inline]
 unsafe fn enable_hwp() {
-    let mut value = rdmsr(IA32_PM_ENABLE);
+    let mut value = unsafe { rdmsr(IA32_PM_ENABLE) };
 
     value |= 1;
 
-    wrmsr(IA32_PM_ENABLE, value);
+    unsafe { wrmsr(IA32_PM_ENABLE, value) };
 }
 
 
@@ -474,29 +444,12 @@ unsafe fn enable_hwp() {
 ///
 /// Only Maximum_Performance is modified.
 unsafe fn hwp_set_maximum(maximum: u8) {
-    let mut request = rdmsr(IA32_HWP_REQUEST);
+    let mut request = unsafe { rdmsr(IA32_HWP_REQUEST) };
 
     request &= !HWP_MAX_MASK;
     request |= (maximum as u64) << HWP_MAX_SHIFT;
 
-    wrmsr(IA32_HWP_REQUEST, request);
-}
-
-
-/// Optionally make HWP's desired value agree with the cap.
-///
-/// This is useful if you want a more aggressively slow operating point,
-/// but is NOT necessary for imposing the maximum.
-///
-/// Keeping Desired=0 lets hardware choose its preferred point under
-/// the supplied constraints.
-unsafe fn hwp_set_desired(desired: u8) {
-    let mut request = rdmsr(IA32_HWP_REQUEST);
-
-    request &= !HWP_DESIRED_MASK;
-    request |= (desired as u64) << HWP_DESIRED_SHIFT;
-
-    wrmsr(IA32_HWP_REQUEST, request);
+    unsafe { wrmsr(IA32_HWP_REQUEST, request) };
 }
 
 
@@ -504,12 +457,12 @@ unsafe fn hwp_set_desired(desired: u8) {
 ///
 /// Do not normally use this for a "maximum 800 MHz" policy.
 unsafe fn hwp_set_minimum(minimum: u8) {
-    let mut request = rdmsr(IA32_HWP_REQUEST);
+    let mut request = unsafe { rdmsr(IA32_HWP_REQUEST) };
 
     request &= !HWP_MIN_MASK;
     request |= (minimum as u64) << HWP_MIN_SHIFT;
 
-    wrmsr(IA32_HWP_REQUEST, request);
+    unsafe { wrmsr(IA32_HWP_REQUEST, request) };
 }
 
 
@@ -522,12 +475,12 @@ unsafe fn hwp_set_minimum(minimum: u8) {
 ///
 /// EPP is a preference, NOT a frequency limit.
 unsafe fn hwp_set_epp(epp: u8) {
-    let mut request = rdmsr(IA32_HWP_REQUEST);
+    let mut request = unsafe { rdmsr(IA32_HWP_REQUEST) };
 
     request &= !HWP_EPP_MASK;
     request |= (epp as u64) << HWP_EPP_SHIFT;
 
-    wrmsr(IA32_HWP_REQUEST, request);
+    unsafe { wrmsr(IA32_HWP_REQUEST, request) };
 }
 
 
@@ -545,14 +498,14 @@ unsafe fn hwp_set_epp(epp: u8) {
 /// It does NOT provide the same autonomous min/max constraint semantics
 /// as HWP.
 unsafe fn eist_set_ratio(ratio: u8) {
-    let mut perf_ctl = rdmsr(IA32_PERF_CTL);
+    let mut perf_ctl = unsafe { rdmsr(IA32_PERF_CTL) };
 
     // Preserve everything except the target P-state field.
     perf_ctl &= !0x0000_ff00u64;
 
     perf_ctl |= (ratio as u64) << 8;
 
-    wrmsr(IA32_PERF_CTL, perf_ctl);
+    unsafe { wrmsr(IA32_PERF_CTL, perf_ctl) };
 }
 
 
@@ -565,11 +518,11 @@ unsafe fn eist_set_ratio(ratio: u8) {
 /// This restores the normal clock path without touching unrelated
 /// reserved/configuration bits.
 unsafe fn clock_modulation_disable() {
-    let mut value = rdmsr(IA32_CLOCK_MODULATION);
+    let mut value = unsafe { rdmsr(IA32_CLOCK_MODULATION) };
 
     value &= !(1u64 << 4);
 
-    wrmsr(IA32_CLOCK_MODULATION, value);
+    unsafe { wrmsr(IA32_CLOCK_MODULATION, value) };
 }
 
 
@@ -590,13 +543,13 @@ unsafe fn clock_modulation_disable() {
 /// effective throughput rather than selecting a genuine 800 MHz
 /// operating point.
 unsafe fn clock_modulation_enable(duty_encoding: u8) {
-    let mut value = rdmsr(IA32_CLOCK_MODULATION);
+    let mut value = unsafe { rdmsr(IA32_CLOCK_MODULATION) };
 
     value &= !0x1e;
     value |= ((duty_encoding as u64) & 0x07) << 1;
     value |= 1 << 4;
 
-    wrmsr(IA32_CLOCK_MODULATION, value);
+    unsafe { wrmsr(IA32_CLOCK_MODULATION, value) };
 }
 
 
@@ -611,7 +564,7 @@ unsafe fn clock_modulation_enable(duty_encoding: u8) {
 /// This function is intentionally separate because HWP EPP supersedes
 /// much of the practical usefulness of EPB when HWP is active.
 unsafe fn set_energy_perf_bias_max_savings() {
-    wrmsr(IA32_ENERGY_PERF_BIAS, 0x0f);
+    unsafe { wrmsr(IA32_ENERGY_PERF_BIAS, 0x0f) };
 }
 
 
@@ -637,10 +590,11 @@ unsafe fn enable_hwp_slow_mode() -> SlowModeResult {
     // means that an exact HWP representation of the requested target
     // does not exist.
     //
-    if requested < caps.lowest {
+    let clamped = caps.clamp_minimum(requested);
+    if clamped != requested {
         return SlowModeResult::HwpCannotRepresentTarget {
             requested,
-            minimum: caps.lowest,
+            minimum: clamped,
         };
     }
 
@@ -658,7 +612,7 @@ unsafe fn enable_hwp_slow_mode() -> SlowModeResult {
     //
     // and modify only Maximum.
     //
-    hwp_set_maximum(requested);
+    unsafe { hwp_set_maximum(clamped) };
 
     //
     // An EPP of FF encourages energy-efficient operation.
@@ -666,7 +620,7 @@ unsafe fn enable_hwp_slow_mode() -> SlowModeResult {
     // It is deliberately a preference, not part of the frequency limit.
     //
     if has_hwp_epp() {
-        hwp_set_epp(0xff);
+        unsafe { hwp_set_epp(0xff) };
     }
 
     SlowModeResult::Hwp
@@ -735,10 +689,10 @@ pub unsafe fn enable_cpu_slow_mode() -> SlowModeResult {
         //
 
         if !hwp_enabled() {
-            enable_hwp();
+            unsafe { enable_hwp() };
         }
 
-        let result = enable_hwp_slow_mode();
+        let result = unsafe { enable_hwp_slow_mode() };
 
         match result {
             SlowModeResult::Hwp => {
@@ -778,14 +732,14 @@ pub unsafe fn enable_cpu_slow_mode() -> SlowModeResult {
         // 800 MHz with the nominal 100 MHz reference clock.
         //
 
-        eist_set_ratio(SLOW_MAX_RATIO);
+        unsafe { eist_set_ratio(SLOW_MAX_RATIO) };
 
         //
         // Energy Performance Bias is a preference, so it can be applied
         // in the non-HWP fallback path.
         //
 
-        set_energy_perf_bias_max_savings();
+        unsafe { set_energy_perf_bias_max_savings() };
 
         return SlowModeResult::Eist;
     }
@@ -822,7 +776,7 @@ pub unsafe fn enable_cpu_slow_mode() -> SlowModeResult {
         // 800 MHz frequency setting.
         //
 
-        clock_modulation_enable(0b010);
+        unsafe { clock_modulation_enable(0b010) };
 
         return SlowModeResult::ClockModulation;
     }
@@ -857,15 +811,16 @@ pub unsafe fn force_hwp_slow_mode() -> SlowModeResult {
     }
 
     if !hwp_enabled() {
-        enable_hwp();
+        unsafe { enable_hwp() };
     }
 
     let caps = HwpCapabilities::read();
 
-    if SLOW_MAX_RATIO < caps.lowest {
+    let clamped = caps.clamp_minimum(SLOW_MAX_RATIO);
+    if clamped != SLOW_MAX_RATIO {
         return SlowModeResult::HwpCannotRepresentTarget {
             requested: SLOW_MAX_RATIO,
-            minimum: caps.lowest,
+            minimum: clamped,
         };
     }
 
@@ -875,11 +830,13 @@ pub unsafe fn force_hwp_slow_mode() -> SlowModeResult {
     //
     // Desired remains untouched.
     //
-    hwp_set_minimum(SLOW_MAX_RATIO);
-    hwp_set_maximum(SLOW_MAX_RATIO);
+    unsafe {
+        hwp_set_minimum(clamped);
+        hwp_set_maximum(clamped);
+    }
 
     if has_hwp_epp() {
-        hwp_set_epp(0xff);
+        unsafe { hwp_set_epp(0xff) };
     }
 
     SlowModeResult::Hwp
@@ -899,7 +856,7 @@ pub unsafe fn clear_hwp_slow_max() {
 
     let caps = HwpCapabilities::read();
 
-    hwp_set_maximum(caps.highest);
+    unsafe { hwp_set_maximum(caps.highest) };
 }
 
 
@@ -907,7 +864,7 @@ pub unsafe fn clear_hwp_slow_max() {
 ///
 /// This does not alter HWP or IA32_PERF_CTL.
 pub unsafe fn clear_cpu_clock_modulation() {
-    clock_modulation_disable();
+    unsafe { clock_modulation_disable() };
 }
 
 
@@ -949,7 +906,7 @@ pub unsafe fn read_hwp_request() -> Option<u64> {
         return None;
     }
 
-    Some(rdmsr(IA32_HWP_REQUEST))
+    Some(unsafe { rdmsr(IA32_HWP_REQUEST) })
 }
 
 
@@ -959,25 +916,25 @@ pub unsafe fn read_hwp_status() -> Option<u64> {
         return None;
     }
 
-    Some(rdmsr(IA32_HWP_STATUS))
+    Some(unsafe { rdmsr(IA32_HWP_STATUS) })
 }
 
 
 /// Read current IA32_PERF_CTL.
 pub unsafe fn read_perf_ctl() -> u64 {
-    rdmsr(IA32_PERF_CTL)
+    unsafe { rdmsr(IA32_PERF_CTL) }
 }
 
 
 /// Read current IA32_PERF_STATUS.
 pub unsafe fn read_perf_status() -> u64 {
-    rdmsr(IA32_PERF_STATUS)
+    unsafe { rdmsr(IA32_PERF_STATUS) }
 }
 
 
 /// Read current clock modulation state.
 pub unsafe fn read_clock_modulation() -> u64 {
-    rdmsr(IA32_CLOCK_MODULATION)
+    unsafe { rdmsr(IA32_CLOCK_MODULATION) }
 }
 
 

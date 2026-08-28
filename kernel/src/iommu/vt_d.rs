@@ -14,8 +14,38 @@ use crate::acpi::{DmarInfo, Drhd};
 use crate::drivers::serial::SerialPort;
 use crate::mm::phys_alloc::BitmapAllocator;
 
+use core::arch::asm;
+use core::sync::atomic::AtomicBool;
+
 use super::qi::{self, QiState};
 use super::slpt::{self, Agaw};
+
+// ── local cache-flush helper (per-file local, mirrors ahci.rs / slpt.rs) ──
+#[inline]
+fn cache_flush_line_local(addr: *const u8) {
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    static HAS_OPT: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        let res = core::arch::x86_64::__cpuid(7);
+        HAS_OPT.store((res.ebx >> 23) & 1 == 1, Ordering::Relaxed);
+        CHECKED.store(true, Ordering::Relaxed);
+    }
+    if HAS_OPT.load(Ordering::Relaxed) {
+        unsafe { asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags)) };
+    } else {
+        unsafe { asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags)) };
+    }
+}
+
+#[inline]
+fn flush_range_local(va: u64, len: u64) {
+    let mut off = 0u64;
+    while off < len {
+        cache_flush_line_local((va + off) as *const u8);
+        off += 64;
+    }
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
 
 // ── Register offsets ───────────────────────────────────────────────
 const REG_VER: u64 = 0x00;
@@ -249,6 +279,7 @@ impl VtDUnit {
         let root_phys = alloc.alloc().ok_or("IOMMU root OOM")?;
         let root_va = crate::mm::layout::to_physmap(root_phys);
         unsafe { core::ptr::write_bytes(root_va as *mut u8, 0, 4096) };
+        flush_range_local(root_va, 4096);
         self.root_phys = root_phys;
 
         // For global scope we alias a single context table across all buses to save memory.
@@ -285,6 +316,7 @@ impl VtDUnit {
         let ctx_phys = alloc.alloc().ok_or("IOMMU ctx OOM")?;
         let ctx_va = crate::mm::layout::to_physmap(ctx_phys);
         unsafe { core::ptr::write_bytes(ctx_va as *mut u8, 0, 4096) };
+        flush_range_local(ctx_va, 4096);
 
         // Fill context entries: per-DRHD DID, present for all devfn.
         let did = self.did;
@@ -300,6 +332,8 @@ impl VtDUnit {
                 *ptr.add(devfn * 2 + 1) = hi;
             }
         }
+        // Flush context table so non-coherent walk (ECAP.C=0) sees DID/AW
+        flush_range_local(ctx_va, 4096);
         // Install root entries
         for bus in 0..256 {
             if !buses_to_program[bus] {
@@ -313,6 +347,7 @@ impl VtDUnit {
                 *rptr.add(idx + 1) = 0;
             }
         }
+        flush_range_local(root_va, 4096);
         fence(Ordering::SeqCst);
         SerialPort::puts("[iommu] alloc_tables did=");
         SerialPort::put_u64(effective_did as u64);
@@ -806,6 +841,7 @@ pub fn init(
     };
     let slpt_va = crate::mm::layout::to_physmap(slpt_root);
     unsafe { core::ptr::write_bytes(slpt_va as *mut u8, 0, 4096) };
+    flush_range_local(slpt_va, 4096);
     let mut domain = Domain::new(global_agaw, slpt_root, min_mgaw, min_haw, allow_snp);
     // Effective RMRR set for IOVA allocation — starts as firmware RMRRs and will also reserve the GOP framebuffer
     // (instead of bumping next_iova past high MMIO which would exhaust 32-bit IOVA space for alloc_iova_below).
@@ -830,6 +866,7 @@ pub fn init(
         SerialPort::put_hex(size);
         SerialPort::puts("\n");
         let pages = size / 4096;
+        let mut rmrr_fail = false;
         for p in 0..pages {
             let addr = base + p * 4096;
             if let Err(e) = slpt::map_4k(slpt_root, alloc, addr, addr, global_agaw, allow_snp) {
@@ -838,7 +875,13 @@ pub fn init(
                 SerialPort::puts(" err=");
                 SerialPort::puts(e);
                 SerialPort::puts("\n");
+                rmrr_fail = true;
+                break;
             }
+        }
+        if rmrr_fail {
+            SerialPort::puts("[iommu] CRITICAL: RMRR identity map failed -> abort IOMMU, fallback to noiommu\n");
+            return false;
         }
         if domain.next_iova <= end_exclusive && end_exclusive < domain.iova_limit {
             domain.next_iova = (end_exclusive + 0xFFF) & !0xFFF;
@@ -1031,33 +1074,81 @@ pub fn init(
 
     // Early fault window: display engine DMAs continuously; if FB/RMRR identity was wrong
     // or any early DMA faults, it will appear within microseconds after TE.
-    // On any fault, fallback fully to noiommu so USB/storage (xHCI) does not hang
-    // waiting for faulting DMA. Previously we tried per-unit fallback but that
-    // left the include_all unit enabled and hung at xHCI init on this ASUS.
+    // Policy: per-unit quarantine — disable only faulting engines, keep healthy
+    // ones live (e.g., GFX faults but PCH stays protecting xHCI/AHCI). If
+    // quarantine leaves no engine or the survivors fault again, escalate to
+    // full noiommu with loud logging.
     {
-        let mut any_fault = false;
+        let mut victims: Vec<usize> = Vec::new();
         for _ in 0..200_000 {
-            for u in &units {
+            victims.clear();
+            for (idx, u) in units.iter().enumerate() {
+                if !u.enabled || u.root_phys == 0 {
+                    continue;
+                }
                 let fsts = unsafe { read32(u.reg_va, REG_FSTS) };
                 if fsts & FSTS_ALL_FAULT != 0 {
-                    any_fault = true;
-                    break;
+                    victims.push(idx);
                 }
             }
-            if any_fault {
+            if !victims.is_empty() {
                 break;
             }
             core::hint::spin_loop();
         }
-        if any_fault {
-            SerialPort::puts("[iommu] early faults after TE -> full fallback to noiommu, dumping FRCD\n");
-            for u in &mut units {
+        if !victims.is_empty() {
+            // Per-unit quarantine
+            for &idx in &victims {
+                let u = &mut units[idx];
+                SerialPort::puts("[iommu] early fault on DID=");
+                SerialPort::put_u64(u.did as u64);
+                SerialPort::puts(" reg=");
+                SerialPort::put_hex(u.reg_base_phys);
+                SerialPort::puts(" -> quarantining unit, dumping FRCD\n");
                 u.drain_faults();
-                if u.enabled {
-                    u.disable_translation();
+                u.disable_translation();
+                if ok_count > 0 {
+                    ok_count -= 1;
                 }
             }
-            return false;
+            let remain = units.iter().filter(|u| u.enabled).count();
+            if remain == 0 {
+                SerialPort::puts("[iommu] CRITICAL: all VT-d units faulted in early window -> full fallback to noiommu, DMA UNPROTECTED\n");
+                // drain any newly faulted state before return (already drained victims)
+                return false;
+            }
+            // Second window — ensure survivors are truly healthy after quarantine.
+            let mut second_fault = false;
+            for _ in 0..50_000 {
+                for u in &units {
+                    if !u.enabled { continue; }
+                    let fsts = unsafe { read32(u.reg_va, REG_FSTS) };
+                    if fsts & FSTS_ALL_FAULT != 0 {
+                        second_fault = true;
+                        break;
+                    }
+                }
+                if second_fault { break; }
+                core::hint::spin_loop();
+            }
+            if second_fault {
+                SerialPort::puts("[iommu] CRITICAL: remaining units faulted after per-unit quarantine -> full fallback to noiommu, DMA UNPROTECTED\n");
+                for u in &mut units {
+                    u.drain_faults();
+                    if u.enabled {
+                        u.disable_translation();
+                    }
+                }
+                return false;
+            }
+            SerialPort::puts("[iommu] WARN: degraded IOMMU — quarantined ");
+            SerialPort::put_u64((units.len() - remain) as u64);
+            SerialPort::puts("/");
+            SerialPort::put_u64(units.len() as u64);
+            SerialPort::puts(" units, continuing with ");
+            SerialPort::put_u64(remain as u64);
+            SerialPort::puts(" live (devices behind quarantined engines are DMA UNPROTECTED)\n");
+            // continue to publish degraded domain (ok_count already reflects remain)
         }
     }
 

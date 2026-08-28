@@ -139,6 +139,26 @@ pub fn parse_dmar(vaddr: u64, length: u32) -> Result<DmarInfo, AcpiError> {
                     SerialPort::puts(" dev_scopes=");
                     SerialPort::put_u64(devices.len() as u64);
                     SerialPort::puts("\n");
+                    for ds in &devices {
+                        SerialPort::puts("  [dmar]  scope type=");
+                        SerialPort::put_hex(ds.device_type as u64);
+                        SerialPort::puts(" enum=");
+                        SerialPort::put_hex(ds.enumeration_id as u64);
+                        SerialPort::puts(" bus=");
+                        SerialPort::put_hex(ds.start_bus_number as u64);
+                        SerialPort::puts(" path=");
+                        if ds.path.is_empty() {
+                            SerialPort::puts("(none)");
+                        } else {
+                            for (dev, func) in &ds.path {
+                                SerialPort::puts(" ");
+                                SerialPort::put_hex(*dev as u64);
+                                SerialPort::puts(":");
+                                SerialPort::put_hex(*func as u64);
+                            }
+                        }
+                        SerialPort::puts("\n");
+                    }
                     drhds.push(Drhd {
                         flags: flags_drhd,
                         segment,
@@ -178,7 +198,27 @@ pub fn parse_dmar(vaddr: u64, length: u32) -> Result<DmarInfo, AcpiError> {
                     SerialPort::put_hex(base);
                     SerialPort::puts(" limit=");
                     SerialPort::put_hex(limit);
+                    SerialPort::puts(" scopes=");
+                    SerialPort::put_u64(devices.len() as u64);
                     SerialPort::puts("\n");
+                    for ds in &devices {
+                        SerialPort::puts("  [dmar]  rmrr scope type=");
+                        SerialPort::put_hex(ds.device_type as u64);
+                        SerialPort::puts(" bus=");
+                        SerialPort::put_hex(ds.start_bus_number as u64);
+                        SerialPort::puts(" path=");
+                        if ds.path.is_empty() {
+                            SerialPort::puts("(none)");
+                        } else {
+                            for (dev, func) in &ds.path {
+                                SerialPort::puts(" ");
+                                SerialPort::put_hex(*dev as u64);
+                                SerialPort::puts(":");
+                                SerialPort::put_hex(*func as u64);
+                            }
+                        }
+                        SerialPort::puts("\n");
+                    }
                     // Sanity: base <= limit ?
                     if limit >= base {
                         rmrrs.push(Rmrr {

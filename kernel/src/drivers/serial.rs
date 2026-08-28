@@ -110,7 +110,7 @@ pub fn capture_bytes(out: &mut Vec<u8>) {
 pub fn try_dump_last_lines<W: core::fmt::Write>(w: &mut W, max_lines: usize) -> bool {
     const MAX_BYTES: usize = 1024;
     let mut buf = [0u8; MAX_BYTES];
-    let mut copy_len = 0usize;
+    let copy_len: usize;
     {
         let Some(guard) = CAPTURE.try_lock() else {
             return false;

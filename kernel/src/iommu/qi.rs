@@ -4,9 +4,43 @@
 //! IOTLB invalidation, plus reg-based fallback via CCMD/IOTLB. Caller must
 //! have mapped the IOMMU registers UC.
 
-use core::sync::atomic::{Ordering, fence};
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering, fence};
 
 use crate::drivers::serial::SerialPort;
+
+// ── local cache-flush helper (per-file local) ──
+#[inline]
+fn cache_flush_line_local(addr: *const u8) {
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    static HAS_OPT: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        let res = core::arch::x86_64::__cpuid(7);
+        HAS_OPT.store((res.ebx >> 23) & 1 == 1, Ordering::Relaxed);
+        CHECKED.store(true, Ordering::Relaxed);
+    }
+    if HAS_OPT.load(Ordering::Relaxed) {
+        unsafe { asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags)) };
+    } else {
+        unsafe { asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags)) };
+    }
+}
+#[inline]
+fn flush_range_local(va: u64, len: u64) {
+    let mut off = 0u64;
+    while off < len {
+        cache_flush_line_local((va + off) as *const u8);
+        off += 64;
+    }
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
+#[inline]
+fn flush_qi_desc(va: u64) {
+    // Descriptor is 16B, but flush the 64B line containing it.
+    let line = va & !63;
+    cache_flush_line_local(line as *const u8);
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
 
 // ── VT-d register offsets ──────────────────────────────────────────
 // Only the registers this module touches (spec Chapter 11):
@@ -111,6 +145,7 @@ pub fn init_qi(
     };
     let page_va = crate::mm::layout::to_physmap(page_phys);
     unsafe { core::ptr::write_bytes(page_va as *mut u8, 0, 4096) };
+    flush_range_local(page_va, 4096);
     qi.iqa_phys = page_phys;
     qi.iqa_va = page_va;
     qi.queue_size = 4096 / 16; // 256 entries ×16 B =4096 (QS=0: 2^(0+8)=256)
@@ -126,6 +161,7 @@ pub fn init_qi(
     };
     let status_va = crate::mm::layout::to_physmap(status_phys);
     unsafe { core::ptr::write_bytes(status_va as *mut u8, 0, 4096) };
+    flush_range_local(status_va, 4096);
     qi.wait_status_phys = status_phys;
     qi.wait_status_va = status_va;
     // Program IQA: bits 63:12 = phys, 11 = DW (0=128-bit), 2:0 = QS where entries=2^(QS+8).
@@ -218,6 +254,8 @@ pub fn qi_submit(qi: &mut QiState, dw0: u64, dw1: u64) -> bool {
         core::ptr::write_volatile((va + 8) as *mut u64, dw1);
         fence(Ordering::SeqCst);
     }
+    // Non-coherent engines fetch the descriptor via DMA without snooping.
+    flush_qi_desc(va);
     qi.tail = (qi.tail + 1) % qi.queue_size;
     // IQT is byte offset (tail*16) per spec 11.4.9.2 (DW=0 => shift 4, DW=1 => shift 5)
     let tail_off = (qi.tail as u64) * 16;
@@ -292,6 +330,7 @@ pub fn qi_invalidate_wait(qi: &mut QiState) -> bool {
         return qi_submit(qi, 0x5u64 | (1u64 << 6), 0);
     }
     unsafe { core::ptr::write_volatile(qi.wait_status_va as *mut u32, 0) };
+    flush_qi_desc(qi.wait_status_va);
     fence(Ordering::SeqCst);
     // Status Data = 1 signals completion.
     let dw0 = 0x5u64 | (1u64 << 5) | (1u64 << 6) | (1u64 << 32);
@@ -299,8 +338,11 @@ pub fn qi_invalidate_wait(qi: &mut QiState) -> bool {
     if qi_submit(qi, dw0, dw1) {
         // IQH already passed the WAIT inside qi_submit (in-order hardware),
         // so ordering is guaranteed; poll briefly for the visible status word.
+        // For non-coherent engines, IOMMU's DMA write to status page bypasses
+        // cache — invalidate before each CPU read.
         let mut spins = 0u32;
         while spins < 50_000 {
+            flush_qi_desc(qi.wait_status_va);
             let v = unsafe { core::ptr::read_volatile(qi.wait_status_va as *const u32) };
             if v == 1 {
                 return true;

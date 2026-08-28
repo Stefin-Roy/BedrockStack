@@ -61,7 +61,7 @@ pub unsafe fn start_aps(
         core::ptr::copy_nonoverlapping(src as *const u8, TRAMPOLINE_ADDR as *mut u8, size);
     }
 
-    let entry = ap_entry_riscv as usize as u64;
+    let entry = ap_entry_riscv as *const () as usize as u64;
     let data = (TRAMPOLINE_ADDR + DATA_OFFSET) as *mut TrampolineData;
     let satp = (8u64 << 60) | (page_table_root >> 12);
 

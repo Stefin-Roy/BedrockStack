@@ -3,7 +3,49 @@
 //! Fully spec-compliant second-level page table walker supporting
 //! AGAW 39 (3 levels, 512GB) and AGAW 48 (4 levels, 256TB).
 
+use core::arch::asm;
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::mm::phys_alloc::BitmapAllocator;
+
+// ── local cache-flush helper (mirrors ahci.rs, but local per policy) ──
+#[inline]
+fn cache_flush_line(addr: *const u8) {
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    static HAS_OPT: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        let res = core::arch::x86_64::__cpuid(7);
+        HAS_OPT.store((res.ebx >> 23) & 1 == 1, Ordering::Relaxed);
+        CHECKED.store(true, Ordering::Relaxed);
+    }
+    if HAS_OPT.load(Ordering::Relaxed) {
+        unsafe {
+            asm!("clflushopt [{}]", in(reg) addr, options(nostack, preserves_flags));
+        }
+    } else {
+        unsafe {
+            asm!("clflush [{}]", in(reg) addr, options(nostack, preserves_flags));
+        }
+    }
+}
+
+#[inline]
+fn flush_range(va: u64, len: u64) {
+    let mut off = 0u64;
+    while off < len {
+        cache_flush_line((va + off) as *const u8);
+        off += 64;
+    }
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
+
+#[inline]
+fn flush_pte(table_va: u64, idx: usize) {
+    // PTE is 8 bytes, but flush whole 64B line that contains it
+    let line = (table_va + (idx & 0x1FF) as u64 * 8) & !63;
+    cache_flush_line(line as *const u8);
+    unsafe { asm!("mfence", options(nostack, preserves_flags)) };
+}
 
 // Second-Level Paging Entry Bits (VT-d Spec §9.3 & Table 9-4..9-7)
 pub const PTE_READ: u64 = 1 << 0;
@@ -80,9 +122,13 @@ impl Agaw {
 
 fn alloc_table(alloc: &mut BitmapAllocator) -> Option<u64> {
     let phys = alloc.alloc()?;
+    let va = crate::mm::layout::to_physmap(phys);
     unsafe {
-        core::ptr::write_bytes(crate::mm::layout::to_physmap(phys) as *mut u8, 0, 4096);
+        core::ptr::write_bytes(va as *mut u8, 0, 4096);
     }
+    // Non-coherent VT-d (ECAP.C=0) walks DRAM without snooping CPU caches.
+    // Flush the freshly zeroed page so hardware sees zeros, not stale cache.
+    flush_range(va, 4096);
     Some(phys)
 }
 
@@ -122,6 +168,8 @@ pub fn map_4k(
             let next = alloc_table(alloc).ok_or("IOMMU SLPT OOM")?;
             let new_entry = sl_pte(next, PTE_READ | PTE_WRITE);
             unsafe { write_pte(table, i, new_entry) };
+            // Flush the parent PTE so non-coherent IOMMU sees the new table pointer
+            flush_pte(table as u64, i);
             cur = next;
         } else {
             // Superpages are not supported for 4K walks — return error instead of orphaning subtree.
@@ -151,6 +199,7 @@ pub fn map_4k(
 
     let pte = sl_pte(phys, leaf_flags);
     unsafe { write_pte(table, leaf_i, pte) };
+    flush_pte(table as u64, leaf_i);
     Ok(())
 }
 
@@ -216,6 +265,7 @@ pub fn unmap_4k(root: u64, iova: u64, agaw: Agaw) -> bool {
         return false;
     }
     unsafe { write_pte(table, leaf_i, 0) };
+    flush_pte(table as u64, leaf_i);
     true
 }
 

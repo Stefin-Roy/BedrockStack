@@ -13,7 +13,6 @@ const MAX_MEMORY_REGIONS: usize = 8;
 static mut DTB_MEMORY_REGIONS: [MemoryRegion; MAX_MEMORY_REGIONS] = unsafe { core::mem::zeroed() };
 
 struct FdtHeader {
-    magic: u32,
     total_size: u32,
     off_dt_struct: u32,
     off_dt_strings: u32,
@@ -57,14 +56,13 @@ fn fdt_parse_header(dtb: *const u8) -> Option<FdtHeader> {
         return None;
     }
     Some(FdtHeader {
-        magic,
         total_size,
         off_dt_struct,
         off_dt_strings,
     })
 }
 
-fn dtb_off(hdr: &FdtHeader, dtb: *const u8, pos: *const u8) -> usize {
+fn dtb_off(_hdr: &FdtHeader, dtb: *const u8, pos: *const u8) -> usize {
     (pos as usize).wrapping_sub(dtb as usize)
 }
 
@@ -101,7 +99,6 @@ fn align_ptr(p: *const u8) -> *const u8 {
 }
 
 fn skip_name(hdr: &FdtHeader, dtb: *const u8, mut pos: *const u8) -> *const u8 {
-    let start_off = dtb_off(hdr, dtb, pos);
     let max_off = hdr.total_size as usize;
     while dtb_off(hdr, dtb, pos) < max_off {
         if unsafe { core::ptr::read_volatile(pos) } == 0 {
@@ -150,266 +147,6 @@ fn fallback_memory() -> &'static [MemoryRegion] {
     &FALLBACK
 }
 
-fn walk_dtb<F>(dtb: *const u8, node_match: &[u8], prop_match: &[u8], mut callback: F) -> bool
-where
-    F: FnMut(u64, u64),
-{
-    let hdr = match fdt_parse_header(dtb) {
-        Some(h) => h,
-        None => return false,
-    };
-
-    let struct_base = if in_bounds(&hdr, dtb, dtb, hdr.off_dt_struct as usize) {
-        unsafe { dtb.add(hdr.off_dt_struct as usize) }
-    } else {
-        return false;
-    };
-    let mut pos = if in_bounds(&hdr, dtb, struct_base, 4) {
-        unsafe { struct_base.add(4) }
-    } else {
-        return false;
-    };
-    pos = skip_name(&hdr, dtb, pos);
-    if pos.is_null() {
-        return false;
-    }
-    pos = align_ptr(pos);
-
-    let mut addr_cells: u32 = 2;
-    let mut size_cells: u32 = 2;
-
-    loop {
-        if !in_bounds(&hdr, dtb, pos, 4) {
-            return false;
-        }
-        let token = read_be_u32(pos);
-        match token {
-            FDT_PROP => {
-                if !in_bounds(&hdr, dtb, pos, 12) {
-                    return false;
-                }
-                pos = unsafe { pos.add(4) };
-                let len = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let nameoff = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let name_ptr = fdt_string(&hdr, dtb, nameoff);
-                let val_ptr = pos;
-                if fdt_str_eq(name_ptr, b"#address-cells") && len >= 4 {
-                    if in_bounds(&hdr, dtb, val_ptr, 4) {
-                        addr_cells = read_be_u32(val_ptr);
-                    }
-                } else if fdt_str_eq(name_ptr, b"#size-cells") && len >= 4 {
-                    if in_bounds(&hdr, dtb, val_ptr, 4) {
-                        size_cells = read_be_u32(val_ptr);
-                    }
-                }
-                let padded = (len + 3) & !3;
-                if !in_bounds(&hdr, dtb, pos, padded as usize) {
-                    return false;
-                }
-                pos = unsafe { pos.add(padded as usize) };
-            }
-            FDT_BEGIN_NODE => break,
-            FDT_END_NODE => break,
-            FDT_END => break,
-            _ => {
-                if !in_bounds(&hdr, dtb, pos, 4) {
-                    return false;
-                }
-                pos = unsafe { pos.add(4) };
-            }
-        }
-    }
-
-    let mut depth: u32 = 1;
-    let mut in_target = false;
-
-    loop {
-        if !in_bounds(&hdr, dtb, pos, 4) {
-            return false;
-        }
-        let token = read_be_u32(pos);
-        pos = unsafe { pos.add(4) };
-        match token {
-            FDT_BEGIN_NODE => {
-                depth += 1;
-                let node_name = pos;
-                pos = skip_name(&hdr, dtb, pos);
-                if pos.is_null() {
-                    return false;
-                }
-                pos = align_ptr(pos);
-                if depth == 2 {
-                    in_target = fdt_str_eq(node_name, node_match);
-                }
-            }
-            FDT_END_NODE => {
-                depth -= 1;
-                if depth == 1 {
-                    in_target = false;
-                }
-            }
-            FDT_PROP if in_target => {
-                if !in_bounds(&hdr, dtb, pos, 8) {
-                    return false;
-                }
-                let len = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let nameoff = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let name_ptr = fdt_string(&hdr, dtb, nameoff);
-                let val_ptr = pos;
-                if fdt_str_eq(name_ptr, prop_match) {
-                    let mut offset = 0usize;
-                    while (offset as u32) < len {
-                        if !in_bounds(
-                            &hdr,
-                            dtb,
-                            unsafe { val_ptr.add(offset) },
-                            (addr_cells + size_cells) as usize * 4,
-                        ) {
-                            return false;
-                        }
-                        let addr = read_be_n(unsafe { val_ptr.add(offset) }, addr_cells);
-                        offset += addr_cells as usize * 4;
-                        let size = read_be_n(unsafe { val_ptr.add(offset) }, size_cells);
-                        offset += size_cells as usize * 4;
-                        callback(addr, size);
-                    }
-                }
-                let padded = (len + 3) & !3;
-                if !in_bounds(&hdr, dtb, pos, padded as usize) {
-                    return false;
-                }
-                pos = unsafe { pos.add(padded as usize) };
-            }
-            FDT_PROP => {
-                let p = skip_prop(&hdr, dtb, pos);
-                if p.is_null() {
-                    return false;
-                }
-                pos = p;
-            }
-            FDT_END => break,
-            _ => {}
-        }
-    }
-    true
-}
-
-fn walk_dtb_prop_raw<F>(
-    dtb: *const u8,
-    node_match: &[u8],
-    prop_match: &[u8],
-    mut callback: F,
-) -> bool
-where
-    F: FnMut(*const u8, u32),
-{
-    let hdr = match fdt_parse_header(dtb) {
-        Some(h) => h,
-        None => return false,
-    };
-
-    let struct_base = if in_bounds(&hdr, dtb, dtb, hdr.off_dt_struct as usize) {
-        unsafe { dtb.add(hdr.off_dt_struct as usize) }
-    } else {
-        return false;
-    };
-    let mut pos = if in_bounds(&hdr, dtb, struct_base, 4) {
-        unsafe { struct_base.add(4) }
-    } else {
-        return false;
-    };
-    pos = skip_name(&hdr, dtb, pos);
-    if pos.is_null() {
-        return false;
-    }
-    pos = align_ptr(pos);
-
-    loop {
-        if !in_bounds(&hdr, dtb, pos, 4) {
-            return false;
-        }
-        let token = read_be_u32(pos);
-        match token {
-            FDT_PROP => {
-                let p = skip_prop(&hdr, dtb, pos);
-                if p.is_null() {
-                    return false;
-                }
-                pos = p;
-            }
-            FDT_BEGIN_NODE | FDT_END_NODE | FDT_END => break,
-            _ => {
-                if !in_bounds(&hdr, dtb, pos, 4) {
-                    return false;
-                }
-                pos = unsafe { pos.add(4) };
-            }
-        }
-    }
-
-    let mut depth: u32 = 1;
-    let mut in_target = false;
-
-    loop {
-        if !in_bounds(&hdr, dtb, pos, 4) {
-            return false;
-        }
-        let token = read_be_u32(pos);
-        pos = unsafe { pos.add(4) };
-        match token {
-            FDT_BEGIN_NODE => {
-                depth += 1;
-                let node_name = pos;
-                pos = skip_name(&hdr, dtb, pos);
-                if pos.is_null() {
-                    return false;
-                }
-                pos = align_ptr(pos);
-                if depth == 2 {
-                    in_target = fdt_str_eq(node_name, node_match);
-                }
-            }
-            FDT_END_NODE => {
-                depth -= 1;
-                if depth == 1 {
-                    in_target = false;
-                }
-            }
-            FDT_PROP if in_target => {
-                if !in_bounds(&hdr, dtb, pos, 8) {
-                    return false;
-                }
-                let len = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let nameoff = read_be_u32(pos);
-                pos = unsafe { pos.add(4) };
-                let name_ptr = fdt_string(&hdr, dtb, nameoff);
-                if fdt_str_eq(name_ptr, prop_match) {
-                    callback(pos, len);
-                }
-                let padded = (len + 3) & !3;
-                if !in_bounds(&hdr, dtb, pos, padded as usize) {
-                    return false;
-                }
-                pos = unsafe { pos.add(padded as usize) };
-            }
-            FDT_PROP => {
-                let p = skip_prop(&hdr, dtb, pos);
-                if p.is_null() {
-                    return false;
-                }
-                pos = p;
-            }
-            FDT_END => break,
-            _ => {}
-        }
-    }
-    true
-}
 
 pub fn parse_memory(dtb: *const u8) -> &'static [MemoryRegion] {
     let hdr = match fdt_parse_header(dtb) {

@@ -53,6 +53,7 @@ pub struct FadtFields {
     pub reset_value: u8,
     pub reset_supported: bool,
     /// Physical address of the DSDT table (FADT offset 140).
+    #[cfg(target_arch = "x86_64")]
     pub dsdt_addr: u32,
 }
 
@@ -182,6 +183,7 @@ pub fn parse_fadt(vaddr: u64, length: u32) -> Result<FadtFields, AcpiError> {
     let pm1_control = Pm1ControlRegisters::new(pm1a_gas, pm1b_gas);
 
     // DSDT at offset 140 (u32 physical address, present in all revisions).
+    #[cfg(target_arch = "x86_64")]
     let dsdt_addr = if len >= 144 { r32(raw, 140) } else { 0 };
 
     Ok(FadtFields {
@@ -189,6 +191,7 @@ pub fn parse_fadt(vaddr: u64, length: u32) -> Result<FadtFields, AcpiError> {
         reset_gas,
         reset_value,
         reset_supported,
+        #[cfg(target_arch = "x86_64")]
         dsdt_addr,
     })
 }

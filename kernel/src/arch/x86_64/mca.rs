@@ -13,10 +13,10 @@ const IA32_MCG_CAP: u32 = 0x179;
 const IA32_MCG_STATUS: u32 = 0x17A;
 const IA32_MCG_CTL: u32 = 0x17B;
 const IA32_MCG_EXT_CTL: u32 = 0x4D0; // LMCE
-const IA32_MCi_CTL_BASE: u32 = 0x400;
-const IA32_MCi_STATUS_BASE: u32 = 0x401;
-const IA32_MCi_ADDR_BASE: u32 = 0x402;
-const IA32_MCi_MISC_BASE: u32 = 0x403;
+const IA32_MCI_CTL_BASE: u32 = 0x400;
+const IA32_MCI_STATUS_BASE: u32 = 0x401;
+const IA32_MCI_ADDR_BASE: u32 = 0x402;
+const IA32_MCI_MISC_BASE: u32 = 0x403;
 
 #[inline]
 unsafe fn read_msr(msr: u32) -> u64 {
@@ -58,7 +58,7 @@ pub fn enable_mca() {
         }
         let n = count.min(32);
         for i in 0..n {
-            let ctl = IA32_MCi_CTL_BASE + (i as u32) * 4;
+            let ctl = IA32_MCI_CTL_BASE + (i as u32) * 4;
             write_msr(ctl, !0u64);
         }
     }
@@ -107,7 +107,7 @@ pub fn dump_mca<W: Write>(w: &mut W) {
             return;
         }
         for i in 0..n {
-            let st = read_msr(IA32_MCi_STATUS_BASE + (i as u32) * 4);
+            let st = read_msr(IA32_MCI_STATUS_BASE + (i as u32) * 4);
             let valid = (st >> 63) & 1 != 0;
             if !valid {
                 // Only print non-zero banks in minimal mode? Print valid==0 as one-liner?
@@ -129,22 +129,22 @@ pub fn dump_mca<W: Write>(w: &mut W) {
                 i, st, uc, en, pcc, s, ar, addrv, miscv, over, mca_code, mca_model);
 
             if addrv != 0 {
-                let addr = read_msr(IA32_MCi_ADDR_BASE + (i as u32) * 4);
+                let addr = read_msr(IA32_MCI_ADDR_BASE + (i as u32) * 4);
                 let _ = writeln!(w, "      ADDR={:#018x}", addr);
             }
             if miscv != 0 {
-                let misc = read_msr(IA32_MCi_MISC_BASE + (i as u32) * 4);
+                let misc = read_msr(IA32_MCI_MISC_BASE + (i as u32) * 4);
                 let _ = writeln!(w, "      MISC={:#018x}", misc);
             }
             // Also show CTL for completeness
-            let ctl = read_msr(IA32_MCi_CTL_BASE + (i as u32) * 4);
+            let ctl = read_msr(IA32_MCI_CTL_BASE + (i as u32) * 4);
             let _ = writeln!(w, "      CTL ={:#018x}", ctl);
             let _ = misci; // avoid warn
         }
         // For completeness, list invalid banks as absent
         let mut any_valid = false;
         for i in 0..n {
-            let st = read_msr(IA32_MCi_STATUS_BASE + (i as u32) * 4);
+            let st = read_msr(IA32_MCI_STATUS_BASE + (i as u32) * 4);
             if (st >> 63) & 1 != 0 { any_valid = true; break; }
         }
         if !any_valid {

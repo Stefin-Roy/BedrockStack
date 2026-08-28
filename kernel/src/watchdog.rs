@@ -26,7 +26,6 @@ mod imp {
     const IA32_PERFEVTSEL0: u32 = 0x186;
     const IA32_PMC0: u32 = 0xC1;
     const IA32_PERF_GLOBAL_CTRL: u32 = 0x38F;
-    const IA32_PERF_GLOBAL_STATUS: u32 = 0x38E;
 
     // LVT already defined in apic.rs; we use apic::lvt_write.
     const LAPIC_LVT_PERF: u32 = 0x340;
@@ -103,14 +102,6 @@ mod imp {
     const MODE_SOFT: u64 = 3;
 
     // ── Helpers ───────────────────────────────────────────────────────
-    fn rdmsr(msr: u32) -> u64 {
-        let lo: u32;
-        let hi: u32;
-        unsafe {
-            asm!("rdmsr", in("ecx") msr, out("eax") lo, out("edx") hi, options(nomem, nostack));
-        }
-        (hi as u64) << 32 | lo as u64
-    }
     fn wrmsr(msr: u32, val: u64) {
         let lo = val as u32;
         let hi = (val >> 32) as u32;
