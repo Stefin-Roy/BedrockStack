@@ -604,6 +604,111 @@ impl VtDUnit {
 
 // ── Global IOMMU domain state ──────────────────────────────────
 
+/// Fixed-capacity IOVA free list with coalescing.
+/// Mirrors `KernelDma::FreeWindows` but with merging of adjacent ranges and
+/// `below_limit` support for 32-bit DMA. No heap allocation, safe under `IOMMU_STATE` lock.
+struct FreeIovaWindows {
+    entries: [(u64, u64); 64],
+    len: usize,
+}
+
+impl FreeIovaWindows {
+    const fn new() -> Self {
+        FreeIovaWindows {
+            entries: [(0, 0); 64],
+            len: 0,
+        }
+    }
+
+    /// Push a freed `(iova, size)` window, coalescing with neighbours.
+    /// Size and base are assumed 4K-aligned (caller ensures). If the list is full,
+    /// the window is dropped (VA leak, still better than double-free).
+    fn push(&mut self, mut base: u64, mut size: u64) {
+        if base == 0 || size == 0 || (base & 0xFFF) != 0 || (size & 0xFFF) != 0 {
+            return;
+        }
+        // Try to merge with existing entries; loop until no more merges.
+        let mut merged = true;
+        while merged {
+            merged = false;
+            for i in 0..self.len {
+                let (eb, es) = self.entries[i];
+                if eb == 0 && es == 0 {
+                    continue;
+                }
+                // New window immediately before existing: base+size == eb
+                if base + size == eb {
+                    size += es;
+                    // Remove entry i
+                    self.entries[i] = self.entries[self.len - 1];
+                    self.entries[self.len - 1] = (0, 0);
+                    self.len -= 1;
+                    merged = true;
+                    break;
+                }
+                // New window immediately after existing: eb+es == base
+                if eb + es == base {
+                    base = eb;
+                    size += es;
+                    self.entries[i] = self.entries[self.len - 1];
+                    self.entries[self.len - 1] = (0, 0);
+                    self.len -= 1;
+                    merged = true;
+                    break;
+                }
+            }
+        }
+        if self.len < self.entries.len() {
+            self.entries[self.len] = (base, size);
+            self.len += 1;
+        }
+        // If full, VA is leaked (but SLPT/phys already freed, so only IOVA VA leaks).
+    }
+
+    /// Take a window of at least `size` bytes with `base+size <= limit`.
+    /// Prefers exact-fit, otherwise splits the first large enough entry.
+    fn take(&mut self, size: u64, limit: u64) -> Option<u64> {
+        if size == 0 || (size & 0xFFF) != 0 {
+            return None;
+        }
+        // Exact-fit first
+        for i in 0..self.len {
+            let (eb, es) = self.entries[i];
+            if es == size && eb + size <= limit {
+                let va = eb;
+                self.entries[i] = self.entries[self.len - 1];
+                self.entries[self.len - 1] = (0, 0);
+                self.len -= 1;
+                return Some(va);
+            }
+        }
+        // Best-fit: smallest entry that fits and respects limit
+        let mut best_idx: Option<usize> = None;
+        let mut best_size = u64::MAX;
+        for i in 0..self.len {
+            let (eb, es) = self.entries[i];
+            if es >= size && eb + size <= limit && es < best_size {
+                best_idx = Some(i);
+                best_size = es;
+            }
+        }
+        if let Some(idx) = best_idx {
+            let (eb, es) = self.entries[idx];
+            let va = eb;
+            if es == size {
+                self.entries[idx] = self.entries[self.len - 1];
+                self.entries[self.len - 1] = (0, 0);
+                self.len -= 1;
+            } else {
+                // Split: keep remainder
+                self.entries[idx] = (eb + size, es - size);
+            }
+            return Some(va);
+        }
+        None
+    }
+}
+
 pub struct Domain {
     pub slpt_root_phys: u64,
     pub agaw: Agaw,
@@ -611,6 +716,7 @@ pub struct Domain {
     pub next_iova: u64,
     pub iova_limit: u64,
     pub allow_snp: bool, // ECAP.SC global
+    free_iova: FreeIovaWindows,
 }
 
 impl Domain {
@@ -632,6 +738,7 @@ impl Domain {
             next_iova: 0x1000,
             iova_limit: limit,
             allow_snp,
+            free_iova: FreeIovaWindows::new(),
         }
     }
 
@@ -655,6 +762,14 @@ impl Domain {
         self.alloc_iova_with_limit(size, limit, rmrrs)
     }
 
+    pub fn free_iova(&mut self, iova: u64, size: u64) {
+        let pages = (size + 0xFFF) & !0xFFF;
+        if pages == 0 || (iova & 0xFFF) != 0 {
+            return;
+        }
+        self.free_iova.push(iova, pages);
+    }
+
     fn alloc_iova_with_limit(
         &mut self,
         size: u64,
@@ -665,6 +780,10 @@ impl Domain {
             return None;
         }
         let pages = size.checked_add(0xFFF)? & !0xFFF;
+        // Try free list first (reclaimed IOVA VA) before bump allocation.
+        if let Some(va) = self.free_iova.take(pages, limit) {
+            return Some(va);
+        }
         let mut candidate = self.next_iova.checked_add(0xFFF)? & !0xFFF;
         let max_attempts = 64;
         let mut attempts = 0;
@@ -1256,6 +1375,7 @@ fn map_phys_to_iova_inner(
         None => state.domain.alloc_iova(total_size, &rmrrs_snapshot)?,
     };
     let pages = (total_size.checked_add(0xFFF)? & !0xFFF) / 4096;
+    let size_aligned = pages.checked_mul(4096)?;
     for p in 0..pages {
         let i = iova.checked_add(p.checked_mul(4096)?)?;
         let pa = phys_aligned.checked_add(p.checked_mul(4096)?)?;
@@ -1267,11 +1387,15 @@ fn map_phys_to_iova_inner(
             SerialPort::puts(" err=");
             SerialPort::puts(e);
             SerialPort::puts("\n");
-            // Rollback: unmap pages already successfully mapped in this call and restore bump allocator.
+            // Rollback: unmap pages already successfully mapped in this call, return
+            // IOVA window to free list (whether it came from bump or FreeIovaWindows)
+            // and restore bump cursor. This prevents free-list leak on partial map
+            // failure and keeps bump+free-list consistent for NVMe retry.
             for rb in 0..p {
                 let rb_iova = iova.checked_add((rb as u64).checked_mul(4096)?).unwrap_or(0);
                 let _ = slpt::unmap_4k(slpt_root, rb_iova, agaw);
             }
+            state.domain.free_iova(iova, size_aligned);
             state.domain.next_iova = prev_next_iova;
             return None;
         }
@@ -1329,4 +1453,32 @@ pub fn disable_all() {
     }
     IOMMU_ENABLED.store(false, Ordering::Release);
     SerialPort::puts("[iommu] globally disabled due to faults -> fallback to noiommu\n");
+}
+
+pub fn unmap_iova(iova: u64, size: u64) -> bool {
+    if size == 0 || (iova & 0xFFF) != 0 || (size & 0xFFF) != 0 {
+        return false;
+    }
+    let Some(m) = IOMMU_STATE.get() else { return false };
+    let mut state = m.lock();
+    let pages = size / 4096;
+    let mut ok = true;
+    for p in 0..pages {
+        let cur = iova + p * 4096;
+        if !slpt::unmap_4k(state.domain.slpt_root_phys, cur, state.domain.agaw) {
+            ok = false;
+        }
+    }
+    // Return IOVA VA to free list for reuse (full reclamation). Even if some
+    // pages were already unmapped (ok==false), still push the range so the bump
+    // allocator does not leak IOVA VA forever (NVMe 32× free pattern).
+    state.domain.free_iova(iova, size);
+    // Invalidate IOTLB/context on all enabled units so stale IOVA is not walked.
+    for unit in &mut state.units {
+        if unit.enabled {
+            let _ = unit.invalidate_all();
+        }
+    }
+    fence(Ordering::SeqCst);
+    ok
 }

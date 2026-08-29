@@ -44,6 +44,8 @@ pub fn register(driver: &'static dyn StorageDriver) {
 fn register_all() {
     #[cfg(target_arch = "x86_64")]
     register(&super::ahci::AhciDriver);
+    #[cfg(target_arch = "x86_64")]
+    register(&crate::nvme::NvmeDriver);
 }
 
 pub fn init_all(pci_devices: &[PciDevice]) -> Vec<Arc<dyn BlockDevice>> {

@@ -36,6 +36,8 @@ pub mod iommu;
 #[cfg(target_arch = "x86_64")]
 pub mod usb;
 #[cfg(target_arch = "x86_64")]
+pub mod nvme;
+#[cfg(target_arch = "x86_64")]
 pub mod watchdog;
 #[cfg(target_arch = "x86_64")]
 pub mod bootlog;

@@ -47,10 +47,10 @@ echo Running QEMU with BedrockOS (x86_64^)...
     -drive if=pflash,format=raw,file="%OVMF_VARS%" ^
     -accel tcg ^
     -drive file="%IMAGE_PATH%",format=raw,if=none,id=disk0 ^
-    -device ahci,id=ahci ^
+    -device ahci,id=ahci,addr=03.0 ^
     -device ide-hd,drive=disk0,bus=ahci.0 ^
-    -drive file="%NTFS_IMAGE%",format=raw,if=none,id=ntfs_disk ^
-    -device ide-hd,drive=ntfs_disk,bus=ahci.1 ^
+    -drive file="%NTFS_IMAGE%",format=raw,if=none,id=nvme0 ^
+    -device nvme,drive=nvme0,serial=BRNVME01,addr=04.0 ^
     -drive file="%NVME_IMAGE%",format=raw,if=none,id=usb_disk ^
     -device qemu-xhci,msi=on,msix=on ^
     -device usb-storage,drive=usb_disk ^

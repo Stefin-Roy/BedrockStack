@@ -304,6 +304,9 @@ impl DmaAllocator for KernelDma {
         }
         if freed_any {
             inner.free_windows.push(buf.virt, buf.size as u64);
+            // Invalidate translation cache for the freed range so a later reuse of the same VA
+            // does not return a stale phys via virt_to_phys (which is used for PRP building).
+            TRANS_CACHE.lock().invalidate_range(buf.virt, buf.size as u64);
         }
     }
 
