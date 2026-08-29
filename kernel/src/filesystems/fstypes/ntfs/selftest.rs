@@ -6,7 +6,7 @@
 use crate::drivers::serial::SerialPort;
 use crate::filesystems::vfs;
 use crate::filesystems::vfs::error::VfsError;
-use crate::filesystems::vfs::types::{FileType, OpenFlags, SeekFrom};
+use crate::filesystems::vfs::types::{FileType, OpenFlags};
 
 const MAX_DEPTH: usize = 8;
 
@@ -17,20 +17,20 @@ fn print_indent(depth: usize) {
 }
 
 fn read_whole(path: &str, max: u64) -> Result<alloc::vec::Vec<u8>, VfsError> {
-    let fd = vfs::open(path, OpenFlags::READ)?;
     let mut out = alloc::vec::Vec::new();
     let mut buf = [0u8; 4096];
+    let mut off = 0u64;
     loop {
-        let n = vfs::read(fd, &mut buf)?;
+        let n = vfs::pread(path, off, &mut buf)?;
         if n == 0 {
             break;
         }
         out.extend_from_slice(&buf[..n]);
+        off += n as u64;
         if (out.len() as u64) >= max {
             break;
         }
     }
-    vfs::close(fd)?;
     Ok(out)
 }
 
@@ -109,29 +109,17 @@ pub fn run() {
             SerialPort::puts(" mtime=");
             SerialPort::put_u64(st.mtime);
             SerialPort::puts("\n");
-            let fd = match vfs::open("C>/Yo/big.bin", OpenFlags::READ) {
-                Ok(fd) => fd,
-                Err(e) => {
-                    SerialPort::puts("[ntfs] FAIL open big.bin: ");
-                    SerialPort::puts(&alloc::format!("{:?}", e));
-                    SerialPort::puts("\n");
-                    return;
-                }
-            };
             let mut probe = [0u8; 16];
-            let _ = vfs::seek(fd, SeekFrom::Start(0));
-            if vfs::read(fd, &mut probe).is_ok() && probe[0] == 0x00 {
+            if vfs::pread("C>/Yo/big.bin", 0, &mut probe).is_ok() && probe[0] == 0x00 {
                 SerialPort::puts("[ntfs] OK   big.bin head\n");
             } else {
                 SerialPort::puts("[ntfs] FAIL big.bin head\n");
             }
-            let _ = vfs::seek(fd, SeekFrom::Start(st.size - 16));
-            if vfs::read(fd, &mut probe).is_ok() && probe[0] == ((st.size - 16) % 251) as u8 {
+            if vfs::pread("C>/Yo/big.bin", st.size - 16, &mut probe).is_ok() && probe[0] == ((st.size - 16) % 251) as u8 {
                 SerialPort::puts("[ntfs] OK   big.bin tail\n");
             } else {
                 SerialPort::puts("[ntfs] FAIL big.bin tail\n");
             }
-            let _ = vfs::close(fd);
         }
         Err(e) => {
             SerialPort::puts("[ntfs] FAIL stat big.bin: ");
@@ -147,16 +135,7 @@ pub fn run() {
     let _ = expect("C>/Yo/uni-\u{540d}.txt", b"unicode name file\n");
 
     // The write path must be refused.
-    let fd = match vfs::open("C>/Yo/wassup.txt", OpenFlags::WRITE) {
-        Ok(fd) => fd,
-        Err(e) => {
-            SerialPort::puts("[ntfs] FAIL open for write: ");
-            SerialPort::puts(&alloc::format!("{:?}", e));
-            SerialPort::puts("\n");
-            return;
-        }
-    };
-    match vfs::write(fd, b"nope") {
+    match vfs::pwrite("C>/Yo/wassup.txt", 0, b"nope", OpenFlags::WRITE) {
         Err(VfsError::ReadOnly) => SerialPort::puts("[ntfs] OK   write rejected (read-only)\n"),
         Ok(_) => SerialPort::puts("[ntfs] FAIL write unexpectedly succeeded\n"),
         Err(e) => {
@@ -165,7 +144,6 @@ pub fn run() {
             SerialPort::puts("\n");
         }
     }
-    let _ = vfs::close(fd);
 
     // Mutating namespace ops are refused too.
     let mut refuses = 0u32;

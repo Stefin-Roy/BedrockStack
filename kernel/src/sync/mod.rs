@@ -22,36 +22,40 @@ impl<T> PreemptMutex<T> {
         // Disable preemption before taking the spin lock so holder cannot be
         // preempted and then deadlock spinner on same CPU.
         let was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable = false;
         if was_enabled {
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable = true;
             }
         }
         PreemptGuard {
             guard: Some(self.inner.lock()),
-            was_enabled,
+            was_enabled: did_disable,
         }
     }
 
     pub fn try_lock(&self) -> Option<PreemptGuard<'_, T>> {
         let was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable = false;
         if was_enabled {
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable = true;
             }
         }
         let g = match self.inner.try_lock() {
             Some(g) => g,
             None => {
-                if was_enabled {
+                if did_disable {
                     crate::smp::preempt_enable_and_maybe_resched();
                 }
                 return None;
             }
         };
-        Some(PreemptGuard { guard: Some(g), was_enabled })
+        Some(PreemptGuard { guard: Some(g), was_enabled: did_disable })
     }
 }
 
@@ -95,29 +99,33 @@ impl<T> PreemptRwLock<T> {
 
     pub fn read(&self) -> PreemptRwLockReadGuard<'_, T> {
         let was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable = false;
         if was_enabled {
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable = true;
             }
         }
         PreemptRwLockReadGuard {
             guard: Some(self.inner.read()),
-            was_enabled,
+            was_enabled: did_disable,
         }
     }
 
     pub fn write(&self) -> PreemptRwLockWriteGuard<'_, T> {
         let was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable = false;
         if was_enabled {
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable = true;
             }
         }
         PreemptRwLockWriteGuard {
             guard: Some(self.inner.write()),
-            was_enabled,
+            was_enabled: did_disable,
         }
     }
 }

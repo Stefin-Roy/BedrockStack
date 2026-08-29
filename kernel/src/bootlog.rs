@@ -95,58 +95,49 @@ fn do_flush(delta: &[u8], first: bool) -> bool {
     use crate::filesystems::vfs::types::OpenFlags;
 
     let path = "B>EFI/BEDROCK/boot.log";
-    let flags = if first {
-        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNC
-    } else {
-        OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::APPEND
-    };
 
-    let fd = match vfs::open(path, flags) {
-        Ok(fd) => fd,
-        Err(_) => {
-            // Retry once after IOMMU fallback if still enabled.
-            if crate::iommu::is_enabled() {
-                crate::iommu::fault_handler();
-                crate::iommu::disable_all();
-                match vfs::open(path, flags) {
-                    Ok(fd2) => fd2,
-                    Err(_) => return false,
+    // Helper to write delta in chunks using path-based I/O.
+    let write_delta = |is_first: bool| -> bool {
+        let mut off = 0usize;
+        while off < delta.len() {
+            let chunk = &delta[off..core::cmp::min(off + 4096, delta.len())];
+            let res = if is_first {
+                if off == 0 {
+                    // First chunk of a TRUNC sequence truncates the file.
+                    vfs::pwrite(path, 0, chunk, OpenFlags::CREATE | OpenFlags::TRUNC)
+                } else {
+                    vfs::pwrite(path, off as u64, chunk, OpenFlags::WRITE)
                 }
             } else {
-                return false;
+                // APPEND sequence — each chunk appends at authoritative EOF.
+                vfs::pwrite(path, 0, chunk, OpenFlags::CREATE | OpenFlags::APPEND)
+            };
+            match res {
+                Ok(n) if n > 0 => off += n,
+                _ => return false,
             }
         }
+        let _ = vfs::sync_all();
+        off == delta.len()
     };
 
-    let mut off = 0usize;
-    let mut ok = true;
-    while off < delta.len() {
-        let chunk = &delta[off..core::cmp::min(off + 4096, delta.len())];
-        match vfs::write(fd, chunk) {
-            Ok(n) if n > 0 => off += n,
-            Ok(_) => {
-                ok = false;
-                break;
-            }
-            Err(_) => {
-                ok = false;
-                break;
-            }
-        }
+    // First attempt
+    let mut ok = write_delta(first);
+    if !ok && crate::iommu::is_enabled() {
+        crate::iommu::fault_handler();
+        crate::iommu::disable_all();
+        ok = write_delta(first);
     }
-    let _ = vfs::close(fd);
-    let _ = vfs::sync_all();
-    if ok && off != delta.len() {
-        ok = false;
+    if ok {
+        return true;
     }
     // On incomplete write, do not advance FLUSHED_LEN; next interval retries delta.
     // First flush that was truncated but only partially written is still considered
     // not done, so next attempt will re-truncate and retry the full delta.
-    if !ok && first {
-        // Leave FIRST_DONE false so next attempt re-truncates rather than appending a partial.
+    if first {
         FIRST_DONE.store(false, Ordering::Release);
     }
-    ok
+    false
 }
 
 #[cfg(not(target_arch = "x86_64"))]

@@ -1081,14 +1081,16 @@ impl HeapInner {
 }
 
 static HEAP_INITIALIZED: AtomicBool = AtomicBool::new(false);
-// PreemptMutex (not `IrqMutex`) for the global heap: growth may
-// trigger `VMM::map` → `shootdown_tlb()` which waits for IPI acks. An
-// `IrqMutex` would hold IRQs disabled across that wait, deadlocking if the
-// target CPU is spinning on `HEAP` with IRQs off (e.g. inside a `VFS IrqMutex`).
-// Full preemption: PreemptMutex disables preemption (not IRQs) so holder
-// cannot be preempted and deadlock spinner on BSP.
+// IrqMutex for the global heap: disables both preemption AND IRQs while
+// held.  This closes the self-deadlock where an IRQ handler (timer ISR,
+// schedule()) allocates from the heap, misses the per-CPU cache, and
+// spins on HEAP held by the interrupted thread on the same CPU.
+// The old PreemptMutex let IRQs fire while HEAP was held, so the handler
+// would spin with IF=0 forever.  The shootdown-across-HEAP issue that
+// originally motivated PreemptMutex is gone: heap_grow() drops HEAP
+// before the Vmm::map → shootdown_tlb() wait (see heap_grow docs).
 // The per-CPU cache (below) *is* `IrqMutex` so IRQ-time `free` never spins.
-static HEAP: crate::sync::PreemptMutex<HeapInner> = crate::sync::PreemptMutex::new(HeapInner::empty());
+static HEAP: IrqMutex<HeapInner> = IrqMutex::new(HeapInner::empty());
 
 /// Raw pointer to the physical allocator, stashed so `alloc()` can grow the heap.
 ///
@@ -1285,6 +1287,164 @@ fn allocate_pages(heap: &mut HeapInner, count: usize) -> bool {
     true
 }
 
+/// Growth without holding `HEAP` across TLB shootdown (A — split unmap).
+///
+/// The old `allocate_pages` held `HEAP` across `Vmm::map` → `shootdown` which
+/// waits for IPI ACKs.  With `HEAP` as an `IrqMutex` (IF off while held), a
+/// shootdown target spinning on another `IrqMutex` with IF=0 could never
+/// acknowledge the shootdown → deadlock.  This helper reserves VA under
+/// `HEAP`, drops `HEAP`, does the `Vmm::map`+phys alloc with IF=1 (only
+/// preemption disabled via the manual `preempt_disable` — shootdown can
+/// complete because IRQs are re-enabled once `HEAP` is dropped), then
+/// re-acquires `HEAP` to commit.  The manual preemption disable serializes
+/// concurrent grows across CPUs without holding the spin lock.
+fn heap_grow(count: usize) -> bool {
+    // Serialize grows via preemption disable (BSP-only: no task switch while
+    // disabled; IRQs stay enabled so shootdown can be acked).
+    crate::smp::preempt_disable();
+    let reserve = {
+        let mut heap = HEAP.lock();
+        let size = match (count as u64).checked_mul(4096) {
+            Some(s) => s,
+            None => {
+                SerialPort::puts("[heap] WARN: growth size overflow\n");
+                crate::smp::preempt_enable();
+                return false;
+            }
+        };
+        let low_opt = if heap.low_vaddr == u64::MAX {
+            match HEAP_TOP.checked_sub(size) {
+                Some(v) if v >= HEAP_FLOOR => Some(v),
+                _ => {
+                    SerialPort::puts("[heap] WARN: initial chunk exceeds arena\n");
+                    None
+                }
+            }
+        } else {
+            match heap
+                .low_vaddr
+                .checked_sub(HEAP_GUARD_BYTES)
+                .and_then(|v| v.checked_sub(size))
+            {
+                Some(v) if v >= HEAP_FLOOR => Some(v),
+                _ => {
+                    SerialPort::puts("[heap] WARN: arena floor reached at low=0x");
+                    SerialPort::put_hex(heap.low_vaddr);
+                    SerialPort::puts("\n");
+                    None
+                }
+            }
+        };
+        match low_opt {
+            Some(low) => {
+                let old_low = heap.low_vaddr;
+                let root = heap.root;
+                heap.low_vaddr = low; // reserve VA
+                Some((low, size, root, old_low))
+            }
+            None => None,
+        }
+    };
+    let (low, size, root, old_low) = match reserve {
+        Some(v) => v,
+        None => {
+            crate::smp::preempt_enable();
+            return false;
+        }
+    };
+
+    // Phys alloc + map without HEAP. Preemption stays disabled (manual), IRQs enabled.
+    let phys = unsafe { phys_allocator() };
+    let mut vmm = Vmm::from_root(root);
+    let contig = if count >= 512 {
+        phys.try_alloc_contiguous_aligned(count, 512)
+    } else {
+        Err(crate::mm::phys_alloc::AllocError::NoFrames)
+    }
+    .or_else(|_| phys.try_alloc_contiguous(count));
+
+    let mut success = false;
+    let mut commit_phys: u64 = 0;
+    let mut commit_scattered = false;
+
+    if let Ok(pa) = contig {
+        let alloc = &mut *phys;
+        vmm.map(alloc, low, pa, size, PageFlags::READ | PageFlags::WRITE);
+        commit_phys = pa;
+        commit_scattered = false;
+        success = true;
+    } else {
+        // Scattered fallback
+        let mut got = 0usize;
+        let mut ok = true;
+        while got < count {
+            match phys.alloc() {
+                Some(frame) => {
+                    vmm.map_4k(
+                        phys,
+                        low + (got as u64) * 4096,
+                        frame,
+                        PageFlags::READ | PageFlags::WRITE,
+                    );
+                    got += 1;
+                }
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && got == count {
+            commit_phys = 0;
+            commit_scattered = true;
+            success = true;
+        } else {
+            SerialPort::puts("[heap] WARN: scattered growth short ");
+            SerialPort::put_u64(got as u64);
+            SerialPort::puts("/");
+            SerialPort::put_u64(count as u64);
+            SerialPort::puts("\n");
+            for i in 0..got {
+                let va = low + (i as u64) * 4096;
+                let pa = vmm.translate(va);
+                vmm.unmap(phys, va, 4096);
+                if let Some(pa) = pa {
+                    unsafe { phys.free(pa & !0xFFF) };
+                }
+            }
+            success = false;
+        }
+    }
+
+    // Commit or rollback under HEAP (preemption still disabled, so HEAP's
+    // did_disable will be false and Drop won't re-enable).
+    {
+        let mut heap = HEAP.lock();
+        if success {
+            unsafe { heap.add_region(low as usize, size as usize) };
+            heap.register_chunk(low, commit_phys, size, commit_scattered);
+            // low_vaddr already reserved; keep as is (already lowest unless
+            // an IRQ grow raced and reserved even lower — then lowest stays
+            // correct).
+        } else {
+            // Rollback VA reservation only if no racing lower reservation happened.
+            if heap.low_vaddr == low {
+                heap.low_vaddr = old_low;
+            } else {
+                // Racing lower reservation → leak this VA hole (rare, at most one
+                // chunk). Keeping lowest preserves correctness.
+                SerialPort::puts("[heap] WARN: grow rollback skipped (racing lower reservation) low=0x");
+                SerialPort::put_hex(low);
+                SerialPort::puts(" cur_low=0x");
+                SerialPort::put_hex(heap.low_vaddr);
+                SerialPort::puts("\n");
+            }
+        }
+    }
+    crate::smp::preempt_enable();
+    success
+}
+
 // ── Per-CPU free-list caches ───────────────────────────────────────
 //
 // The shared arena (`HEAP`) is protected by a mutex, so every allocation/
@@ -1451,30 +1611,28 @@ unsafe impl GlobalAlloc for HeapAllocator {
             }
         }
         let ptr = heap.alloc_inner(layout);
-        let ptr = if ptr.is_null() {
-            // Grow by at least the number of pages required for this
-            // allocation so that a single large resize (e.g. a hashmap
-            // backing array at ~260 KiB) does not loop indefinitely.
-            // +1 page reserves room for the block header/padding so an
-            // allocation that is an exact multiple of the page size (e.g. a
-            // 3 MiB framebuffer shadow) still fits in the grown chunk.
-            let Some(pages_needed) = layout
-                .size()
-                .checked_add(4095)
-                .and_then(|size| size.checked_div(4096))
-                .and_then(|pages| pages.checked_add(1))
-            else {
-                return core::ptr::null_mut();
-            };
-            allocate_pages(&mut heap, pages_needed.max(HEAP_GROW_PAGES));
-            heap.alloc_inner(layout)
-        } else {
-            ptr
-        };
         if !ptr.is_null() {
             if ENABLE_HEAP_CHUNK_RECLAIM {
                 heap.mark_live(ptr as u64);
             }
+            return ptr;
+        }
+        // Need to grow. Drop HEAP before shootdown — see heap_grow docs.
+        let Some(pages_needed) = layout
+            .size()
+            .checked_add(4095)
+            .and_then(|size| size.checked_div(4096))
+            .and_then(|pages| pages.checked_add(1))
+        else {
+            return core::ptr::null_mut();
+        };
+        let grow_pages = pages_needed.max(HEAP_GROW_PAGES);
+        drop(heap);
+        heap_grow(grow_pages);
+        let mut heap = HEAP.lock();
+        let ptr = heap.alloc_inner(layout);
+        if !ptr.is_null() && ENABLE_HEAP_CHUNK_RECLAIM {
+            heap.mark_live(ptr as u64);
         }
         ptr
     }

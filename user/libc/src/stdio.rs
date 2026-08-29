@@ -406,16 +406,16 @@ pub extern "C" fn fseek(f: *mut FILE, offset: c_long, whence: c_int) -> c_int {
         fref.eof = false;
         match whence {
             0 => {
-                fref.offset = offset.max(0) as u64;
+                fref.offset = (offset as i64).max(0) as u64;
                 0
             }
             1 => {
-                fref.offset = (fref.offset as i64 + offset).max(0) as u64;
+                fref.offset = (fref.offset as i64 + offset as i64).max(0) as u64;
                 0
             }
             2 => match file_size(fref) {
                 Some(base) => {
-                    fref.offset = (base as i64 + offset).max(0) as u64;
+                    fref.offset = (base as i64 + offset as i64).max(0) as u64;
                     0
                 }
                 None => {

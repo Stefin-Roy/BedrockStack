@@ -45,11 +45,13 @@ impl<T> IrqMutex<T> {
         // full preemption, SCHED-L002). Order: preempt -> IRQ.
         // Use try_current_per_cpu to stay safe before early_init_bsp.
         let preempt_was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable_preempt = false;
         if preempt_was_enabled {
             // try_current_per_cpu handles pre-early_init null-PerCpu safely
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable_preempt = true;
             }
         }
         let was = crate::arch::CurrentArch::are_interrupts_enabled();
@@ -63,7 +65,7 @@ impl<T> IrqMutex<T> {
         IrqGuard {
             guard: Some(self.inner.lock()),
             was_enabled: was,
-            preempt_was_enabled,
+            preempt_was_enabled: did_disable_preempt,
             #[cfg(feature = "lockdep")]
             class: self.class,
         }
@@ -71,10 +73,12 @@ impl<T> IrqMutex<T> {
 
     pub fn try_lock(&self) -> Option<IrqGuard<'_, T>> {
         let preempt_was_enabled = crate::smp::preempt_is_enabled();
+        let mut did_disable_preempt = false;
         if preempt_was_enabled {
             if let Some(pc) = crate::smp::try_current_per_cpu() {
                 pc.preempt_count.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                 core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
+                did_disable_preempt = true;
             }
         }
         let was = crate::arch::CurrentArch::are_interrupts_enabled();
@@ -87,7 +91,7 @@ impl<T> IrqMutex<T> {
                 if was {
                     crate::arch::CurrentArch::enable_interrupts();
                 }
-                if preempt_was_enabled {
+                if did_disable_preempt {
                     crate::smp::preempt_enable_and_maybe_resched();
                 }
                 return None;
@@ -98,7 +102,7 @@ impl<T> IrqMutex<T> {
         Some(IrqGuard {
             guard: Some(inner_guard),
             was_enabled: was,
-            preempt_was_enabled,
+            preempt_was_enabled: did_disable_preempt,
             #[cfg(feature = "lockdep")]
             class: self.class,
         })
