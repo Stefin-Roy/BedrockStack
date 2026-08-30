@@ -686,6 +686,46 @@ fn cancel_slice_timer() {
     }
 }
 
+// ── Sleeper wake timer (monika invasive: fixes lone-Running starvation) ──
+//
+// Sleepers are parked in `SLEEPING` with no per-task `UniversalTimer` entry;
+// wakeup relies on `schedule()` draining expired entries. When a lone
+// `Running` task keeps the CPU (empty-queue fast-path / no slice timer) a
+// sleeper would never be polled. A dedicated one-shot at the earliest deadline
+// forces a `need_resched` tick so `schedule()->wake_sleepers()` runs on time.
+static SLEEP_TIMER_SEQ: AtomicU64 = AtomicU64::new(0);
+fn sleep_timer_expired(_ctx: *mut u8) {
+    crate::smp::set_need_resched();
+}
+fn arm_sleep_timer(deadline_ns: u64) {
+    let old = SLEEP_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    if old != 0 {
+        crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
+    }
+    if let Some(id) =
+        crate::services::universal_timer::set_oneshot(deadline_ns, sleep_timer_expired, core::ptr::null_mut())
+    {
+        SLEEP_TIMER_SEQ.store(id.seq, Ordering::Release);
+    }
+}
+fn cancel_sleep_timer() {
+    let old = SLEEP_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    if old != 0 {
+        crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
+    }
+}
+fn sync_sleep_timer() {
+    if let Some(d) = earliest_sleep_deadline() {
+        // If already armed to this exact deadline, keep it.
+        // Otherwise (re)arm - the previous arm is canceled inside arm_sleep_timer.
+        // We unconditionally re-arm to handle deadline moves earlier.
+        // Cost is one cancel+set per schedule, cheap vs starvation.
+        arm_sleep_timer(d);
+    } else {
+        cancel_sleep_timer();
+    }
+}
+
 /// A new task became Ready: make sure a CPU-bound current gets preempted so
 /// the arrival can run. If a slice timer is already armed (competition
 /// existed), it will raise `need_resched` on expiry and nothing more is
@@ -696,8 +736,30 @@ fn preempt_kick() {
         return;
     }
     crate::smp::set_need_resched();
-    if SLICE_TIMER_SEQ.load(Ordering::Acquire) == 0 {
+    // Priority-aware kick: if a slice timer is already armed for a Batch
+    // quantum (12ms), an Interactive arrival must not wait. Re-arm to the
+    // Interactive quantum when the existing arm is not already short.
+    // We also must not hide a pending sleeper wake: if a sleep timer is
+    // pending far in the future, the new Interactive must still preempt early,
+    // so slice and sleep timers are independent (two UniversalTimer entries).
+    let has_slice = SLICE_TIMER_SEQ.load(Ordering::Acquire) != 0;
+    if !has_slice {
         arm_slice_timer(SLICE_INTERACTIVE_NS);
+    } else {
+        // Slice already armed - shorten it for Interactive arrival.
+        // The new arrival is always Interactive (spawn defaults Interactive,
+        // fork inherits, spawn_with_priority may be Batch). To avoid
+        // penalising Batch arrivals, only shorten if we can prove an
+        // Interactive is now Ready. Cheap scan - queue is small and this
+        // path is rare (task arrival).
+        let needs_short = {
+            let q = QUEUE.lock();
+            q.iter().any(|t| t.state == TaskState::Ready && t.prio == Priority::Interactive)
+        };
+        if needs_short {
+            // Re-arm to Interactive quantum - this preempts Batch sooner.
+            arm_slice_timer(SLICE_INTERACTIVE_NS);
+        }
     }
 }
 
@@ -777,10 +839,15 @@ pub fn fork_current() -> Result<u64, i64> {
     // Snapshot the caller's live syscall frame. It sits directly below
     // kernel_stack_top: the entry stub builds it there immediately after the
     // rsp0 xchg, and dispatch-time RSP only ever moves further down.
+    // Pin preemption across the copy so a tick cannot switch away mid-read
+    // and leave a torn frame (preempt is otherwise enabled between the
+    // validate->copy windows of the outer syscall).
+    crate::smp::preempt_disable();
     let pframe: SyscallFrame = unsafe {
         *((parent.kernel_stack_top - core::mem::size_of::<SyscallFrame>() as u64)
             as *const SyscallFrame)
     };
+    crate::smp::preempt_enable();
 
     // 1) COW address-space clone. The parent's supervisor caps window is
     //    excluded from the structural clone (it is re-established privately
@@ -1280,16 +1347,49 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
         if !zombie_present(pid) && !pid_live(pid) {
             return Err(WaitError::NotFound);
         }
-        let mut cur = CURRENT.lock();
-        if let Some(t) = cur.as_mut() {
-            t.state = TaskState::ZzZ;
-            let raw = &mut **t as *mut Task;
-            drop(cur);
-            WAITERS.lock().push((unsafe { &mut *raw }, pid));
-            schedule();
-            continue;
+        let raw: *mut Task = {
+            let mut cur = CURRENT.lock();
+            match cur.as_mut() {
+                Some(t) => {
+                    t.state = TaskState::ZzZ;
+                    &mut **t as *mut Task
+                }
+                None => return Err(WaitError::NotFound),
+            }
+        };
+        // Push waiter then double-check for lost wakeup: the target may have
+        // exited between our consume check and this push, and park_zombie
+        // would have found WAITERS empty and returned, leaving us parked
+        // forever. Re-check ZOMBIES after push; if zombie now present, unpark
+        // ourselves synchronously and loop to consume.
+        WAITERS.lock().push((unsafe { &mut *raw }, pid));
+        // MONIKA INVASIVE FIX: close lost-wakeup window. Re-check after push.
+        if zombie_present(pid) {
+            let mut w = WAITERS.lock();
+            if let Some(pos) = w.iter().position(|(t, _)| t.id == unsafe { (*raw).id }) {
+                // Still parked - not yet woken by park_zombie. Remove ourselves,
+                // mark Running (both WAITERS entry and CURRENT alias same Task),
+                // and retry consume without parking.
+                let (t, _) = w.remove(pos);
+                t.state = TaskState::Running;
+                drop(w);
+                continue;
+            } else {
+                // Already woken: park_zombie moved us from WAITERS to QUEUE as Ready,
+                // but CURRENT still holds the same Task as ZzZ -> duplicate.
+                // Remove duplicate from QUEUE and fix CURRENT to Running so the
+                // upcoming schedule (if we were to park) is avoided; just retry.
+                drop(w);
+                let mut q = QUEUE.lock();
+                if let Some(pos) = q.iter().position(|t| t.id == unsafe { (*raw).id }) {
+                    q.remove(pos);
+                }
+                drop(q);
+                unsafe { (*raw).state = TaskState::Running; }
+                continue;
+            }
         }
-        return Err(WaitError::NotFound);
+        schedule();
     }
 }
 
@@ -1520,6 +1620,10 @@ pub fn schedule() {
     // previously only in the idle loops (Kernel::run / enter_userspace) which
     // starved sleepers under load (S1).
     wake_sleepers();
+    // Keep the sleeper wake timer in sync: if a future sleeper remains,
+    // arm a one-shot so a lone Running task gets preempted on time
+    // (MONIKA fix for lone-Running starvation when slice timer canceled).
+    sync_sleep_timer();
 
     let prev = CURRENT.lock().take();
     let mut q = QUEUE.lock();
@@ -1586,6 +1690,9 @@ pub fn schedule() {
             } else {
                 cancel_slice_timer();
             }
+            // Lone dispatch still needs sleeper wake: if more==false but a
+            // sleeper remains, its deadline is already armed via
+            // sync_sleep_timer above; keep it. No extra work.
             (ctx_ptr, root)
         }
         None => {
@@ -1595,6 +1702,10 @@ pub fn schedule() {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
                     *CURRENT.lock() = None;
                     cancel_slice_timer();
+                    // Sleeper timer already synced at entry; keep it - idle
+                    // loop also wait_until's earliest, but having a wake timer
+                    // while idle is harmless and covers the window before idle
+                    // wait_until re-arms.
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     debug_assert!(root != 0, "KERNEL_ROOT zero on Dead->idle");
@@ -1639,11 +1750,10 @@ pub fn schedule() {
                     // Keep state Running (p was Running before take).
                     debug_assert!(p_valid, "fast-path ctx invalid");
                     debug_assert!(p_rip_ne_root, "fast-path RIP==CR3");
-                    // Alone on the CPU: run untimed. No slice-expiry timer is
-                    // armed, so a lone CPU-bound task is not interrupted
-                    // periodically; the next arrival re-arms via
-                    // `preempt_kick` (spawn/fork) or a sleep deadline tick
-                    // (wake_sleepers → Ready + need_resched).
+                    // Alone on the CPU: slice timer canceled, but sleeper timer
+                    // (if any) remains armed via sync_sleep_timer at entry, so
+                    // the lone task is still preempted at the next sleeper
+                    // deadline. Next arrival re-arms slice via preempt_kick.
                     crate::smp::current_per_cpu().current_task.store(ptr, Ordering::Relaxed);
                     *CURRENT.lock() = Some(p);
                     set_kernel_stack_meta(stack_top);
@@ -1685,10 +1795,11 @@ pub fn schedule() {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
+            // Enable before switch so new task starts count==0 tick-preemptible.
+            crate::smp::preempt_enable();
             unsafe {
                 switch_to_checked(pctx, next_ptr, next_root);
             }
-            crate::smp::preempt_enable();
         }
         Some(p) => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
@@ -1696,18 +1807,18 @@ pub fn schedule() {
             q.push_back(p);
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
+            crate::smp::preempt_enable();
             unsafe {
                 switch_to_checked(pctx, next_ptr, next_root);
             }
-            crate::smp::preempt_enable();
         }
         None => {
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
+            crate::smp::preempt_enable();
             unsafe {
                 switch_to_checked(idle_ctx(), next_ptr, next_root);
             }
-            crate::smp::preempt_enable();
         }
     }
 }
