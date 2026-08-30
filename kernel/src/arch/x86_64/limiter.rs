@@ -11,7 +11,7 @@
 pub use common::cpu_slow::enable_cpu_slow_mode;
 
 #[cfg(feature = "cpu_slow")]
-const REPEAT_INTERVAL_NS: u64 = 100_000_000; // 100 ms
+const REPEAT_INTERVAL_NS: u64 = 10_000_000; // 100 ms
 
 #[cfg(feature = "cpu_slow")]
 use core::sync::atomic::{AtomicBool, Ordering};
