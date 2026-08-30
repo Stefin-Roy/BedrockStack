@@ -357,7 +357,7 @@ pub fn validate_cap(cap: &Cap) -> Result<(), UnispaceError> {
             }
         }
     }
-    // Also validate via path parser by round-tripping - MONIKA INVASIVE:
+    // Also validate via path parser by round-tripping -  :
     // avoid heap allocation (alloc::format!) on the spawn hotpath which
     // deadlocks when called with VFS IrqMutex held and heap contended.
     // Manual checks above already cover canonicality; just verify via

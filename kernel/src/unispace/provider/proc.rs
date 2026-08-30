@@ -975,7 +975,7 @@ fn spawn_proc(path: &str, args: &str, caps: Vec<crate::caps::Cap>, out: &mut Vec
     crate::drivers::serial::SerialPort::puts(" caps=");
     crate::drivers::serial::SerialPort::put_u64(caps.len() as u64);
     crate::drivers::serial::SerialPort::puts("\n");
-    // MONIKA INVASIVE: staged timing and pre-allocate ELF buffer to avoid
+    //  : staged timing and pre-allocate ELF buffer to avoid
     // repeated heap reallocations while holding VFS locks (observed hang at
     // spawn_caps with HEAP spin and IF=0). Try to stat file first to size.
     let t0 = crate::services::universal_timer::now_ns();

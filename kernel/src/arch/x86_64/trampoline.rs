@@ -284,23 +284,6 @@ pub extern "C" fn ap_entry64() -> ! {
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::mca::enable_mca();
 
-    // Signal ready immediately — APs never write to .idt (fixed in Arch::init_ap),
-    // so there is no race with protect_idt() on the BSP.
-    crate::smp::AP_READY[cpu_id as usize]
-        .ready
-        .store(true, core::sync::atomic::Ordering::Release);
-    crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
-
-    SerialPort::puts("[AP] cpu ");
-    SerialPort::put_u64(cpu_id as u64);
-    SerialPort::puts(" online\n");
-
-    #[cfg(feature = "cpu_slow")]
-    {
-        SerialPort::puts("[AP] Enabling CPU slow mode...\n");
-        unsafe { crate::arch::x86_64::limiter::enable_cpu_slow_mode() };
-    }
-
     // Per-CPU GDT + TSS (double-fault IST stack).  This reloads CS/DS/ES/SS
     // from the real kernel GDT and loads the task register.
     crate::arch::x86_64::gdt::init();
@@ -313,6 +296,25 @@ pub extern "C" fn ap_entry64() -> ! {
 
     // Now safe to enable interrupts — GDT, TSS, and IDT are all set.
     crate::arch::CurrentArch::enable_interrupts();
+
+    // Only now publish Online: the AP has a valid GDT, IDT, local APIC, and
+    // interrupt-enabled entry path. AP_READY is an observation for the
+    // bootstrapper; the online mask is the authoritative IPI/shootdown
+    // target set, so a caller that observes ready also observes Online.
+    crate::smp::set_cpu_state(cpu_id, crate::smp::CpuState::Online);
+    crate::smp::AP_READY[cpu_id as usize]
+        .ready
+        .store(true, core::sync::atomic::Ordering::Release);
+
+    SerialPort::puts("[AP] cpu ");
+    SerialPort::put_u64(cpu_id as u64);
+    SerialPort::puts(" online\n");
+
+    #[cfg(feature = "cpu_slow")]
+    {
+        SerialPort::puts("[AP] Enabling CPU slow mode...\n");
+        unsafe { crate::arch::x86_64::limiter::enable_cpu_slow_mode() };
+    }
 
     // Periodic 100 ms re-application of `cpu_slow` on this AP's own
     // `UniversalTimer` base (opt-out with `nocpuslowrepeat`). The one-shot

@@ -557,7 +557,7 @@ pub fn load_init_from_esp(alloc: &mut BitmapAllocator) {
     SerialPort::puts(" stack 0x");
     SerialPort::put_hex(user_stack_top);
     SerialPort::puts("\n");
-    // MONIKA INVASIVE: validate before handoff - guarantees entry != root
+    //  : validate before handoff - guarantees entry != root
     if entry == root {
         SerialPort::puts("[sched] FATAL: entry == root\n");
         crate::mm::vmm::destroy_root(root, alloc);

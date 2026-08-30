@@ -4,6 +4,7 @@ use super::super::cpu::CpuManager;
 use crate::acpi::AcpiSubsystem;
 use crate::platform::x86_64_pc::apic;
 use crate::smp::ApContext;
+use crate::smp::CpuInfo;
 
 pub struct X86Cpu;
 
@@ -24,11 +25,14 @@ impl CpuManager for X86Cpu {
         apic::send_ipi_all_except_self(vector);
     }
 
-    fn discover_cpus(&self, acpi: Option<&AcpiSubsystem>) -> Vec<(u32, bool)> {
+    fn discover_cpus(&self, acpi: Option<&AcpiSubsystem>) -> Vec<CpuInfo> {
         let Some(acpi) = acpi else {
             return Vec::new();
         };
-        acpi.cpus.clone()
+        acpi.cpus
+            .iter()
+            .map(|&(hardware_id, enabled)| CpuInfo { hardware_id, enabled })
+            .collect()
     }
 
     unsafe fn wake_aps(&self, page_table_root: u64, aps: &[ApContext]) -> usize {

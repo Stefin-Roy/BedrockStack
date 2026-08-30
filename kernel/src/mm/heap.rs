@@ -1595,7 +1595,7 @@ unsafe impl GlobalAlloc for HeapAllocator {
         // can observe live == 0 after the cache lock is released, unmap the
         // chunk, and the allocator can return that stale cached pointer.  The
         // lock order is HEAP -> per-CPU cache, matching drain_cached_blocks.
-        // MONIKA INVASIVE: when reclamation is disabled, the second cache
+        //  : when reclamation is disabled, the second cache
         // probe inside HEAP is unnecessary and only widens the HEAP hold window
         // (holding HEAP while taking PER_CPU_CACHE IrqMutex). The outer probe
         // already checked the same CPU's cache without HEAP, so skip the inner

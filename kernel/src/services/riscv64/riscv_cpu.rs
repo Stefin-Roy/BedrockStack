@@ -4,6 +4,7 @@ use super::super::cpu::CpuManager;
 use crate::acpi::AcpiSubsystem;
 use crate::arch::riscv64::sbi;
 use crate::smp::ApContext;
+use crate::smp::CpuInfo;
 
 pub struct RiscvCpu;
 
@@ -33,16 +34,23 @@ impl CpuManager for RiscvCpu {
         sbi::send_ipi(mask);
     }
 
-    fn discover_cpus(&self, acpi: Option<&AcpiSubsystem>) -> Vec<(u32, bool)> {
+    fn discover_cpus(&self, acpi: Option<&AcpiSubsystem>) -> Vec<CpuInfo> {
         if let Some(dtb) = crate::platform::riscv_virt::get_dtb_ptr() {
             let cpus = crate::dtb::parse_cpus(dtb);
             if !cpus.is_empty() {
-                return cpus;
+                return cpus
+                    .into_iter()
+                    .map(|(hardware_id, enabled)| CpuInfo { hardware_id, enabled })
+                    .collect();
             }
         }
         if let Some(ref acpi) = acpi {
             if !acpi.cpus.is_empty() {
-                return acpi.cpus.clone();
+                return acpi
+                    .cpus
+                    .iter()
+                    .map(|&(hardware_id, enabled)| CpuInfo { hardware_id, enabled })
+                    .collect();
             }
         }
         Vec::new()

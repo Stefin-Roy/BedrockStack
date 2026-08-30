@@ -2,7 +2,24 @@
 
 **Version:** 0.2.0
 **Source:** `kernel/src/task/mod.rs`, `kernel/src/task/switch.rs`, `kernel/src/task/load.rs`, `kernel/src/smp/mod.rs` (PerCpu), `kernel/src/arch/x86_64/syscall.rs`, `kernel/src/arch/x86_64/idt.rs`, `kernel/src/services/universal_timer.rs`
-**Status:** Stable (preemptive tick-sliced BSP-only, 2-class weighted round-robin)
+**Status:** Stable (preemptive tick-sliced BSP-only scheduler with SMP bring-up/ownership groundwork)
+
+## SMP preparation invariants
+
+**SMP-001 — Explicit single-CPU escape hatch:** `bootargs::is_nosmp()` disables AP bring-up. `bootargs::max_cpus()` accepts `maxcpus=N`/`max_cpus=N`, includes the BSP, rejects zero/invalid/overflowing values, and is clamped to `1..=MAX_CPUS`. These controls are diagnostic only; they do not change task semantics.
+- `kernel/src/bootargs.rs`, `kernel/src/smp/mod.rs`
+
+**SMP-002 — Logical CPU topology:** Firmware hardware IDs are represented by `smp::CpuInfo`. Logical IDs are assigned densely after filtering disabled entries, the actual BSP hardware ID, duplicate hardware IDs, and the configured CPU limit; firmware ordering is not treated as a BSP guarantee.
+- `kernel/src/services/cpu.rs`, `kernel/src/smp/mod.rs`
+
+**SMP-003 — Online accounting:** `CPU_STATES` is authoritative for lifecycle state and `ONLINE_MASK` is authoritative for IPI/TLB eligibility. `CPU_COUNT` is the population count of the online mask, not the number of APs selected or allocated. CPUs that time out during startup become `Failed` and are never targeted as online CPUs.
+- `kernel/src/smp/mod.rs`, `kernel/src/mm/vmm/mod.rs`
+
+**SMP-004 — Per-CPU scheduler runtime:** `SchedulerRuntime[MAX_CPUS]` owns future per-CPU idle context, idle stack, scheduler timer IDs, WRR credit, context-switch count, and handoff generation. It is reset before a CPU is admitted to the scheduler; the BSP-only scheduler continues to use its legacy global state until the multi-CPU scheduler phase.
+- `kernel/src/smp/mod.rs`
+
+**SMP-005 — Task ownership groundwork:** Every task starts with `owner_cpu=TASK_NO_CPU` and `queue_cpu=TASK_NO_CPU`. A queued task is marked with `TASK_GLOBAL_QUEUE`; a dispatched task must atomically claim one logical CPU; a parked or requeued task must release ownership before entering a scheduler list. Reaping requires both sentinels. The current BSP scheduler maintains these markers, but AP scheduling is not enabled by this invariant alone.
+- `kernel/src/task/mod.rs`
 
 ---
 
@@ -38,7 +55,7 @@
 **SCHED-010 — `schedule()` wakes before picking:** Since 2026-08-23 `schedule()` calls `wake_sleepers()` before popping FIFO, so sleepers never starve (S1). Idle loops (`Kernel::run` / `enter_userspace`) also wake, but wake-in-schedule is primary.
 - `mod.rs:1261-1265`
 
-**SCHED-011 — Empty-queue fast-path keeps Running (with sleeper arm):** When `next==None` and `prev==Running`, `schedule()` restores `CURRENT=Some(prev)`, `PerCpu.current_task=prev`, `TSS.rsp0=syscall_rsp0=prev.kernel_stack_top`, keeps `Running`, **cancels slice timer but keeps/arms sleep timer** to the earliest `SLEEPING` deadline (`sync_sleep_timer`), so a sleeping task is still woken even while a lone Batch burns CPU (MONIKA liveness fix). Returns without switch/requeue, LAPIC stays event-driven (no periodic tick). Later arrival re-arms slice via `preempt_kick` (now priority-aware: shortens Batch 12ms to 4ms for Interactive), or sleeper fires. Previously left `CURRENT=None` while task ran (S0); `yield` removed 2026-08-26.
+**SCHED-011 — Empty-queue fast-path keeps Running (with sleeper arm):** When `next==None` and `prev==Running`, `schedule()` restores `CURRENT=Some(prev)`, `PerCpu.current_task=prev`, `TSS.rsp0=syscall_rsp0=prev.kernel_stack_top`, keeps `Running`, **cancels slice timer but keeps/arms sleep timer** to the earliest `SLEEPING` deadline (`sync_sleep_timer`), so a sleeping task is still woken even while a lone Batch burns CPU ( liveness fix). Returns without switch/requeue, LAPIC stays event-driven (no periodic tick). Later arrival re-arms slice via `preempt_kick` (now priority-aware: shortens Batch 12ms to 4ms for Interactive), or sleeper fires. Previously left `CURRENT=None` while task ran (S0); `yield` removed 2026-08-26.
 - `mod.rs:1287-1301`
 
 **SCHED-012 — Bootstrap idle halts:** `enter_userspace` loop after `schedule()` does `if earliest => wait_until(d+1) else halt()` so no 100% spin when INIT is `WAITERS` and no sleeper (S3).
@@ -52,9 +69,9 @@
 **SCHED-L001 — Never hold together:** `SLEEPING` dropped before `QUEUE` (`wake_sleepers`, `sleep_until`), `WAITERS` dropped before `QUEUE` (`wake_waiters_for`), `ZOMBIES` never acquired while holding those (`park_zombie` drops `QUEUE` first, `kill` drops before park). `reap_dead` holds `ZOMBIES` while reading `pid_live` (which scans others) — safe because nothing acquires `ZOMBIES` while holding those and `reap_dead` only runs on idle kernel CR3.
 - `mod.rs:494-498,586-592,876-907`
 
-**SCHED-L002 — ISR touches atomics, full preemption (MONIKA invasive):** `universal_timer::tick` never takes scheduler locks; it sets `need_resched` via atomics. After EOI, vector 32/52/49/33-239 handlers call `task::try_preempt_from_irq(_from_user)` which now preempts **both ring-3 and kernel** when `preempt_count==0` and `sched_active` and `Running`. Kernel holders are protected by `IrqMutex` (which does `cli` + `preempt_disable`) or explicit `preempt_disable` around plain locks (HEAP, VMM, NS, BLOCK_CACHE). `from_user` is retained for audit but no longer gates. Further gates: non-null current, `Running`, EOI before switch. This is the full-preemption mode requested (2026-08-30); plain spin locks must be audited to `IrqMutex`/`PreemptMutex` before use in new code.
+**SCHED-L002 — ISR touches atomics, full preemption ( ):** `universal_timer::tick` never takes scheduler locks; it sets `need_resched` via atomics. After EOI, vector 32/52/49/33-239 handlers call `task::try_preempt_from_irq(_from_user)` which now preempts **both ring-3 and kernel** when `preempt_count==0` and `sched_active` and `Running`. Kernel holders are protected by `IrqMutex` (which does `cli` + `preempt_disable`) or explicit `preempt_disable` around plain locks (HEAP, VMM, NS, BLOCK_CACHE). `from_user` is retained for audit but no longer gates. Further gates: non-null current, `Running`, EOI before switch. This is the full-preemption mode requested (2026-08-30); plain spin locks must be audited to `IrqMutex`/`PreemptMutex` before use in new code.
 
-**SCHED-L005 — Slice + sleeper timers are UniversalTimer entries:** Slice expiry (`arm_slice_timer`, `SLICE_TIMER_SEQ`) and the dedicated sleeper wake timer (`arm_sleep_timer`/`sync_sleep_timer`, `SLEEP_TIMER_SEQ`) are both one-shot `UniversalTimer` entries; `UniversalTimer` is the single LAPIC one-shot owner, so both share the queue. Slice is armed **only while competition remains** after a dispatch; lone task runs untimed but **sleeper timer keeps the lone task preemptible** at the earliest `SLEEPING` deadline (`sync_sleep_timer` at `schedule` entry, MONIKA fix for starvation). Slice expiry and sleeper expiry both set `need_resched` (atomics) and `schedule()->wake_sleepers` drains. `preempt_kick` re-arms slice to `SLICE_INTERACTIVE_NS` even when a slice timer exists if an Interactive becomes Ready (shortens Batch quantum). `cancel_*` on idle/fast-path; fast-path now cancels slice but keeps sleep timer.
+**SCHED-L005 — Slice + sleeper timers are UniversalTimer entries:** Slice expiry (`arm_slice_timer`, `SLICE_TIMER_SEQ`) and the dedicated sleeper wake timer (`arm_sleep_timer`/`sync_sleep_timer`, `SLEEP_TIMER_SEQ`) are both one-shot `UniversalTimer` entries; `UniversalTimer` is the single LAPIC one-shot owner, so both share the queue. Slice is armed **only while competition remains** after a dispatch; lone task runs untimed but **sleeper timer keeps the lone task preemptible** at the earliest `SLEEPING` deadline (`sync_sleep_timer` at `schedule` entry,  fix for starvation). Slice expiry and sleeper expiry both set `need_resched` (atomics) and `schedule()->wake_sleepers` drains. `preempt_kick` re-arms slice to `SLICE_INTERACTIVE_NS` even when a slice timer exists if an Interactive becomes Ready (shortens Batch quantum). `cancel_*` on idle/fast-path; fast-path now cancels slice but keeps sleep timer.
 - `kernel/src/task/mod.rs` (`SLICE_TIMER_SEQ`, `arm_slice_timer`, `preempt_kick`), `kernel/src/services/universal_timer.rs` (`set_oneshot`/`cancel_timer_id`)
 
 **SCHED-L006 — WRR classes and slices:** `Priority::{Interactive,Batch}`; slices 4ms / 12ms; Interactive holds a 3:1 dispatch budget (`WRR_CREDIT`, reset by each Batch pick; decremented — saturating at 0 — on every Interactive pick, including the no-Batch-ready fallback). The expiry timer is granted per dispatch only under competition; preempted Running tasks requeue as `Ready` at the back of the queue.
@@ -86,7 +103,7 @@
 
 **SCHED-API-003 — `sleep_until(deadline_ns)` / `sleep_current(ns)`:** Marks current `ZzZ`, binary-inserts sorted `SLEEPING`, drops lock before `schedule()`.
 
-**SCHED-API-004 — `wait(pid)->Result<code,WaitError>`:** Child-only (Unix `wait`). Consumes `ZOMBIES` → `RECLAIM` if present, else parks in `WAITERS` + `schedule()` loop; re-checks `!zombie_present && !pid_live => NotFound` (S2). Parks with double-check after `WAITERS.push` to close lost-wakeup window where exit raced the check-then-park (MONIKA fix): re-checks `zombie_present`, unparks self synchronously or removes duplicate `QUEUE` entry.
+**SCHED-API-004 — `wait(pid)->Result<code,WaitError>`:** Child-only (Unix `wait`). Consumes `ZOMBIES` → `RECLAIM` if present, else parks in `WAITERS` + `schedule()` loop; re-checks `!zombie_present && !pid_live => NotFound` (S2). Parks with double-check after `WAITERS.push` to close lost-wakeup window where exit raced the check-then-park ( fix): re-checks `zombie_present`, unparks self synchronously or removes duplicate `QUEUE` entry.
 
 **SCHED-API-005 — `kill(pid)`:** Self-kill diverges via `kill_current`; else scans `QUEUE/SLEEPING/WAITERS` preserving order, marks `Dead`/`KILLED_EXIT_CODE` `0xDEAD_BEEF`, `park_zombie` (which `wake_waiters_for`).
 

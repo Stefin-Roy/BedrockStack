@@ -915,17 +915,15 @@ fn shootdown_impl(scope: Option<u64>) {
     // The local CPU was flushed by the caller before the seq bump.
     acknowledge_tlb(seq);
 
-    let count = crate::smp::cpu_count() as usize;
-
     // Resolve the target set once so send and wait phases agree exactly.
     // Send to online CPUs only — a starting AP has no IDT to handle this IPI,
     // and reclaim cannot run before all APs are online anyway.
     let mut targets: u16 = 0;
-    for cpu in 0..count.min(crate::smp::MAX_CPUS) {
+    for cpu in 0..crate::smp::MAX_CPUS {
         if cpu == my {
             continue;
         }
-        if crate::smp::cpu_state(cpu as u32) != crate::smp::CpuState::Online {
+        if !crate::smp::is_cpu_online(cpu as u32) {
             continue;
         }
         if let Some(root) = scope {

@@ -168,7 +168,8 @@ pub fn spawn_pump(alloc: &mut crate::mm::phys_alloc::BitmapAllocator) {
         top,
         root,
         0,
-        crate::task::TaskContext::new(top - 8, audio_pump_entry as *const () as usize as u64),
+        // Leave room below the entry stack for switch_to's atomic iretq frame.
+        crate::task::TaskContext::new(top - 40, audio_pump_entry as *const () as usize as u64),
     );
     task.kstack_slot = slot;
     crate::task::spawn(task);

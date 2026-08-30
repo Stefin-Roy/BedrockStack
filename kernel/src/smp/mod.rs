@@ -1,15 +1,25 @@
 use crate::services::KernelServices;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
+/// Firmware-described processor identity used during topology discovery.
+/// `hardware_id` is an APIC ID on x86_64 and a hart ID on RISC-V. Logical
+/// kernel CPU IDs are assigned by `smp::init` after filtering this list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CpuInfo {
+    pub hardware_id: u32,
+    pub enabled: bool,
+}
+
 /// SMP initialization guard — prevents double-init which would double-start APs,
 /// leak stacks, and corrupt the CPU counter.
 static SMP_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
 /// Per-CPU online state for future hotplug support.
 ///
-/// 0 = Offline, 1 = Starting, 2 = Online.
+/// 0 = Offline, 1 = Starting, 2 = Online, 3 = Failed.
 /// The BSP transitions 0→2 in `early_init_bsp`; APs transition 0→1 in
-/// `smp::init` then 1→2 in their respective `ap_entry`.
+/// `smp::init` then 1→2 in their respective `ap_entry`, or 1→3 when the
+/// bounded startup handshake times out.
 static CPU_STATES: [AtomicU8; MAX_CPUS] = [
     AtomicU8::new(0),
     AtomicU8::new(0),
@@ -34,6 +44,7 @@ pub enum CpuState {
     Offline,
     Starting,
     Online,
+    Failed,
 }
 
 impl From<u8> for CpuState {
@@ -41,6 +52,7 @@ impl From<u8> for CpuState {
         match v {
             1 => CpuState::Starting,
             2 => CpuState::Online,
+            3 => CpuState::Failed,
             _ => CpuState::Offline,
         }
     }
@@ -67,8 +79,17 @@ pub(crate) fn set_cpu_state(cpu_id: u32, new_state: CpuState) {
         CpuState::Offline => 0,
         CpuState::Starting => 1,
         CpuState::Online => 2,
+        CpuState::Failed => 3,
     };
     CPU_STATES[cpu_id as usize].store(new_val, Ordering::Release);
+
+    let bit = 1u32 << cpu_id;
+    if new_state == CpuState::Online {
+        ONLINE_MASK.fetch_or(bit, Ordering::AcqRel);
+    } else {
+        ONLINE_MASK.fetch_and(!bit, Ordering::AcqRel);
+    }
+    CPU_COUNT.store(ONLINE_MASK.load(Ordering::Acquire).count_ones(), Ordering::Release);
 }
 
 /// Cache-line-aligned per-AP ready flag, avoiding false sharing between CPUs.
@@ -160,6 +181,73 @@ pub struct PerCpu {
     pub sched_active: AtomicBool,
 }
 
+/// Scheduler-owned state that is indexed by logical CPU.
+///
+/// This lives beside, rather than inside, the GS-visible `PerCpu` record so
+/// the assembly-facing prefix and the syscall offset remain stable while the
+/// scheduler grows. All fields are atomic because remote CPUs will eventually
+/// inspect or update parts of this record when waking, balancing, or stopping
+/// a CPU.
+#[repr(C)]
+pub struct SchedulerRuntime {
+    /// Context pointer used when a CPU returns to its own idle loop.
+    pub idle_context: AtomicPtr<core::ffi::c_void>,
+    /// Live stack top used by the CPU's idle/TSS bootstrap path.
+    pub idle_stack_top: AtomicU64,
+    /// UniversalTimer sequence for this CPU's scheduler slice, if armed.
+    pub slice_timer_seq: AtomicU64,
+    /// UniversalTimer sequence for this CPU's sleeper wake timer, if armed.
+    pub sleep_timer_seq: AtomicU64,
+    /// Local weighted-round-robin credit.
+    pub wrr_credit: AtomicU32,
+    /// Number of completed local context switches.
+    pub context_switches: AtomicU64,
+    /// Monotonic scheduler handoff generation for diagnostics and ownership
+    /// validation. It is not a task or timer sequence number.
+    pub handoff_generation: AtomicU64,
+}
+
+impl SchedulerRuntime {
+    pub const fn new() -> Self {
+        Self {
+            idle_context: AtomicPtr::new(core::ptr::null_mut()),
+            idle_stack_top: AtomicU64::new(0),
+            slice_timer_seq: AtomicU64::new(0),
+            sleep_timer_seq: AtomicU64::new(0),
+            wrr_credit: AtomicU32::new(0),
+            context_switches: AtomicU64::new(0),
+            handoff_generation: AtomicU64::new(0),
+        }
+    }
+}
+
+static SCHEDULER_RUNTIME: [SchedulerRuntime; MAX_CPUS] =
+    [const { SchedulerRuntime::new() }; MAX_CPUS];
+
+pub fn scheduler_runtime(cpu_id: u32) -> &'static SchedulerRuntime {
+    assert!(cpu_id < MAX_CPUS as u32, "scheduler_runtime: CPU out of range");
+    &SCHEDULER_RUNTIME[cpu_id as usize]
+}
+
+pub fn current_scheduler_runtime() -> &'static SchedulerRuntime {
+    scheduler_runtime(current_cpu_id())
+}
+
+/// Reset scheduler-owned runtime state for a CPU before it is admitted to the
+/// scheduler. This is intentionally separate from `PerCpu` initialization so
+/// AP startup and future hotplug can reuse the same reset protocol.
+pub fn reset_scheduler_runtime(cpu_id: u32, idle_stack_top: u64) {
+    let rt = scheduler_runtime(cpu_id);
+    rt.idle_context
+        .store(core::ptr::null_mut(), Ordering::Release);
+    rt.idle_stack_top.store(idle_stack_top, Ordering::Release);
+    rt.slice_timer_seq.store(0, Ordering::Release);
+    rt.sleep_timer_seq.store(0, Ordering::Release);
+    rt.wrr_credit.store(3, Ordering::Release);
+    rt.context_switches.store(0, Ordering::Release);
+    rt.handoff_generation.store(0, Ordering::Release);
+}
+
 /// Byte offset of `PerCpu::syscall_rsp0` within the struct, for the syscall
 /// entry asm (`gs:[PERCPU_SYSCALL_RSP0_OFF]`).
 pub const PERCPU_SYSCALL_RSP0_OFF: u64 = core::mem::offset_of!(PerCpu, syscall_rsp0) as u64;
@@ -168,6 +256,7 @@ pub const PERCPU_SYSCALL_RSP0_OFF: u64 = core::mem::offset_of!(PerCpu, syscall_r
 pub const MAX_CPUS: usize = 16;
 
 static CPU_COUNT: AtomicU32 = AtomicU32::new(1);
+static ONLINE_MASK: AtomicU32 = AtomicU32::new(0);
 
 static mut PER_CPU_SLOTS: [PerCpu; MAX_CPUS] = [
     PerCpu {
@@ -501,6 +590,16 @@ pub fn cpu_count() -> u32 {
     CPU_COUNT.load(Ordering::Relaxed)
 }
 
+/// Bit mask of CPUs currently in `CpuState::Online`.
+pub fn online_mask() -> u32 {
+    ONLINE_MASK.load(Ordering::Acquire)
+}
+
+/// True if the logical CPU is currently online and may receive IPIs.
+pub fn is_cpu_online(cpu_id: u32) -> bool {
+    cpu_id < MAX_CPUS as u32 && (online_mask() & (1u32 << cpu_id)) != 0
+}
+
 pub fn current_cpu_id() -> u32 {
     current_per_cpu().cpu_id
 }
@@ -522,6 +621,7 @@ pub unsafe fn early_init_bsp() {
     pc.preempt_count.store(0, Ordering::Relaxed);
     pc.sched_ticks.store(0, Ordering::Relaxed);
     pc.sched_active.store(false, Ordering::Relaxed);
+    reset_scheduler_runtime(0, 0);
 
     set_cpu_state(0, CpuState::Online);
 
@@ -798,15 +898,44 @@ pub unsafe fn init(
     );
     SerialPort::puts("[smp] init\n");
 
-    let cpus = services.cpu.discover_cpus(acpi);
-    let _bsp_id = cpus.first().map(|(id, _)| *id).unwrap_or(0);
+    let discovered = services.cpu.discover_cpus(acpi);
+    let bsp_hardware_id = current_per_cpu().apic_id;
+    let max_cpus = if crate::bootargs::is_nosmp() {
+        1
+    } else {
+        crate::bootargs::max_cpus()
+            .unwrap_or(MAX_CPUS)
+            .clamp(1, MAX_CPUS)
+    };
+
+    SerialPort::puts("[smp] BSP hardware_id=");
+    SerialPort::put_u64(bsp_hardware_id as u64);
+    SerialPort::puts(" max_cpus=");
+    SerialPort::put_u64(max_cpus as u64);
+    SerialPort::puts("\n");
+
+    if crate::bootargs::is_nosmp() {
+        SerialPort::puts("[smp] nosmp requested\n");
+    }
 
     let mut ap_list = alloc::vec::Vec::new();
-    for (cpu_id_offset, &(hardware_id, enabled)) in cpus.iter().enumerate().skip(1) {
-        if !enabled {
+    let mut seen_hardware_ids = alloc::vec::Vec::new();
+    seen_hardware_ids.push(bsp_hardware_id);
+    for info in discovered.iter() {
+        if !info.enabled || info.hardware_id == bsp_hardware_id || ap_list.len() + 1 >= max_cpus {
             continue;
         }
-        let cpu_id = cpu_id_offset as u32;
+        if seen_hardware_ids.contains(&info.hardware_id) {
+            SerialPort::puts("[smp] WARN: duplicate hardware_id=");
+            SerialPort::put_u64(info.hardware_id as u64);
+            SerialPort::puts(" ignored\n");
+            continue;
+        }
+        seen_hardware_ids.push(info.hardware_id);
+        // Logical IDs are assigned densely after filtering disabled entries,
+        // the BSP, duplicates, and the max-cpu limit.
+        let cpu_id = (ap_list.len() + 1) as u32;
+        let hardware_id = info.hardware_id;
         // Skip (don't brick) when no contiguous stack window exists — the
         // machine boots with fewer CPUs rather than hanging forever.
         let stack_top = match allocate_ap_stack(cpu_id) {
@@ -830,6 +959,10 @@ pub unsafe fn init(
         pc.sched_ticks.store(0, Ordering::Relaxed);
         pc.sched_active.store(false, Ordering::Relaxed);
         slot_release(cpu_id as usize);
+        reset_scheduler_runtime(cpu_id, stack_top);
+        AP_READY[cpu_id as usize]
+            .ready
+            .store(false, Ordering::Release);
 
         ap_list.push(ApContext {
             cpu_id,
@@ -845,16 +978,13 @@ pub unsafe fn init(
     }
 
     let ap_count = ap_list.len();
-    let total = 1 + ap_count as u32;
-    CPU_COUNT.store(total, Ordering::Relaxed);
-
-    SerialPort::puts("[smp] total CPUs: ");
-    SerialPort::put_u64(total as u64);
+    SerialPort::puts("[smp] APs selected: ");
+    SerialPort::put_u64(ap_count as u64);
     SerialPort::puts("\n");
 
     if ap_count == 0 {
         SerialPort::puts("[smp] no APs found, running uniprocessor\n");
-        return 1;
+        return cpu_count();
     }
 
     let started = unsafe { services.cpu.wake_aps(page_table_root, &ap_list) };
@@ -863,7 +993,25 @@ pub unsafe fn init(
     SerialPort::put_u64(started as u64);
     SerialPort::puts("\n");
 
-    total
+    // AP_READY is only a startup observation. The authoritative count is the
+    // online state mask, which prevents timed-out APs from being targeted by
+    // TLB/IPI paths or reported as usable CPUs.
+    for ap in &ap_list {
+        if !AP_READY[ap.cpu_id as usize]
+            .ready
+            .load(Ordering::Acquire)
+            && cpu_state(ap.cpu_id) == CpuState::Starting
+        {
+            set_cpu_state(ap.cpu_id, CpuState::Failed);
+        }
+    }
+    let online = cpu_count();
+    SerialPort::puts("[smp] online CPUs: ");
+    SerialPort::put_u64(online as u64);
+    SerialPort::puts(" mask=0x");
+    SerialPort::put_hex(online_mask() as u64);
+    SerialPort::puts("\n");
+    online
 }
 
 /// Allocate the 17-page contiguous AP stack for one AP.
@@ -919,9 +1067,11 @@ pub fn try_allocate_ap_stack(_cpu_id: u32) -> Result<u64, crate::mm::phys_alloc:
 
 pub fn smp_snapshot() -> alloc::vec::Vec<(u32, u32, bool, u8, u64, bool, u32, u64)> {
     let mut out = alloc::vec::Vec::new();
-    let count = crate::smp::cpu_count() as usize;
-    for i in 0..count.min(MAX_CPUS) {
+    for i in 0..MAX_CPUS {
         let pc = per_cpu_by_id(i as u32);
+        if pc.self_ptr.is_null() {
+            continue;
+        }
         let state = cpu_state(i as u32) as u8;
         let has_task = !pc.current_task.load(Ordering::Relaxed).is_null();
         let preempt = pc.preempt_count.load(Ordering::Relaxed);

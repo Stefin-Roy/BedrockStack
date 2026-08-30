@@ -66,20 +66,41 @@ impl TaskContext {
     /// the user root (observed `RIP=CR3=0x2e05000`, error `0x10`).
     #[inline]
     pub fn is_valid(&self) -> bool {
+        // This kernel currently runs with 48-bit virtual addresses. A value
+        // whose upper 16 bits do not sign-extend bit 47 causes #GP on `ret`;
+        // merely checking that an address is above the user range is not
+        // sufficient (e.g. 0x00ffffff80000000 is above it but non-canonical).
+        const CANONICAL_LOW: u64 = (1u64 << 48) - 1;
+        const KERNEL_BASE: u64 = 0xffff_8000_0000_0000;
+        let canonical = |addr: u64| {
+            let low = addr & CANONICAL_LOW;
+            let upper = addr & !CANONICAL_LOW;
+            let sign = (low & (1u64 << 47)) != 0;
+            (upper == 0 && !sign) || (upper == !CANONICAL_LOW && sign)
+        };
+
+        if !canonical(self.rip) || !canonical(self.rsp) {
+            return false;
+        }
+        // The zeroed context is reserved for the idle anchor. A real resume
+        // address without a stack would enter the task and fault on its first
+        // prologue instruction; if that fault occurs while the stack is zero,
+        // the CPU escalates immediately to #DF on the IST stack.
+        if self.rip != 0 && self.rsp == 0 {
+            return false;
+        }
         // RIP must be canonical high-half kernel text (or user_iret) and never
         // the low half.  Low half values are user entry points that belong in
         // the iretq frame, not in TaskContext.rip.
-        if self.rip < 0x0000_8000_0000_0000 {
+        if self.rip != 0 && self.rip < KERNEL_BASE {
             // Below USER_BOUNDARY is low — only valid if it's the `user_iret`
             // stub itself which lives high.  So any low RIP is invalid here.
             // The only allowed low RIP would be 0 for the idle anchor (never
             // dispatched as next).
-            if self.rip != 0 {
-                return false;
-            }
+            return false;
         }
         // RSP must be canonical high (kernel stacks) or zero for idle.
-        if self.rsp != 0 && self.rsp < 0x0000_8000_0000_0000 {
+        if self.rsp != 0 && self.rsp < KERNEL_BASE {
             return false;
         }
         // RFLAGS must keep IF=1 for a fresh task (0x202) and not have reserved
@@ -98,7 +119,8 @@ impl TaskContext {
 // ── switch_to ─────────────────────────────────────────────────────
 //
 // ABI (SysV): rdi = old (*mut TaskContext), rsi = new (*const TaskContext),
-// rdx = new_cr3.
+// rdx = new_cr3, rcx = outgoing RFLAGS captured before interrupts were
+// disabled by switch_to_checked.
 //
 // Saves the six callee-saved registers, the post-call RSP, and the return
 // address (currently at the top of the stack) into `old`; restores them from
@@ -113,17 +135,19 @@ impl TaskContext {
 // context switch.
 //
 // CR3 reload: the kernel's higher-half alias is mapped in every address
-// space, so the code between the reload and the `ret` stays mapped even when
-// jumping into a user root. The `ret` pops the resume pointer that was pushed
-// on the freshly-restored stack.
+// space, so the code between the reload and the return stays mapped even
+// when jumping into a user root. The final iretq restores the target RIP and
+// RFLAGS as one architectural operation, so an IRQ cannot land between
+// enabling interrupts and entering the target context. User-bound tasks
+// resume at `user_iret`, which consumes their prebuilt five-word ring-3 frame.
 core::arch::global_asm!(
     r#"
 .globl switch_to
 .code64
 switch_to:
-    pushfq
-    pop  rax                      # RFLAGS of the outgoing context
-    mov  [rdi + 0x40], rax
+    # The caller has already executed CLI, so RCX is the only reliable copy
+    # of the outgoing flags. Reading PUSHFQ here would incorrectly save IF=0.
+    mov  [rdi + 0x40], rcx
     mov  [rdi + 0x00], r15
     mov  [rdi + 0x08], r14
     mov  [rdi + 0x10], r13
@@ -141,18 +165,24 @@ switch_to:
     mov  r12, [rsi + 0x18]
     mov  rbx, [rsi + 0x20]
     mov  rbp, [rsi + 0x28]
-    mov  rsp, [rsi + 0x30]
+    mov  rax, [rsi + 0x30]       # desired post-return RSP
+    sub  rax, 40                 # five-word same-ring safety frame
+    mov  rsp, rax
     mov  rax, [rsi + 0x38]
+    mov  [rsp + 0x00], rax       # RIP
+    mov  qword ptr [rsp + 0x08], 0x08 # kernel CS
+    mov  rax, [rsi + 0x40]
+    mov  [rsp + 0x10], rax       # RFLAGS
+    mov  rax, [rsi + 0x30]
+    mov  [rsp + 0x18], rax       # guarded outer-return RSP
+    mov  qword ptr [rsp + 0x20], 0x10 # guarded outer-return SS
 
     mov  rcx, cr3
     cmp  rcx, rdx
     je   1f
     mov  cr3, rdx
 1:
-    push qword ptr [rsi + 0x40]   # RFLAGS of the incoming context
-    popfq                         # restores IF (and the rest) deterministically
-    push rax
-    ret
+    iretq
 "#
 );
 
@@ -195,7 +225,12 @@ user_iret:
 );
 
 unsafe extern "C" {
-    pub(crate) fn switch_to(old: *mut TaskContext, new: *const TaskContext, new_cr3: u64);
+    pub(crate) fn switch_to(
+        old: *mut TaskContext,
+        new: *const TaskContext,
+        new_cr3: u64,
+        old_rflags: u64,
+    );
     pub(crate) static user_iret: u8;
 }
 
@@ -249,5 +284,21 @@ pub(crate) unsafe fn switch_to_checked(
         crate::drivers::serial::SerialPort::puts("\n");
         crate::kerneldump::dump_fatal("low TaskContext rip");
     }
-    unsafe { switch_to(old, new, new_cr3) };
+    // Close the handoff window. The scheduler intentionally lowers its
+    // preemption count before switching so the incoming task starts at zero,
+    // but that means an IRQ must not arrive between that point and the first
+    // instruction of `switch_to`. Capture the original IF bit and execute
+    // CLI in one asm block; if an IRQ lands between PUSHFQ and CLI, execution
+    // simply resumes at CLI and the switch has not started yet.
+    let old_rflags: u64;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",
+            "pop {flags}",
+            "cli",
+            flags = out(reg) old_rflags,
+            options(nomem),
+        );
+    }
+    unsafe { switch_to(old, new, new_cr3, old_rflags) };
 }

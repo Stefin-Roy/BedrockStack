@@ -138,6 +138,63 @@ pub fn is_nokaslr() -> bool {
     contains_word("nokaslr")
 }
 
+/// `nosmp` disables Application Processor bring-up and keeps the kernel on
+/// the BSP. This is a bring-up escape hatch for isolating scheduler and AP
+/// startup failures.
+pub fn is_nosmp() -> bool {
+    contains_word("nosmp") || contains_word("no_smp")
+}
+
+/// Optional upper bound on the number of CPUs brought online. `maxcpus=N`
+/// and `max_cpus=N` include the BSP, so `maxcpus=1` is equivalent to
+/// `nosmp`. Invalid, zero, and overflowing values are ignored.
+pub fn max_cpus() -> Option<usize> {
+    let bytes = as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        while i < bytes.len()
+            && (bytes[i] == b' ' || bytes[i] == b'\t' || bytes[i] == b'\n' || bytes[i] == b'\r')
+        {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len()
+            && bytes[i] != b' '
+            && bytes[i] != b'\t'
+            && bytes[i] != b'\n'
+            && bytes[i] != b'\r'
+        {
+            i += 1;
+        }
+        let token = &bytes[start..i];
+        let prefixes: [&[u8]; 4] = [b"maxcpus=", b"-maxcpus=", b"max_cpus=", b"-max_cpus="];
+        for prefix in prefixes {
+            if token.len() <= prefix.len() || !token.starts_with(prefix) {
+                continue;
+            }
+            let mut value = 0usize;
+            let mut valid = true;
+            for &digit in &token[prefix.len()..] {
+                if !digit.is_ascii_digit() {
+                    valid = false;
+                    break;
+                }
+                value = match value.checked_mul(10).and_then(|v| v.checked_add((digit - b'0') as usize)) {
+                    Some(v) => v,
+                    None => {
+                        valid = false;
+                        break;
+                    }
+                };
+            }
+            if valid && value != 0 {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
 /// `noiommu` disables the VT-d IOMMU (also `-noiommu`). Without this flag
 /// the IOMMU is always on when DMAR is present (opt-out, not opt-in).
 pub fn is_noiommu() -> bool {

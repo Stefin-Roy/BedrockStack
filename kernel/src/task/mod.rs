@@ -1,8 +1,8 @@
 //! Preemptive task scheduler (BSP-only, full kernel preemption).
 //!
 //! A single global FIFO run queue of kernel tasks is switched by `switch_to`.
-//! The scheduler runs on the BSP only (APs idle in `ap_entry64`), so no
-//! per-CPU queues or cross-CPU locking are needed yet. Preemption is tick-
+//! The scheduler still runs on the BSP only (APs idle in `ap_entry64`), so no
+//! per-CPU queues or cross-CPU task dispatch are enabled yet. Preemption is tick-
 //! driven via the slice timer (UniversalTimer one-shot) and device IRQs; both
 //! user and kernel contexts are preemptible when `preempt_count==0` (IrqMutex
 //! and PreemptMutex disable preemption across critical sections). Tasks are
@@ -61,6 +61,12 @@ pub const SLICE_BATCH_NS: u64 = 12_000_000;
 /// WRR budget: Interactive is dispatched this many times per Batch round.
 const WEIGHT_INTERACTIVE: u32 = 3;
 
+/// Sentinel values used by the scheduler ownership protocol. A task is
+/// either owned by one logical CPU while running, on the global ready queue,
+/// or parked outside a run queue.
+pub const TASK_NO_CPU: u32 = u32::MAX;
+pub const TASK_GLOBAL_QUEUE: u32 = u32::MAX - 1;
+
 impl Priority {
     #[inline]
     pub fn slice_ns(self) -> u64 {
@@ -77,6 +83,16 @@ pub struct Task {
     pub state: TaskState,
     /// Scheduling class (WRR weight + slice length). Never mutated after spawn.
     pub prio: Priority,
+    /// Logical CPU currently executing this task, or `TASK_NO_CPU` while the
+    /// task is queued or parked. Atomic so future remote wake/kill paths can
+    /// observe ownership without borrowing a task mutably.
+    pub owner_cpu: AtomicU32,
+    /// Logical CPU queue containing this task, `TASK_GLOBAL_QUEUE` for the
+    /// current bootstrap global queue, or `TASK_NO_CPU` when parked/running.
+    pub queue_cpu: AtomicU32,
+    /// Monotonic handoff counter used to diagnose duplicate enqueue/ownership
+    /// transitions during the SMP scheduler conversion.
+    pub ownership_generation: AtomicU64,
     pub kernel_stack_top: u64,
     /// Index into the fixed task-stack window (see `alloc_kernel_stack`),
     /// `usize::MAX` when the task has no kernel stack of its own (the idle
@@ -127,6 +143,9 @@ impl Task {
             id: 0,
             state: TaskState::Ready,
             prio: Priority::Interactive,
+            owner_cpu: AtomicU32::new(TASK_NO_CPU),
+            queue_cpu: AtomicU32::new(TASK_NO_CPU),
+            ownership_generation: AtomicU64::new(0),
             kernel_stack_top,
             kstack_slot: usize::MAX,
             vm: 0,
@@ -142,6 +161,69 @@ impl Task {
             caps_slot_va: crate::mm::layout::CAP_SLOT_VA,
             pkru: 0,
         }
+    }
+
+    /// Claim the task for one CPU. The CAS is the future migration barrier;
+    /// the current BSP scheduler also checks it so later SMP work cannot
+    /// silently preserve the old single-owner assumption.
+    pub fn try_claim_owner(&self, cpu_id: u32) -> bool {
+        self.owner_cpu
+            .compare_exchange(
+                TASK_NO_CPU,
+                cpu_id,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    pub fn release_owner(&self, cpu_id: u32) {
+        assert_eq!(
+            self.owner_cpu.load(Ordering::Acquire),
+            cpu_id,
+            "task owner release by wrong CPU"
+        );
+        self.owner_cpu.store(TASK_NO_CPU, Ordering::Release);
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Release ownership when a task may already have been parked and woken
+    /// during the current scheduler pass. The no-owner result is expected in
+    /// that race; a different live owner remains a hard protocol violation.
+    pub fn release_owner_if_owned(&self, cpu_id: u32) {
+        match self.owner_cpu.compare_exchange(
+            cpu_id,
+            TASK_NO_CPU,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.ownership_generation.fetch_add(1, Ordering::AcqRel);
+            }
+            Err(TASK_NO_CPU) => {}
+            Err(owner) => panic!(
+                "task owner release by wrong CPU: owner={} releaser={}",
+                owner,
+                cpu_id
+            ),
+        }
+    }
+
+    pub fn mark_queued(&self, cpu_id: u32) {
+        assert_eq!(
+            self.owner_cpu.load(Ordering::Acquire),
+            TASK_NO_CPU,
+            "queued task still has an owner"
+        );
+        let old = self.queue_cpu.swap(cpu_id, Ordering::AcqRel);
+        assert_eq!(old, TASK_NO_CPU, "task enqueued twice");
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub fn clear_queued(&self, cpu_id: u32) {
+        let old = self.queue_cpu.swap(TASK_NO_CPU, Ordering::AcqRel);
+        assert_eq!(old, cpu_id, "task removed from wrong queue");
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -551,7 +633,7 @@ static SLEEPING: IrqMutex<Vec<(u64, &'static mut Task)>> =
 /// Anchor context: the idle (run()/scheduler) register state. Captured by the
 /// first `switch_to` away from it; restored when no ready task remains.
 /// Uses `UnsafeCell` instead of `static mut` to avoid `static_mut_refs` UB
-/// (MONIKA invasive fix S5). Only the BSP scheduler touches this, but the
+/// (  fix S5). Only the BSP scheduler touches this, but the
 /// compiler must not assume `&mut` aliasing across `switch_to` asm.
 struct IdleCell(core::cell::UnsafeCell<Task>);
 unsafe impl Sync for IdleCell {}
@@ -628,6 +710,7 @@ pub fn spawn(mut task: Task) -> u64 {
     lineage_insert(task.id, task.parent_pid);
     let leaked: &'static mut Task = Box::leak(Box::new(task));
     let id = leaked.id;
+    leaked.mark_queued(TASK_GLOBAL_QUEUE);
     crate::unispace::provider::proc::attach(id);
     QUEUE.lock().push_back(leaked);
     preempt_kick();
@@ -686,7 +769,7 @@ fn cancel_slice_timer() {
     }
 }
 
-// ── Sleeper wake timer (monika invasive: fixes lone-Running starvation) ──
+// ── Sleeper wake timer ( : fixes lone-Running starvation) ──
 //
 // Sleepers are parked in `SLEEPING` with no per-task `UniversalTimer` entry;
 // wakeup relies on `schedule()` draining expired entries. When a lone
@@ -922,6 +1005,10 @@ pub fn sleep_until(deadline_ns: u64) {
         Some(t) => {
             let raw = &mut **t as *mut Task;
             t.state = TaskState::ZzZ;
+            // A parked task is no longer executing on this CPU. Release the
+            // ownership before publishing it to SLEEPING so an early timer
+            // expiry can safely move it to QUEUE before schedule() runs.
+            t.release_owner(crate::smp::current_cpu_id());
             drop(cur);
             // Binary-insert so the list stays deadline-sorted (front = earliest).
             {
@@ -976,6 +1063,7 @@ pub fn wake_sleepers() {
     let mut q = QUEUE.lock();
     for t in due {
         t.state = TaskState::Ready;
+        t.mark_queued(TASK_GLOBAL_QUEUE);
         q.push_back(t);
     }
 }
@@ -1140,7 +1228,10 @@ fn take_from_lists(pid: u64) -> Option<&'static mut Task> {
     {
         let mut q = QUEUE.lock();
         if let Some(i) = q.iter().position(|t| t.id == pid) {
-            return q.remove(i);
+            if let Some(task) = q.remove(i) {
+                task.clear_queued(TASK_GLOBAL_QUEUE);
+                return Some(task);
+            }
         }
     }
     {
@@ -1237,6 +1328,8 @@ pub enum WaitError {
 /// which consumes it on the next run.
 fn park_zombie(task: &'static mut Task) {
     let pid = task.id;
+    debug_assert_eq!(task.owner_cpu.load(Ordering::Acquire), TASK_NO_CPU);
+    debug_assert_eq!(task.queue_cpu.load(Ordering::Acquire), TASK_NO_CPU);
     ZOMBIES.lock().push(task);
     wake_waiters_for(pid);
 }
@@ -1264,6 +1357,7 @@ fn wake_waiters_for(pid: u64) {
     let mut q = QUEUE.lock();
     for t in due {
         t.state = TaskState::Ready;
+        t.mark_queued(TASK_GLOBAL_QUEUE);
         q.push_back(t);
     }
 }
@@ -1352,6 +1446,11 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
             match cur.as_mut() {
                 Some(t) => {
                     t.state = TaskState::ZzZ;
+                    // Publish the parked state with no CPU owner. The target
+                    // may exit immediately after WAITERS is populated, so a
+                    // wakeup must be allowed to queue this task before the
+                    // scheduler gets control again.
+                    t.release_owner(crate::smp::current_cpu_id());
                     &mut **t as *mut Task
                 }
                 None => return Err(WaitError::NotFound),
@@ -1363,7 +1462,7 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
         // forever. Re-check ZOMBIES after push; if zombie now present, unpark
         // ourselves synchronously and loop to consume.
         WAITERS.lock().push((unsafe { &mut *raw }, pid));
-        // MONIKA INVASIVE FIX: close lost-wakeup window. Re-check after push.
+        //   FIX: close lost-wakeup window. Re-check after push.
         if zombie_present(pid) {
             let mut w = WAITERS.lock();
             if let Some(pos) = w.iter().position(|(t, _)| t.id == unsafe { (*raw).id }) {
@@ -1372,6 +1471,10 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
                 // and retry consume without parking.
                 let (t, _) = w.remove(pos);
                 t.state = TaskState::Running;
+                assert!(
+                    t.try_claim_owner(crate::smp::current_cpu_id()),
+                    "wait recovery: task already owned"
+                );
                 drop(w);
                 continue;
             } else {
@@ -1382,10 +1485,16 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
                 drop(w);
                 let mut q = QUEUE.lock();
                 if let Some(pos) = q.iter().position(|t| t.id == unsafe { (*raw).id }) {
-                    q.remove(pos);
+                    if let Some(task) = q.remove(pos) {
+                        task.clear_queued(TASK_GLOBAL_QUEUE);
+                    }
                 }
                 drop(q);
                 unsafe { (*raw).state = TaskState::Running; }
+                assert!(
+                    unsafe { (*raw).try_claim_owner(crate::smp::current_cpu_id()) },
+                    "wait recovery: task already owned after wake"
+                );
                 continue;
             }
         }
@@ -1436,6 +1545,16 @@ pub fn caps_snapshot(pid: u64) -> Option<Vec<crate::caps::Cap>> {
 /// the idle reaper and a consuming `:wait` both qualify (the scheduler is
 /// BSP-only, so the dead root is never the active CR3).
 fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
+    assert_eq!(
+        task.owner_cpu.load(Ordering::Acquire),
+        TASK_NO_CPU,
+        "reap_one: task still owned by a CPU"
+    );
+    assert_eq!(
+        task.queue_cpu.load(Ordering::Acquire),
+        TASK_NO_CPU,
+        "reap_one: task still queued"
+    );
     let root = task.root;
     // Free caps window before destroying root so its leaves are still present for unmap
     if task.caps_phys != 0 {
@@ -1611,6 +1730,7 @@ pub fn schedule() {
     #[cfg(target_arch = "x86_64")]
     crate::watchdog::pet();
     crate::smp::preempt_disable();
+    let cpu_id = crate::smp::current_cpu_id();
     // Deadline-only: `need_resched` may be set by deadline expiry helpers
     // (never a periodic LAPIC tick). Consume here.
     let _ = crate::smp::take_need_resched();
@@ -1622,7 +1742,7 @@ pub fn schedule() {
     wake_sleepers();
     // Keep the sleeper wake timer in sync: if a future sleeper remains,
     // arm a one-shot so a lone Running task gets preempted on time
-    // (MONIKA fix for lone-Running starvation when slice timer canceled).
+    // ( fix for lone-Running starvation when slice timer canceled).
     sync_sleep_timer();
 
     let prev = CURRENT.lock().take();
@@ -1666,8 +1786,18 @@ pub fn schedule() {
 
     let (next_ptr, next_root) = match next {
         Some(t) => {
+            debug_assert_eq!(
+                t.queue_cpu.load(Ordering::Acquire),
+                TASK_GLOBAL_QUEUE,
+                "scheduler selected task not marked on global queue"
+            );
+            t.clear_queued(TASK_GLOBAL_QUEUE);
+            assert!(
+                t.try_claim_owner(cpu_id),
+                "scheduler selected task already owned by another CPU"
+            );
             t.state = TaskState::Running;
-            // Invasive validation: next context must not alias its root (the
+            //  validation: next context must not alias its root (the
             // observed RIP==CR3 fault). Also ensure high-half RIP.
             debug_assert!(t.root != 0 && t.root & 0xFFF == 0);
             debug_assert!(t.ctx.rip != t.root, "next rip == root");
@@ -1709,6 +1839,7 @@ pub fn schedule() {
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     debug_assert!(root != 0, "KERNEL_ROOT zero on Dead->idle");
+                    p.release_owner(cpu_id);
                     drop(q);
                     park_zombie(p);
                     // Idle must run on KERNEL_ROOT — unified fixup (was WARN-only, never `mov cr3`).
@@ -1783,6 +1914,7 @@ pub fn schedule() {
     match prev {
         Some(p) if p.state == TaskState::Dead => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
+            p.release_owner(cpu_id);
             drop(q);
             park_zombie(p);
             crate::mm::vmm::set_current_root(next_root);
@@ -1804,7 +1936,22 @@ pub fn schedule() {
         Some(p) => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             p.state = TaskState::Ready;
-            q.push_back(p);
+            p.release_owner_if_owned(cpu_id);
+            // A wakeup can publish this same task to QUEUE before this
+            // scheduler pass consumes CURRENT. In that case it is already
+            // queued and must not be appended a second time.
+            match p.queue_cpu.load(Ordering::Acquire) {
+                TASK_NO_CPU => {
+                    p.mark_queued(TASK_GLOBAL_QUEUE);
+                    q.push_back(p);
+                }
+                TASK_GLOBAL_QUEUE => {}
+                queue => panic!(
+                    "task requeue on unexpected queue: queue={} cpu={}",
+                    queue,
+                    cpu_id
+                ),
+            }
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
             crate::smp::preempt_enable();
@@ -1983,6 +2130,10 @@ pub fn enter_userspace(
     // (IRQ remains enabled so the timer tick still fires, but the preempt
     // gate blocks the scheduler).
     crate::smp::preempt_disable();
+    assert!(
+        t.try_claim_owner(crate::smp::current_cpu_id()),
+        "enter_userspace: task already has an owner"
+    );
     set_kernel_stack_meta(kernel_stack_top);
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
@@ -2126,19 +2277,20 @@ pub fn smoke_test(alloc: &mut BitmapAllocator) {
     // (uniform with every other task, and reaped with it once parked).
     let (top_a, slot_a) = alloc_kernel_stack(alloc).expect("smoke: kernel stack slots exhausted");
     let (top_b, slot_b) = alloc_kernel_stack(alloc).expect("smoke: kernel stack slots exhausted");
-    // Entry RSP must be 8 mod 16 (SysV callee entry) — top minus 8.
+    // Leave room below the entry stack for switch_to's atomic iretq frame.
+    // The resulting entry RSP remains 8 mod 16 (SysV alignment).
     let mut ta = Task::new(
         top_a,
         root,
         0,
-        TaskContext::new(top_a - 8, smoke_task_a as *const () as usize as u64),
+        TaskContext::new(top_a - 40, smoke_task_a as *const () as usize as u64),
     );
     ta.kstack_slot = slot_a;
     let mut tb = Task::new(
         top_b,
         root,
         0,
-        TaskContext::new(top_b - 8, smoke_task_b as *const () as usize as u64),
+        TaskContext::new(top_b - 40, smoke_task_b as *const () as usize as u64),
     );
     tb.kstack_slot = slot_b;
     spawn(ta);

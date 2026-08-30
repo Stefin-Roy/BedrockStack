@@ -1043,7 +1043,7 @@ extern "x86-interrupt" fn page_fault_handler(
     if u {
         swapgs();
     }
-    // MONIKA INVASIVE: log supervisor I-fetch at low VA (RIP==CR3) before dump
+    //  : log supervisor I-fetch at low VA (RIP==CR3) before dump
     if !u {
         let rip = frame.instruction_pointer.as_u64();
         let cr3: u64;

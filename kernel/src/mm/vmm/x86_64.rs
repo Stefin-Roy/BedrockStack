@@ -1140,7 +1140,7 @@ pub fn clone_high_half(alloc: &mut BitmapAllocator, parent_root: u64) -> u64 {
     // iterating the registry.
     let _guard = super::lock();
     let new_root = alloc.alloc().expect("x86_64 VMM: OOM for cloned root");
-    // MONIKA INVASIVE: new_root must not alias any live Task's rip/rsp/entry
+    //  : new_root must not alias any live Task's rip/rsp/entry
     // (observed RIP==CR3). Poison check: the fresh PML4 page is zeroed below,
     // and we assert the allocator never returns a frame that is currently used
     // as a task stack or caps page (all those live in KSTACK window or heap,
