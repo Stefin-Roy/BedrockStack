@@ -4,6 +4,7 @@
 #[cfg(target_arch = "riscv64")]
 use core::arch::global_asm;
 use core::panic::PanicInfo;
+#[allow(unused_imports)]
 use kernel::arch::CurrentArch;
 #[cfg(any(target_arch = "riscv64", not(feature = "kernelmb2")))]
 use kernel::boot::FramebufferInfo;
@@ -222,50 +223,80 @@ pub extern "C" fn rust_entry(hart_id: u64, dtb_ptr: *const u8) -> ! {
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    SerialPort::puts("\n*** KERNEL PANIC: ");
-    if let Some(loc) = info.location() {
-        SerialPort::puts(loc.file());
-        SerialPort::puts(":");
-        SerialPort::put_u64(loc.line() as u64);
-        SerialPort::puts(" ");
-    }
-    use core::fmt::Write;
-    let _ = write!(SerialPort::new(), "{}", info.message());
-    SerialPort::puts("\n");
-    // Stage + last 4 lines of serial log that preceded the panic,
-    // so the crash is self-describing without needing the full dump.
-    // Mirrors to the on-screen panic buffer if it was already claimed.
-    SerialPort::puts("--- Kernel Stage ---\n");
-    SerialPort::puts("Stage: ");
-    SerialPort::puts(kernel::stage::as_str());
-    SerialPort::puts(" (");
-    SerialPort::puts(kernel::stage::bootanim_str());
-    SerialPort::puts(")\n");
-    SerialPort::puts("--- Last Log (4 lines) ---\n");
+    // SMP-aware panic: freeze peers via NMI, dump all CPU stacks/MSRs, then halt.
+    // Use lock-free dump path so we never deadlock on SerialPort spinlocks when
+    // panic fires with IF=0 or inside an IrqMutex.
+    #[cfg(target_arch = "x86_64")]
     {
-        struct PanicWriter;
-        impl Write for PanicWriter {
-            fn write_str(&mut self, s: &str) -> core::fmt::Result {
-                SerialPort::puts(s);
-                #[cfg(target_arch = "x86_64")]
-                if kernel::kerneldump::screen::is_ready() {
-                    kernel::kerneldump::screen::panic_puts(s);
+        // Check for panic-while-panic (nested panic during dump) — just halt to avoid triple fault.
+        let _cpu = kernel::smp::current_cpu_id() as usize;
+        if kernel::kerneldump::dump::is_dump_in_progress() {
+            kernel::drivers::serial::SerialPort::puts("\n*** NESTED PANIC while dumping — halting\n");
+            loop { unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) }; }
+        }
+        // Build panic message into a small stack buffer for dump_fatal context.
+        // dump_fatal will synthesize a frame and invoke the full SMP dump (freeze + all CPUs).
+        // We still emit the panic location first via lock-free path. Avoid heap alloc here —
+        // panic may have corrupted the heap, so use only stack + dump_puts.
+        {
+            use kernel::drivers::serial::{dump_puts, dump_put_hex};
+            dump_puts("\n*** KERNEL PANIC: ");
+            if let Some(loc) = info.location() {
+                dump_puts(loc.file());
+                dump_puts(":");
+                dump_put_hex(loc.line() as u64);
+                dump_puts(" ");
+            }
+            dump_puts(" (see SMP dump below)\n");
+            // Also try to emit panic message via lock-free writer (best effort, no alloc)
+            // Use a tiny stack buffer and fmt::write to dump_puts.
+            struct DumpSink;
+            impl core::fmt::Write for DumpSink {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result { dump_puts(s); Ok(()) }
+            }
+            let _ = core::fmt::write(&mut DumpSink, format_args!("{}", info.message()));
+            dump_puts("\n");
+        }
+        // Try SMP freeze dump — this never returns (halts). It will print stage, last log, registers, stacks, MSRs for all CPUs.
+        // Use static context to avoid alloc; dump_fatal requires 'static str.
+        kernel::kerneldump::dump::dump_fatal("panic");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        SerialPort::puts("\n*** KERNEL PANIC: ");
+        if let Some(loc) = info.location() {
+            SerialPort::puts(loc.file());
+            SerialPort::puts(":");
+            SerialPort::put_u64(loc.line() as u64);
+            SerialPort::puts(" ");
+        }
+        use core::fmt::Write;
+        let _ = write!(SerialPort::new(), "{}", info.message());
+        SerialPort::puts("\n");
+        SerialPort::puts("--- Kernel Stage ---\n");
+        SerialPort::puts("Stage: ");
+        SerialPort::puts(kernel::stage::as_str());
+        SerialPort::puts(" (");
+        SerialPort::puts(kernel::stage::bootanim_str());
+        SerialPort::puts(")\n");
+        SerialPort::puts("--- Last Log (4 lines) ---\n");
+        {
+            struct PanicWriter;
+            impl Write for PanicWriter {
+                fn write_str(&mut self, s: &str) -> core::fmt::Result {
+                    SerialPort::puts(s);
+                    Ok(())
                 }
-                Ok(())
+            }
+            let mut w = PanicWriter;
+            if !kernel::drivers::serial::try_dump_last_lines(&mut w, 4) {
+                let _ = write!(w, "(log unavailable: contended)\n");
             }
         }
-        let mut w = PanicWriter;
-        if !kernel::drivers::serial::try_dump_last_lines(&mut w, 4) {
-            let _ = write!(w, "(log unavailable: contended)\n");
+        CurrentArch::disable_interrupts();
+        loop {
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            CurrentArch::halt();
         }
-    }
-    // Disable interrupts and spin forever with wfi to prevent reboot.
-    CurrentArch::disable_interrupts();
-    loop {
-        // wfi may be a NOP when interrupts are disabled on some implementations;
-        // busy-wait with a fence to prevent the compiler from optimising the
-        // loop away entirely.
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-        CurrentArch::halt();
     }
 }

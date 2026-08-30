@@ -1085,14 +1085,16 @@ extern "x86-interrupt" fn page_fault_handler(
     }
     // ── PF recovery during a kernel dump ───────────────────────────
     if dump::is_dump_in_progress() {
-        let target = dump::PF_RECOVERY_RIP.load(Ordering::Relaxed);
+        let cpu = crate::smp::current_cpu_id() as usize;
+        let idx = if cpu < crate::smp::MAX_CPUS { cpu } else { 0 };
+        let target = dump::PF_RECOVERY_RIP[idx].load(Ordering::Relaxed);
         if target != 0 {
             let cr2: u64;
             unsafe {
                 core::arch::asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack));
             }
-            dump::PF_FAULT_ADDR.store(cr2, Ordering::Relaxed);
-            dump::PF_ERROR_CODE.store(error_code.bits(), Ordering::Relaxed);
+            dump::PF_FAULT_ADDR[idx].store(cr2, Ordering::Relaxed);
+            dump::PF_ERROR_CODE[idx].store(error_code.bits(), Ordering::Relaxed);
             unsafe {
                 frame
                     .as_mut()

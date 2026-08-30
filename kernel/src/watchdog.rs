@@ -96,7 +96,8 @@ mod imp {
     ];
     static NMI_ARMED: AtomicBool = AtomicBool::new(false);
     static LAST_DUMP_NS: AtomicU64 = AtomicU64::new(0);
-    static HOTKEY_PENDING: AtomicBool = AtomicBool::new(false);
+    static HOTKEY_SEQ: AtomicU64 = AtomicU64::new(0);
+    static HOTKEY_HANDLED: AtomicU64 = AtomicU64::new(0);
     static HOTKEY_LAST_NS: AtomicU64 = AtomicU64::new(0);
     static FALLBACK_MODE: AtomicBool = AtomicBool::new(false);
     // 0=none 1=pmu 2=pit 3=soft
@@ -136,7 +137,7 @@ mod imp {
             return;
         }
         HOTKEY_LAST_NS.store(now, Ordering::Relaxed);
-        HOTKEY_PENDING.store(true, Ordering::Release);
+        HOTKEY_SEQ.fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn is_armed() -> bool {
@@ -253,9 +254,12 @@ mod imp {
                 // Use dump_fatal synthetic — shows soft handler RIP, not ideal but better than hung silent
                 crate::kerneldump::dump::dump_fatal("watchdog soft timeout (no PMU/NMI — hung RIP not captured)");
             }
-            if HOTKEY_PENDING.swap(false, Ordering::AcqRel)
-                || crate::drivers::ps2::poll_for_hotkey_nmi()
-            {
+            let seq = HOTKEY_SEQ.load(Ordering::Acquire);
+            let handled = HOTKEY_HANDLED.load(Ordering::Acquire);
+            if seq != handled || crate::drivers::ps2::poll_for_hotkey_nmi() {
+                if seq != handled {
+                    HOTKEY_HANDLED.store(seq, Ordering::Release);
+                }
                 crate::drivers::serial::SerialPort::puts("[wdog] soft hotkey — dumping\n");
                 crate::kerneldump::dump::dump_fatal("F9 hotkey (soft, no NMI frame)");
             }
@@ -326,6 +330,14 @@ mod imp {
         let cpu = crate::smp::current_cpu_id() as usize;
         let cpu_idx = if cpu < 16 { cpu } else { 0 };
 
+        // If global dump already active and we are not owner, snapshot + halt (follower freeze).
+        // This captures AP stacks before owner dumps verbose. NMI bypasses IF, so even
+        // spin-locked APs freeze correctly.
+        if crate::kerneldump::dump::is_global_dump_active() && !crate::kerneldump::dump::is_dump_owner(cpu) {
+            // Don't use NMI_IN_PROGRESS guard for followers — just snapshot directly.
+            crate::kerneldump::dump::frozen_follower_halt(&frame);
+        }
+
         // Re-entrancy guard — NMIs are not masked inside NMI until iret
         if NMI_IN_PROGRESS[cpu_idx].swap(true, Ordering::SeqCst) {
             // Nested NMI while dumping — spin, no EOI for NMI
@@ -359,37 +371,40 @@ mod imp {
         crate::drivers::ps2::poll_for_hotkey_nmi();
 
         // ── Hotkey path (F9) — dump interrupted frame, not handler frame ──
-        if HOTKEY_PENDING.swap(false, Ordering::AcqRel) {
-            // Broadcast NMI to APs so they dump their own hung frames
-            // Don't send if we are in fallback soft mode (no NMI delivery to self anyway)
-            if NMI_ARMED.load(Ordering::Relaxed) {
-                apic::send_nmi_all_except_self();
-                // tiny delay to let AP NMIs arrive before we hog serial
-                for _ in 0..1000 {
-                    core::hint::spin_loop();
+        // Use sequence counter to avoid swap-before-broadcast race.
+        let seq = HOTKEY_SEQ.load(Ordering::Acquire);
+        let handled = HOTKEY_HANDLED.load(Ordering::Acquire);
+        let hotkey_pending = seq != handled;
+        if hotkey_pending {
+            // Claim this hotkey seq so peers don't also trigger initiator path.
+            if HOTKEY_HANDLED.compare_exchange(handled, seq, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                LAST_DUMP_NS.store(now_ns(), Ordering::Relaxed);
+                // Mark last RIP so next watchdog check doesn't also fire
+                LAST_RIP[cpu_idx].store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
+                // Let dump_nmi handle global freeze broadcast
+                crate::kerneldump::dump::dump_nmi_full_fault(&frame, 2, "PS/2 F9 hotkey");
+                // F9 never halts — always continue (interactive debug), regardless of watchdog_cont
+                NMI_IN_PROGRESS[cpu_idx].store(false, Ordering::SeqCst);
+                if from_user {
+                    unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };
                 }
+                return;
             }
-            LAST_DUMP_NS.store(now_ns(), Ordering::Relaxed);
-            // Mark last RIP so next watchdog check doesn't also fire
-            LAST_RIP[cpu_idx].store(frame.instruction_pointer.as_u64(), Ordering::Relaxed);
-            crate::kerneldump::dump::dump_nmi_full_fault(&frame, 2, "PS/2 F9 hotkey");
-            // F9 never halts — always continue (interactive debug), regardless of watchdog_cont
-            NMI_IN_PROGRESS[cpu_idx].store(false, Ordering::SeqCst);
-            if from_user {
-                unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };
-            }
-            return;
+            // Lost race to another CPU's hotkey — become follower? The other CPU
+            // will have claimed global dump, so we would have been caught by the
+            // early follower check on next NMI. For this NMI just return.
         }
 
         // ── Watchdog path ──────────────────────────────────────────────
         let now = now_ns();
         let hb = HEARTBEAT[cpu_idx].load(Ordering::Relaxed);
 
-        // Hang = heartbeat stale. Don't suppress when idle — `hlt` with IF=1
-        // still pets via timer (hb fresh), so no false dump. Early `cli;hlt`
-        // after #MC/#PF or before `sched_active` has stale hb and should dump.
-        // `is_idle` kept only for logging, not gating.
-        let _is_idle = {
+        // Hang = heartbeat stale. AP idle halt loop pets explicitly but long halt
+        // could still be >3s without timer ticks, so gate watchdog on is_idle:
+        // idle APs (no current_task) are not considered hung, only BSP/active CPUs.
+        // This prevents spurious self-dump from AP PMU while still allowing BSP
+        // freeze to capture idle AP stacks via NMI broadcast.
+        let is_idle = {
             let per = crate::smp::try_current_per_cpu();
             if let Some(p) = per {
                 let has_task = !p.current_task.load(Ordering::Relaxed).is_null();
@@ -398,8 +413,12 @@ mod imp {
                 false
             }
         };
+        // Pet once more for idle to keep heartbeat fresh-ish (helps debounce)
+        if is_idle {
+            HEARTBEAT[cpu_idx].store(now, Ordering::Relaxed);
+        }
 
-        if now.wrapping_sub(hb) > WATCHDOG_TIMEOUT_NS {
+        if !is_idle && now.wrapping_sub(hb) > WATCHDOG_TIMEOUT_NS {
             let rip = frame.instruction_pointer.as_u64();
             // Hang = heartbeat stale + not idle. Any RIP (loop or single insn)
             // is hung — don't require same RIP twice (misses loops).
@@ -408,20 +427,13 @@ mod imp {
             let last_dump = LAST_DUMP_NS.load(Ordering::Relaxed);
             if now.wrapping_sub(last_dump) >= DEBOUNCE_NS {
                 LAST_DUMP_NS.store(now, Ordering::Relaxed);
-                // Broadcast to peers for full system view
-                if NMI_ARMED.load(Ordering::Relaxed) {
-                    apic::send_nmi_all_except_self();
-                    for _ in 0..2000 {
-                        core::hint::spin_loop();
-                    }
-                }
+                // Let dump_nmi handle broadcast + freeze; no manual broadcast here
                 // Dump *interrupted* frame (hung RIP), not handler RIP
                 crate::kerneldump::dump::dump_nmi_full_fault(&frame, 2, "watchdog timeout (NMI)");
                 // Default halt, feature watchdog_cont continues
                 #[cfg(not(feature = "watchdog_cont"))]
                 {
                     // halt forever — mirrors dump_full_fault final loop but inside NMI IST
-                    // Re-enable DUMP guard already set by dump_nmi; just halt.
                     NMI_IN_PROGRESS[cpu_idx].store(false, Ordering::SeqCst);
                     if from_user {
                         unsafe { asm!("swapgs", options(nomem, nostack, preserves_flags)) };

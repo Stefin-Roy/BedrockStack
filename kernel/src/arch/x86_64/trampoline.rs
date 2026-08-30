@@ -325,7 +325,11 @@ pub extern "C" fn ap_entry64() -> ! {
     // (`PerCpu.sched_active` stays false from smp::init): APs halt here and
     // never run tasks or reap. `is_sched_active()` on an AP correctly reads
     // false, which is what `reap_dead`/`schedule` assert against.
+    // Pet watchdog so AP idle halt is not mis-detected as hung. The LAPIC
+    // periodic tick is masked on APs (one-shot only), so explicit pet here is
+    // required for NMI watchdog liveness.
     loop {
+        crate::watchdog::pet();
         crate::arch::CurrentArch::halt();
     }
 }
