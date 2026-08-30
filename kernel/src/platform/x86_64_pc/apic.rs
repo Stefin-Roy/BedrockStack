@@ -312,10 +312,14 @@ pub fn send_ipi_all_except_self(vector: u8) {
     }
 }
 
-pub const IPI_RESCHEDULE: u8 = 49;
-pub const IPI_TLB_SHOOTDOWN: u8 = 50;
-pub const IPI_HALT: u8 = 51;
-pub const IPI_TIMER: u8 = 52;
+pub const IPI_RESCHEDULE: u8 = 240;
+pub const IPI_TLB_SHOOTDOWN: u8 = 241;
+pub const IPI_HALT: u8 = 242;
+pub const IPI_TIMER: u8 = 243;
+// Device vectors are 33-239 (207 vectors); system vectors 240-245 as above.
+// IOMMU vectors defined in idt.rs as 244/245 – kept in sync here for APIC MSI.
+pub const IOMMU_FAULT_VECTOR: u8 = 244;
+pub const IOMMU_QI_VECTOR: u8 = 245;
 
 pub fn send_resched(cpu_id: u8) {
     send_ipi(

@@ -1,7 +1,7 @@
 //! AHCI (Advanced Host Controller Interface) SATA driver.
 //!
 //! Polling-mode driver for the Q35 ICH9 AHCI controller with interrupt
-//! support via the pre-registered device interrupt vectors (33-48).
+//! support via the pre-registered device interrupt vectors (33-239).
 //!
 //! Features:
 //!   - NCQ (Native Command Queuing) via FPDMA QUEUED (0x60/0x61)
@@ -182,7 +182,7 @@ unsafe impl Sync for AhciPort {}
 
 // ── Global AHCI interrupt handler ──────────────────────────────
 //
-// Called from the IDT device interrupt dispatch (irq_33..irq_48).
+// Called from the IDT device interrupt dispatch (irq_33..irq_239).
 // Reads PxIS from all active ports, clears the status, and records
 // completion in the per-port `irq_completed` mask.
 

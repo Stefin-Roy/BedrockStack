@@ -9,6 +9,12 @@ impl MsiAllocator for NullMsi {
 
     fn release_device_vector(&self, _vector: u8) {}
 
+    fn allocate_device_vectors(&self, _handler: fn(), _count: usize) -> Option<u8> {
+        None
+    }
+
+    fn release_device_vectors(&self, _base: u8, _count: usize) {}
+
     fn msi_message_address(&self, _target_cpu: u32) -> u64 {
         0
     }

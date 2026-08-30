@@ -983,7 +983,7 @@ fn shootdown_impl(scope: Option<u64>) {
 
 /// Flush this CPU's TLB and acknowledge the latest shootdown generation.
 ///
-/// Called from the TLB-shootdown IPI handler (vector 50 on x86_64, the SBI
+/// Called from the TLB-shootdown IPI handler (vector 241 on x86_64, the SBI
 /// software-IPI branch on riscv64) on every online CPU.
 pub fn tlb_shootdown_on_this_cpu() {
     flush_tlb();

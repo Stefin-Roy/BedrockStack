@@ -114,10 +114,16 @@ pub fn enable_irq(gsi: u32, polarity: Polarity, trigger: TriggerMode) -> Option<
 
     let index = 0x10 + 2 * (gsi - state.gsi_base);
     let vector = state.next_vector;
-    if vector >= 49 || vector < 33 {
+    if vector >= crate::arch::x86_64::idt::DEVICE_VECTOR_END
+        || vector < crate::arch::x86_64::idt::DEVICE_VECTOR_BASE
+    {
         SerialPort::puts("[ioapic] WARN: interrupt vectors exhausted, cannot enable GSI ");
         SerialPort::put_u64(gsi as u64);
-        SerialPort::puts("\n");
+        SerialPort::puts(" (allocated ");
+        SerialPort::put_u64(crate::arch::x86_64::idt::allocated_device_vectors() as u64);
+        SerialPort::puts("/");
+        SerialPort::put_u64(crate::arch::x86_64::idt::NUM_DEVICE_VECTORS as u64);
+        SerialPort::puts(")\n");
         return None;
     }
     state.next_vector += 1;

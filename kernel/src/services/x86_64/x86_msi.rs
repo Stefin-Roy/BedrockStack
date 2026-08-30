@@ -12,6 +12,22 @@ impl MsiAllocator for X86Msi {
         idt::unregister_device_handler(vector);
     }
 
+    fn allocate_device_vectors(&self, handler: fn(), count: usize) -> Option<u8> {
+        idt::register_device_handlers(count, handler)
+    }
+
+    fn release_device_vectors(&self, base: u8, count: usize) {
+        idt::unregister_device_handlers(base, count)
+    }
+
+    fn allocated_vectors(&self) -> usize {
+        idt::allocated_device_vectors()
+    }
+
+    fn total_vectors(&self) -> usize {
+        idt::NUM_DEVICE_VECTORS
+    }
+
     fn msi_message_address(&self, target_cpu: u32) -> u64 {
         0xFEE00000 | ((target_cpu as u64) << 12)
     }

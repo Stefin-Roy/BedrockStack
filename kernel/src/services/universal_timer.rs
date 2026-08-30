@@ -334,7 +334,7 @@ pub fn early_init(clocksource: &'static dyn Clocksource, clockevent: &'static dy
     // the APIC vector 32 handler; on other platforms the analogous path.
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::idt::set_timer_callback(universal_timer_tick);
-    // Wire the reschedule IPI handler (APIC vector 52) on x86_64.  On
+    // Wire the reschedule IPI handler (APIC vector 243) on x86_64.  On
     // riscv64 the SBI software-interrupt branch in trap.rs calls tick()
     // directly.
     #[cfg(target_arch = "x86_64")]
