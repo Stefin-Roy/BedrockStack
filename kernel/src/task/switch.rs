@@ -120,7 +120,8 @@ impl TaskContext {
 //
 // ABI (SysV): rdi = old (*mut TaskContext), rsi = new (*const TaskContext),
 // rdx = new_cr3, rcx = outgoing RFLAGS captured before interrupts were
-// disabled by switch_to_checked.
+// disabled by switch_to_checked, r8 = outgoing owner word (or null), and r9
+// = outgoing ownership generation word (or null).
 //
 // Saves the six callee-saved registers, the post-call RSP, and the return
 // address (currently at the top of the stack) into `old`; restores them from
@@ -136,9 +137,11 @@ impl TaskContext {
 //
 // CR3 reload: the kernel's higher-half alias is mapped in every address
 // space, so the code between the reload and the return stays mapped even
-// when jumping into a user root. The final iretq restores the target RIP and
-// RFLAGS as one architectural operation, so an IRQ cannot land between
-// enabling interrupts and entering the target context. User-bound tasks
+// when jumping into a user root. The outgoing owner is released only after
+// the new stack is installed, so a reaper cannot free the stack still being
+// used by this assembly. The final iretq restores the target RIP and RFLAGS
+// as one architectural operation, so an IRQ cannot land between enabling
+// interrupts and entering the target context. User-bound tasks
 // resume at `user_iret`, which consumes their prebuilt five-word ring-3 frame.
 core::arch::global_asm!(
     r#"
@@ -182,6 +185,21 @@ switch_to:
     je   1f
     mov  cr3, rdx
 1:
+
+    # The task may already be visible in the ready/parked set, but remains
+    # owned until its complete context is saved and this CPU is off its old
+    # stack. Update diagnostics before publishing the owner release; after
+    # the xchg another CPU may reap the task immediately.
+    test r9, r9
+    jz   2f
+    lock inc qword ptr [r9]
+2:
+    test r8, r8
+    jz   3f
+    mov  eax, 0xffffffff
+    xchg dword ptr [r8], eax
+3:
+
     iretq
 "#
 );
@@ -230,6 +248,8 @@ unsafe extern "C" {
         new: *const TaskContext,
         new_cr3: u64,
         old_rflags: u64,
+        outgoing_owner: *mut core::sync::atomic::AtomicU32,
+        outgoing_generation: *mut core::sync::atomic::AtomicU64,
     );
     pub(crate) static user_iret: u8;
 }
@@ -247,6 +267,8 @@ pub(crate) unsafe fn switch_to_checked(
     old: *mut TaskContext,
     new: *const TaskContext,
     new_cr3: u64,
+    outgoing_owner: *mut core::sync::atomic::AtomicU32,
+    outgoing_generation: *mut core::sync::atomic::AtomicU64,
 ) {
     // Validate new context before touching CR3/stack.
     let ctx = unsafe { &*new };
@@ -300,5 +322,14 @@ pub(crate) unsafe fn switch_to_checked(
             options(nomem),
         );
     }
-    unsafe { switch_to(old, new, new_cr3, old_rflags) };
+    unsafe {
+        switch_to(
+            old,
+            new,
+            new_cr3,
+            old_rflags,
+            outgoing_owner,
+            outgoing_generation,
+        )
+    };
 }

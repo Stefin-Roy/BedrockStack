@@ -1014,6 +1014,26 @@ pub unsafe fn init(
     online
 }
 
+/// Request a scheduling pass on `cpu_id`.  The flag is published before the
+/// IPI, so the handler can only observe a pending request.  Sending to an
+/// offline/starting CPU is deliberately ignored; the global ready queue will
+/// be picked up when that CPU becomes online.
+pub fn request_reschedule(cpu_id: u32) {
+    if !is_cpu_online(cpu_id) {
+        return;
+    }
+    per_cpu_by_id(cpu_id)
+        .need_resched
+        .store(true, Ordering::Release);
+    if cpu_id == current_cpu_id() {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    crate::platform::x86_64_pc::apic::send_resched(cpu_id as u8);
+    #[cfg(target_arch = "riscv64")]
+    crate::arch::riscv64::sbi::send_ipi(1u64 << cpu_id);
+}
+
 /// Allocate the 17-page contiguous AP stack for one AP.
 ///
 /// Retries a few times (another CPU's `free()` may land between attempts and

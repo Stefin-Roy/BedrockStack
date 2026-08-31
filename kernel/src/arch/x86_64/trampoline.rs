@@ -323,17 +323,11 @@ pub extern "C" fn ap_entry64() -> ! {
     // is present. Only the first CPU to arm logs.
     crate::arch::x86_64::limiter::arm_repeat();
 
-    // This CPU's scheduler is deliberately NEVER marked active
-    // (`PerCpu.sched_active` stays false from smp::init): APs halt here and
-    // never run tasks or reap. `is_sched_active()` on an AP correctly reads
-    // false, which is what `reap_dead`/`schedule` assert against.
-    // Pet watchdog so AP idle halt is not mis-detected as hung. The LAPIC
-    // periodic tick is masked on APs (one-shot only), so explicit pet here is
-    // required for NMI watchdog liveness.
-    loop {
-        crate::watchdog::pet();
-        crate::arch::CurrentArch::halt();
-    }
+    // The scheduler barrier is published by the BSP after Kernel::run has
+    // initialized the task subsystem. Until then this function waits with
+    // interrupts live; once published it never returns to the AP bootstrap
+    // stack and owns this CPU's idle/scheduler loop.
+    crate::task::ap_scheduler_entry()
 }
 
 fn apic_delay_ms(ms: u64) {

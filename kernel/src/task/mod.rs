@@ -1,8 +1,9 @@
-//! Preemptive task scheduler (BSP-only, full kernel preemption).
+//! Preemptive SMP task scheduler with a global ready queue.
 //!
-//! A single global FIFO run queue of kernel tasks is switched by `switch_to`.
-//! The scheduler still runs on the BSP only (APs idle in `ap_entry64`), so no
-//! per-CPU queues or cross-CPU task dispatch are enabled yet. Preemption is tick-
+//! A single global FIFO run queue of tasks is protected by an SMP-safe IRQ
+//! mutex. Each online CPU has its own current task, idle context, timer state,
+//! and scheduler accounting; the queue is intentionally global for this first
+//! SMP scheduler. Preemption is tick-
 //! driven via the slice timer (UniversalTimer one-shot) and device IRQs; both
 //! user and kernel contexts are preemptible when `preempt_count==0` (IrqMutex
 //! and PreemptMutex disable preemption across critical sections). Tasks are
@@ -81,6 +82,12 @@ impl Priority {
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
+    /// Set by a remote `kill` request. The owning CPU consumes it at the next
+    /// scheduler boundary; the task is never freed by the requester.
+    pub kill_pending: core::sync::atomic::AtomicBool,
+    /// A wakeup that raced with the owner's park handoff. The owner consumes
+    /// this before releasing the task, so another CPU never runs its stack.
+    pub wake_pending: core::sync::atomic::AtomicBool,
     /// Scheduling class (WRR weight + slice length). Never mutated after spawn.
     pub prio: Priority,
     /// Logical CPU currently executing this task, or `TASK_NO_CPU` while the
@@ -142,6 +149,8 @@ impl Task {
         Task {
             id: 0,
             state: TaskState::Ready,
+            kill_pending: core::sync::atomic::AtomicBool::new(false),
+            wake_pending: core::sync::atomic::AtomicBool::new(false),
             prio: Priority::Interactive,
             owner_cpu: AtomicU32::new(TASK_NO_CPU),
             queue_cpu: AtomicU32::new(TASK_NO_CPU),
@@ -220,6 +229,20 @@ impl Task {
         self.ownership_generation.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// Publish a queue membership while the task is still executing on its
+    /// owner CPU. `switch_to` clears that owner only after saving the context;
+    /// dispatch must ignore this entry until then.
+    pub fn mark_queued_from_owner(&self, owner_cpu: u32) {
+        assert_eq!(
+            self.owner_cpu.load(Ordering::Acquire),
+            owner_cpu,
+            "queued handoff from wrong owner"
+        );
+        let old = self.queue_cpu.swap(TASK_GLOBAL_QUEUE, Ordering::AcqRel);
+        assert_eq!(old, TASK_NO_CPU, "task enqueued twice");
+        self.ownership_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     pub fn clear_queued(&self, cpu_id: u32) {
         let old = self.queue_cpu.swap(TASK_NO_CPU, Ordering::AcqRel);
         assert_eq!(old, cpu_id, "task removed from wrong queue");
@@ -293,7 +316,9 @@ pub fn current_pid() -> Option<u64> {
 fn lineage_gc() {
     // Collect live pids (those with a Task still allocated)
     let mut live: Vec<u64> = Vec::new();
-    if let Some(t) = CURRENT.lock().as_ref() { live.push(t.id); }
+    for cpu in 0..crate::smp::MAX_CPUS {
+        if let Some(t) = current_lock_for(cpu as u32).lock().as_ref() { live.push(t.id); }
+    }
     for t in QUEUE.lock().iter() { live.push(t.id); }
     for (_, t) in SLEEPING.lock().iter() { live.push(t.id); }
     for (t, _) in WAITERS.lock().iter() { live.push(t.id); }
@@ -574,7 +599,8 @@ static QUEUE: IrqMutex<VecDeque<&'static mut Task>> =
     IrqMutex::new_keyed(LOCK_CLASS_QUEUE, VecDeque::new());
 
 /// The task currently running on this CPU, or `None` when idle.
-static CURRENT: IrqMutex<Option<&'static mut Task>> = IrqMutex::new_keyed(LOCK_CLASS_CURRENT, None);
+static CURRENT: [IrqMutex<Option<&'static mut Task>>; crate::smp::MAX_CPUS] =
+    [const { IrqMutex::new_keyed(LOCK_CLASS_CURRENT, None) }; crate::smp::MAX_CPUS];
 
 /// Parked dead tasks (zombies) awaiting a parent's `:wait` or the death of
 /// their own parent.
@@ -637,11 +663,17 @@ static SLEEPING: IrqMutex<Vec<(u64, &'static mut Task)>> =
 /// compiler must not assume `&mut` aliasing across `switch_to` asm.
 struct IdleCell(core::cell::UnsafeCell<Task>);
 unsafe impl Sync for IdleCell {}
-static IDLE: IdleCell = IdleCell(core::cell::UnsafeCell::new(Task::new(0, 0, 0, TaskContext::zeroed())));
+static IDLE: [IdleCell; crate::smp::MAX_CPUS] = [const {
+    IdleCell(core::cell::UnsafeCell::new(Task::new(0, 0, 0, TaskContext::zeroed())))
+}; crate::smp::MAX_CPUS];
 
 /// Kernel page-table root. Kernel threads share it; it is also the root to
 /// restore when parking an exiting task into idle.
 static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
+/// Set by the BSP after the scheduler's global state is initialized. APs wait
+/// on this publication before entering their local idle scheduler.
+static SCHEDULER_READY: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 /// PIDs are 64-bit, monotonically increasing, and never reused: `NEXT_ID`
 /// is only ever `fetch_add`ed — reap/GC of dead tasks never resets or recycles
@@ -671,16 +703,79 @@ fn idle_ctx() -> *mut TaskContext {
     // The idle anchor task lives in a static; writing its context is inherent
     // to capturing/restoring the scheduler register state. `UnsafeCell` gives
     // a raw `*mut` without creating a `&mut` reference (S5).
-    unsafe { core::ptr::addr_of_mut!((*IDLE.0.get()).ctx) }
+    idle_ctx_for(crate::smp::current_cpu_id())
+}
+
+fn idle_ctx_for(cpu_id: u32) -> *mut TaskContext {
+    assert!((cpu_id as usize) < crate::smp::MAX_CPUS, "idle CPU out of range");
+    unsafe { core::ptr::addr_of_mut!((*IDLE[cpu_id as usize].0.get()).ctx) }
+}
+
+#[inline]
+fn current_lock() -> &'static IrqMutex<Option<&'static mut Task>> {
+    current_lock_for(crate::smp::current_cpu_id())
+}
+
+#[inline]
+fn current_lock_for(cpu_id: u32) -> &'static IrqMutex<Option<&'static mut Task>> {
+    assert!((cpu_id as usize) < crate::smp::MAX_CPUS, "current CPU out of range");
+    &CURRENT[cpu_id as usize]
 }
 
 /// Record the kernel page-table root. Call once from `Kernel::run` before any
 /// task is spawned.
 pub fn init(root: u64) {
     KERNEL_ROOT.store(root, Ordering::Relaxed);
-    // Single global FIFO: mark BSP active for deadline accounting. No periodic
-    // LAPIC — `sched_ticks` increments voluntarily in `schedule()` (deadline-only).
+    let cpu = crate::smp::current_cpu_id();
+    assert_eq!(cpu, 0, "task::init must run on the BSP");
+    crate::smp::reset_scheduler_runtime(cpu, idle_stack_top());
+    crate::mm::vmm::set_current_root(root);
+    // The global FIFO is shared, but current/idle/timer state is local.
     crate::smp::set_sched_active(0, true);
+    SCHEDULER_READY.store(true, Ordering::Release);
+}
+
+/// Enter the scheduler on an AP after the BSP has published the kernel root
+/// and task subsystem. The AP owns its idle context and TSS stack; it may
+/// consume tasks from the shared ready queue concurrently with the BSP.
+#[cfg(target_arch = "x86_64")]
+pub fn ap_scheduler_entry() -> ! {
+    let cpu = crate::smp::current_cpu_id();
+    while !SCHEDULER_READY.load(Ordering::Acquire) {
+        crate::watchdog::pet();
+        crate::arch::CurrentArch::halt();
+    }
+
+    let root = kernel_root();
+    assert!(root != 0, "AP scheduler entered without kernel root");
+    let boot_stack_top = crate::smp::current_per_cpu().stack_top;
+    let idle_stack = crate::mm::layout::to_physmap(boot_stack_top);
+    crate::smp::reset_scheduler_runtime(cpu, idle_stack);
+    set_kernel_stack_meta(idle_stack);
+    crate::mm::vmm::set_current_root(root);
+    unsafe { core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack)) };
+    crate::smp::set_sched_active(cpu, true);
+
+    SerialPort::puts("[sched] AP scheduler online cpu=");
+    SerialPort::put_u64(cpu as u64);
+    SerialPort::puts("\n");
+
+    loop {
+        wake_sleepers();
+        schedule();
+        if crate::smp::current_per_cpu()
+            .current_task
+            .load(Ordering::Acquire)
+            .is_null()
+        {
+            if let Some(deadline) = earliest_sleep_deadline() {
+                crate::services::universal_timer::wait_until(deadline.saturating_add(1));
+            } else {
+                crate::watchdog::pet();
+                crate::arch::CurrentArch::halt();
+            }
+        }
+    }
 }
 
 /// The kernel page-table root shared by kernel threads and cloned for user
@@ -710,11 +805,18 @@ pub fn spawn(mut task: Task) -> u64 {
     lineage_insert(task.id, task.parent_pid);
     let leaked: &'static mut Task = Box::leak(Box::new(task));
     let id = leaked.id;
-    leaked.mark_queued(TASK_GLOBAL_QUEUE);
     crate::unispace::provider::proc::attach(id);
-    QUEUE.lock().push_back(leaked);
+    enqueue_global(leaked);
     preempt_kick();
     id
+}
+
+/// Publish a task to the shared ready queue. Callers must have removed it from
+/// every parked list first; the queue marker is the duplicate-enqueue guard.
+fn enqueue_global(task: &'static mut Task) {
+    task.state = TaskState::Ready;
+    task.mark_queued(TASK_GLOBAL_QUEUE);
+    QUEUE.lock().push_back(task);
 }
 
 /// Enqueue a task with an explicit scheduling class. Returns the task's id.
@@ -732,7 +834,8 @@ pub fn spawn_with_priority(mut task: Task, prio: Priority) -> u64 {
 // The expiry callback only raises `need_resched`; the actual preemption
 // happens in `try_preempt_from_irq`, called from the timer ISR after EOI.
 
-static SLICE_TIMER_SEQ: AtomicU64 = AtomicU64::new(0);
+static SLICE_TIMER_SEQ: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
 
 fn slice_expired(_ctx: *mut u8) {
     crate::smp::set_need_resched();
@@ -749,7 +852,8 @@ fn this_cpu_timer_id(seq: u64) -> crate::services::universal_timer::TimerId {
 /// Arm (replacing any previous) the slice-expiry timer for the freshly
 /// dispatched task.
 fn arm_slice_timer(slice_ns: u64) {
-    let old = SLICE_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    let cpu = crate::smp::current_cpu_id() as usize;
+    let old = SLICE_TIMER_SEQ[cpu].swap(0, Ordering::AcqRel);
     if old != 0 {
         crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
     }
@@ -757,13 +861,14 @@ fn arm_slice_timer(slice_ns: u64) {
     if let Some(id) =
         crate::services::universal_timer::set_oneshot(deadline, slice_expired, core::ptr::null_mut())
     {
-        SLICE_TIMER_SEQ.store(id.seq, Ordering::Release);
+        SLICE_TIMER_SEQ[cpu].store(id.seq, Ordering::Release);
     }
 }
 
 /// Drop to idle: no task owns a slice anymore.
 fn cancel_slice_timer() {
-    let old = SLICE_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    let cpu = crate::smp::current_cpu_id() as usize;
+    let old = SLICE_TIMER_SEQ[cpu].swap(0, Ordering::AcqRel);
     if old != 0 {
         crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
     }
@@ -776,23 +881,26 @@ fn cancel_slice_timer() {
 // `Running` task keeps the CPU (empty-queue fast-path / no slice timer) a
 // sleeper would never be polled. A dedicated one-shot at the earliest deadline
 // forces a `need_resched` tick so `schedule()->wake_sleepers()` runs on time.
-static SLEEP_TIMER_SEQ: AtomicU64 = AtomicU64::new(0);
+static SLEEP_TIMER_SEQ: [AtomicU64; crate::smp::MAX_CPUS] =
+    [const { AtomicU64::new(0) }; crate::smp::MAX_CPUS];
 fn sleep_timer_expired(_ctx: *mut u8) {
     crate::smp::set_need_resched();
 }
 fn arm_sleep_timer(deadline_ns: u64) {
-    let old = SLEEP_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    let cpu = crate::smp::current_cpu_id() as usize;
+    let old = SLEEP_TIMER_SEQ[cpu].swap(0, Ordering::AcqRel);
     if old != 0 {
         crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
     }
     if let Some(id) =
         crate::services::universal_timer::set_oneshot(deadline_ns, sleep_timer_expired, core::ptr::null_mut())
     {
-        SLEEP_TIMER_SEQ.store(id.seq, Ordering::Release);
+        SLEEP_TIMER_SEQ[cpu].store(id.seq, Ordering::Release);
     }
 }
 fn cancel_sleep_timer() {
-    let old = SLEEP_TIMER_SEQ.swap(0, Ordering::AcqRel);
+    let cpu = crate::smp::current_cpu_id() as usize;
+    let old = SLEEP_TIMER_SEQ[cpu].swap(0, Ordering::AcqRel);
     if old != 0 {
         crate::services::universal_timer::cancel_timer_id(this_cpu_timer_id(old));
     }
@@ -815,17 +923,37 @@ fn sync_sleep_timer() {
 /// needed; otherwise arm a one-shot kick — the LAPIC stays event-driven
 /// (no periodic tick): without competition no timer runs at all (SCHED-011).
 fn preempt_kick() {
-    if !crate::smp::is_sched_active() {
+    if !SCHEDULER_READY.load(Ordering::Acquire) {
         return;
     }
-    crate::smp::set_need_resched();
+    let me = crate::smp::current_cpu_id();
+    let target = if crate::smp::current_per_cpu()
+        .current_task
+        .load(Ordering::Acquire)
+        .is_null()
+    {
+        me
+    } else {
+        (0..crate::smp::MAX_CPUS as u32)
+            .find(|&cpu| {
+                cpu != me
+                    && crate::smp::is_cpu_online(cpu)
+                    && crate::smp::per_cpu_by_id(cpu)
+                        .current_task
+                        .load(Ordering::Acquire)
+                        .is_null()
+            })
+            .unwrap_or(me)
+    };
+    crate::smp::request_reschedule(target);
     // Priority-aware kick: if a slice timer is already armed for a Batch
     // quantum (12ms), an Interactive arrival must not wait. Re-arm to the
     // Interactive quantum when the existing arm is not already short.
     // We also must not hide a pending sleeper wake: if a sleep timer is
     // pending far in the future, the new Interactive must still preempt early,
     // so slice and sleep timers are independent (two UniversalTimer entries).
-    let has_slice = SLICE_TIMER_SEQ.load(Ordering::Acquire) != 0;
+    let has_slice = SLICE_TIMER_SEQ[crate::smp::current_cpu_id() as usize]
+        .load(Ordering::Acquire) != 0;
     if !has_slice {
         arm_slice_timer(SLICE_INTERACTIVE_NS);
     } else {
@@ -849,15 +977,15 @@ fn preempt_kick() {
 /// Preemption entry from IRQ context (slice-expiry tick, any deadline tick,
 /// or the resched IPI), invoked *after* EOI.
 ///
-/// Under full BSP-only preemption both ring-3 and kernel contexts are
-/// preemptible when `preempt_count == 0`. Kernel holders are protected by
+/// Under full SMP preemption both ring-3 and kernel contexts are preemptible
+/// when `preempt_count == 0`. Kernel holders are protected by
 /// `IrqMutex` (now `preempt_disable`+`cli`) or explicit `preempt_disable`
 /// around intentionally-plain locks (HEAP, VMM_LOCK, NS_LOCK, BLOCK_CACHE
 /// wait split). The `from_user` flag is retained for future auditing but no
 /// longer gates the switch.
 ///
 /// Additional gates: `sched_active`, `preempt_count == 0`,
-/// non-null current, current state == `Running`. APs never schedule.
+/// non-null current, current state == `Running`.
 /// Unified: `schedule()` now always leaves idle with `preempt_count==0`
 /// (see `Dead->idle`/`ZzZ->idle` enable-before-switch), so this gating
 /// on `preempt_is_enabled()` correctly blocks while a lock is held but
@@ -875,7 +1003,7 @@ pub fn try_preempt_from_irq(_from_user: bool) {
     }
     // Only preempt a genuinely Running current (never mid-park/exit).
     {
-        let cur = CURRENT.lock();
+        let cur = current_lock().lock();
         match cur.as_deref() {
             Some(t) if t.state == TaskState::Running => {}
             _ => return,
@@ -1000,15 +1128,11 @@ pub fn fork_current() -> Result<u64, i64> {
 /// `wake_sleepers`).  Returns only when the task is later rescheduled.
 /// With no current task (kernel boot context) it returns immediately.
 pub fn sleep_until(deadline_ns: u64) {
-    let mut cur = CURRENT.lock();
+    let mut cur = current_lock().lock();
     match cur.as_mut() {
         Some(t) => {
             let raw = &mut **t as *mut Task;
             t.state = TaskState::ZzZ;
-            // A parked task is no longer executing on this CPU. Release the
-            // ownership before publishing it to SLEEPING so an early timer
-            // expiry can safely move it to QUEUE before schedule() runs.
-            t.release_owner(crate::smp::current_cpu_id());
             drop(cur);
             // Binary-insert so the list stays deadline-sorted (front = earliest).
             {
@@ -1041,30 +1165,115 @@ pub fn earliest_sleep_deadline() -> Option<u64> {
     SLEEPING.lock().first().map(|(d, _)| *d)
 }
 
+/// Remove a parked task after its owner has established that it is no longer
+/// executing. This is intentionally called without any queue lock held.
+fn remove_parked_task(raw: *mut Task) -> bool {
+    {
+        let mut sleeping = SLEEPING.lock();
+        if let Some(pos) = sleeping
+            .iter()
+            .position(|(_, t)| (*t as *const Task) as *mut Task == raw)
+        {
+            sleeping.remove(pos);
+            return true;
+        }
+    }
+    {
+        let mut waiters = WAITERS.lock();
+        if let Some(pos) = waiters
+            .iter()
+            .position(|(t, _)| (*t as *const Task) as *mut Task == raw)
+        {
+            waiters.remove(pos);
+            return true;
+        }
+    }
+    false
+}
+
+/// Complete wakeups held in a parked list while a task's outgoing context was
+/// being saved. Once `switch_to` clears owner_cpu, this pass can safely move
+/// the task to the global ready queue.
+fn drain_released_wakes() {
+    let mut ready = Vec::new();
+    {
+        let mut sleeping = SLEEPING.lock();
+        let mut i = 0;
+        while i < sleeping.len() {
+            let task: &Task = &*sleeping[i].1;
+            if task.wake_pending.load(Ordering::Acquire)
+                && task.owner_cpu.load(Ordering::Acquire) == TASK_NO_CPU
+            {
+                ready.push(sleeping.remove(i).1);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    {
+        let mut waiters = WAITERS.lock();
+        let mut i = 0;
+        while i < waiters.len() {
+            let task: &Task = &*waiters[i].0;
+            if task.wake_pending.load(Ordering::Acquire)
+                && task.owner_cpu.load(Ordering::Acquire) == TASK_NO_CPU
+            {
+                ready.push(waiters.remove(i).0);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    if ready.is_empty() {
+        return;
+    }
+    let mut q = QUEUE.lock();
+    for task in ready {
+        task.wake_pending.store(false, Ordering::Release);
+        task.state = TaskState::Ready;
+        task.mark_queued(TASK_GLOBAL_QUEUE);
+        q.push_back(task);
+    }
+}
+
 /// Requeue every sleeping task whose deadline has passed.  Called from the
 /// idle loop only — it may lock `QUEUE`, which must never be held across a
 /// timer ISR (the ISR itself never touches scheduler locks).  `SLEEPING` is
 /// dropped before `QUEUE` is taken, so the two are never held together.
 pub fn wake_sleepers() {
     let now = crate::services::universal_timer::now_ns();
-    let due = {
+    let (due, owned) = {
         let mut sleeping = SLEEPING.lock();
-        // The list is deadline-sorted, so the expired tasks are a contiguous
-        // front prefix; drain them in one shift instead of per-element removes.
-        let mut n = 0;
-        while n < sleeping.len() && sleeping[n].0 <= now {
-            n += 1;
+        let mut due = Vec::new();
+        let mut owned = Vec::new();
+        let mut i = 0;
+        while i < sleeping.len() && sleeping[i].0 <= now {
+            let owner = sleeping[i].1.owner_cpu.load(Ordering::Acquire);
+            if owner == TASK_NO_CPU {
+                due.push(sleeping.remove(i).1);
+            } else {
+                sleeping[i].1.wake_pending.store(true, Ordering::Release);
+                owned.push(owner);
+                i += 1;
+            }
         }
-        sleeping.drain(..n).map(|(_, t)| t).collect::<Vec<_>>()
+        (due, owned)
     };
-    if due.is_empty() {
+    if due.is_empty() && owned.is_empty() {
         return;
     }
+    let had_due = !due.is_empty();
     let mut q = QUEUE.lock();
     for t in due {
         t.state = TaskState::Ready;
+        t.wake_pending.store(false, Ordering::Release);
         t.mark_queued(TASK_GLOBAL_QUEUE);
         q.push_back(t);
+    }
+    drop(q);
+    if had_due { preempt_kick(); }
+    for cpu in owned {
+        crate::smp::request_reschedule(cpu);
     }
 }
 
@@ -1073,14 +1282,14 @@ pub fn wake_sleepers() {
 /// consumes it or its parent dies), so a parent can collect it.  A Dead task
 /// is never requeued, so this never returns.
 pub fn exit_current(code: u64) -> ! {
-    let pid = CURRENT.lock().as_ref().map(|t| t.id).unwrap_or(0);
+    let pid = current_lock().lock().as_ref().map(|t| t.id).unwrap_or(0);
     log::info!("[sched] task exit(pid={} code={})", pid, code);
     SerialPort::puts("[sched] task exit(pid=");
     SerialPort::put_u64(pid);
     SerialPort::puts(" code=");
     SerialPort::put_u64(code);
     SerialPort::puts(")\n");
-    if let Some(t) = CURRENT.lock().as_mut() {
+    if let Some(t) = current_lock().lock().as_mut() {
         t.exit_code = code;
     }
     kill_current()
@@ -1093,7 +1302,7 @@ pub const KILLED_EXIT_CODE: u64 = 0xDEAD_BEEF;
 /// Park the current task forever. Marks it Dead and hands the scheduler to the
 /// next ready task (or idle). Never returns.
 fn kill_current() -> ! {
-    if let Some(t) = CURRENT.lock().as_mut() {
+    if let Some(t) = current_lock().lock().as_mut() {
         t.state = TaskState::Dead;
     }
     schedule();
@@ -1107,11 +1316,11 @@ fn kill_current() -> ! {
 /// task Dead and parks it, abandoning the handler's iretq frame — control never
 /// returns to the faulting user context.
 pub fn kill_user_fault() -> ! {
-    let pid = CURRENT.lock().as_ref().map(|t| t.id).unwrap_or(0);
+    let pid = current_lock().lock().as_ref().map(|t| t.id).unwrap_or(0);
     SerialPort::puts("[sched] user fault — killing pid=");
     SerialPort::put_u64(pid);
     SerialPort::puts("\n");
-    if let Some(t) = CURRENT.lock().as_mut() {
+    if let Some(t) = current_lock().lock().as_mut() {
         t.exit_code = KILLED_EXIT_CODE;
     }
     kill_current()
@@ -1122,16 +1331,26 @@ pub fn kill_user_fault() -> ! {
 /// two `IrqMutex` at once. Single global FIFO, deadline-only (no periodic
 /// LAPIC). Deduplicates O(n) scans and keeps contention in one helper.
 fn with_task<R>(pid: u64, mut f: impl FnMut(&Task) -> Option<R>) -> Option<R> {
-    {
-        let cur = CURRENT.lock();
+    for cpu in 0..crate::smp::MAX_CPUS {
+        let cur = current_lock_for(cpu as u32).lock();
         if let Some(t) = cur.as_ref() {
             if t.id == pid {
                 if let Some(r) = f(*t) {
                     return Some(r);
                 }
-                // pid unique — no need to scan further, but keep same
-                // semantics as before (RECLAIM not live).
                 return None;
+            }
+        }
+        // `schedule` briefly removes CURRENT before publishing the outgoing
+        // task to its queue/park list. The atomic mirror closes that diagnostic
+        // visibility gap without taking a second lock.
+        let ptr = crate::smp::per_cpu_by_id(cpu as u32)
+            .current_task
+            .load(Ordering::Acquire);
+        if cur.is_none() && !ptr.is_null() {
+            let t = unsafe { &*(ptr as *const Task) };
+            if t.id == pid {
+                return f(t);
             }
         }
     }
@@ -1172,12 +1391,12 @@ fn with_task<R>(pid: u64, mut f: impl FnMut(&Task) -> Option<R>) -> Option<R> {
 
 /// Mutable twin of [`with_task`]: hands the closure `&mut Task` for `pid`,
 /// scanning the five live sets one lock at a time. Exclusive access is sound
-/// under the cooperative BSP-only scheduler — the task being mutated is by
-/// definition not running (or is the caller itself in `CURRENT`), and no
-/// other CPU can reach these lists.
+/// under the SMP scheduler — parked tasks are protected by their list lock;
+/// a current task is protected by that CPU's current lock. Remote mutation of
+/// a running task is limited to the kill-pending flag and exit code protocol.
 fn with_task_mut<R>(pid: u64, mut f: impl FnMut(&mut Task) -> Option<R>) -> Option<R> {
-    {
-        let mut cur = CURRENT.lock();
+    for cpu in 0..crate::smp::MAX_CPUS {
+        let mut cur = current_lock_for(cpu as u32).lock();
         if let Some(t) = cur.as_mut() {
             if t.id == pid {
                 return f(*t);
@@ -1237,13 +1456,17 @@ fn take_from_lists(pid: u64) -> Option<&'static mut Task> {
     {
         let mut s = SLEEPING.lock();
         if let Some(i) = s.iter().position(|(_, t)| t.id == pid) {
-            return Some(s.remove(i).1);
+            let task = s.remove(i).1;
+            task.wake_pending.store(false, Ordering::Release);
+            return Some(task);
         }
     }
     {
         let mut w = WAITERS.lock();
         if let Some(i) = w.iter().position(|(t, _)| t.id == pid) {
-            return Some(w.remove(i).0);
+            let task = w.remove(i).0;
+            task.wake_pending.store(false, Ordering::Release);
+            return Some(task);
         }
     }
     None
@@ -1253,15 +1476,15 @@ fn take_from_lists(pid: u64) -> Option<&'static mut Task> {
 ///
 /// True if CURRENT holds a Running task (helper for syscall return resched).
 pub fn is_current_running() -> bool {
-    let cur = CURRENT.lock();
+    let cur = current_lock().lock();
     matches!(cur.as_deref(), Some(t) if t.state == TaskState::Running)
 }
 
-/// The scheduler is BSP-only (single global queue), so every live task is exactly one
-/// of: the current task (`Running`, in `CURRENT`), a ready task in `QUEUE`, a
-/// parked sleeper in `SLEEPING` (`ZzZ`), a parked waiter in `WAITERS` (`ZzZ`),
-/// or a zombie in `ZOMBIES` (`Dead`). The five locks are taken and read
-/// separately, never nested with each other.
+/// Every live task is exactly one of: a current task (`Running`, in one
+/// per-CPU `CURRENT` slot), a ready task in `QUEUE`, a parked sleeper in
+/// `SLEEPING` (`ZzZ`), a parked waiter in `WAITERS` (`ZzZ`), or a zombie in
+/// `ZOMBIES` (`Dead`). The five lock families are taken and read separately,
+/// never nested with each other.
 pub fn process_state(pid: u64) -> Option<TaskState> {
     with_task(pid, |t| Some(t.state))
 }
@@ -1283,19 +1506,53 @@ pub fn task_vm(pid: u64) -> Option<usize> {
 ///   into `ZOMBIES`; its own children then orphan out on the next reap;
 /// - anything else (already reaped, or an unknown id) yields `Err(())`.
 ///
-/// BSP-only: every live non-executing task is in `QUEUE`,
-/// `SLEEPING`, or `WAITERS`, and the only `Running` task is the caller.
+/// A remote current task is marked for deferred death and kicked with a
+/// reschedule IPI; its owning CPU performs the actual park transition.
 pub fn kill(pid: u64) -> Result<(), ()> {
     let is_self = {
-        let cur = CURRENT.lock();
+        let cur = current_lock().lock();
         cur.as_ref().map(|t| t.id == pid).unwrap_or(false)
     };
     if is_self {
-        CURRENT
+        current_lock()
             .lock()
             .as_mut()
             .map(|t| t.exit_code = KILLED_EXIT_CODE);
         kill_current(); // diverges: marked Dead and parked, never returns
+    }
+    for cpu in 0..crate::smp::MAX_CPUS as u32 {
+        if cpu == crate::smp::current_cpu_id() {
+            continue;
+        }
+        let mut cur = current_lock_for(cpu).lock();
+        if let Some(t) = cur.as_mut() {
+            if t.id == pid {
+                t.exit_code = KILLED_EXIT_CODE;
+                t.kill_pending.store(true, Ordering::Release);
+                drop(cur);
+                crate::smp::request_reschedule(cpu);
+                return Ok(());
+            }
+        }
+    }
+    // The current lock is intentionally dropped before the context handoff;
+    // the atomic PerCpu mirror still names the outgoing task in that window.
+    for cpu in 0..crate::smp::MAX_CPUS as u32 {
+        if cpu == crate::smp::current_cpu_id() {
+            continue;
+        }
+        let ptr = crate::smp::per_cpu_by_id(cpu)
+            .current_task
+            .load(Ordering::Acquire);
+        if ptr.is_null() {
+            continue;
+        }
+        let t = unsafe { &*(ptr as *const Task) };
+        if t.id == pid {
+            t.kill_pending.store(true, Ordering::Release);
+            crate::smp::request_reschedule(cpu);
+            return Ok(());
+        }
     }
     if let Some(t) = take_from_lists(pid) {
         t.state = TaskState::Dead;
@@ -1328,7 +1585,11 @@ pub enum WaitError {
 /// which consumes it on the next run.
 fn park_zombie(task: &'static mut Task) {
     let pid = task.id;
-    debug_assert_eq!(task.owner_cpu.load(Ordering::Acquire), TASK_NO_CPU);
+    debug_assert!(
+        task.owner_cpu.load(Ordering::Acquire) == TASK_NO_CPU
+            || task.owner_cpu.load(Ordering::Acquire) == crate::smp::current_cpu_id(),
+        "zombie parked by a different CPU"
+    );
     debug_assert_eq!(task.queue_cpu.load(Ordering::Acquire), TASK_NO_CPU);
     ZOMBIES.lock().push(task);
     wake_waiters_for(pid);
@@ -1340,25 +1601,40 @@ fn park_zombie(task: &'static mut Task) {
 /// same discipline as `wake_sleepers`).
 fn wake_waiters_for(pid: u64) {
     let mut due = Vec::new();
+    let mut owned = Vec::new();
     {
         let mut w = WAITERS.lock();
         let mut i = 0;
         while i < w.len() {
             if w[i].1 == pid {
-                due.push(w.remove(i).0);
+                let owner = w[i].0.owner_cpu.load(Ordering::Acquire);
+                if owner == TASK_NO_CPU {
+                    due.push(w.remove(i).0);
+                } else {
+                    w[i].0.wake_pending.store(true, Ordering::Release);
+                    owned.push(owner);
+                    i += 1;
+                }
             } else {
                 i += 1;
             }
         }
     }
-    if due.is_empty() {
+    if due.is_empty() && owned.is_empty() {
         return;
     }
+    let had_due = !due.is_empty();
     let mut q = QUEUE.lock();
     for t in due {
         t.state = TaskState::Ready;
+        t.wake_pending.store(false, Ordering::Release);
         t.mark_queued(TASK_GLOBAL_QUEUE);
         q.push_back(t);
+    }
+    drop(q);
+    if had_due { preempt_kick(); }
+    for cpu in owned {
+        crate::smp::request_reschedule(cpu);
     }
 }
 
@@ -1416,7 +1692,7 @@ fn consume_zombie(pid: u64) -> Option<u64> {
 /// list is touched from an ISR.
 pub fn wait(pid: u64) -> Result<u64, WaitError> {
     let me = {
-        let cur = CURRENT.lock();
+        let cur = current_lock().lock();
         match cur.as_ref() {
             Some(t) => t.id,
             None => return Err(WaitError::NotFound),
@@ -1442,15 +1718,10 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
             return Err(WaitError::NotFound);
         }
         let raw: *mut Task = {
-            let mut cur = CURRENT.lock();
+            let mut cur = current_lock().lock();
             match cur.as_mut() {
                 Some(t) => {
                     t.state = TaskState::ZzZ;
-                    // Publish the parked state with no CPU owner. The target
-                    // may exit immediately after WAITERS is populated, so a
-                    // wakeup must be allowed to queue this task before the
-                    // scheduler gets control again.
-                    t.release_owner(crate::smp::current_cpu_id());
                     &mut **t as *mut Task
                 }
                 None => return Err(WaitError::NotFound),
@@ -1470,11 +1741,11 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
                 // mark Running (both WAITERS entry and CURRENT alias same Task),
                 // and retry consume without parking.
                 let (t, _) = w.remove(pos);
+                t.wake_pending.store(false, Ordering::Release);
                 t.state = TaskState::Running;
-                assert!(
-                    t.try_claim_owner(crate::smp::current_cpu_id()),
-                    "wait recovery: task already owned"
-                );
+                let cpu = crate::smp::current_cpu_id();
+                let owner = t.owner_cpu.load(Ordering::Acquire);
+                assert!(owner == cpu || t.try_claim_owner(cpu), "wait recovery: task owner changed");
                 drop(w);
                 continue;
             } else {
@@ -1491,10 +1762,10 @@ pub fn wait(pid: u64) -> Result<u64, WaitError> {
                 }
                 drop(q);
                 unsafe { (*raw).state = TaskState::Running; }
-                assert!(
-                    unsafe { (*raw).try_claim_owner(crate::smp::current_cpu_id()) },
-                    "wait recovery: task already owned after wake"
-                );
+                unsafe { (*raw).wake_pending.store(false, Ordering::Release); }
+                let cpu = crate::smp::current_cpu_id();
+                let owner = unsafe { (*raw).owner_cpu.load(Ordering::Acquire) };
+                assert!(owner == cpu || unsafe { (*raw).try_claim_owner(cpu) }, "wait recovery: task owner changed after wake");
                 continue;
             }
         }
@@ -1542,8 +1813,10 @@ pub fn caps_snapshot(pid: u64) -> Option<Vec<crate::caps::Cap>> {
 /// drop the task box.
 ///
 /// Safe from any context as long as the task is not parked on its own stack —
-/// the idle reaper and a consuming `:wait` both qualify (the scheduler is
-/// BSP-only, so the dead root is never the active CR3).
+/// the idle reaper and a consuming `:wait` both qualify. A dead task may be
+/// visible in `ZOMBIES` briefly while its outgoing switch is still completing;
+/// `reap_one` requires owner/queue release and checks every per-CPU current
+/// slot before freeing anything.
 fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
     assert_eq!(
         task.owner_cpu.load(Ordering::Acquire),
@@ -1555,6 +1828,16 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
         TASK_NO_CPU,
         "reap_one: task still queued"
     );
+    let raw = task as *mut Task as *mut core::ffi::c_void;
+    for cpu in 0..crate::smp::MAX_CPUS {
+        assert_ne!(
+            crate::smp::per_cpu_by_id(cpu as u32)
+                .current_task
+                .load(Ordering::Acquire),
+            raw,
+            "reap_one: task is still current on CPU"
+        );
+    }
     let root = task.root;
     // Free caps window before destroying root so its leaves are still present for unmap
     if task.caps_phys != 0 {
@@ -1610,14 +1893,14 @@ fn reap_one(task: &'static mut Task, alloc: &mut BitmapAllocator) {
 /// unmapped memory. Re-pinning here makes ring-0 entry always land on live
 /// memory.
 pub fn reap_dead(alloc: &mut BitmapAllocator) {
-    // Single global FIFO, idle-only: must be called from idle (no CURRENT)
-    // and on the kernel root (APIC MMIO for TLB shootdown). APs halt (SMP
-    // out) so no AP ever reaps. `IrqMutex` keeps deadline wake ISR from
-    // nesting, but the idle check enforces the SCHED-L001 ordering.
+    // Reclamation is kept on the BSP idle path because the physical allocator
+    // is still exposed as one process-wide mutable object. The SMP safety
+    // proof below is nevertheless global: the target cannot be current or
+    // queued on any CPU before its root/stack are freed.
     // Unconditional (not debug_assert): reaping on a user root or with a live
     // CURRENT would corrupt page tables / free a running task's state in
     // release builds too. `is_sched_active` gates the pre-`task::init` window.
-    assert!(CURRENT.lock().is_none(), "reap_dead: must be idle, CURRENT Some");
+    assert!(current_lock().lock().is_none(), "reap_dead: must be idle, current Some");
     assert!(
         crate::smp::is_sched_active(),
         "reap_dead: scheduler not initialized (sched_active false)"
@@ -1643,10 +1926,16 @@ pub fn reap_dead(alloc: &mut BitmapAllocator) {
         zombies
             .iter()
             .enumerate()
-            // parent_pid == 0 (kernel-launched, e.g. INIT from
-            // `enter_userspace`) has no possible waiter: orphaned by
-            // definition, matching the pre-two-phase behavior.
-            .map(|(i, t)| (i, t.parent_pid))
+            // A zombie may be published before the outgoing switch has
+            // completed its atomic owner release. Leave such a task in the
+            // list until the owner handoff is complete; freeing its stack or
+            // address space here would race the AP that still has its saved
+            // context on that stack.
+            .filter_map(|(i, t)| {
+                let owner_free = t.owner_cpu.load(Ordering::Acquire) == TASK_NO_CPU;
+                let queue_free = t.queue_cpu.load(Ordering::Acquire) == TASK_NO_CPU;
+                (owner_free && queue_free).then_some((i, t.parent_pid))
+            })
             .collect()
     };
     let mut free_idx: Vec<usize> = Vec::new();
@@ -1680,6 +1969,13 @@ fn idle_stack_top() -> u64 {
     core::ptr::addr_of!(__kernel_end) as *const u8 as u64
 }
 
+fn current_idle_stack_top() -> u64 {
+    let local = crate::smp::current_scheduler_runtime()
+        .idle_stack_top
+        .load(Ordering::Acquire);
+    if local != 0 { local } else { idle_stack_top() }
+}
+
 /// Public accessor for idle stack top (used by Kernel::run fixup).
 pub fn idle_stack_top_pub() -> u64 {
     idle_stack_top()
@@ -1702,12 +1998,13 @@ fn ensure_idle_root(kroot: u64) {
         crate::mm::vmm::set_current_root(kroot);
         unsafe { core::arch::asm!("mov cr3, {}", in(reg) kroot, options(nostack)) };
     }
-    set_kernel_stack_meta(idle_stack_top());
+    set_kernel_stack_meta(current_idle_stack_top());
 }
 
 /// Weighted round-robin budget: Interactive dispatches remaining before one
 /// Batch dispatch resets it.
-static WRR_CREDIT: AtomicU32 = AtomicU32::new(WEIGHT_INTERACTIVE);
+static WRR_CREDIT: [AtomicU32; crate::smp::MAX_CPUS] =
+    [const { AtomicU32::new(WEIGHT_INTERACTIVE) }; crate::smp::MAX_CPUS];
 
 /// Preemptive scheduler: switch to the next ready task.
 ///
@@ -1740,12 +2037,42 @@ pub fn schedule() {
     // previously only in the idle loops (Kernel::run / enter_userspace) which
     // starved sleepers under load (S1).
     wake_sleepers();
+    drain_released_wakes();
     // Keep the sleeper wake timer in sync: if a future sleeper remains,
     // arm a one-shot so a lone Running task gets preempted on time
     // ( fix for lone-Running starvation when slice timer canceled).
     sync_sleep_timer();
 
-    let prev = CURRENT.lock().take();
+    let mut prev = current_lock().lock().take();
+    if let Some(p) = prev.as_mut() {
+        if p.kill_pending.swap(false, Ordering::AcqRel) {
+            p.state = TaskState::Dead;
+        }
+    }
+    let resume_woken = prev
+        .as_ref()
+        .is_some_and(|p| p.state == TaskState::ZzZ && p.wake_pending.load(Ordering::Acquire));
+    if resume_woken {
+        let p = prev.take().expect("woken task disappeared");
+        let raw = &mut *p as *mut Task;
+        assert!(remove_parked_task(raw), "woken task missing from parked list");
+        p.wake_pending.store(false, Ordering::Release);
+        p.state = TaskState::Running;
+        let ptr = raw as *mut core::ffi::c_void;
+        let more = QUEUE.lock().iter().any(|t| t.state == TaskState::Ready);
+        set_kernel_stack_meta(p.kernel_stack_top);
+        #[cfg(target_arch = "x86_64")]
+        {
+            crate::arch::x86_64::cpufeat::pku_apply(p.pkru);
+            crate::arch::x86_64::syscall::set_user_gs(if p.vm != 0 { p.user_gs } else { 0 });
+        }
+        crate::smp::current_per_cpu().current_task.store(ptr, Ordering::Release);
+        let slice = p.prio.slice_ns();
+        *current_lock().lock() = Some(p);
+        if more { arm_slice_timer(slice); } else { cancel_slice_timer(); }
+        crate::smp::preempt_enable();
+        return;
+    }
     let mut q = QUEUE.lock();
 
     // Weighted round-robin pick: first Ready Interactive and first Ready
@@ -1754,7 +2081,9 @@ pub fn schedule() {
     let mut inter: Option<usize> = None;
     let mut batch: Option<usize> = None;
     for i in 0..q.len() {
-        if q[i].state != TaskState::Ready {
+        if q[i].state != TaskState::Ready
+            || q[i].owner_cpu.load(Ordering::Acquire) != TASK_NO_CPU
+        {
             continue;
         }
         match q[i].prio {
@@ -1765,20 +2094,22 @@ pub fn schedule() {
     }
     let next = loop {
         if let Some(i) = inter {
-            let c = WRR_CREDIT.load(Ordering::Relaxed);
+            let credit = &WRR_CREDIT[cpu_id as usize];
+            let c = credit.load(Ordering::Relaxed);
             if c > 0 {
-                WRR_CREDIT.store(c - 1, Ordering::Relaxed);
+                credit.store(c - 1, Ordering::Relaxed);
                 break q.remove(i);
             }
         }
         if let Some(i) = batch {
-            WRR_CREDIT.store(WEIGHT_INTERACTIVE, Ordering::Relaxed);
+            WRR_CREDIT[cpu_id as usize].store(WEIGHT_INTERACTIVE, Ordering::Relaxed);
             break q.remove(i);
         }
         // Only Interactive ready (or nothing): spend it regardless of budget.
         if let Some(i) = inter {
-            let c = WRR_CREDIT.load(Ordering::Relaxed);
-            WRR_CREDIT.store(c.saturating_sub(1), Ordering::Relaxed);
+            let credit = &WRR_CREDIT[cpu_id as usize];
+            let c = credit.load(Ordering::Relaxed);
+            credit.store(c.saturating_sub(1), Ordering::Relaxed);
             break q.remove(i);
         }
         break None;
@@ -1812,9 +2143,12 @@ pub fn schedule() {
             let ctx_ptr = core::ptr::addr_of_mut!(t.ctx);
             set_kernel_stack_meta(stack_top);
             #[cfg(target_arch = "x86_64")]
-            crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
+            {
+                crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
+                crate::arch::x86_64::syscall::set_user_gs(if t.vm != 0 { t.user_gs } else { 0 });
+            }
             crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
-            *CURRENT.lock() = Some(t);
+            *current_lock().lock() = Some(t);
             if more {
                 arm_slice_timer(slice);
             } else {
@@ -1830,7 +2164,7 @@ pub fn schedule() {
             match prev {
                 Some(p) if p.state == TaskState::Dead => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
-                    *CURRENT.lock() = None;
+                    *current_lock().lock() = None;
                     cancel_slice_timer();
                     // Sleeper timer already synced at entry; keep it - idle
                     // loop also wait_until's earliest, but having a wake timer
@@ -1839,7 +2173,8 @@ pub fn schedule() {
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
                     debug_assert!(root != 0, "KERNEL_ROOT zero on Dead->idle");
-                    p.release_owner(cpu_id);
+                    let owner = core::ptr::addr_of_mut!(p.owner_cpu);
+                    let generation = core::ptr::addr_of_mut!(p.ownership_generation);
                     drop(q);
                     park_zombie(p);
                     // Idle must run on KERNEL_ROOT — unified fixup (was WARN-only, never `mov cr3`).
@@ -1847,7 +2182,13 @@ pub fn schedule() {
                     // Dead never resumes — release preempt before switch so idle resumes count==0 and is tick-preemptible (unified with ZzZ).
                     crate::smp::preempt_enable();
                     unsafe {
-                        switch_to_checked(pctx, idle_ctx(), root);
+                        switch_to_checked(
+                            pctx,
+                            idle_ctx(),
+                            root,
+                            owner,
+                            generation,
+                        );
                     }
                     return;
                 }
@@ -1855,7 +2196,7 @@ pub fn schedule() {
                     // Unified with Dead->idle: enable-before-switch so idle resumes with count==0 and is tick-preemptible.
                     // Previously this parked "elevated" (count==1 across switch, enable after) leaving idle non-preemptible until next schedule.
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
-                    *CURRENT.lock() = None;
+                    *current_lock().lock() = None;
                     cancel_slice_timer();
                     let pctx = core::ptr::addr_of_mut!(p.ctx);
                     let root = KERNEL_ROOT.load(Ordering::Relaxed);
@@ -1864,7 +2205,13 @@ pub fn schedule() {
                     ensure_idle_root(root);
                     crate::smp::preempt_enable();
                     unsafe {
-                        switch_to_checked(pctx, idle_ctx(), root);
+                        switch_to_checked(
+                            pctx,
+                            idle_ctx(),
+                            root,
+                            core::ptr::addr_of_mut!(p.owner_cpu),
+                            core::ptr::addr_of_mut!(p.ownership_generation),
+                        );
                     }
                     return;
                 }
@@ -1886,7 +2233,7 @@ pub fn schedule() {
                     // the lone task is still preempted at the next sleeper
                     // deadline. Next arrival re-arms slice via preempt_kick.
                     crate::smp::current_per_cpu().current_task.store(ptr, Ordering::Relaxed);
-                    *CURRENT.lock() = Some(p);
+                    *current_lock().lock() = Some(p);
                     set_kernel_stack_meta(stack_top);
                     cancel_slice_timer();
                     drop(q);
@@ -1899,7 +2246,7 @@ pub fn schedule() {
                 }
                 None => {
                     crate::smp::current_per_cpu().current_task.store(core::ptr::null_mut(), Ordering::Relaxed);
-                    *CURRENT.lock() = None;
+                    *current_lock().lock() = None;
                     cancel_slice_timer();
                     let kroot = KERNEL_ROOT.load(Ordering::Relaxed);
                     ensure_idle_root(kroot);
@@ -1912,37 +2259,51 @@ pub fn schedule() {
     };
 
     match prev {
+        Some(p) if core::ptr::eq(core::ptr::addr_of!(p.ctx), next_ptr) => {
+            // A remote exit can wake this task after it published WAITERS but
+            // before this CPU entered schedule(). The wake path has already
+            // queued the same task, so dispatch selected our own context. It
+            // is now Running/current again; do not call switch_to on a context
+            // against itself or requeue it a second time.
+            drop(q);
+            crate::mm::vmm::set_current_root(next_root);
+            crate::smp::preempt_enable();
+        }
         Some(p) if p.state == TaskState::Dead => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
-            p.release_owner(cpu_id);
+            let owner = core::ptr::addr_of_mut!(p.owner_cpu);
+            let generation = core::ptr::addr_of_mut!(p.ownership_generation);
             drop(q);
             park_zombie(p);
             crate::mm::vmm::set_current_root(next_root);
             crate::smp::preempt_enable();
             unsafe {
-                switch_to_checked(pctx, next_ptr, next_root);
+                switch_to_checked(pctx, next_ptr, next_root, owner, generation);
             }
         }
         Some(p) if p.state == TaskState::ZzZ => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
+            let owner = core::ptr::addr_of_mut!(p.owner_cpu);
+            let generation = core::ptr::addr_of_mut!(p.ownership_generation);
             drop(q);
             crate::mm::vmm::set_current_root(next_root);
             // Enable before switch so new task starts count==0 tick-preemptible.
             crate::smp::preempt_enable();
             unsafe {
-                switch_to_checked(pctx, next_ptr, next_root);
+                switch_to_checked(pctx, next_ptr, next_root, owner, generation);
             }
         }
         Some(p) => {
             let pctx = core::ptr::addr_of_mut!(p.ctx);
             p.state = TaskState::Ready;
-            p.release_owner_if_owned(cpu_id);
+            let owner = core::ptr::addr_of_mut!(p.owner_cpu);
+            let generation = core::ptr::addr_of_mut!(p.ownership_generation);
             // A wakeup can publish this same task to QUEUE before this
             // scheduler pass consumes CURRENT. In that case it is already
             // queued and must not be appended a second time.
             match p.queue_cpu.load(Ordering::Acquire) {
                 TASK_NO_CPU => {
-                    p.mark_queued(TASK_GLOBAL_QUEUE);
+                    p.mark_queued_from_owner(cpu_id);
                     q.push_back(p);
                 }
                 TASK_GLOBAL_QUEUE => {}
@@ -1956,7 +2317,7 @@ pub fn schedule() {
             crate::mm::vmm::set_current_root(next_root);
             crate::smp::preempt_enable();
             unsafe {
-                switch_to_checked(pctx, next_ptr, next_root);
+                switch_to_checked(pctx, next_ptr, next_root, owner, generation);
             }
         }
         None => {
@@ -1964,7 +2325,13 @@ pub fn schedule() {
             crate::mm::vmm::set_current_root(next_root);
             crate::smp::preempt_enable();
             unsafe {
-                switch_to_checked(idle_ctx(), next_ptr, next_root);
+                switch_to_checked(
+                    idle_ctx(),
+                    next_ptr,
+                    next_root,
+                    core::ptr::null_mut(),
+                    core::ptr::null_mut(),
+                );
             }
         }
     }
@@ -1982,7 +2349,7 @@ pub fn maybe_resched_from_preempt() {
         return;
     }
     let should = {
-        let cur = CURRENT.lock();
+        let cur = current_lock().lock();
         match cur.as_deref() {
             Some(t) if t.state == TaskState::Running => true,
             _ => false,
@@ -2138,7 +2505,7 @@ pub fn enter_userspace(
     #[cfg(target_arch = "x86_64")]
     crate::arch::x86_64::cpufeat::pku_apply(t.pkru);
     crate::smp::current_per_cpu().current_task.store(t as *mut Task as *mut core::ffi::c_void, Ordering::Relaxed);
-    *CURRENT.lock() = Some(t);
+    *current_lock().lock() = Some(t);
 
     crate::mm::vmm::set_current_root(root);
     // Hardened handoff: validate idle->INIT switch (RIP==CR3 would #PF at PD[23]=0)
@@ -2163,7 +2530,13 @@ pub fn enter_userspace(
         }
     }
     unsafe {
-        switch_to_checked(idle_ctx(), ctx_ptr, root);
+        switch_to_checked(
+            idle_ctx(),
+            ctx_ptr,
+            root,
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        );
     }
     // Returned to idle after INIT exit — re-enable preempt (balance the disable above).
     crate::smp::preempt_enable();
@@ -2233,11 +2606,13 @@ extern "C" fn smoke_task_b() -> ! {
     exit_current(1)
 }
 
-/// Snapshot for unispace: (next_id, qlen, current_present, sleeping, waiters, zombies, reclaim, kstack_in_use)
+/// Snapshot for unispace: (next_id, qlen, any_current, sleeping, waiters,
+/// zombies, reclaim, kstack_in_use).
 pub fn sched_snapshot() -> (u64, usize, bool, usize, usize, usize, usize, usize) {
     let next = NEXT_ID.load(Ordering::Relaxed);
     let qlen = QUEUE.lock().len();
-    let cur = CURRENT.lock().is_some();
+    let cur = (0..crate::smp::MAX_CPUS)
+        .any(|cpu| current_lock_for(cpu as u32).lock().is_some());
     let sleeping = SLEEPING.lock().len();
     let waiters = WAITERS.lock().len();
     let zombies = ZOMBIES.lock().len();
